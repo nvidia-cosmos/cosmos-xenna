@@ -14,7 +14,8 @@ ci:unit-tests:
   image:
     name: ghcr.io/astral-sh/uv:python3.9-bookworm-slim
   script:
-    - ls
+    - uv sync
+    - uv run run_presubmit.py test
   tags:
     - cpu
 
@@ -24,7 +25,8 @@ ci:lint:
   image:
     name: ghcr.io/astral-sh/uv:python3.9-bookworm-slim
   script:
-    - ls
+    - uv sync
+    - uv run run_presubmit.py lint
   tags:
     - cpu
 
