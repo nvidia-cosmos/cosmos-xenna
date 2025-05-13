@@ -13,6 +13,7 @@ SOURCE_PATH_TO_COPY = "packages/cosmos-xenna"
 PRESERVE_PATTERNS_IN_DESTINATION = [
     'sync_from_i4.py',
     '.gitlab-ci.yml',
+    '.git',
 ]
 
 def run_command(command, cwd=None):
@@ -71,14 +72,6 @@ def main():
         source_rsync_path = os.path.join(temp_clone_dir, SOURCE_PATH_TO_COPY) + os.sep
         target_copy_destination_in_repo = repo_root
         
-        if os.path.exists(target_copy_destination_in_repo):
-            print(f"Removing existing target directory in repo: {target_copy_destination_in_repo}")
-            if os.path.isdir(target_copy_destination_in_repo):
-                shutil.rmtree(target_copy_destination_in_repo)
-            else:
-                os.remove(target_copy_destination_in_repo)
-        os.makedirs(target_copy_destination_in_repo, exist_ok=True)
-
         print(f"Copying files from {source_rsync_path} to {target_copy_destination_in_repo}...")
         rsync_command = [
             "rsync", "-av", "--delete", 
