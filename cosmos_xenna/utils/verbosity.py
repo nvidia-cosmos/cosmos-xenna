@@ -12,3 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Unified definition of verbosity levels."""
+
+import enum
+
+
+class VerbosityLevel(enum.IntEnum):
+    NONE = 0
+    INFO = 1
+    DEBUG = 2

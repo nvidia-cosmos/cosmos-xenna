@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Code used to run the pipeline workers in a streaming Ray pipeline.
 
 This module defines the `StageWorker` class, a Ray actor responsible for processing
@@ -63,9 +78,11 @@ import attrs
 import ray
 import ray.experimental
 from loguru import logger
+from ray.util.metrics import Gauge
 
 from cosmos_xenna.ray_utils import resources, stage
 from cosmos_xenna.utils import gpu, retry
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -276,7 +293,13 @@ class StageWorker(abc.ABC, Generic[T, V]):
             to overlap with the processing of the current task.
     """
 
-    def __init__(self, stage_interface: stage.Interface, params: stage.Params, worker: resources.Worker) -> None:
+    def __init__(
+        self,
+        stage_interface: stage.Interface,
+        params: stage.Params,
+        worker: resources.Worker,
+        verbosity_level: VerbosityLevel,
+    ) -> None:
         """Initializes the StageWorker actor.
 
         Args:
@@ -289,6 +312,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self._is_setup = False
         self._node_location: str | None = None
         self._worker = worker
+        self._verbosity_level = verbosity_level
 
         # Tasks waiting to be downloaded
         self.task_queue: queue.Queue[_TaskDataWithId[T]] = queue.Queue()
@@ -312,6 +336,13 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         self._error_map: dict[str, Exception] = {}
         self._global_error: Exception | None = None
+
+        # GPU metrics
+        self._metrics_gpu_alloc = Gauge(
+            "pipeline_stage_gpu_alloc",
+            description="Number of GPUs allocated to this stage",
+            tag_keys=("stage", "ActorId", "GpuIndex"),
+        )
 
     def _get_node_location(self) -> str:
         if self._node_location is None:
@@ -354,9 +385,11 @@ class StageWorker(abc.ABC, Generic[T, V]):
             def func_to_call() -> None:
                 return self._stage_interface.setup_on_node(resources.NodeInfo(node_location), copy.deepcopy(metadata))
 
-            logger.info(f"Setting up actor for stage={self._params.name} on node={node_location}")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Setting up actor for stage={self._params.name} on node={node_location}")
             retry.do_with_retries(func_to_call, max_attempts=self._params.num_node_setup_retries)
-            logger.info(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
             return node_location
 
     @ray.method(retry_exceptions=False)
@@ -385,11 +418,25 @@ class StageWorker(abc.ABC, Generic[T, V]):
             def func_to_call() -> None:
                 return self._stage_interface.setup(copy.deepcopy(metadata))
 
-            logger.info(f"Setting up actor for stage={self._params.name}")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Setting up actor for stage={self._params.name}")
             retry.do_with_retries(func_to_call, max_attempts=self._params.num_setup_retries)
             node_location = self._get_node_location()
             self._is_setup = True
-            logger.info(f"Finished setting up actor for stage={self._params.name}")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Finished setting up actor for stage={self._params.name}")
+
+            # metrics
+            for gpu_alloc in self._worker.allocation.gpus:
+                self._metrics_gpu_alloc.set(
+                    gpu_alloc.fraction,
+                    tags={
+                        "stage": self._params.name,
+                        "ActorId": self._worker.id,
+                        "GpuIndex": str(gpu_alloc.gpu_index),
+                    },
+                )
+
             return node_location
 
     @ray.method(num_returns="dynamic", retry_exceptions=False)

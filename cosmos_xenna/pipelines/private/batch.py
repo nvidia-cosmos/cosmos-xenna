@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import typing
@@ -8,7 +23,7 @@ from loguru import logger
 from cosmos_xenna.pipelines.private import monitoring, specs
 from cosmos_xenna.pipelines.private.scheduling import autoscaling_algorithms, data_structures
 from cosmos_xenna.ray_utils import actor_pool, allocator, resources
-from cosmos_xenna.utils import deque, grouping, timing
+from cosmos_xenna.utils import deque, grouping, timing, verbosity
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -18,6 +33,7 @@ _MAX_MAIN_LOOP_RATE_HZ = 100
 
 
 def _determine_number_of_workers_and_scale_pool(
+    stage_spec: specs.StageSpec,
     pool: actor_pool.ActorPool,
     cluster_resources: resources.ClusterResources,
     factory: autoscaling_algorithms.WorkerIdFactory,
@@ -27,6 +43,10 @@ def _determine_number_of_workers_and_scale_pool(
     We re-use the autoscaling algorithm we use for streaming. This is kind of a hack as it is much more complex
     than we need, but a batch pipeline is basically just a single-stage streaming pipeline, so it should work fine.
     """
+    maybe_requested_num_workers = stage_spec.num_workers
+    if stage_spec.num_workers_per_node is not None:
+        maybe_requested_num_workers = cluster_resources.num_nodes * stage_spec.num_workers_per_node
+
     problem = data_structures.Problem(
         cluster_resources=cluster_resources,
         stages=[
@@ -34,6 +54,7 @@ def _determine_number_of_workers_and_scale_pool(
                 name=pool.name,
                 stage_batch_size=1,
                 worker_shape=pool.worker_shape,
+                requested_num_workers=maybe_requested_num_workers,
             )
         ],
     )
@@ -47,7 +68,7 @@ def _determine_number_of_workers_and_scale_pool(
             stages=[autoscaling_algorithms.Estimate(batches_per_second_per_worker=1, num_returns_per_batch=1)]
         ),
         factory=factory,
-        verbosity_level=specs.VerbosityLevel.NONE,
+        verbosity_level=verbosity.VerbosityLevel.NONE,
     )
     assert solution.stages[0].deleted_workers == []
     for worker_to_add in solution.stages[0].new_workers:
@@ -81,11 +102,22 @@ def run_pipeline(
     for idx, spec in enumerate(pipeline_spec.stages):
         assert isinstance(spec, specs.StageSpec)
         wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, spec, idx)
-        pool = actor_pool.ActorPool(worker_allocator, wrapped_stage.stage, wrapped_stage.params, spec.name(idx))
+        pool = actor_pool.ActorPool(
+            worker_allocator,
+            wrapped_stage.stage,
+            wrapped_stage.params,
+            spec.name(idx),
+            verbosity_level=pipeline_spec.config.actor_pool_verbosity_level,
+        )
         pools.append(pool)
 
     num_completed = 0
-    with monitoring.PipelineMonitor(pipeline_spec.config.logging_interval_s, initial_input_len, pools) as monitor:
+    with monitoring.PipelineMonitor(
+        pipeline_spec.config.logging_interval_s,
+        initial_input_len,
+        pools,
+        pipeline_spec.config.monitoring_verbosity_level,
+    ) as monitor:
         for idx, (spec, pool) in enumerate(zip(pipeline_spec.stages, pools)):
             assert isinstance(spec, specs.StageSpec)
             logger.info(f"Starting stage={pool.name}")
@@ -97,7 +129,7 @@ def run_pipeline(
             for input in inputs:
                 pool.add_task(input)
 
-            _determine_number_of_workers_and_scale_pool(pool, cluster_resources, worker_id_factory)
+            _determine_number_of_workers_and_scale_pool(spec, pool, cluster_resources, worker_id_factory)
             while pool.has_work_or_completed:
                 pool.update()
                 # TODO: task_metadata_per_pool should be filled in for reporting purposes.

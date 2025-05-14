@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import collections
@@ -14,7 +29,7 @@ from loguru import logger
 from cosmos_xenna.pipelines.private import monitoring, specs
 from cosmos_xenna.pipelines.private.scheduling import autoscaling_algorithms, data_structures
 from cosmos_xenna.ray_utils import actor_pool, allocator, resources, stage_worker
-from cosmos_xenna.utils import approx, deque, timing
+from cosmos_xenna.utils import approx, deque, timing, verbosity
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -73,7 +88,7 @@ class Autoscaler:
         worker_allocator: allocator.WorkerAllocator,
         pipeline_spec: specs.PipelineSpec,
         cluster_resources: resources.ClusterResources,
-        verbosity_level: specs.VerbosityLevel = specs.VerbosityLevel.NONE,
+        verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
     ) -> None:
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
@@ -115,7 +130,7 @@ class Autoscaler:
             time.time(),
             self._make_problem_state(pools, stages_is_dones),
         )
-        if self._verbosity_level > specs.VerbosityLevel.INFO:
+        if self._verbosity_level > verbosity.VerbosityLevel.INFO:
             logger.info(f"Autoscale result:\n{autoscale_result}")
 
         for result, pool in zip(autoscale_result.stages, pools):
@@ -371,6 +386,7 @@ def run_pipeline(
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
+                verbosity_level=pipeline_spec.config.actor_pool_verbosity_level,
             )
         )
 
@@ -390,7 +406,12 @@ def run_pipeline(
     logger.info("Starting main loop")
 
     last_stats: Optional[StreamingExecutorStats] = None
-    with monitoring.PipelineMonitor(pipeline_spec.config.logging_interval_s, initital_input_length, pools) as monitor:
+    with monitoring.PipelineMonitor(
+        pipeline_spec.config.logging_interval_s,
+        initital_input_length,
+        pools,
+        pipeline_spec.config.monitoring_verbosity_level,
+    ) as monitor:
         # This is the loop which does all the interesting stuff. It was difficult to find the correct way to iterate
         # through this which managed backpressure the correct way.
         while True:
@@ -399,9 +420,11 @@ def run_pipeline(
             # Handle scaling the actor pools.
             # This should get called on the first loop through.
             if autoscale_rate_limiter.can_call():
-                logger.info("Autoscaling...")
+                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
+                    logger.info("Autoscaling...")
                 autoscaler.update(pools, stage_is_dones)
-                logger.info("Done calculating autoscaling...")
+                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
+                    logger.info("Done calculating autoscaling...")
             new_stats.auto_scaling_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
@@ -420,7 +443,8 @@ def run_pipeline(
             pool_extra_metadatas = [deque.pop_all_deque_elements(x.task_extra_data) for x in pools]
 
             if monitor.update(len(input_queue), len(queues[-1]), pool_extra_metadatas) and (last_stats is not None):
-                logger.info(last_stats.to_log_string())
+                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
+                    logger.info(last_stats.to_log_string())
                 if pipeline_spec.config.log_worker_allocation_layout:
                     logger.info(f"Worker allocation:\n{worker_allocator.make_detailed_utilization_table()}")
             new_stats.monitor_update_end = time.time()

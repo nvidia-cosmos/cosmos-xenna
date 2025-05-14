@@ -1,4 +1,18 @@
-# TODO: Turn this into real test with assertians and stuff. Right now, it is meant to be run manually.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 from __future__ import annotations
 
@@ -11,6 +25,7 @@ import pytest
 import ray
 
 from cosmos_xenna.ray_utils import cluster, resources, stage, stage_worker
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 
 @pytest.fixture
@@ -89,6 +104,7 @@ def test_process_data_basic(ray_cluster) -> None:
             "my_stage",
             resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
+        VerbosityLevel.INFO,
     )
     node_id = ray.get(actor.setup.remote())  # type: ignore
     print(node_id)
@@ -112,6 +128,7 @@ def test_process_data_in_parallel(ray_cluster) -> None:
             "my_stage",
             resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
+        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 
@@ -156,6 +173,7 @@ def test_complex_data_in_parallel(ray_cluster) -> None:
             "my_stage",
             resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
+        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 
@@ -182,6 +200,7 @@ def test_multiple_tasks_with_exceptions(ray_cluster) -> None:
             "my_stage",
             resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
+        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 

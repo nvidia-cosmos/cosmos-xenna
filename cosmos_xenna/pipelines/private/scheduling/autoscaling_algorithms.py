@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Algorithms for auto-scaling streaming pipeline workers with smart resource packing.
 
 This module implements an adaptive worker allocation system for streaming pipelines that optimizes
@@ -32,14 +47,13 @@ from typing import Optional, Union
 import attrs
 from loguru import logger
 
-from cosmos_xenna.pipelines.private import specs
 from cosmos_xenna.pipelines.private.scheduling import (
     data_structures,
     fragmentation_allocation_algorithms,
     naiive_worker_allocation,
 )
 from cosmos_xenna.ray_utils import allocator, resources
-from cosmos_xenna.utils import attrs_utils, timing
+from cosmos_xenna.utils import attrs_utils, timing, verbosity
 
 
 class AllocationError(Exception):
@@ -185,7 +199,7 @@ class SpeedAndNumberOfReturnsEstimator:
         num_stages: int,
         window_duration: float = 60 * 3,
         min_num_events: int = 5,
-        verbosity_level: specs.VerbosityLevel = specs.VerbosityLevel.NONE,
+        verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
     ) -> None:
         self._window_duration = float(window_duration)
         self._speed_estimators: list[timing.RateEstimatorDuration] = [
@@ -229,7 +243,7 @@ class SpeedAndNumberOfReturnsEstimator:
                 self._last_valid_speeds[i] = maybe_speed
             if maybe_num_return is not None:
                 self._last_valid_num_returns[i] = maybe_num_return
-        if self._verbosity_level >= specs.VerbosityLevel.DEBUG:
+        if self._verbosity_level >= verbosity.VerbosityLevel.DEBUG:
             logger.debug(
                 f"Got the following speeds:\n{maybe_speeds}\nand the following last valid speeds:\n"
                 f"{self._last_valid_speeds}"
@@ -329,7 +343,7 @@ def _run_naiive_allocation(
     problem: data_structures.Problem,
     state: data_structures.ProblemState,
     estimates: Estimates,
-    verbosity_level: specs.VerbosityLevel = specs.VerbosityLevel.NONE,
+    verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
 ) -> _NaiiveAllocationResult:
     """Perform initial naive allocation of workers to stages.
 
@@ -376,7 +390,7 @@ def _run_naiive_allocation(
         stages=stages,
         cluster_resources=problem.cluster_resources.totals(),
     )
-    if verbosity_level >= specs.VerbosityLevel.INFO:
+    if verbosity_level >= verbosity.VerbosityLevel.INFO:
         logger.info(
             f"Solving the following naiive allocation problem:\n{attrs_utils.format_attrs_object(allocation_problem)}"
         )
@@ -387,7 +401,7 @@ def _run_naiive_allocation(
         [x.batches_per_second_per_worker for x in estimates.stages],
     )
     out = _NaiiveAllocationResult(allocation_result, num_slots_per_stage)
-    if verbosity_level >= specs.VerbosityLevel.INFO:
+    if verbosity_level >= verbosity.VerbosityLevel.INFO:
         logger.info(f"Got the following naiive allocation result:\n{attrs_utils.format_attrs_object(out)}")
     return out
 
@@ -502,7 +516,7 @@ def run_fragmentation_autoscaler(
     problem: data_structures.Problem,
     state: data_structures.ProblemState,
     estimates: Estimates,
-    verbosity_level: specs.VerbosityLevel = specs.VerbosityLevel.NONE,
+    verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
     overallocation_target: float = 1.5,
     factory: Optional[WorkerIdFactory] = None,
 ) -> data_structures.Solution:
@@ -551,7 +565,7 @@ def run_fragmentation_autoscaler(
     """
     if factory is None:
         factory = WorkerIdFactory()
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info(
             "Running fragmentation based autoscaler on the following problem:\n"
             f"{attrs_utils.format_attrs_object(problem)}\n"
@@ -576,16 +590,16 @@ def run_fragmentation_autoscaler(
 
     stage_names = [x.name for x in stages]
     assert len(stage_names) == len(set(stage_names)), f"Expected stage names to be unique, but got: {stage_names}"
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info("Running naiive allocation.")
 
     for stage in stages:
         if stage.speed_per_worker is None:
-            if verbosity_level >= specs.VerbosityLevel.DEBUG:
+            if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
                 logger.warning(f"Stage {stage.name} has no speed measurements. Using 1.0 as speed.")
             stage.speed_per_worker = 1.0
         if stage.num_returns_per_batch is None or stage.num_returns_per_batch == 0:
-            if verbosity_level >= specs.VerbosityLevel.DEBUG:
+            if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
                 logger.warning(
                     f"Stage {stage.name} has no num_returns_per_batch measurements. "
                     "Using stage_batch_size as num_returns_per_batch."
@@ -669,7 +683,7 @@ def run_fragmentation_autoscaler(
     # priority and must be satisfied exactly. Failing to meet these requirements
     # is a fatal error.
     #
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info("Running phase 1...")
     for stage in stages:
         if stage.requested_num_workers is None:
@@ -687,7 +701,7 @@ def run_fragmentation_autoscaler(
         while stage.current_workers > stage.requested_num_workers:
             _remove_best_worker(stage)
 
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info(f"Phase 1 complete. Current state:\n{attrs_utils.format_attrs_list(stages)}")
 
     # Phase 2: Ensure minimum workers
@@ -695,7 +709,7 @@ def run_fragmentation_autoscaler(
     # Every stage must have at least one worker to maintain pipeline flow.
     # Skip stages with manual worker counts (already handled in Phase 1).
     #
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info("Running phase 2...")
     for stage in stages:
         if stage.requested_num_workers is not None:
@@ -705,7 +719,7 @@ def run_fragmentation_autoscaler(
             if not _try_allocate_worker(stage):
                 raise RuntimeError(f"Unable to allocate minimum worker for stage={stage.name}")
 
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info(f"Phase 2 complete. Current state:\n{attrs_utils.format_attrs_list(stages)}")
 
     # Phase 3: Optimize minimum throughput
@@ -719,7 +733,7 @@ def run_fragmentation_autoscaler(
     # - Exclude manually specified stages (already handled)
     # - Exclude stages without speed measurements (can't optimize what we can't measure)
     #
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info("Running phase 3...")
     active_stages = [
         s
@@ -761,7 +775,7 @@ def run_fragmentation_autoscaler(
         stage_to_remove_from = max(removable_stages, key=lambda s: s.throughput_if_one_worker_removed)
         _remove_best_worker(stage_to_remove_from)
 
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info(f"Phase 3 complete. Current state:\n{attrs_utils.format_attrs_list(active_stages)}")
     #
     # Phase 4: Over-allocation
@@ -774,7 +788,7 @@ def run_fragmentation_autoscaler(
     # a) Won't exceed the over-allocation target
     # b) Has available resources for allocation
     #
-    if verbosity_level >= specs.VerbosityLevel.INFO:
+    if verbosity_level >= verbosity.VerbosityLevel.INFO:
         logger.info("Running phase 4...")
 
     # Find current slowest stage - this is what we're trying to improve
@@ -810,7 +824,7 @@ def run_fragmentation_autoscaler(
         # Remove stages that we know we can't allocate to anymore
         active_stages = [s for s in active_stages if s not in stages_to_remove]
 
-    if verbosity_level >= specs.VerbosityLevel.DEBUG:
+    if verbosity_level >= verbosity.VerbosityLevel.DEBUG:
         logger.info(f"Phase 4 complete. Current state:\n{attrs_utils.format_attrs_list(active_stages)}")
     return _make_output()
 
@@ -825,7 +839,7 @@ class FragmentationBasedAutoscaler(data_structures.AutoScalingAlgorithmInterface
     def __init__(
         self,
         speed_estimation_window_duration_s: float = 60.0 * 3,
-        verbosity_level: specs.VerbosityLevel = specs.VerbosityLevel.NONE,
+        verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
     ):
         self._speed_estimation_window_duration_s = speed_estimation_window_duration_s
         self._id_factory = WorkerIdFactory()
@@ -836,7 +850,7 @@ class FragmentationBasedAutoscaler(data_structures.AutoScalingAlgorithmInterface
         return "fragmentation_based_autoscaler"
 
     def setup(self, problem: data_structures.Problem) -> None:
-        if self._verbosity_level >= specs.VerbosityLevel.INFO:
+        if self._verbosity_level >= verbosity.VerbosityLevel.INFO:
             logger.info(f"Setting up fragmentation based autoscaler with problem: {problem}")
         self._problem = problem
         stage_names = [x.name for x in problem.stages]
@@ -857,7 +871,7 @@ class FragmentationBasedAutoscaler(data_structures.AutoScalingAlgorithmInterface
         state = copy.deepcopy(state)
         avg_speeds = self._speed_calculator.get_last_valid_estimates(current_time)
 
-        if self._verbosity_level >= specs.VerbosityLevel.DEBUG:
+        if self._verbosity_level >= verbosity.VerbosityLevel.DEBUG:
             logger.info("Running algorithm...")
         # Call a function which isolates the actual algorithm. We do this to make it slightly easier to test.
         out = run_fragmentation_autoscaler(
@@ -868,6 +882,6 @@ class FragmentationBasedAutoscaler(data_structures.AutoScalingAlgorithmInterface
             overallocation_target=1.5,
             factory=self._id_factory,
         )
-        if self._verbosity_level >= specs.VerbosityLevel.DEBUG:
+        if self._verbosity_level >= verbosity.VerbosityLevel.DEBUG:
             logger.info("Finished running algorithm.")
         return out

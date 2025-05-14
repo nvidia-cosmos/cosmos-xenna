@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Code for managing a pool of Ray actors. This is used for both Batch and Streaming pipelines."""
 
 from __future__ import annotations
@@ -17,9 +32,11 @@ import ray.util.scheduling_strategies
 from loguru import logger
 from ray import ObjectRef
 from ray.actor import ActorHandle
+from ray.util.metrics import Counter
 
 from cosmos_xenna.ray_utils import allocator, monitoring, resources, stage, stage_worker
 from cosmos_xenna.utils import stats, timing
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -106,7 +123,7 @@ class _ReadyActor(Generic[V]):
     def maybe_resize_num_slots_per_actor(self, new_slots_per_actor: int) -> None:
         if len(self.slots) == new_slots_per_actor:
             return
-        elif len(self.slots) < new_slots_per_actor:
+        if len(self.slots) < new_slots_per_actor:
             self.slots.append(_Slot(None))
         else:  # len(slots) > new_num_slots:
             # TODO: Implement this. I think it's actually pretty hard? We need to clear running tasks from an
@@ -300,6 +317,7 @@ class ActorPool(Generic[T, V]):
         params: stage.Params,
         name: str,
         queue_params: QueueParams | None = None,
+        verbosity_level: VerbosityLevel = VerbosityLevel.INFO,
     ):
         self._name = str(name)
         self._queue_params = queue_params
@@ -307,6 +325,7 @@ class ActorPool(Generic[T, V]):
         self._params = params
         self._worker_shape = params.shape
         self._allocator = worker_allocator
+        self._verbosity_level = verbosity_level
 
         # State related to node-level setup (`setup_on_node`)
         self._nodes_with_completed_setups: set[str] = set()  # Nodes where setup_on_node succeeded.
@@ -332,6 +351,7 @@ class ActorPool(Generic[T, V]):
         # Internal state & stats
         self._num_null_tasks = 0
         self._num_completed_tasks = 0
+        self._num_dynamically_spawned_tasks = 0
         self._slots_per_actor = params.slots_per_actor
         self._task_result_metadatas: collections.deque[stage_worker.TaskResultMetadata] = collections.deque(
             maxlen=_MAX_QUEUED_TASK_METADATAS
@@ -340,6 +360,39 @@ class ActorPool(Generic[T, V]):
         self._num_actors_failed_to_start = 0
         self._actors_to_delete: collections.deque[resources.Worker] = collections.deque()
         self._actors_to_create: collections.deque[resources.Worker] = collections.deque()
+
+        # Metrics
+        self._metrics_stage_deserialize_count = Counter(
+            "pipeline_stage_deserialize_count_total",
+            description="Count of the deserialized object",
+            tag_keys=("stage",),
+        )
+        self._metrics_stage_deserialize_size = Counter(
+            "pipeline_stage_deserialize_size_total",
+            description="Size of the deserialized objects",
+            tag_keys=("stage",),
+        )
+        self._metrics_stage_deserialize_time = Counter(
+            "pipeline_stage_deserialize_time_total",
+            description="Time taken to deserialize the pipeline objects",
+            tag_keys=("stage",),
+        )
+        self._metrics_stage_process_time = Counter(
+            "pipeline_stage_process_time_total",
+            description="Time taken to process the pipeline objects",
+            tag_keys=("stage",),
+        )
+        self._metrics_schedule_task_count = Counter(
+            "pipeline_schedule_task_count_total",
+            description="Number of tasks scheduled to actors",
+            tag_keys=("stage", "affinity"),
+        )
+        # Initialize scheduling metrics as we may want to calculate ratio
+        for affinity in ["local", "remote"]:
+            self._metrics_schedule_task_count.inc(
+                0.01,
+                tags={"stage": self._name, "affinity": affinity},
+            )
 
     @property
     def name(self) -> str:
@@ -413,7 +466,11 @@ class ActorPool(Generic[T, V]):
                 self.num_idle_actors,
             ),
             monitoring.TaskStats(
-                self._num_completed_tasks, self._num_null_tasks, len(self._task_queue), len(self._completed_tasks)
+                self._num_completed_tasks,
+                self._num_null_tasks,
+                self._num_dynamically_spawned_tasks,
+                len(self._task_queue),
+                len(self._completed_tasks),
             ),
             monitoring.SlotStats(self.num_used_slots, self.num_empty_slots),
             self.calc_median_rate_estimate(),
@@ -514,6 +571,7 @@ class ActorPool(Generic[T, V]):
             self._stage_interface,
             self._params,
             worker,
+            self._verbosity_level,
         )
         actor_handle = typing.cast(ActorHandle, actor)
 
@@ -733,6 +791,11 @@ class ActorPool(Generic[T, V]):
 
         # Find the actor with the minimum penalty
         best_actor = min(actors_with_free_slots, key=penalty_key)
+
+        # metrics
+        schedule_affinity = "local" if task.origin_node_id == best_actor.metadata.worker.allocation.node else "remote"
+        self._metrics_schedule_task_count.inc(tags={"stage": self._name, "affinity": schedule_affinity})
+
         return best_actor.metadata.worker.id
 
     def _maybe_resize_num_slots_per_actor(self) -> None:
@@ -755,7 +818,8 @@ class ActorPool(Generic[T, V]):
             raise AssertionError(f"Unknown actor with id: {actor_id} requested for deletion.")
 
         # Only delete from allocator if we successfully found and killed the actor representation
-        logger.info(f"Deleting worker {actor_id} from allocator.")
+        if self._verbosity_level >= VerbosityLevel.INFO:
+            logger.info(f"Deleting worker {actor_id} from allocator.")
         self._allocator.delete_worker(actor_id)
 
     def _try_delete_pending_actor(self, actor_id: str) -> bool:
@@ -773,7 +837,8 @@ class ActorPool(Generic[T, V]):
         """Attempts to delete an actor from the ready state."""
         if actor_id in self._ready_actors:
             actor = self._ready_actors.pop(actor_id)
-            logger.info(f"Killing ready actor {actor_id}.")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Killing ready actor {actor_id}.")
             # Return any tasks assigned to this actor back to the main queue.
             num_returned_tasks = 0
             for task_slot in actor.slots:
@@ -951,9 +1016,22 @@ class ActorPool(Generic[T, V]):
         else:
             self._completed_tasks.append(Task(out_data_refs, actor.metadata.worker.allocation.node))
         self._num_completed_tasks += 1
+        # Number of tasks spawned dynamically from this stage
+        self._num_dynamically_spawned_tasks += metadata.num_returns - self._params.stage_batch_size
+        # Metrics
+        self._update_task_metrics(metadata)
         # Mark the slot as empty
         actor.slots[slot_num].clear_task()
         return metadata.failure_info.should_restart_worker
+
+    def _update_task_metrics(self, metadata: stage_worker.TaskResultMetadata) -> None:
+        self._metrics_stage_deserialize_count.inc(1, tags={"stage": self._name})
+        self._metrics_stage_deserialize_size.inc(
+            metadata.task_data_info.serialized_input_size, tags={"stage": self._name}
+        )
+        if metadata.timing.deserialize_dur is not None and metadata.timing.process_dur is not None:
+            self._metrics_stage_deserialize_time.inc(metadata.timing.deserialize_dur, tags={"stage": self._name})
+            self._metrics_stage_process_time.inc(metadata.timing.process_dur, tags={"stage": self._name})
 
     def update(self) -> None:
         """Performs one update cycle of the actor pool state machine."""

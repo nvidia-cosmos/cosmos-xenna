@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import abc
@@ -10,6 +25,7 @@ import attrs
 
 from cosmos_xenna.ray_utils import resources, runtime_envs, stage
 from cosmos_xenna.utils import approx
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -17,12 +33,6 @@ V = typing.TypeVar("V")
 
 _DEFAULT_SLOTS_PER_ACTOR = 2
 _DEFAULT_LOG_INTERVAL_S = 60
-
-
-class VerbosityLevel(enum.IntEnum):
-    NONE = 0
-    INFO = 1
-    DEBUG = 2
 
 
 class ExecutionMode(enum.Enum):
@@ -283,6 +293,7 @@ class StreamingSpecificSpec:
     autoscale_interval_s: float = 60 * 3.0
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
+    executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
 
 
 @attrs.define
@@ -330,6 +341,9 @@ class PipelineConfig:
     # be discarded and `run_pipeline` will return None. Retaining this data can be useful if you want to further process
     # it. However, users can also very easily forget that they are doing this and run our of memory.
     return_last_stage_outputs: bool = False
+    # Logging verbosity control
+    actor_pool_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
+    monitoring_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
     # Mode specific parameters
     mode_specific: StreamingSpecificSpec | None = None
     # Whether to log the layout of the ray workers.
@@ -430,6 +444,7 @@ def make_actor_pool_stage_from_stage_spec(
         WrappedStage(spec.stage),
         stage.Params(
             shape=spec.stage.required_resources.to_shape(),
+            stage_batch_size=spec.stage.stage_batch_size,
             slots_per_actor=spec.slots_per_actor,
             name=spec.name(stage_idx),
             num_node_setup_retries=1,  # TODO: Make this configurable

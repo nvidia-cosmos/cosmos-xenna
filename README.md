@@ -68,3 +68,10 @@ To add packages to the core dependencies, use `uv add some-package-name`
 To add packages to dev use `uv add --dev some-package-name`
 
 To add packages to other groups use `uv add --group some-group some-package-name`
+
+## License and Contact
+
+This project will download and install additional third-party open source software projects. Review the
+license terms of these open source projects before use.
+
+NVIDIA Cosmos source code is released under the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).

@@ -12,7 +12,7 @@ stages:
 ci:unit-tests:
   stage: ci
   image:
-    name: ghcr.io/astral-sh/uv:python3.9-bookworm-slim
+    name: ghcr.io/astral-sh/uv:python3.9-bookworm
   script:
     - uv sync
     - uv run run_presubmit.py test
@@ -23,7 +23,7 @@ ci:unit-tests:
 ci:lint:
   stage: ci
   image:
-    name: ghcr.io/astral-sh/uv:python3.9-bookworm-slim
+    name: ghcr.io/astral-sh/uv:python3.9-bookworm
   script:
     - uv sync
     - uv run run_presubmit.py lint

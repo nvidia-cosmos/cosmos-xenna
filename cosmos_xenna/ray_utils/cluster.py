@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 
 import loguru
@@ -60,6 +75,8 @@ def init_or_connect_to_cluster(
     # These need to be set to allow listing debug info about more than 10k actors.
     os.environ["RAY_MAX_LIMIT_FROM_API_SERVER"] = str(API_LIMIT)
     os.environ["RAY_MAX_LIMIT_FROM_DATA_SOURCE"] = str(API_LIMIT)
+    # User can turn on metrics export via env var XENNA_RAY_METRICS_PORT
+    ray_metrics_port = os.getenv("XENNA_RAY_METRICS_PORT", None)
 
     # Turn off serization for loguru. This is needed as loguru is not serializable in general.
     ray.util.register_serializer(
@@ -70,6 +87,7 @@ def init_or_connect_to_cluster(
         include_dashboard=True,
         ignore_reinit_error=True,
         log_to_driver=log_to_driver,
+        _metrics_export_port=ray_metrics_port,
     )
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context

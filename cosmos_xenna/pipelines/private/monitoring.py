@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Utitilities for monitoring our Ray jobs.
 
 Things which still need to be tracked:
@@ -33,6 +48,7 @@ import ray
 import ray.util.scheduling_strategies
 import ray.util.state
 from loguru import logger
+from ray.util.metrics import Gauge
 
 from cosmos_xenna.pipelines.private.monitoring_types import (
     ActorInfo,
@@ -45,8 +61,7 @@ from cosmos_xenna.pipelines.private.monitoring_types import (
 )
 from cosmos_xenna.ray_utils import actor_pool, resource_monitor, stage_worker
 from cosmos_xenna.utils import timing
-
-_VEBOSE = True
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 
 @attrs.define
@@ -254,10 +269,12 @@ class PipelineMonitor:
         log_interval_s: float,
         initial_input_len: int,
         actor_pools: list[actor_pool.ActorPool],
+        verbosity_level: VerbosityLevel,
     ) -> None:
         self._actor_pools = list(actor_pools)
         self._log_interval_s = float(log_interval_s)
         self._initital_input_length = int(initial_input_len)
+        self._verbosity_level = verbosity_level
         self._opened = False
 
     def __enter__(self) -> PipelineMonitor:
@@ -276,6 +293,7 @@ class PipelineMonitor:
         self._pipeline_start_time = time.time()
         self._log_rate_limiter = timing.RateLimitChecker(1.0 / self._log_interval_s)
         self._nodes_resource_monitor = RayResourceMonitor()
+        self._create_ray_metrics()
         self._opened = True
 
     def update(
@@ -295,8 +313,12 @@ class PipelineMonitor:
         start = time.time()
         stats = PipelinestatsWithTime(time.time(), self._make_stats(input_len, output_len, task_metadata_per_pool))
 
-        if _VEBOSE:
+        if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"took {time.time() - start} to get stats.")
+
+        # Update metrics
+        self._update_ray_metrics(stats.pipeline)
+
         # Clear actors. We don't really need to keep track of this info and it's pretty heavy.
         stats.pipeline.cluster.actors = []
         # Maybe log the current state.
@@ -307,16 +329,19 @@ class PipelineMonitor:
             return False
 
     def _make_stats(
-        self, input_len: int, output_len: int, task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]]
+        self,
+        input_len: int,
+        output_len: int,
+        task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]],
     ) -> PipelineStats:
         start = time.time()
         node_resource_data = self._nodes_resource_monitor.update()
-        if _VEBOSE:
+        if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"Took {time.time() - start} seconds to get node resource info.")
 
         start = time.time()
         cluster_info = make_ray_cluster_info()
-        if _VEBOSE:
+        if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"Took {time.time() - start} seconds to get cluster info.")
         stats = [x.make_stats() for x in self._actor_pools]
         actor_id_to_pool_mapping = {}
@@ -325,10 +350,11 @@ class PipelineMonitor:
                 actor_id_to_pool_mapping[x] = pool_stats.name
         start = time.time()
         actors = get_ray_actors()
-        if _VEBOSE:
+        if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"Took {time.time() - start} seconds to get actor info.")
         actor_resource_usage = calculate_actor_resource_usage(
-            actors, {k: v.process_tree for k, v in node_resource_data.items() if v is not None}
+            actors,
+            {k: v.process_tree for k, v in node_resource_data.items() if v is not None},
         )
         t = time.time()
 
@@ -355,10 +381,143 @@ class PipelineMonitor:
 
     def _print_state(self, stats: PipelineStats) -> None:
         display = stats.display()
-        logger.info(display)
+        if self._verbosity_level >= VerbosityLevel.INFO:
+            logger.info(display)
 
     def close(self) -> None:
         assert self._opened
+
+    def _create_ray_metrics(self) -> None:
+        self._metrics_input_tasks = Gauge(
+            "pipeline_input_tasks",
+            "Number of total input tasks",
+            tag_keys=None,
+        )
+        self._metrics_finished_tasks = Gauge(
+            "pipeline_finished_tasks",
+            "Number of finished tasks",
+            tag_keys=("stage",),
+        )
+        self._metrics_finished_tasks_norm = Gauge(
+            "pipeline_finished_tasks_normalized",
+            "Number of finished tasks normalized to original input to the pipeline",
+            tag_keys=("stage",),
+        )
+        self._metrics_pipeline_progress = Gauge(
+            "pipeline_progress",
+            "Progress of the pipeline",
+            tag_keys=None,
+        )
+        self._metrics_slots_used = Gauge(
+            "pipeline_slots_used",
+            "Number of slots used per stage",
+            tag_keys=("stage",),
+        )
+        self._metrics_slots_empty = Gauge(
+            "pipeline_slots_empty",
+            "Number of slots empty per stage",
+            tag_keys=("stage",),
+        )
+        self._metrics_input_queue_size = Gauge(
+            "pipeline_input_queue_size",
+            "Input task queue size per stage",
+            tag_keys=("stage",),
+        )
+        self._metrics_output_queue_size = Gauge(
+            "pipeline_output_queue_size",
+            "Output task queue size per stage",
+            tag_keys=("stage",),
+        )
+        self._metrics_actor_count = Gauge(
+            "pipeline_actor_count",
+            "Number of actors per stage per state",
+            tag_keys=("stage", "state"),
+        )
+        self._metrics_actor_process_time = Gauge(
+            "pipeline_actor_process_time",
+            "Time taken to process one task by one actor",
+            tag_keys=("stage",),
+        )
+        self._metrics_actor_resource_request = Gauge(
+            "pipeline_actor_resource_request",
+            "Resource request for actors",
+            tag_keys=("stage", "resource"),
+        )
+        self._metrics_actor_resource_usage = Gauge(
+            "pipeline_actor_resource_usage",
+            "Resource usage for actors",
+            tag_keys=("stage", "resource"),
+        )
+
+        # set initial values
+        self._metrics_input_tasks.set(self._initital_input_length)
+        for pool in self._actor_pools:
+            self._metrics_actor_resource_request.set(
+                pool.worker_shape.get_num_cpus(),
+                tags={"stage": pool.name, "resource": "cpu"},
+            )
+            self._metrics_actor_resource_request.set(
+                pool.worker_shape.get_num_gpus(),
+                tags={"stage": pool.name, "resource": "gpu"},
+            )
+
+    def _update_ray_metrics(self, stats: PipelineStats) -> None:
+        # track how many tasks are dynamically spawned by earlier stage(s)
+        num_spawned_tasks = [0 for _ in range(len(stats.actor_pools))]
+        # calculate a normalization factor for the next stage when calculating progress
+        normalization_factor = 1.0
+        # total completed task stages
+        total_completed_task_stages = 0
+
+        # loop through all stages
+        for idx, pool_stats in enumerate(stats.actor_pools):
+            self._metrics_finished_tasks.set(pool_stats.task_stats.total_completed, tags={"stage": pool_stats.name})
+            # for progress tracking
+            # apply normalization factor from last stage
+            total_completed_norm = pool_stats.task_stats.total_completed * normalization_factor
+            self._metrics_finished_tasks_norm.set(
+                total_completed_norm,
+                tags={"stage": pool_stats.name},
+            )
+            total_completed_task_stages += total_completed_norm
+            # calculate the normalization factor for the next stage
+            num_spawned_tasks[idx] = pool_stats.task_stats.total_dynamically_spawned
+            if idx > 0:
+                num_spawned_tasks[idx] += num_spawned_tasks[idx - 1]
+            if pool_stats.task_stats.total_completed > 0:
+                normalization_factor = pool_stats.task_stats.total_completed / (
+                    pool_stats.task_stats.total_completed + num_spawned_tasks[idx]
+                )
+            # state of current stage's actor pool
+            self._metrics_slots_used.set(pool_stats.slot_stats.num_used, tags={"stage": pool_stats.name})
+            self._metrics_slots_empty.set(pool_stats.slot_stats.num_empty, tags={"stage": pool_stats.name})
+            self._metrics_input_queue_size.set(pool_stats.task_stats.input_queue_size, tags={"stage": pool_stats.name})
+            self._metrics_output_queue_size.set(
+                pool_stats.task_stats.output_queue_size, tags={"stage": pool_stats.name}
+            )
+            # count of actors in different states, e.g. pending or ready, busy or idle
+            for state, count in attrs.asdict(pool_stats.actor_stats).items():
+                self._metrics_actor_count.set(count, tags={"stage": pool_stats.name, "state": state})
+            # speed measurement
+            if pool_stats.processing_speed_tasks_per_second is not None:
+                self._metrics_actor_process_time.set(
+                    1.0 / pool_stats.processing_speed_tasks_per_second,
+                    tags={"stage": pool_stats.name},
+                )
+
+        # overall pipeline progress
+        pipeline_progress = total_completed_task_stages / (self._initital_input_length * len(stats.actor_pools))
+        self._metrics_pipeline_progress.set(pipeline_progress)
+        # resource usage per stage
+        for stage_name, usage_stats in stats.resource_usage_per_stage.items():
+            self._metrics_actor_resource_usage.set(
+                usage_stats.cpu_utilization,
+                tags={"stage": stage_name, "resource": "cpu"},
+            )
+            self._metrics_actor_resource_usage.set(
+                usage_stats.memory_usage,
+                tags={"stage": stage_name, "resource": "memory"},
+            )
 
 
 @attrs.define
