@@ -1,8 +1,18 @@
 # Cosmos-xenna
 
-TODO: Fill this in more.
-
 ## Introduction
+
+Cosmos-xenna is a Python library for building and running distributed data pipelines using Ray. It
+has a heavy focus on pipelines which are a series of inference steps using AI models. For example, a
+pipeline which downloads an image, runs a VLM on it to produce a caption, and then runs an embedding model
+to produce a text embedding and uploads the resulting data.
+
+Cosmos-xenna simplifies the development of distributed AI pipelines by providing:
+
+- A simple interface
+- Autoscaling/autobalancing of stages
+- Stateful actors which allow the user to load/download weights before running processing
+- Independent allocation of NVDEC/NVENC hardware and "main" GPU compute
 
 ## Installing
 
@@ -10,15 +20,19 @@ TODO: Fill this in more.
 pip install cosmos-xenna[gpu]
 ```
 
+## Quick Start
+
+For detailed examples, check out the `examples/` directory.
+
 ## Ray cluster requirements
 
-Cosmos-xenna needs a few env vars to be set before starting Ray clusters. These are set by Xenna when we
-start clusters locally, but, if using an already existing cluster, they will need to be set in the processes
+Cosmos-xenna needs a few environment variables to be set before starting Ray clusters. These are set by Xenna when we
+start clusters locally, but if using an already existing cluster, they will need to be set in the processes
 initializing the cluster.
 
-``` bash
-# Needed to Xenna control over setting CUDA env vars. Without this, Ray will overwrite the
-# env vars we set.
+```bash
+# Needed to give Xenna control over setting CUDA environment variables. Without this, Ray will overwrite the
+# environment variables we set.
 RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES="0"
 # Needed to get debug info from as many actors as possible. By default, Ray only allows 10k
 # actors to be listed. However, on large clusters, we may have more than 10k actors.
@@ -30,34 +44,34 @@ RAY_MAX_LIMIT_FROM_DATA_SOURCE=40000
 
 ### Setup development environment
 
-We use UV for developement. To get started, [install UV](https://docs.astral.sh/uv/#installation), and
+We use UV for development. To get started, [install UV](https://docs.astral.sh/uv/#installation), and
 run `uv sync` in this directory.
 
-This will create a virtual environment at `.venv` based on the current lock file and will include all of
-the dependencies from core, dev, gpu and examples.
+This will create a virtual environment at `.venv` based on the current lock file and will include all
+of the dependencies from core, dev, GPU, and examples.
 
 ### Running commands
 
-Use UV to run all commands. For example. To run the example pipeline, use:
+Use UV to run all commands. For example, to run the example pipeline, use:
 
-``` bash
+```bash
 uv run examples/simple_vlm_inference.py 
 ```
 
-This will auto-sync dependencies if needed and execute the command in the uv-managed virtualenv.
+This will auto-sync dependencies if needed and execute the command in the UV-managed virtualenv.
 
-### Vscode integration
+### VSCode integration
 
 We provide recommended extensions and default settings for yotta via the .vscode/ folder. With these
-settings, vscode should automatically format your code and raise linting/typing issues. Vscode will
+settings, VSCode should automatically format your code and raise linting/typing issues. VSCode will
 try to fix some minor linting issues on save.
 
 ### Linting
 
-We use Ruff and PyRight for static analysis. Using the default vscode settings and recomended extensions,
-these should auto-run in vscode. They can be run manually with:
+We use Ruff and PyRight for static analysis. Using the default VSCode settings and recommended extensions,
+these should auto-run in VSCode. They can be run manually with:
 
-``` bash
+```bash
 uv run run_presubmit.py default
 ```
 

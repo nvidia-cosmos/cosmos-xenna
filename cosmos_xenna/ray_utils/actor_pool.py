@@ -1017,7 +1017,8 @@ class ActorPool(Generic[T, V]):
             self._completed_tasks.append(Task(out_data_refs, actor.metadata.worker.allocation.node))
         self._num_completed_tasks += 1
         # Number of tasks spawned dynamically from this stage
-        self._num_dynamically_spawned_tasks += metadata.num_returns - self._params.stage_batch_size
+        if metadata.num_returns > self._params.stage_batch_size:
+            self._num_dynamically_spawned_tasks += metadata.num_returns - self._params.stage_batch_size
         # Metrics
         self._update_task_metrics(metadata)
         # Mark the slot as empty

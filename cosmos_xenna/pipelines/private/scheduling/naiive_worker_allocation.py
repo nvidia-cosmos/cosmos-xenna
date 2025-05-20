@@ -253,7 +253,7 @@ def solve_allocation_with_no_manual_stages(
     """
     assert len(problem.stages) == len(input_samples_per_sample)
     # Initialize the LP problem
-    prob = pulp.LpProblem("Worker Allocation", pulp.LpMaximize)
+    prob = pulp.LpProblem("Worker_Allocation", pulp.LpMaximize)
 
     # Define decision variables
     z = pulp.LpVariable("z", lowBound=0)  # Minimum throughput across all stages

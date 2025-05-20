@@ -83,7 +83,7 @@ class NodeResourceMonitor:
     """
 
     def __init__(self) -> None:
-        self._node_id = ray.get_runtime_context().node_id
+        self._node_id = ray.get_runtime_context().get_node_id()
         self._latest_metrics: SystemDataAndProcessTree | None = None
         self._exception = None
         self._stop_event = threading.Event()
@@ -484,6 +484,7 @@ class PipelineMonitor:
             num_spawned_tasks[idx] = pool_stats.task_stats.total_dynamically_spawned
             if idx > 0:
                 num_spawned_tasks[idx] += num_spawned_tasks[idx - 1]
+            normalization_factor = 1.0
             if pool_stats.task_stats.total_completed > 0:
                 normalization_factor = pool_stats.task_stats.total_completed / (
                     pool_stats.task_stats.total_completed + num_spawned_tasks[idx]
