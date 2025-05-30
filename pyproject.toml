@@ -1,0 +1,199 @@
+[project]
+name = "cosmos-xenna"
+version = "0.1.0"
+description = "TODO:Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "attrs>=25.3.0",
+    "cattrs>=24.1.3",
+    "jinja2>=3.1.6",
+    "loguru>=0.7.3",
+    "pulp>=3.1.1",
+    "ray[default]>=2.46.0",
+    "tabulate>=0.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "plotly>=6.0.1",
+    "pyright>=1.1.399",
+    "pytest>=8.3.5",
+    "ruff>=0.11.5",
+    "typer>=0.15.2",
+]
+examples = [
+    "huggingface-hub>=0.30.2",
+    "requests>=2.32.3",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "transformers>=4.51.3",
+]
+gpu = [
+    "gpustat>=1.1.1",
+    "pynvml>=12.0.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "examples", "gpu"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cosmos_xenna"]
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+
+# See https://beta.ruff.rs/docs/rules/ for list of these.
+select = [
+    "A",   # flake8-builtins
+    "ANN", # flake8-annotations
+    "COM", # flake8-commas
+    "ICN", # flake8-import-conventions
+    "BLE", # flake8-blind-except
+    "B",   # flake8-bugbear
+    "E",   # pycodestyle-errors
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "T10", # flake8-debugger
+    "W",   # pycodestyle-warnings
+    "C90", # mccabe
+    "PT",  # flake8-pytest-style
+    "PLE",
+    "PLW",
+    "RUF",
+]
+ignore = [
+    # --- Be chill about shadowing built ins. This is generally safe.
+    "A001", # variables
+    "A002", # args
+    "A003", # class attributes
+    # --- Disable type annotation requirements for a bunch of stuff
+    "ANN002", # args
+    "ANN003", # kwargs
+    "ANN401", # Let people use "Any" annotations. They are not ideal, but neccesary sometimes
+    # --- Be a bit more chill about naming because the "correct" way to do it conflicts with some pytorch conventions.
+    "N803",
+    "N806",
+    "N812",
+    # --- Flake
+    "COM812", # This conflicts with Black. https://github.com/astral-sh/ruff/issues/6525
+    # --- Other stuff
+    "E203",  # pep8 and black disagree and black is correct
+    "E741",  # Be chill about one letter argument names
+    "C901",  # Let reviewers decide when a function is too complex
+    "PT018", # Let users have multiple asserts in one line
+]
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "I",
+    "N",
+    "Q",
+    "S",
+    "T",
+    "W",
+    "ANN",
+    "ARG",
+    "BLE",
+    "COM",
+    "DJ",
+    "DTZ",
+    "EM",
+    "ERA",
+    "EXE",
+    "FBT",
+    "ICN",
+    "INP",
+    "ISC",
+    "NPY",
+    "PD",
+    "PGH",
+    "PIE",
+    "PL",
+    "PT",
+    "PTH",
+    "PYI",
+    "RET",
+    "RSE",
+    "RUF",
+    "SIM",
+    "SLF",
+    "TCH",
+    "TID",
+    "TRY",
+    "UP",
+    "YTT",
+]
+unfixable = [
+    # Don't auto delete unused stuff as it can get really annoying during development.
+    "F841", # unused variable.
+    "F401", # unused module
+    "B007", # Local variable not accessed
+]
+
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+
+# Be more chill about linting in tests.
+"**/test_*.py" = [
+    "ANN",
+    "D100",    # Missing docstring in public module
+    "D101",    # Missing docstring in public class
+    "D102",    # Missing docstring in public method
+    "D103",    # Missing docstring in public function
+    "D104",    # Missing docstring in public package
+    "S101",    # Use of assert detected
+    "PLR2004", # Magic value used in comparison, consider replacing {value} with a constant variable
+    "PT011",   # {exc} is to broad
+]
+"**/smoke_test_*.py" = [
+    "ANN",
+    "D100",    # Missing docstring in public module
+    "D101",    # Missing docstring in public class
+    "D102",    # Missing docstring in public method
+    "D103",    # Missing docstring in public function
+    "D104",    # Missing docstring in public package
+    "S101",    # Use of assert detected
+    "PLR2004", # Magic value used in comparison, consider replacing {value} with a constant variable
+    "PT011",   # {exc} is to broad
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all" # Disallow all relative imports.
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true # Let RUFF infer the return type for most __init__ methods
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.9"
+
+reportOptionalCall = false
+reportOptionalIterable = false
+reportOptionalMemberAccess = false
+reportOptionalOperand = false
+reportOptionalSubscript = false
