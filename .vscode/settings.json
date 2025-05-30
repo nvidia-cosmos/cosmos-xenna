@@ -1,0 +1,33 @@
+{
+    "python.analysis.autoFormatStrings": true,
+    "editor.formatOnSave": true,
+    "git.detectSubmodules": false,
+    "python.languageServer": "Pylance",
+    "[python]": {
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit"
+        },
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "charliermarsh.ruff",
+    },
+    "[markdown]": {
+        "editor.formatOnSave": true,
+        "editor.formatOnPaste": true,
+        "editor.codeActionsOnSave": {
+            "source.fixAll.markdownlint": "explicit"
+        }
+    },
+    "markdownlint.config": {
+        "default": true,
+        "MD013": {
+            "code_blocks": false,
+            "line_length": 110,
+            "tables": false,
+        },
+        "MD024": false, // This one has a lot of false posititves.
+    },
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+    "ruff.interpreter": [
+        "${workspaceFolder}/.venv/bin/python"
+    ]
+}
