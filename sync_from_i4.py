@@ -16,6 +16,7 @@
 import os
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -31,6 +32,8 @@ PRESERVE_PATTERNS_IN_DESTINATION = [
     ".git",
     ".venv",
     "INTERNAL_README.md",
+    "sync_to_github.py",
+    ".gitignore",
 ]
 
 
@@ -136,14 +139,26 @@ def main() -> None:
             "-o",
             "merge_request.target=main",
         ]
-        try:
-            run_command(push_command_with_mr, cwd=repo_root)
-            print(f"Successfully pushed branch {new_branch_name} and requested MR creation.")
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to push with MR creation options: {e}")
-            print(f"Attempting a simple push for branch {new_branch_name} without MR creation options...")
-            run_command(["git", "push", "-u", "origin", new_branch_name], cwd=repo_root)
-            print(f"Successfully pushed branch {new_branch_name}. Please create MR manually if needed.")
+
+        max_retries = 3
+        retry_delay = 5  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    print(f"Retry attempt {attempt + 1}/{max_retries} after {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                run_command(push_command_with_mr, cwd=repo_root)
+                print(f"Successfully pushed branch {new_branch_name} and requested MR creation.")
+                break
+            except subprocess.CalledProcessError as e:
+                if attempt == max_retries - 1:  # Last attempt failed
+                    print(f"Failed to push with MR creation options after {max_retries} attempts: {e}")
+                    print(f"Attempting a simple push for branch {new_branch_name} without MR creation options...")
+                    run_command(["git", "push", "-u", "origin", new_branch_name], cwd=repo_root)
+                    print(f"Successfully pushed branch {new_branch_name}. Please create MR manually if needed.")
+                else:
+                    print(f"Attempt {attempt + 1} failed: {e}")
 
     print("\nScript finished.")
     print(f"Branch '{new_branch_name}' processed with changes from '{SOURCE_PATH_TO_COPY}'.")
