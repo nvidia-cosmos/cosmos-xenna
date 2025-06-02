@@ -55,6 +55,10 @@ class Params:
     shape: resources.WorkerShape = attrs.field(factory=make_cpu_worker_shape)
     stage_batch_size: int = 1
     slots_per_actor: int = 2
+    # Maxmum lifetime in minutes before we internally terminate and restart a worker. 0 means disabled.
+    worker_max_lifetime_m: int = 0
+    # Restart interval in minutes between two consecutive over-lifetime restart within each actor pool.
+    worker_restart_interval_m: int = 1
     # The name of the worker stage.
     name: str = "default"
     # Number of times to retry worker setup on node. Defaults to 1.
