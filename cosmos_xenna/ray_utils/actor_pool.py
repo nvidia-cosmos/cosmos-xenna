@@ -55,6 +55,8 @@ class _ActorMetadata:
 @attrs.define
 class _SlotData(Generic[V]):
     task: Task[V]
+    # when this task was scheduled to run on the actor.
+    scheduled_time: float
     # We use dynamic number of returns, so this is a ref which contains more refs when ray.get() is called.
     # See https://docs.ray.io/en/latest/ray-core/tasks/generators.html#id2
     object_ref: ObjectRef
@@ -88,6 +90,8 @@ class _ReadyActor(Generic[V]):
     metadata: _ActorMetadata
     # A ray reference to the actor
     actor_ref: ActorHandle
+    # Tracking the running time of an actor.
+    start_time: float
     # A slot which can be filled with tasks.
     # Each actor can have multiple slots. Only one task will ever be processing at a time,
     # but may have additional slots are spots for assigned, but not presently running tasks.
@@ -112,6 +116,10 @@ class _ReadyActor(Generic[V]):
     @property
     def is_running(self) -> bool:
         return self.num_used_slots > 0
+
+    @property
+    def used_slots(self) -> list[_Slot]:
+        return [x for x in self.slots if x.has_task]
 
     @property
     def idle_slots(self) -> list[_Slot]:
@@ -360,6 +368,8 @@ class ActorPool(Generic[T, V]):
         self._num_actors_failed_to_start = 0
         self._actors_to_delete: collections.deque[resources.Worker] = collections.deque()
         self._actors_to_create: collections.deque[resources.Worker] = collections.deque()
+        # Timestamp of last intentional actor-restart event
+        self._last_actor_restart_time = time.time()
 
         # Metrics
         self._metrics_stage_deserialize_count = Counter(
@@ -660,6 +670,7 @@ class ActorPool(Generic[T, V]):
             new_actor = _ReadyActor(
                 actor.metadata,
                 typing.cast(ActorHandle, actor.actor_ref),
+                start_time=time.time(),
             )
             # Initialize slots for the newly ready actor
             for _ in range(self._slots_per_actor):
@@ -758,6 +769,46 @@ class ActorPool(Generic[T, V]):
             node_id = ref_to_node_id_map.get(ready_ref)
             if node_id and node_id in self._pending_node_actors:  # Check if still pending node setup
                 self._move_pending_node_actor_to_pending(node_id)
+
+    def _maybe_restart_long_running_actor(self) -> None:
+        """Restarts actors that have been running for too long.
+
+        This is a simple heuristic to avoid system OOM in case there is hard-to-debug memory issues.
+        """
+        # disabled if worker_max_lifetime_m is 0
+        if self._params.worker_max_lifetime_m == 0:
+            return None
+        # avoid restarting too many actors in one pool at once
+        time_from_last_restart_m = (time.time() - self._last_actor_restart_time) / 60
+        if time_from_last_restart_m < self._params.worker_restart_interval_m:
+            return None
+        # now find the longest-running actor
+        max_running_time_m = 0
+        actor_id_to_delete: str | None = None
+        worker_allocation_to_restart: resources.Worker | None = None
+        for actor_id, actor in self._ready_actors.items():
+            # whether the actor has been running too long
+            running_time_m = (time.time() - actor.start_time) / 60
+            if running_time_m <= self._params.worker_max_lifetime_m:
+                continue
+            # whether the actor has a task that has been running too long
+            if actor.num_used_slots > 0:
+                oldest_task_scheduled_time = min(slot.get_task.scheduled_time for slot in actor.used_slots)
+                oldest_task_running_time_m = (time.time() - oldest_task_scheduled_time) / 60
+                if oldest_task_running_time_m >= self._params.worker_max_lifetime_m * 0.6:
+                    # we better let it finish, otherwise this will be a live-lock
+                    continue
+            if running_time_m > max_running_time_m:
+                logger.info(f"Found actor {actor_id} of stage {self._name} running for {running_time_m:.0f} minutes, ")
+                max_running_time_m = running_time_m
+                actor_id_to_delete = actor_id
+                worker_allocation_to_restart = actor.metadata.worker
+        # restart the actor if we found one
+        if actor_id_to_delete is not None and worker_allocation_to_restart is not None:
+            logger.info(f"Restarting {actor_id_to_delete} from {self._name} after {max_running_time_m:.0f} minutes")
+            self._delete_actor(actor_id_to_delete)
+            self._add_actor(worker_allocation_to_restart)
+            self._last_actor_restart_time = time.time()
 
     def _pick_actor_for_task(self, task: Task[T]) -> str | None:
         """Picks the best ready actor for a task based on locality and busyness.
@@ -945,7 +996,7 @@ class ActorPool(Generic[T, V]):
             actor.actor_ref.process_data.remote(stage_worker.TaskData(task.task_data)),  # type: ignore
         )
         # Store task data and future references in the chosen slot
-        idle_slot.task = _SlotData(task, future)
+        idle_slot.task = _SlotData(task, time.time(), future)
         if _VERBOSE:
             logger.info(f"Scheduled task {task.task_data} on actor {actor.metadata.worker.id}")
 
@@ -1046,9 +1097,11 @@ class ActorPool(Generic[T, V]):
         self._move_pending_actors_to_ready()
         # 4. Apply any requested actor additions or deletions
         self._adjust_actors()
-        # 5. Check for and process results from completed tasks
+        # 5. Restart long-running actors if configured to do so
+        self._maybe_restart_long_running_actor()
+        # 6. Check for and process results from completed tasks
         self._process_completed_tasks()
-        # 6. Schedule new tasks onto idle slots of ready actors
+        # 7. Schedule new tasks onto idle slots of ready actors
         self._schedule_new_tasks()
         if _VERBOSE:
             logger.debug(f"Finished update cycle for {self.name}")

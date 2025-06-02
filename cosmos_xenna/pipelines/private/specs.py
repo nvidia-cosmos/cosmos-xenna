@@ -250,13 +250,15 @@ class StageSpec(typing.Generic[T, V]):
     ignore_failures: bool | None = None
     reset_workers_on_failure: bool | None = None
     slots_per_actor: int | None = None
+    worker_max_lifetime_m: int | None = None
+    worker_restart_interval_m: int | None = None
     max_setup_failure_percentage: float | None = None
 
     def name(self, index: int | None = None) -> str:
         if index is None:
             return str(type(self.stage).__name__)
         else:
-            return f"Stage {index} - {type(self.stage).__name__}"
+            return f"Stage {index:02d} - {type(self.stage).__name__}"
 
     def validate(self) -> None:
         if self.num_workers is not None and self.num_workers_per_node is not None:
@@ -283,6 +285,8 @@ class StageSpec(typing.Generic[T, V]):
         _override_if_none("ignore_failures")
         _override_if_none("reset_workers_on_failure")
         _override_if_none("slots_per_actor")
+        _override_if_none("worker_max_lifetime_m")
+        _override_if_none("worker_restart_interval_m")
         _override_if_none("max_setup_failure_percentage")
         return c
 
@@ -332,6 +336,10 @@ class PipelineConfig:
     # ray to process multiple tasks per worker (default 2). This forces Ray to pre-fetch data and should make it so we
     # are very unlikely to be blocked on IO.
     slots_per_actor: int = _DEFAULT_SLOTS_PER_ACTOR
+    # Maxmum lifetime in minutes for stage workers before getting terminated and restarted.
+    worker_max_lifetime_m: int = 0
+    # Interval in minutes between two over-lifetime restart within a stage's actor pool.
+    worker_restart_interval_m: int = 1
     # How long to wait between loging pipeline status. Default is every 60 seconds.
     logging_interval_s: float = _DEFAULT_LOG_INTERVAL_S
     # If true, failed tasks will return Nones. This means that the task will not be retried.
@@ -424,6 +432,8 @@ def make_actor_pool_stage_from_stage_spec(
     pipeline_config: PipelineConfig, spec: StageSpec, stage_idx: int
 ) -> StageAndParams:
     assert spec.slots_per_actor is not None
+    assert spec.worker_max_lifetime_m is not None
+    assert spec.worker_restart_interval_m is not None
     assert spec.num_setup_attempts_python is not None
     assert spec.num_run_attempts_python is not None
     assert spec.ignore_failures is not None
@@ -446,6 +456,8 @@ def make_actor_pool_stage_from_stage_spec(
             shape=spec.stage.required_resources.to_shape(),
             stage_batch_size=spec.stage.stage_batch_size,
             slots_per_actor=spec.slots_per_actor,
+            worker_max_lifetime_m=spec.worker_max_lifetime_m,
+            worker_restart_interval_m=spec.worker_restart_interval_m,
             name=spec.name(stage_idx),
             num_node_setup_retries=1,  # TODO: Make this configurable
             num_setup_retries=spec.num_setup_attempts_python,
