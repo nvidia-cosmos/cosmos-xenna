@@ -283,6 +283,13 @@ class PipelineMonitor:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # noqa: ANN001
+        # final update for metrics
+        if os.environ.get("XENNA_RAY_METRICS_PORT", None) is not None:
+            stats = PipelinestatsWithTime(time.time(), self._make_stats(0, 0, [[] for _ in self._actor_pools]))
+            self._update_ray_metrics(stats.pipeline)
+            # wait a few seconds to ensure metrisc are updated
+            time.sleep(10)
+        # exit
         assert self._opened
         self.close()
 
@@ -462,17 +469,17 @@ class PipelineMonitor:
             )
 
     def _update_ray_metrics(self, stats: PipelineStats) -> None:
-        # track how many tasks are dynamically spawned by earlier stage(s)
-        num_spawned_tasks = [0 for _ in range(len(stats.actor_pools))]
         # calculate a normalization factor for the next stage when calculating progress
         normalization_factor = 1.0
         # total completed task stages
         total_completed_task_stages = 0
 
         # loop through all stages
-        for idx, pool_stats in enumerate(stats.actor_pools):
+        for pool_stats in stats.actor_pools:
             self._metrics_finished_tasks.set(pool_stats.task_stats.total_completed, tags={"stage": pool_stats.name})
             # for progress tracking
+            num_completed_tasks = pool_stats.task_stats.total_completed
+            num_spawned_tasks = pool_stats.task_stats.total_dynamically_spawned
             # apply normalization factor from last stage
             total_completed_norm = pool_stats.task_stats.total_completed * normalization_factor
             self._metrics_finished_tasks_norm.set(
@@ -481,14 +488,9 @@ class PipelineMonitor:
             )
             total_completed_task_stages += total_completed_norm
             # calculate the normalization factor for the next stage
-            num_spawned_tasks[idx] = pool_stats.task_stats.total_dynamically_spawned
-            if idx > 0:
-                num_spawned_tasks[idx] += num_spawned_tasks[idx - 1]
-            normalization_factor = 1.0
             if pool_stats.task_stats.total_completed > 0:
-                normalization_factor = pool_stats.task_stats.total_completed / (
-                    pool_stats.task_stats.total_completed + num_spawned_tasks[idx]
-                )
+                new_normalization_factor = num_completed_tasks / (num_completed_tasks + num_spawned_tasks)
+                normalization_factor *= new_normalization_factor
             # state of current stage's actor pool
             self._metrics_slots_used.set(pool_stats.slot_stats.num_used, tags={"stage": pool_stats.name})
             self._metrics_slots_empty.set(pool_stats.slot_stats.num_empty, tags={"stage": pool_stats.name})
