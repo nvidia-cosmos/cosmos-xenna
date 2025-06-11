@@ -1,10 +1,11 @@
 # Cosmos-Xenna
 
-[!IMPORTANT]
-Xenna is currently in a pre-alpha state. We have open sourced it because it is needed for
-[Cosmos Curate](https://github.com/nvidia-cosmos/cosmos-curate), but it is not ready yet for a general release.
-It needs better documentation and some usability improvements before it will be ready. We may make breaking changes
-at any time.
+
+> [!IMPORTANT]
+> Xenna is currently in a pre-alpha state. We have open sourced it because it is needed for
+> [Cosmos Curate](https://github.com/nvidia-cosmos/cosmos-curate), but it is not ready yet for a general release.
+> It needs better documentation and some usability improvements before it will be ready. We may make breaking changes
+> at any time.
 
 ## Introduction
 
