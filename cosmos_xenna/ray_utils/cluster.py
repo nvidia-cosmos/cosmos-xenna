@@ -69,8 +69,7 @@ def init_or_connect_to_cluster(
 
     # We need to set this env var to avoid ray from setting CUDA_VISIBLE_DEVICES.
     # We set these manually in Xenna because we allocate the gpus manually instead of relying on ray's mechanisms.
-    # This will *only* get picked up from here if the cluster is started from this script. In the case of previously
-    # existing clusters, this needs to be set in the processes that set up the cluster.
+    # Set for the current process (needed for cluster initialization)
     os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "0"
     # These need to be set to allow listing debug info about more than 10k actors.
     os.environ["RAY_MAX_LIMIT_FROM_API_SERVER"] = str(API_LIMIT)
@@ -88,6 +87,8 @@ def init_or_connect_to_cluster(
         ignore_reinit_error=True,
         log_to_driver=log_to_driver,
         _metrics_export_port=ray_metrics_port,
+        # Ensure Ray workers also have the environment variable set (works for both new and existing clusters)
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0"}}
     )
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context
