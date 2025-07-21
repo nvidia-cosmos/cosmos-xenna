@@ -721,6 +721,7 @@ def _make_gpu_resources_from_gpu_name(gpu_name: str) -> GpuResources:
 class GpuInfo:
     index: int
     name: str
+    uuid: str
 
 
 def _get_local_gpu_info() -> list[GpuInfo]:
@@ -735,8 +736,9 @@ def _get_local_gpu_info() -> list[GpuInfo]:
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             name = pynvml.nvmlDeviceGetName(handle)
+            uuid = pynvml.nvmlDeviceGetUUID(handle)
             # pynvml returns bytes, decode to string
-            gpus.append(GpuInfo(index=i, name=str(name)))
+            gpus.append(GpuInfo(index=i, name=str(name), uuid=str(uuid)))
     except pynvml.NVMLError as e:
         logger.warning(f"Could not initialize NVML or get GPU info: {e}. Assuming no GPUs.")
         # Return empty list if NVML fails (e.g., no NVIDIA driver)
