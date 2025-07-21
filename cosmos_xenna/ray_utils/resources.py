@@ -750,44 +750,50 @@ def _get_local_gpu_info() -> list[GpuInfo]:
             # Ignore shutdown errors if initialization failed
             pass
 
-    # Respect CUDA_VISIBLE_DEVICES
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
-        for visible_device in os.environ["CUDA_VISIBLE_DEVICES"].split(","):
-            if visible_device.isdigit():
-                gpus = [x for x in gpus if x.index == int(visible_device)]
-            elif visible_device.startswith("GPU-")  :
-                gpus = [x for x in gpus if x.uuid == visible_device]
-            else:
-                raise ValueError(f"Unknown CUDA_VISIBLE_DEVICES value: {visible_device}")
-            
     return gpus
 
 
-def _make_gpu_resources_from_current_node() -> Optional[GpuResources]:
+def _make_gpu_resources_from_current_node() -> Optional[list[GpuResources]]:
     """Look at the current node and determine the resources available per gpu.
 
     There is no good way to find number of nvdecs/nvdecs available. So we do this hack where we look at
     """
     logger.info("Determining number of nvdecs/nvencs per gpu in this cluster.")
     gpus = _get_local_gpu_info()
+
     if not gpus:
         logger.info("No gpus found. Returning None.")
         return None
-
+    
     # HACK: when running in CI/CD, we ignore 'NVIDIA DGX Display' gpus
     # This hack is incomplete. We also need to make sure the cuda env vars are set correctly.
     if CICD_ENV_VAR in os.environ:
         logger.info("Running in CI/CD. Ignoring 'NVIDIA DGX Display' gpus")
         gpus = [x for x in gpus if "NVIDIA DGX Display" not in x.name]
 
+    # Respect CUDA_VISIBLE_DEVICES
+    visible_device = []
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        visible_device = [int(x) for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+    else:
+        visible_device = [x.index for x in gpus]
+
     unique_names = set([str(x.name) for x in gpus])
     if len(unique_names) != 1:
         raise ValueError(f"Running on a node with multiple gpu types: {unique_names}. This is not supported as of now.")
-    name = next(iter(unique_names))
-    logger.info(f"Gpu with name {name} found. Looking up nvdecs and nvencs...")
-    out = _make_gpu_resources_from_gpu_name(name)
-    logger.info(f"Found the following gpu resources: {out}")
-    return out
+
+    outs = []
+    for gpu in gpus:
+        logger.info(f"Gpu with name {gpu.name} found. Looking up nvdecs and nvencs...")
+        out = _make_gpu_resources_from_gpu_name(gpu.name)
+        logger.info(f"Found the following gpu resources: {out}")
+
+        if not (gpu.index in visible_device or gpu.uuid in visible_device):
+            out.gpu_fraction = 0
+            logger.warning(f"Gpu with index {gpu.index} and uuid {gpu.uuid} not in CUDA_VISIBLE_DEVICES. 
+                        Not allocating any resources for this gpu. But Xenna will still use the nvdecs/nvencs for this gpu.")
+        outs.append(out)
+    return outs
 
 
 @attrs.define
@@ -861,11 +867,9 @@ class ClusterResources:
             if "GPU" not in reported_resources:
                 gpus = []
             else:
-                resources_per_gpu = _make_gpu_resources_from_current_node()
-                if resources_per_gpu is None:
+                gpus = _make_gpu_resources_from_current_node()
+                if gpus is None:
                     gpus = []
-                else:
-                    gpus = [copy.deepcopy(resources_per_gpu) for _ in range(int(reported_resources["GPU"]))]
             out.nodes[str(node_id)] = NodeResources(
                 cpus=int(reported_resources["CPU"] * cpu_allocation_percentage),
                 gpus=gpus,  # type: ignore
