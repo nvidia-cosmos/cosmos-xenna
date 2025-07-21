@@ -747,6 +747,17 @@ def _get_local_gpu_info() -> list[GpuInfo]:
         except pynvml.NVMLError:
             # Ignore shutdown errors if initialization failed
             pass
+
+    # Respect CUDA_VISIBLE_DEVICES
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        for visible_device in os.environ["CUDA_VISIBLE_DEVICES"].split(","):
+            if visible_device.isdigit():
+                gpus = [x for x in gpus if x.index == int(visible_device)]
+            elif visible_device.startswith("GPU-")  :
+                gpus = [x for x in gpus if x.uuid == visible_device]
+            else:
+                raise ValueError(f"Unknown CUDA_VISIBLE_DEVICES value: {visible_device}")
+            
     return gpus
 
 
