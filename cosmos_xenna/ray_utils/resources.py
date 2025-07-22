@@ -31,7 +31,7 @@ from typing import Optional, Union
 import attrs
 import ray
 from loguru import logger
-
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from cosmos_xenna.utils import approx
 
 try:
@@ -752,8 +752,15 @@ def _get_local_gpu_info() -> list[GpuInfo]:
 
     return gpus
 
+@ray.remote
+def _get_cuda_visible_devices() -> list[str]:
+    """Get the CUDA visible devices from the environment variables."""
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        return [x for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+    else:
+        return []
 
-def _make_gpu_resources_from_current_node() -> Optional[list[GpuResources]]:
+def _make_gpu_resources_from_node(node_id: str, num_gpus: int) -> Optional[list[GpuResources]]:
     """Look at the current node and determine the resources available per gpu.
 
     There is no good way to find number of nvdecs/nvdecs available. So we do this hack where we look at
@@ -771,12 +778,18 @@ def _make_gpu_resources_from_current_node() -> Optional[list[GpuResources]]:
         logger.info("Running in CI/CD. Ignoring 'NVIDIA DGX Display' gpus")
         gpus = [x for x in gpus if "NVIDIA DGX Display" not in x.name]
 
-    # Respect CUDA_VISIBLE_DEVICES
-    visible_device = []
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
-        visible_device = [int(x) for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
-    else:
+    # Respect CUDA_VISIBLE_DEVICES. Get CUDA_VISIBLE_DEVICES from the node when the ray was started.
+    visible_device_node = _get_cuda_visible_devices.options(num_cpus=1, num_gpus=num_gpus,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),).remote()
+    
+    visible_device_node = ray.get(visible_device_node)
+    
+    if len(visible_device_node) == 0:
         visible_device = [x.index for x in gpus]
+    else:
+        visible_device = visible_device_node
+        visible_device = [int(x) for x in visible_device if x.isdigit()]
+
 
     unique_names = set([str(x.name) for x in gpus])
     if len(unique_names) != 1:
@@ -790,8 +803,8 @@ def _make_gpu_resources_from_current_node() -> Optional[list[GpuResources]]:
 
         if not (gpu.index in visible_device or gpu.uuid in visible_device):
             out.gpu_fraction = 0
-            logger.warning(f"Gpu with index {gpu.index} and uuid {gpu.uuid} not in CUDA_VISIBLE_DEVICES. 
-                        Not allocating any resources for this gpu. But Xenna will still use the nvdecs/nvencs for this gpu.")
+            logger.warning(f"Gpu with index {gpu.index} and uuid {gpu.uuid} not in CUDA_VISIBLE_DEVICES." 
+                        "Not allocating any resources for this gpu. But Xenna will still use the nvdecs/nvencs for this gpu.")
         outs.append(out)
     return outs
 
@@ -867,7 +880,7 @@ class ClusterResources:
             if "GPU" not in reported_resources:
                 gpus = []
             else:
-                gpus = _make_gpu_resources_from_current_node()
+                gpus = _make_gpu_resources_from_node(node_id, int(reported_resources["GPU"]))
                 if gpus is None:
                     gpus = []
             out.nodes[str(node_id)] = NodeResources(
