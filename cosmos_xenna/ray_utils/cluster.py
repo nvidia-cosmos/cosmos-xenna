@@ -44,7 +44,6 @@ def init_or_connect_to_cluster(
     log_to_driver: bool = True,
 ) -> ray.runtime_context.RuntimeContext:
     """Initializes a new local Ray cluster or connects to an existing one.
-
     This function serves as a central point for managing Ray cluster connections.
     - If `existing_cluster` is True, it attempts to connect to a pre-existing Ray cluster
       using `ray.init(address="auto")`. This is typically used in environments where
@@ -53,7 +52,6 @@ def init_or_connect_to_cluster(
       using `ray.init()`. This starts a head node on the local machine, along with
       a dashboard for monitoring. The dashboard will be accessible via the URL
       printed to the logs.
-
     Args:
         log_to_driver: If True (default), logs from Ray workers will be forwarded to the
             driver process (the process that called this function). This is useful for
@@ -61,15 +59,20 @@ def init_or_connect_to_cluster(
             due to the volume of logs. Set to False to disable log forwarding from workers.
         existing_cluster: If True, connect to an existing cluster identified by `ray.init(address="auto")`.
             If False (default), start a new local Ray cluster.
-
     Returns:
         ray.runtime_context.RuntimeContext: The Ray RuntimeContext object, which provides
             information about the connected Ray cluster, including the dashboard URL.
     """
+    # This will *only* get picked up from here if the cluster is started from this script. In the case of previously
+    # existing clusters, this needs to be set in the processes that set up the cluster.
+    # These need to be set to allow listing debug info about more than 10k actors.
+
+    # Only set these environment variables if Ray is not already initialized (i.e., we're starting a new cluster)
+    os.environ["RAY_MAX_LIMIT_FROM_API_SERVER"] = str(API_LIMIT)
+    os.environ["RAY_MAX_LIMIT_FROM_DATA_SOURCE"] = str(API_LIMIT)
 
     # User can turn on metrics export via env var XENNA_RAY_METRICS_PORT
     ray_metrics_port = os.getenv("XENNA_RAY_METRICS_PORT", None)
-
     # Turn off serization for loguru. This is needed as loguru is not serializable in general.
     ray.util.register_serializer(
         logger.__class__, serializer=logger_custom_serializer, deserializer=logger_custom_deserializer
@@ -80,12 +83,11 @@ def init_or_connect_to_cluster(
         ignore_reinit_error=True,
         log_to_driver=log_to_driver,
         _metrics_export_port=ray_metrics_port,
-        runtime_env={"env_vars": {
-            # We need to set this env var to avoid ray from setting CUDA_VISIBLE_DEVICES.
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0", 
-            # These need to be set to allow listing debug info about more than 10k actors.
-            "RAY_MAX_LIMIT_FROM_API_SERVER": str(API_LIMIT), 
-            "RAY_MAX_LIMIT_FROM_DATA_SOURCE": str(API_LIMIT)}
+        runtime_env={
+            "env_vars": {
+                # We need to set this env var to avoid ray from setting CUDA_VISIBLE_DEVICES.
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
+            }
         },
     )
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
