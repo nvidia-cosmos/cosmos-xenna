@@ -38,9 +38,6 @@ start clusters locally, but if using an already existing cluster, they will need
 initializing the cluster.
 
 ```bash
-# Needed to give Xenna control over setting CUDA environment variables. Without this, Ray will overwrite the
-# environment variables we set.
-RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES="0"
 # Needed to get debug info from as many actors as possible. By default, Ray only allows 10k
 # actors to be listed. However, on large clusters, we may have more than 10k actors.
 RAY_MAX_LIMIT_FROM_API_SERVER=40000
