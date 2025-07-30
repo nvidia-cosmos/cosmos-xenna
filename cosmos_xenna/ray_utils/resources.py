@@ -782,37 +782,20 @@ def _make_gpu_resources_from_current_node(visible_devices: list[int]) -> Optiona
 
 
 def _get_visible_devices_node(node_id: str, num_gpus: int) -> list[int]:
-    # Respect CUDA_VISIBLE_DEVICES. Get CUDA_VISIBLE_DEVICES from the node when the ray was started.
+    """Get the visible devices for node_id.
+
+    Given a node_id. This function calls a ray remote function that gets scheduled on the node 
+    and gets the CUDA_VISIBLE_DEVICES env var.
+    """
+
     @ray.remote
     def _get_cuda_visible_devices(num_gpus: int) -> list[int]:
         """Get the CUDA visible devices from the environment variables."""
         if "CUDA_VISIBLE_DEVICES" in os.environ:
-            visible_devices =  [x for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
-            # Visible devices can have ints or uuids. Convert uuids to ints.
-            import pynvml
-            pynvml.nvmlInit()
-            final_devices = []
-            device_uuid_to_index = {}
-
-            device_count = pynvml.nvmlDeviceGetCount()
-            for i in range(device_count):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                uuid = pynvml.nvmlDeviceGetUUID(handle)
-                # pynvml returns bytes, decode to string
-                device_uuid_to_index[str(uuid)] = i
-            
-
-            for device in visible_devices:
-                if device.startswith("GPU-"):
-                    if device not in device_uuid_to_index:
-                        raise ValueError(f"Device {device} not found on node. This is likely because the CUDA_VISIBLE_DEVICES environment variable is set incorrectly.")
-                    final_devices.append(device_uuid_to_index[device])
-                else:
-                    final_devices.append(int(device))
-
+            visible_devices =  [int(x) for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
             # Sort the devices
-            final_devices.sort()
-            return final_devices
+            visible_devices.sort()
+            return visible_devices
         else:
             return [x for x in range(num_gpus)]
     
@@ -831,16 +814,27 @@ class ClusterResources:
 
     nodes: dict[str, NodeResources]  # dict of all nodes in the cluster
 
+    # This dict holds the mapping of node_id to visible devices on that node_id.
+    # The setter for this dict is `_get_visible_devices_node` for each node in the cluster.
+    # And the getter is `_get_visible_devices_node_from_gpu_index`.
     _node_to_visible_devices: ClassVar[dict[str, list[int]]] = {}
 
     @staticmethod
     def _get_visible_devices_node_from_gpu_index(node_id: str, gpu_index: int) -> int:
-        if node_id not in ClusterResources._node_to_visible_devices or len(ClusterResources._node_to_visible_devices[node_id]) <= gpu_index:
+        """Get the visible device for a given node_id and gpu_index.
+
+        This function is used to get the visible device for a given node_id and gpu_index.
+        """
+        if len(ClusterResources._node_to_visible_devices) == 0:
             # This is expected if you used the simulation (make_uniform) instead of starting ray.
-            logger.warning(f"Gpu index {gpu_index} is out of range for node {node_id}. Returning the original gpu index. "
-                           f"Ignore if you used the simulation instead of starting ray.")
             return gpu_index
-        return ClusterResources._node_to_visible_devices[node_id][gpu_index]
+        
+        try:
+            return ClusterResources._node_to_visible_devices[node_id][gpu_index]
+        except KeyError:
+            # We don't ever expect this to happen by putting this in a try/except to ensure we have a fallback.
+            logger.warning(f"Gpu index {gpu_index} is out of range for node {node_id}. Returning the original gpu index. ")
+            return gpu_index
     
     @classmethod
     def make_uniform(cls, node_resources: NodeResources, node_ids: set[str]) -> ClusterResources:
