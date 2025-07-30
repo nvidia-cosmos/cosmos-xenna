@@ -558,7 +558,14 @@ class ActorPool(Generic[T, V]):
             gpu_ids.add(alloc.gpu_index)
         env_vars = {}
         if self._params.modify_cuda_visible_devices_env_var:
-            cuda_visible_devices = ",".join(str(x) for x in sorted(gpu_ids))
+            # Get the visible devices for the node. We will use the gpu_index to visible device mapping.
+            actual_visible_gpus = set()
+            for gpu_id in sorted(gpu_ids):
+                # Get the visible device for the gpu_id.
+                actual_visible_gpu = resources.ClusterResources._get_visible_devices_node_from_gpu_index(worker.allocation.node, gpu_id)
+                actual_visible_gpus.add(actual_visible_gpu)
+                   
+            cuda_visible_devices = ",".join(str(x) for x in sorted(actual_visible_gpus))
             env_vars["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
 
         env_vars.update(self._params.runtime_env.extra_env_vars)
