@@ -871,6 +871,12 @@ class FragmentationBasedAutoscaler(data_structures.AutoScalingAlgorithmInterface
         state = copy.deepcopy(state)
         avg_speeds = self._speed_calculator.get_last_valid_estimates(current_time)
 
+        for avg_speed, stage in zip(avg_speeds.stages, self._problem.stages):
+            if stage.over_provision_factor is not None:
+                avg_speed.batches_per_second_per_worker = (
+                    avg_speed.batches_per_second_per_worker / stage.over_provision_factor
+                )
+
         if self._verbosity_level >= verbosity.VerbosityLevel.DEBUG:
             logger.info("Running algorithm...")
         # Call a function which isolates the actual algorithm. We do this to make it slightly easier to test.

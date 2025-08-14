@@ -16,6 +16,7 @@
 from cosmos_xenna.pipelines.private.pipelines import run_pipeline
 from cosmos_xenna.pipelines.private.specs import (
     ExecutionMode,
+    JobInfo,
     PipelineConfig,
     PipelineSpec,
     Stage,
@@ -29,6 +30,7 @@ from cosmos_xenna.utils.verbosity import VerbosityLevel
 __all__ = [
     "CondaEnv",
     "ExecutionMode",
+    "JobInfo",
     "NodeInfo",
     "PipelineConfig",
     "PipelineSpec",

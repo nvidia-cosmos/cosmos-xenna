@@ -1,20 +1,13 @@
-# Cosmos-Xenna
-
-
-> [!IMPORTANT]
-> Xenna is currently in a pre-alpha state. We have open sourced it because it is needed for
-> [Cosmos Curate](https://github.com/nvidia-cosmos/cosmos-curate), but it is not ready yet for a general release.
-> It needs better documentation and some usability improvements before it will be ready. We may make breaking changes
-> at any time.
+# Cosmos-xenna
 
 ## Introduction
 
-Cosmos-Xenna is a Python library for building and running distributed data pipelines using Ray. It
+Cosmos-xenna is a Python library for building and running distributed data pipelines using Ray. It
 has a heavy focus on pipelines which are a series of inference steps using AI models. For example, a
 pipeline which downloads an image, runs a VLM on it to produce a caption, and then runs an embedding model
 to produce a text embedding and uploads the resulting data.
 
-Cosmos-Xenna simplifies the development of distributed AI pipelines by providing:
+Cosmos-xenna simplifies the development of distributed AI pipelines by providing:
 
 - A simple interface
 - Autoscaling/autobalancing of stages
@@ -31,9 +24,9 @@ pip install cosmos-xenna[gpu]
 
 For detailed examples, check out the `examples/` directory.
 
-## Ray Cluster Requirements
+## Ray cluster requirements
 
-Cosmos-Xenna needs a few environment variables to be set before starting Ray clusters. These are set by Xenna when we
+Cosmos-xenna needs a few environment variables to be set before starting Ray clusters. These are set by Xenna when we
 start clusters locally, but if using an already existing cluster, they will need to be set in the processes
 initializing the cluster.
 
