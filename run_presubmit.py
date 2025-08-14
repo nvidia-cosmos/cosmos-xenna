@@ -178,9 +178,9 @@ def _lint(fix: bool = True) -> None:
     _run_command("ruff format")
     if fix:
         _run_command("ruff check --fix-only .")
-    _run_command("pyright .")
+    _run_command("pyright")
     _run_command("ruff format --check .")
-    _run_command("ruff check --preview .")
+    _run_command("ruff check")
 
 
 def _unit_test() -> None:

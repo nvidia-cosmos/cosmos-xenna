@@ -14,18 +14,27 @@
 # limitations under the License.
 
 """
-Simple ray example which uses ray to download, slightly modify and upload a directory of tars.
+Simple example which shows the poor allocation when there are limited tasks.
 
-See the "Running a multinode Ray job" of pipelines/examples/README.md for more info.
+The issue is that when there are limited tasks, and when actors take longer to set up than other actors,
+the actor pool will allocate multiple tasks to the already-setup actors, and then will run out of tasks
+for new actors.
+
+As a result, actors will be idle even through there is work to do.
+
+Maybe we should do some sort of work-stealing?
 """
+
+import time
 
 import cosmos_xenna.pipelines.v1 as pipelines_v1
 from cosmos_xenna.ray_utils import resources
 
 
 class _ProcessStage(pipelines_v1.Stage):
-    def __init__(self, return_empty: bool) -> None:
-        self._return_empty = return_empty
+    def __init__(self, setup_dur: float, process_dur: float) -> None:
+        self._setup_dur = float(setup_dur)
+        self._process_dur = float(process_dur)
 
     @property
     def stage_batch_size(self) -> int:
@@ -36,34 +45,28 @@ class _ProcessStage(pipelines_v1.Stage):
         return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
 
     def setup(self, worker_metadata: resources.WorkerMetadata) -> None:
-        pass
+        time.sleep(self._setup_dur)
 
-    def process_data(self, samples: list[float]) -> list[float]:
-        if self._return_empty:
-            return []
-        return [x * 2 for x in samples]
+    def process_data(self, task: list[float]) -> list[float]:
+        time.sleep(self._process_dur)
+        return [x * 2 for x in task]
 
 
 def main() -> None:
-    tasks = range(1000)
-    # We make a "spec" which tells our code how to run our pipeline. This spec is very simple. It is just a list of
-    # objects we want to run over and a single stage to run over the objects.
+    tasks = range(12)
     pipeline_spec = pipelines_v1.PipelineSpec(
         input_data=tasks,
         stages=[
-            pipelines_v1.StageSpec(_ProcessStage(return_empty=False)),
-            pipelines_v1.StageSpec(_ProcessStage(return_empty=True)),
+            pipelines_v1.StageSpec(_ProcessStage(0, 60), num_workers_per_node=10),
         ],
         config=pipelines_v1.PipelineConfig(
             logging_interval_s=5,
             mode_specific=pipelines_v1.StreamingSpecificSpec(
-                autoscale_interval_s=1,
+                autoscale_interval_s=30,
                 autoscaler_verbosity_level=pipelines_v1.VerbosityLevel.DEBUG,
             ),
         ),
     )
-    # Start the pipeline. If we run this locally, it will start a local ray cluster and submit our job. If we run it
-    # with "uv run yotta launch --mode=ngc-ray", it will connect to the existing cluster and submit our job.
     pipelines_v1.run_pipeline(pipeline_spec)
 
 

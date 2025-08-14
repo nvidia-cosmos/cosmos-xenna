@@ -23,6 +23,7 @@ solutions in a distributed computing environment.
 from __future__ import annotations
 
 import abc
+import math
 
 import attrs
 import tabulate
@@ -50,6 +51,7 @@ class ProblemStage:
     stage_batch_size: int
     worker_shape: resources.WorkerShape
     requested_num_workers: int | None = None
+    over_provision_factor: float | None = None
 
 
 @attrs.define
@@ -192,7 +194,7 @@ class Problem:
             if stage.num_workers is not None:
                 num_workers = stage.num_workers
             elif stage.num_workers_per_node is not None:
-                num_workers = stage.num_workers_per_node * num_nodes
+                num_workers = math.ceil(stage.num_workers_per_node * num_nodes)
             else:
                 num_workers = None
             out.stages.append(
@@ -201,6 +203,7 @@ class Problem:
                     stage.stage.stage_batch_size,
                     stage.stage.required_resources.to_shape(),
                     requested_num_workers=num_workers,
+                    over_provision_factor=stage.over_provision_factor,
                 )
             )
         return out

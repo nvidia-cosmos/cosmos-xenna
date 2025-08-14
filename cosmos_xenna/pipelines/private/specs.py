@@ -19,7 +19,7 @@ import abc
 import copy
 import enum
 import typing
-from typing import Any, Generic, Sequence
+from typing import Any, Generic, Optional, Sequence
 
 import attrs
 
@@ -80,7 +80,6 @@ class Stage(abc.ABC, Generic[T, V]):
     """
 
     @property
-    @abc.abstractmethod
     def stage_batch_size(self) -> int:
         """The number of samples to process at a time.
 
@@ -240,7 +239,7 @@ class StageSpec(typing.Generic[T, V]):
     num_workers: int | None = None
     # Hard-coded number of workers per node to use for this stage. If this and num_workers are both None, we let the
     # scheduling algorithm decide.
-    num_workers_per_node: int | None = None
+    num_workers_per_node: float | None = None
 
     # The following parameters correspond to parameters in PipelineSpec.
     # For this stage, if these values are None, we use the values set in PipelineSpec. Otherwise, these parameters
@@ -253,6 +252,10 @@ class StageSpec(typing.Generic[T, V]):
     worker_max_lifetime_m: int | None = None
     worker_restart_interval_m: int | None = None
     max_setup_failure_percentage: float | None = None
+
+    # Over-provision factor for this stage. It is applied to the measured processing
+    # speed of the stage to influence the worker allocation.
+    over_provision_factor: float | None = None
 
     def name(self, index: int | None = None) -> str:
         if index is None:
@@ -367,6 +370,18 @@ class PipelineConfig:
 
 
 @attrs.define
+class JobInfo:
+    """Info about the pipeline job.
+
+    This info can be used to tag reported pipeline metrics.
+    """
+
+    pipeline_type: str
+    pipeline_version: str
+    pipeline_mode: str
+
+
+@attrs.define
 class PipelineSpec:
     """Specification for a simplified ray pipeline.
 
@@ -380,6 +395,7 @@ class PipelineSpec:
     input_data: Sequence[Any]
     stages: Sequence[StageSpec | Stage]
     config: PipelineConfig = attrs.field(factory=PipelineConfig)
+    job_info: Optional[JobInfo] = None
 
     def _format_stage_spec(self, stage_spec: StageSpec) -> str:
         stage = stage_spec.stage

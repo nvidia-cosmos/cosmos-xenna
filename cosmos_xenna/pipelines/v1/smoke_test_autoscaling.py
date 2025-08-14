@@ -68,7 +68,7 @@ def main() -> None:
         ),
     )
     # Start the pipeline. If we run this locally, it will start a local ray cluster and submit our job. If we run it
-    # with "yotta launch --mode=ngc-ray", it will connect to the existing cluster and submit our job.
+    # with "uv run yotta launch --mode=ngc-ray", it will connect to the existing cluster and submit our job.
     pipelines_v1.run_pipeline(pipeline_spec)
 
 

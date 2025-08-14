@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import typing
 
 import ray
@@ -45,7 +46,7 @@ def _determine_number_of_workers_and_scale_pool(
     """
     maybe_requested_num_workers = stage_spec.num_workers
     if stage_spec.num_workers_per_node is not None:
-        maybe_requested_num_workers = cluster_resources.num_nodes * stage_spec.num_workers_per_node
+        maybe_requested_num_workers = math.ceil(cluster_resources.num_nodes * stage_spec.num_workers_per_node)
 
     problem = data_structures.Problem(
         cluster_resources=cluster_resources,

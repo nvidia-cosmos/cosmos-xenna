@@ -365,13 +365,13 @@ gpu = [
 
 [package.metadata]
 requires-dist = [
-    { name = "attrs", specifier = ">=25.3.0" },
-    { name = "cattrs", specifier = ">=24.1.3" },
-    { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "loguru", specifier = ">=0.7.3" },
-    { name = "pulp", specifier = ">=3.1.1" },
+    { name = "attrs" },
+    { name = "cattrs" },
+    { name = "jinja2" },
+    { name = "loguru" },
+    { name = "pulp" },
     { name = "ray", extras = ["default"], specifier = ">=2.46.0" },
-    { name = "tabulate", specifier = ">=0.9.0" },
+    { name = "tabulate" },
 ]
 
 [package.metadata.requires-dev]
@@ -390,8 +390,8 @@ examples = [
     { name = "transformers", specifier = ">=4.51.3" },
 ]
 gpu = [
-    { name = "gpustat", specifier = ">=1.1.1" },
-    { name = "pynvml", specifier = ">=12.0.0" },
+    { name = "gpustat" },
+    { name = "pynvml" },
 ]
 
 [[package]]

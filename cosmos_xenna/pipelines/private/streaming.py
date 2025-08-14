@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import collections
+import math
 import random
 import time
 import typing
@@ -152,7 +153,7 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         if stage.num_workers is not None:
             num_required = stage.num_workers
         elif stage.num_workers_per_node is not None:
-            num_required = stage.num_workers_per_node * cluster_resources.num_nodes
+            num_required = math.ceil(stage.num_workers_per_node * cluster_resources.num_nodes)
         else:
             num_required = 1
 

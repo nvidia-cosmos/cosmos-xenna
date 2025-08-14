@@ -10,6 +10,7 @@
 		"ms-python.vscode-pylance",
 		"ms-python.python",
 		"tamasfe.even-better-toml",
+		"samuelcolvin.jinjahtml",
 	],
 	// List of extensions recommended by VS Code that should not be recommended for users of this workspace.
 	"unwantedRecommendations": []
