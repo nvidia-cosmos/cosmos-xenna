@@ -55,3 +55,39 @@ jobs:
           body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  wheels:
+    name: ${{ matrix.conf.os }}-${{ matrix.python-version }}-${{ matrix.conf.target-triple }}-${{ matrix.conf.target }}
+    runs-on: ${{ matrix.conf.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        conf:
+          - { os: ubuntu-latest, target: x86_64,  target-triple: x86_64-unknown-linux-gnu,  manylinux: auto }
+          - { os: ubuntu-latest, target: aarch64, target-triple: aarch64-unknown-linux-gnu, manylinux: auto }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      # Docs: https://github.com/PyO3/maturin-action
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.conf.target }}
+          manylinux: ${{ matrix.conf.manylinux }}
+          args: -i ${{ matrix.python-version }} --release --out dist
+
+      - name: Show wheels
+        run: ls -lh dist
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        if: ${{ ( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
+        with:
+          name: ${{ matrix.conf.os }}-${{ matrix.python-version }}-${{ matrix.conf.target-triple }}-${{ matrix.conf.target }}
+          path: dist

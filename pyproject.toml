@@ -38,8 +38,13 @@ gpu = [
 default-groups = ["dev", "examples", "gpu"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+features = ["pyo3/extension-module"]
+bindings = "pyo3"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cosmos_xenna"]
