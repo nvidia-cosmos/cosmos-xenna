@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import os
 import statistics
 import time
 import typing
@@ -558,7 +559,21 @@ class ActorPool(Generic[T, V]):
             gpu_ids.add(alloc.gpu_index)
         env_vars = {}
         if self._params.modify_cuda_visible_devices_env_var:
-            cuda_visible_devices = ",".join(str(x) for x in sorted(gpu_ids))
+            # Check if env var is set
+            if "XENNA_RESPECT_CUDA_VISIBLE_DEVICES" not in os.environ:
+                cuda_visible_devices = ",".join(str(x) for x in sorted(gpu_ids))
+            else:
+                # Get the visible devices for the node. We will use the gpu_index to visible device mapping.
+                actual_visible_gpus = set()
+                for gpu_id in sorted(gpu_ids):
+                    # Get the visible device for the gpu_id.
+                    actual_visible_gpu = resources.ClusterResources._get_visible_devices_node_from_gpu_index(
+                        worker.allocation.node, gpu_id
+                    )
+                    actual_visible_gpus.add(actual_visible_gpu)
+
+                cuda_visible_devices = ",".join(str(x) for x in sorted(actual_visible_gpus))
+
             env_vars["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
 
         env_vars.update(self._params.runtime_env.extra_env_vars)
@@ -571,7 +586,11 @@ class ActorPool(Generic[T, V]):
 
         # Ask Ray to start the actor on the specified node
         actor = stage_worker.StageWorker.options(
-            max_concurrency=1000,  # High concurrency allows many queued tasks (slots)
+            # TODO: Ray allocates these greedily, so we end up with a lot of allocated IO threads.
+            # Based on how StageWorker is written currently, this needs to be greater than or equal to the max
+            # slots per actor. This is a hack and the real solution is to come up with a better way to handle data
+            # pre-loading.
+            max_concurrency=256,  # High concurrency allows many queued tasks (slots)
             num_cpus=0,  # Resources are managed by the allocator, not directly by Ray options here
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=worker.allocation.node, soft=False
@@ -822,6 +841,11 @@ class ActorPool(Generic[T, V]):
         actors_with_free_slots = [actor for actor in self._ready_actors.values() if actor.num_empty_slots > 0]
 
         if not actors_with_free_slots:
+            if _VERBOSE:
+                logger.info(
+                    f"[{self._name}] No actors with free slots available for task "
+                    f"(origin_node_id: {task.origin_node_id})"
+                )
             return None
 
         def penalty_key(actor: _ReadyActor) -> tuple[bool, int]:
@@ -842,6 +866,21 @@ class ActorPool(Generic[T, V]):
 
         # Find the actor with the minimum penalty
         best_actor = min(actors_with_free_slots, key=penalty_key)
+
+        if _VERBOSE:
+            logger.info(f"[{self._name}] Actor selection for task (origin_node_id: {task.origin_node_id}):")
+            logger.info(f"  Considered {len(actors_with_free_slots)} actors with free slots:")
+            for actor in actors_with_free_slots:
+                is_local = actor.metadata.worker.allocation.node == task.origin_node_id
+                penalty = penalty_key(actor)
+                logger.info(
+                    f"    Actor {actor.metadata.worker.id} (node: {actor.metadata.worker.allocation.node}): "
+                    f"local={is_local}, busyness={actor.num_used_slots}, penalty={penalty}"
+                )
+            logger.info(
+                f"  Selected: Actor {best_actor.metadata.worker.id} "
+                f"(node: {best_actor.metadata.worker.allocation.node})"
+            )
 
         # metrics
         schedule_affinity = "local" if task.origin_node_id == best_actor.metadata.worker.allocation.node else "remote"
@@ -877,7 +916,8 @@ class ActorPool(Generic[T, V]):
         """Attempts to delete an actor from the pending state."""
         if actor_id in self._pending_actors:
             actor = self._pending_actors.pop(actor_id)
-            logger.info(f"Killing pending actor {actor_id}.")
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                logger.info(f"Killing pending actor {actor_id}.")
             actor.kill()
             # Cancel the pending setup call if possible? Ray might handle this automatically on kill.
             # ray.cancel(actor.setup_call_ref, force=True) # Might be necessary if kill is not enough

@@ -26,11 +26,12 @@ import copy
 import enum
 import os
 import pprint
-from typing import Optional, Union
+from typing import ClassVar, Optional, Union
 
 import attrs
 import ray
 from loguru import logger
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from cosmos_xenna.utils import approx
 
@@ -777,6 +778,32 @@ def _make_gpu_resources_from_current_node() -> Optional[GpuResources]:
     return out
 
 
+def _get_visible_devices_node(node_id: str, num_gpus: int) -> list[int]:
+    """Get the visible devices for node_id.
+    Given a node_id. This function calls a ray remote function that gets scheduled on the node
+    and gets the CUDA_VISIBLE_DEVICES env var.
+    """
+
+    @ray.remote
+    def _get_cuda_visible_devices(num_gpus: int) -> list[int]:
+        """Get the CUDA visible devices from the environment variables."""
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            visible_devices = [int(x) for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+            # Sort the devices
+            visible_devices.sort()
+            return visible_devices
+        else:
+            return [x for x in range(num_gpus)]
+
+    visible_device_node = _get_cuda_visible_devices.options(
+        num_cpus=1, num_gpus=num_gpus, scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+    ).remote(num_gpus)
+
+    visible_device_node = ray.get(visible_device_node)
+
+    return visible_device_node
+
+
 @attrs.define
 class ClusterResources:
     """
@@ -784,6 +811,26 @@ class ClusterResources:
     """
 
     nodes: dict[str, NodeResources]  # dict of all nodes in the cluster
+    # This dict holds the mapping of node_id to visible devices on that node_id.
+    # The setter for this dict is `_get_visible_devices_node` for each node in the cluster.
+    # And the getter is `_get_visible_devices_node_from_gpu_index`.
+    _node_to_visible_devices: ClassVar[dict[str, list[int]]] = {}
+
+    @staticmethod
+    def _get_visible_devices_node_from_gpu_index(node_id: str, gpu_index: int) -> int:
+        """Get the visible device for a given node_id and gpu_index.
+        This function is used to get the visible device for a given node_id and gpu_index.
+        """
+        if len(ClusterResources._node_to_visible_devices) == 0:
+            # This is expected if you used the simulation (make_uniform) instead of starting ray.
+            return gpu_index
+
+        try:
+            return ClusterResources._node_to_visible_devices[str(node_id)][gpu_index]
+        except KeyError:
+            # We don't ever expect this to happen by putting this in a try/except to ensure we have a fallback.
+            logger.warning(f"{gpu_index} is out of range for node {node_id}. Returning the original gpu_index.")
+            return gpu_index
 
     @classmethod
     def make_uniform(cls, node_resources: NodeResources, node_ids: set[str]) -> ClusterResources:
@@ -845,9 +892,19 @@ class ClusterResources:
         for node in nodes:
             node_id = node["NodeID"]
             reported_resources = node["Resources"]
+            node_name = node.get("NodeManagerHostname", "unknown")
+            alive = node.get("Alive", True)
+            if not alive:
+                logger.warning(f"Node {node_id} on {node_name} is not alive?? Skipping it.")
+                continue
             if "GPU" not in reported_resources:
                 gpus = []
             else:
+                # If the env var is set, we need to get the visible devices for the node.
+                if "XENNA_RESPECT_CUDA_VISIBLE_DEVICES" in os.environ:
+                    visible_devices = _get_visible_devices_node(str(node_id), int(reported_resources["GPU"]))
+                    ClusterResources._node_to_visible_devices[str(node_id)] = visible_devices
+
                 resources_per_gpu = _make_gpu_resources_from_current_node()
                 if resources_per_gpu is None:
                     gpus = []
@@ -954,6 +1011,19 @@ class Worker:
 class WorkerMetadata:
     worker_id: str
     allocation: WorkerResources
+
+    @classmethod
+    def make_mock(cls) -> WorkerMetadata:
+        return WorkerMetadata(
+            worker_id="mock",
+            allocation=WorkerResources(
+                cpus=1.0,
+                node="mock",
+                gpus=[],
+                nvdecs=[],
+                nvencs=[],
+            ),
+        )
 
 
 @attrs.define
