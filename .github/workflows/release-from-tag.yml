@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -55,3 +56,75 @@ jobs:
           body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-wheels:
+    needs: release
+    runs-on: ${{ matrix.conf.os }}
+    name: ${{ matrix.conf.os }}-${{ matrix.python-version }}-${{ matrix.conf.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ '3.x' ]
+        conf:
+          - { os: ubuntu-latest, target: x86_64,  target-triple: x86_64-unknown-linux-gnu,  manylinux: auto }
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build wheel and sdist
+        run: |
+          python -m build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.conf.os }}-${{ matrix.python-version }}-${{ matrix.conf.target }}
+          path: dist/*
+
+  attach-and-publish:
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect distributions
+        run: |
+          mkdir flat-dist
+          find dist -type f -maxdepth 2 -name "*.whl" -exec cp {} flat-dist/ \;
+          find dist -type f -maxdepth 2 -name "*.tar.gz" -exec cp {} flat-dist/ \;
+
+      - name: Attach wheels to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: flat-dist
+
+      - name: Publish to PyPI
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: flat-dist
