@@ -3,6 +3,18 @@
 
 ## Latest
 
+## [0.1.2]
+
+### Released
+- 2025-08-19
+
+### Added
+- Add workflow to publish packages to PyPI.
+
+### Fixed
+- Fixed bug on queue-size stats when back-pressure kicking in.
+- Fixed a possible hang when having a fan-in stage with large stage_batch_size.
+
 ## [0.1.1]
 
 ### Released

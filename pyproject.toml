@@ -1,8 +1,9 @@
 [project]
 name = "cosmos-xenna"
-version = "0.1.1"
-description = "TODO:Add your description here"
+version = "0.1.2"
+description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
     "attrs",

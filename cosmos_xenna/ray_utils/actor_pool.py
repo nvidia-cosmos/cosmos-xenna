@@ -463,7 +463,7 @@ class ActorPool(Generic[T, V]):
     def task_extra_data(self) -> collections.deque[stage_worker.TaskResultMetadata]:
         return self._task_result_metadatas
 
-    def make_stats(self) -> monitoring.ActorPoolStats:
+    def make_stats(self, ext_output_queue_size: int = 0) -> monitoring.ActorPoolStats:
         ids = self.get_actor_ids()
         # TODO: Add counts for node setup states to ActorStats
         return monitoring.ActorPoolStats(
@@ -481,7 +481,7 @@ class ActorPool(Generic[T, V]):
                 self._num_null_tasks,
                 self._num_dynamically_spawned_tasks,
                 len(self._task_queue),
-                len(self._completed_tasks),
+                len(self._completed_tasks) + ext_output_queue_size,
             ),
             monitoring.SlotStats(self.num_used_slots, self.num_empty_slots),
             self.calc_median_rate_estimate(),

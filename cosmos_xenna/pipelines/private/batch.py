@@ -112,7 +112,6 @@ def run_pipeline(
         )
         pools.append(pool)
 
-    num_completed = 0
     with monitoring.PipelineMonitor(
         pipeline_spec.config.logging_interval_s,
         initial_input_len,
@@ -135,7 +134,9 @@ def run_pipeline(
                 pool.update()
                 # TODO: task_metadata_per_pool should be filled in for reporting purposes.
                 # Skipping for now as it is non-trivial
-                monitor.update(len(input_copy), num_completed, task_metadata_per_pool=[[] for x in pools])
+                monitor.update(
+                    len(input_copy), ext_output_lens=[0 for _ in pools], task_metadata_per_pool=[[] for _ in pools]
+                )
                 latest_outputs = deque.pop_all_deque_elements(pool.completed_tasks)
                 # If this is not the last stage OR the user asked us to return the outputs, record them.
                 # Otherwise, let them get garbage collected.

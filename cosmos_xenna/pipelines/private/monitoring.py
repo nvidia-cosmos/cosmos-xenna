@@ -285,7 +285,9 @@ class PipelineMonitor:
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # noqa: ANN001
         # final update for metrics
         if os.environ.get("XENNA_RAY_METRICS_PORT", None) is not None:
-            stats = PipelinestatsWithTime(time.time(), self._make_stats(0, 0, [[] for _ in self._actor_pools]))
+            stats = PipelinestatsWithTime(
+                time.time(), self._make_stats(0, [0 for _ in self._actor_pools], [[] for _ in self._actor_pools])
+            )
             self._update_ray_metrics(stats.pipeline)
             # wait a few seconds to ensure metrisc are updated
             time.sleep(10)
@@ -306,7 +308,7 @@ class PipelineMonitor:
     def update(
         self,
         input_len: int,
-        output_len: int,
+        ext_output_lens: list[int],
         task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]],
     ) -> bool:
         # TODO: This update method is pretty slow. This should be refactored to hide it behind a background thread or
@@ -318,7 +320,7 @@ class PipelineMonitor:
             return False
 
         start = time.time()
-        stats = PipelinestatsWithTime(time.time(), self._make_stats(input_len, output_len, task_metadata_per_pool))
+        stats = PipelinestatsWithTime(time.time(), self._make_stats(input_len, ext_output_lens, task_metadata_per_pool))
 
         if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"took {time.time() - start} to get stats.")
@@ -338,7 +340,7 @@ class PipelineMonitor:
     def _make_stats(
         self,
         input_len: int,
-        output_len: int,
+        ext_output_lens: list[int],
         task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]],
     ) -> PipelineStats:
         start = time.time()
@@ -350,7 +352,7 @@ class PipelineMonitor:
         cluster_info = make_ray_cluster_info()
         if self._verbosity_level >= VerbosityLevel.INFO:
             logger.info(f"Took {time.time() - start} seconds to get cluster info.")
-        stats = [x.make_stats() for x in self._actor_pools]
+        stats = [pool.make_stats(ext_output_lens[idx]) for idx, pool in enumerate(self._actor_pools)]
         actor_id_to_pool_mapping = {}
         for pool_stats in stats:
             for x in pool_stats.pending_actor_pool_ids + pool_stats.ready_actor_pool_ids:
@@ -374,7 +376,7 @@ class PipelineMonitor:
             time.time(),
             num_initial_input_tasks=self._initital_input_length,
             num_input_tasks_remaining=input_len,
-            num_outputs=output_len,
+            num_outputs=ext_output_lens[-1] if len(ext_output_lens) > 0 else 0,
             actor_pools=stats,
             pipeline_duration_s=t - self._pipeline_start_time,
             main_loop_rate_hz=self._rate_estimator.get_rate(),
