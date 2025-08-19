@@ -442,8 +442,8 @@ def run_pipeline(
 
             # Grab stats from the pools
             pool_extra_metadatas = [deque.pop_all_deque_elements(x.task_extra_data) for x in pools]
-
-            if monitor.update(len(input_queue), len(queues[-1]), pool_extra_metadatas) and (last_stats is not None):
+            queue_lengths = [len(x) for x in queues]
+            if monitor.update(len(input_queue), queue_lengths, pool_extra_metadatas) and (last_stats is not None):
                 if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
                     logger.info(last_stats.to_log_string())
                 if pipeline_spec.config.log_worker_allocation_layout:
@@ -483,7 +483,13 @@ def run_pipeline(
                         num_tasks_completed = 0
                     else:
                         num_tasks_completed = len(output_queue) / avg_samples_per_task
-                    max_queued = pool.num_ready_actors * pool.slots_per_actor
+
+                    next_stage_batch_size = -1
+                    if not is_last_stage:
+                        next_stage_batch_size = pipeline_spec.stages[idx + 1].stage.stage_batch_size  # type: ignore
+
+                    max_queued = max(pool.num_ready_actors * pool.slots_per_actor, next_stage_batch_size)
+
                     if num_tasks_in_progress + num_tasks_completed >= max_queued:
                         break
                     queue_to_pull_from = input_queue if idx == 0 else queues[idx - 1]
