@@ -19,12 +19,17 @@ import math
 import typing
 
 import ray
-from loguru import logger
 
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (
+    allocator,
+    autoscaling_algorithms,
+    data_structures,
+    resources,
+)
 from cosmos_xenna.pipelines.private import monitoring, specs
-from cosmos_xenna.pipelines.private.scheduling import autoscaling_algorithms, data_structures
-from cosmos_xenna.ray_utils import actor_pool, allocator, resources
-from cosmos_xenna.utils import deque, grouping, timing, verbosity
+from cosmos_xenna.ray_utils import actor_pool
+from cosmos_xenna.utils import deque, grouping, timing
+from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -37,7 +42,7 @@ def _determine_number_of_workers_and_scale_pool(
     stage_spec: specs.StageSpec,
     pool: actor_pool.ActorPool,
     cluster_resources: resources.ClusterResources,
-    factory: autoscaling_algorithms.WorkerIdFactory,
+    worker_id_factory: autoscaling_algorithms.WorkerIdFactory,
 ) -> None:
     """Determines how many workers to assign to the active pool/stage and assigns them to the actor pool.
 
@@ -56,6 +61,7 @@ def _determine_number_of_workers_and_scale_pool(
                 stage_batch_size=1,
                 worker_shape=pool.worker_shape,
                 requested_num_workers=maybe_requested_num_workers,
+                over_provision_factor=None,
             )
         ],
     )
@@ -68,8 +74,8 @@ def _determine_number_of_workers_and_scale_pool(
         estimates=autoscaling_algorithms.Estimates(
             stages=[autoscaling_algorithms.Estimate(batches_per_second_per_worker=1, num_returns_per_batch=1)]
         ),
-        factory=factory,
-        verbosity_level=verbosity.VerbosityLevel.NONE,
+        overallocation_target=1.0,
+        worker_id_factory=worker_id_factory,
     )
     assert solution.stages[0].deleted_workers == []
     for worker_to_add in solution.stages[0].new_workers:
@@ -85,7 +91,6 @@ def run_pipeline(
     # We will not use this directly, but it is used by the actor pools
     worker_allocator = allocator.WorkerAllocator(cluster_resources)
     worker_id_factory = autoscaling_algorithms.WorkerIdFactory()
-
     logger.info("Putting all inputs into ray memory store.")
     assert isinstance(pipeline_spec.stages[0], specs.StageSpec)
     groups = grouping.split_by_chunk_size(pipeline_spec.input_data, pipeline_spec.stages[0].stage.stage_batch_size)
@@ -108,7 +113,6 @@ def run_pipeline(
             wrapped_stage.stage,
             wrapped_stage.params,
             spec.name(idx),
-            verbosity_level=pipeline_spec.config.actor_pool_verbosity_level,
         )
         pools.append(pool)
 
@@ -116,7 +120,6 @@ def run_pipeline(
         pipeline_spec.config.logging_interval_s,
         initial_input_len,
         pools,
-        pipeline_spec.config.monitoring_verbosity_level,
     ) as monitor:
         for idx, (spec, pool) in enumerate(zip(pipeline_spec.stages, pools)):
             assert isinstance(spec, specs.StageSpec)

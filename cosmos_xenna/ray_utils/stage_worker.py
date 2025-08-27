@@ -77,12 +77,13 @@ from typing import Generator, Generic, Optional, Union
 import attrs
 import ray
 import ray.experimental
-from loguru import logger
 from ray.util.metrics import Gauge
 
-from cosmos_xenna.ray_utils import resources, stage
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.ray_utils import stage
 from cosmos_xenna.utils import gpu, retry
-from cosmos_xenna.utils.verbosity import VerbosityLevel
+from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -129,6 +130,8 @@ class _DeserializedTaskDataWithId(Generic[T]):
     Holds the actual deserialized data object, ready for processing.
     """
 
+    # References to the input data in the Ray object store.
+    data_refs: list[ray.ObjectRef[T]]
     # The actual deserialized input data.
     data: list[T]
     # Unique identifier for the task.
@@ -297,8 +300,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self,
         stage_interface: stage.Interface,
         params: stage.Params,
-        worker: resources.Worker,
-        verbosity_level: VerbosityLevel,
+        worker: rust_resources.Worker,
     ) -> None:
         """Initializes the StageWorker actor.
 
@@ -312,7 +314,6 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self._is_setup = False
         self._node_location: str | None = None
         self._worker = worker
-        self._verbosity_level = verbosity_level
 
         # Tasks waiting to be downloaded
         self.task_queue: queue.Queue[_TaskDataWithId[T]] = queue.Queue()
@@ -385,11 +386,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
             def func_to_call() -> None:
                 return self._stage_interface.setup_on_node(resources.NodeInfo(node_location), copy.deepcopy(metadata))
 
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Setting up actor for stage={self._params.name} on node={node_location}")
+            logger.debug(f"Setting up actor for stage={self._params.name} on node={node_location}")
             retry.do_with_retries(func_to_call, max_attempts=self._params.num_node_setup_retries)
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
+            logger.debug(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
             return node_location
 
     @ray.method(retry_exceptions=False)
@@ -418,13 +417,11 @@ class StageWorker(abc.ABC, Generic[T, V]):
             def func_to_call() -> None:
                 return self._stage_interface.setup(copy.deepcopy(metadata))
 
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Setting up actor for stage={self._params.name}")
+            logger.debug(f"Setting up actor for stage={self._params.name}")
             retry.do_with_retries(func_to_call, max_attempts=self._params.num_setup_retries)
             node_location = self._get_node_location()
             self._is_setup = True
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Finished setting up actor for stage={self._params.name}")
+            logger.debug(f"Finished setting up actor for stage={self._params.name}")
 
             # metrics
             for gpu_alloc in self._worker.allocation.gpus:
@@ -484,6 +481,57 @@ class StageWorker(abc.ABC, Generic[T, V]):
                     break
             yield result.extras
             yield from result.out_data
+
+    @ray.method(retry_exceptions=False)
+    def cancel_task(self, task_data: TaskData[T]) -> bool:
+        """Attempts to cancel a task that has been submitted but not yet started.
+
+        Best-effort removal from internal queues; returns True if the task was found and removed
+        from either the submission queue or the downloaded-but-not-deserialized queue.
+        If the task has already begun deserialization or processing, cancellation will likely fail
+        and this returns False.
+        """
+
+        # Helper to remove a matching task from a Queue by draining and reconstructing it.
+        def _remove_from_queue(
+            q: queue.Queue[_TaskDataWithId[T]] | queue.Queue[_DeserializedTaskDataWithId[T]],
+            refs: list[ray.ObjectRef[T]],
+        ) -> bool:
+            items: list[_TaskDataWithId[T] | _DeserializedTaskDataWithId[T]] = []
+            while True:
+                try:
+                    item = q.get_nowait()
+                except queue.Empty:
+                    break
+                items.append(item)
+
+            removed_ = False
+            # Restore remaining items preserving order as much as possible
+            for it in items:
+                if it.data_refs == refs:
+                    removed_ = True
+                    continue
+                q.put_nowait(it)  # type: ignore
+            return removed_
+
+        refs = task_data.data_refs
+        # Try to remove from the submission queue first
+        removed = False
+        if _remove_from_queue(self.task_queue, refs):
+            removed = True
+        # If downloader already moved it, try downloaded queue
+        if _remove_from_queue(self.downloaded_queue, refs):
+            removed = True
+        # If deserializer already moved it, try deserialized queue
+        if _remove_from_queue(self.deserialized_queue, refs):
+            removed = True
+        # We cannot reliably cancel from deserialized_queue or once processing has started.
+        if not removed:
+            logger.debug(f"Failed to remove task {task_data} from queues.")
+            logger.debug(f"Task queue: {[item.data_refs for item in self.task_queue.queue]}")
+            logger.debug(f"Downloaded queue: {[item.data_refs for item in self.downloaded_queue.queue]}")
+            logger.debug(f"Deserialized queue: {[item.data_refs for item in self.deserialized_queue.queue]}")
+        return removed
 
     def _downloader_step(self, local_tasks: dict[str, _TaskDataWithId[T]]) -> None:
         """Performs one iteration of the download loop.
@@ -595,7 +643,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         # Pass the list of object sizes calculated in the downloader
         assert task.object_sizes is not None  # Should have been populated by downloader
         self.deserialized_queue.put_nowait(
-            _DeserializedTaskDataWithId(result, task.uuid, out_timing, task.object_sizes)
+            _DeserializedTaskDataWithId(task.data_refs, result, task.uuid, out_timing, task.object_sizes)
         )
 
     def _deserializer_loop(self) -> None:

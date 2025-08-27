@@ -47,7 +47,6 @@ import attrs
 import ray
 import ray.util.scheduling_strategies
 import ray.util.state
-from loguru import logger
 from ray.util.metrics import Gauge
 
 from cosmos_xenna.pipelines.private.monitoring_types import (
@@ -60,8 +59,8 @@ from cosmos_xenna.pipelines.private.monitoring_types import (
     Resources,
 )
 from cosmos_xenna.ray_utils import actor_pool, resource_monitor, stage_worker
+from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import timing
-from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 
 @attrs.define
@@ -269,12 +268,10 @@ class PipelineMonitor:
         log_interval_s: float,
         initial_input_len: int,
         actor_pools: list[actor_pool.ActorPool],
-        verbosity_level: VerbosityLevel,
     ) -> None:
         self._actor_pools = list(actor_pools)
         self._log_interval_s = float(log_interval_s)
         self._initital_input_length = int(initial_input_len)
-        self._verbosity_level = verbosity_level
         self._opened = False
 
     def __enter__(self) -> PipelineMonitor:
@@ -322,8 +319,7 @@ class PipelineMonitor:
         start = time.time()
         stats = PipelinestatsWithTime(time.time(), self._make_stats(input_len, ext_output_lens, task_metadata_per_pool))
 
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(f"took {time.time() - start} to get stats.")
+        logger.debug(f"took {time.time() - start} to get stats.")
 
         # Update metrics
         self._update_ray_metrics(stats.pipeline)
@@ -345,13 +341,11 @@ class PipelineMonitor:
     ) -> PipelineStats:
         start = time.time()
         node_resource_data = self._nodes_resource_monitor.update()
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(f"Took {time.time() - start} seconds to get node resource info.")
+        logger.debug(f"Took {time.time() - start} seconds to get node resource info.")
 
         start = time.time()
         cluster_info = make_ray_cluster_info()
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(f"Took {time.time() - start} seconds to get cluster info.")
+        logger.debug(f"Took {time.time() - start} seconds to get cluster info.")
         stats = [pool.make_stats(ext_output_lens[idx]) for idx, pool in enumerate(self._actor_pools)]
         actor_id_to_pool_mapping = {}
         for pool_stats in stats:
@@ -359,8 +353,7 @@ class PipelineMonitor:
                 actor_id_to_pool_mapping[x] = pool_stats.name
         start = time.time()
         actors = get_ray_actors()
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(f"Took {time.time() - start} seconds to get actor info.")
+        logger.debug(f"Took {time.time() - start} seconds to get actor info.")
         actor_resource_usage = calculate_actor_resource_usage(
             actors,
             {k: v.process_tree for k, v in node_resource_data.items() if v is not None},
@@ -390,8 +383,7 @@ class PipelineMonitor:
 
     def _print_state(self, stats: PipelineStats) -> None:
         display = stats.display()
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(display)
+        print(display)
 
     def close(self) -> None:
         assert self._opened

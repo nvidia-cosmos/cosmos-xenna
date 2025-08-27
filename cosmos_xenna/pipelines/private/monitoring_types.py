@@ -20,7 +20,8 @@ import enum
 import attrs
 from tabulate import tabulate
 
-from cosmos_xenna.ray_utils import allocator, monitoring, stage_worker
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import allocator
+from cosmos_xenna.ray_utils import monitoring, stage_worker
 
 
 @attrs.define

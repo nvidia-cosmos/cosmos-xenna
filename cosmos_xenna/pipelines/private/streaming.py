@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import math
 import random
 import time
@@ -25,12 +26,17 @@ from typing import Optional
 import attrs
 import ray
 import ray.util.state
-from loguru import logger
 
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (
+    allocator,
+    autoscaling_algorithms,
+    data_structures,
+    resources,
+)
 from cosmos_xenna.pipelines.private import monitoring, specs
-from cosmos_xenna.pipelines.private.scheduling import autoscaling_algorithms, data_structures
-from cosmos_xenna.ray_utils import actor_pool, allocator, resources, stage_worker
+from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
+from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -43,17 +49,19 @@ _VERBOSE = False
 @attrs.define
 class StreamingExecutorTiming:
     iteration_start: float = 0.0
+    auto_scaling_apply_end: float = 0.0
     pool_update_end: float = 0.0
+    auto_scaling_submit_end: float = 0.0
     monitor_update_end: float = 0.0
     add_tasks_end: float = 0.0
-    auto_scaling_end: float = 0.0
     sleep_end: float = 0.0
 
     def to_log_string(self) -> str:
         stages: list[tuple[str, float]] = [
-            ("Auto Scaling", self.auto_scaling_end - self.iteration_start),
-            ("Pool Update", self.pool_update_end - self.auto_scaling_end),
-            ("Monitor Update", self.monitor_update_end - self.pool_update_end),
+            ("Auto Scaling Apply", self.auto_scaling_apply_end - self.iteration_start),
+            ("Pool Update", self.pool_update_end - self.auto_scaling_apply_end),
+            ("Auto Scaling Submit", self.auto_scaling_submit_end - self.pool_update_end),
+            ("Monitor Update", self.monitor_update_end - self.auto_scaling_submit_end),
             ("Add Tasks", self.add_tasks_end - self.monitor_update_end),
             ("Sleep", self.sleep_end - self.add_tasks_end),
             ("Total", self.sleep_end - self.iteration_start),
@@ -83,7 +91,83 @@ class AutoscalerResultForStage:
     workers_to_delete: list[resources.Worker]
 
 
+def _make_problem_from_pipeline_spec(
+    pipeline_spec: specs.PipelineSpec, cluster_resources: resources.ClusterResources
+) -> data_structures.Problem:
+    """Creates a Problem instance from a pipeline specification.
+
+    Args:
+        s: Pipeline specification containing stage information.
+        cluster_resources: Available cluster resources.
+
+    Returns:
+        A new Problem instance configured according to the specification.
+    """
+    out_stages = []
+    num_nodes = len(cluster_resources.nodes)
+    for idx, stage in enumerate(pipeline_spec.stages):
+        assert isinstance(stage, specs.StageSpec)
+        if stage.num_workers is not None:
+            num_workers = stage.num_workers
+        elif stage.num_workers_per_node is not None:
+            num_workers = math.ceil(stage.num_workers_per_node * num_nodes)
+        else:
+            num_workers = None
+        out_stages.append(
+            data_structures.ProblemStage(
+                stage.name(idx),
+                stage.stage.stage_batch_size,
+                stage.stage.required_resources.to_rust().to_shape(),
+                requested_num_workers=num_workers,
+                over_provision_factor=stage.over_provision_factor,
+            )
+        )
+    return data_structures.Problem(cluster_resources, out_stages)
+
+
+def make_task_measurement_from_task_metadata(
+    task_metadata: stage_worker.TaskResultMetadata,
+) -> data_structures.TaskMeasurement:
+    return data_structures.TaskMeasurement(
+        start_time=task_metadata.timing.process_start_time_s,
+        end_time=task_metadata.timing.process_end_time_s,
+        num_returns=task_metadata.num_returns,
+    )
+
+
+def make_problem_worker_state_from_worker_state(state: resources.Worker) -> data_structures.ProblemWorkerState:
+    """Creates a ProblemWorkerState from a Worker instance.
+
+    Args:
+        state: Worker instance containing worker state information.
+
+    Returns:
+        A new ProblemWorkerState instance.
+    """
+    return data_structures.ProblemWorkerState(state.id, state.allocation)
+
+
 class Autoscaler:
+    """Manages the autoscaling of pipeline stages in a streaming execution mode.
+
+    This class is responsible for calculating and applying changes to the number of
+    workers in each stage of the pipeline. To avoid blocking the main execution
+    thread, the autoscaling calculation is performed in a background thread.
+
+    The `Autoscaler` is implemented as a context manager to ensure that the
+    background thread executor is properly shut down upon exit.
+
+    Attributes:
+        _verbosity_level: The level of logging verbosity.
+        _allocator: An instance of `WorkerAllocator` to manage worker resources.
+        _algorithm: The autoscaling algorithm to use for calculations.
+        _executor: A `ThreadPoolExecutor` for running calculations in the background.
+        _autoscale_future: A `Future` object representing the pending result of an
+            autoscaling calculation.
+        _autoscale_start_time: The timestamp when the last autoscaling calculation
+            was started.
+    """
+
     def __init__(
         self,
         worker_allocator: allocator.WorkerAllocator,
@@ -91,21 +175,44 @@ class Autoscaler:
         cluster_resources: resources.ClusterResources,
         verbosity_level: verbosity.VerbosityLevel = verbosity.VerbosityLevel.NONE,
     ) -> None:
+        """Initializes the Autoscaler.
+
+        Args:
+            worker_allocator: The worker allocator for the cluster.
+            pipeline_spec: The specification for the pipeline.
+            cluster_resources: The available resources in the cluster.
+            verbosity_level: The verbosity level for logging.
+        """
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(verbosity_level=verbosity_level)
-        self._algorithm.setup(data_structures.Problem.make_from_pipeline_spec(pipeline_spec, cluster_resources))
+        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler()
+        self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._autoscale_future: Optional[concurrent.futures.Future] = None
+        self._autoscale_start_time: float = 0.0
+
+    def __enter__(self) -> Autoscaler:
+        """Enters the context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):  # noqa: ANN001, ANN204
+        """Exits the context manager, shutting down the executor."""
+        self._executor.shutdown(wait=True)
 
     def add_measurements(
         self,
         task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]],
     ) -> None:
+        """Adds new performance measurements to the autoscaling algorithm.
+
+        Args:
+            task_metadata_per_pool: A list of task metadata lists, one for each
+                stage in the pipeline.
+        """
         stage_measurements = []
         for metadatas in task_metadata_per_pool:
             stage_measurements.append(
-                data_structures.StageMeasurements(
-                    [data_structures.TaskMeasurement.make_from_task_metadata(x) for x in metadatas]
-                )
+                data_structures.StageMeasurements([make_task_measurement_from_task_metadata(x) for x in metadatas])
             )
         measurements = data_structures.Measurements(time.time(), stage_measurements)
         self._algorithm.update_with_measurements(time.time(), measurements)
@@ -113,40 +220,84 @@ class Autoscaler:
     def _make_problem_state(
         self, actor_pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]
     ) -> data_structures.ProblemState:
+        """Creates a `ProblemState` instance from the current pipeline state.
+
+        Args:
+            actor_pools: The list of actor pools for each stage.
+            stages_is_dones: A list of booleans indicating if each stage is done.
+
+        Returns:
+            A `ProblemState` object representing the current state of the pipeline.
+        """
         stages = []
         for pool, is_done in zip(actor_pools, stages_is_dones):
             workers = self._allocator.get_workers_in_stage(pool.name)
             stages.append(
                 data_structures.ProblemStageState(
                     pool.name,
-                    [data_structures.ProblemWorkerState.make_from_worker_state(w) for w in workers],
+                    [make_problem_worker_state_from_worker_state(w) for w in workers],
                     pool.slots_per_actor,
                     is_done,
                 )
             )
         return data_structures.ProblemState(stages)
 
-    def update(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
-        autoscale_result = self._algorithm.autoscale(
-            time.time(),
-            self._make_problem_state(pools, stages_is_dones),
-        )
-        if self._verbosity_level > verbosity.VerbosityLevel.INFO:
-            logger.info(f"Autoscale result:\n{autoscale_result}")
+    def start_autoscale_calculation(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
+        """Starts a new autoscaling calculation in a background thread.
 
-        for result, pool in zip(autoscale_result.stages, pools):
-            pool.set_num_slots_per_actor(result.slots_per_worker)
-            for w in result.new_workers:
-                pool.add_actor_to_create(w.to_worker(pool.name))
+        If a calculation is already in progress, this method does nothing.
 
-            for w in result.deleted_workers:
-                pool.add_actor_to_delete(w.to_worker(pool.name))
+        Args:
+            pools: The list of actor pools for each stage.
+            stages_is_dones: A list of booleans indicating if each stage is done.
+        """
+        if self._autoscale_future and not self._autoscale_future.done():
+            if self._verbosity_level > verbosity.VerbosityLevel.INFO:
+                logger.info("Autoscale calculation already in progress. Skipping.")
+            return
+
+        self._autoscale_start_time = time.time()
+        problem_state = self._make_problem_state(pools, stages_is_dones)
+        self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
+
+    def apply_autoscale_result_if_ready(self, pools: list[actor_pool.ActorPool]) -> None:
+        """Applies the result of a completed autoscaling calculation.
+
+        If the calculation is not yet finished, this method does nothing. Once the
+        result is applied, it updates the actor pools with new worker
+        configurations.
+
+        Args:
+            pools: The list of actor pools to update with the new scaling results.
+        """
+        if self._autoscale_future and self._autoscale_future.done():
+            autoscale_result = self._autoscale_future.result()
+
+            for result, pool in zip(autoscale_result.stages, pools):
+                pool.set_num_slots_per_actor(result.slots_per_worker)
+                for w in result.new_workers:
+                    pool.add_actor_to_create(w.to_worker(pool.name))
+
+                for w in result.deleted_workers:
+                    pool.add_actor_to_delete(w.to_worker(pool.name))
+
+            self._autoscale_future = None
+            autoscale_end_time = time.time()
+            if autoscale_end_time - self._autoscale_start_time > 1.0:
+                logger.warning(
+                    f"Applying autoscale results took {autoscale_end_time - self._autoscale_start_time} seconds"
+                )
 
 
 def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resources: resources.ClusterResources) -> None:
     cluster_resource_totals = cluster_resources.totals()
 
-    required_resources = resources.PoolOfResources()
+    required_resources = resources.PoolOfResources(
+        cpus=0.0,
+        gpus=0.0,
+        nvdecs=0,
+        nvencs=0,
+    )
 
     for stage in pipeline_spec.stages:
         assert isinstance(stage, specs.StageSpec)
@@ -157,10 +308,11 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         else:
             num_required = 1
 
-        resources_per_worker = stage.stage.required_resources.to_pool_of_resources(
-            cluster_resources.calc_num_nvdecs_per_gpu(), cluster_resources.calc_num_nvencs_per_gpu()
+        resources_per_worker = stage.stage.required_resources.to_rust().to_pool(
+            cluster_resources.calc_num_nvdecs_per_gpu(),
+            cluster_resources.calc_num_nvencs_per_gpu(),
         )
-        required_resources += resources_per_worker.mutiply_by(num_required)
+        required_resources = required_resources.add(resources_per_worker.multiply_by(num_required))
 
     summary_string = (
         f"If running locally, you can run the pipeline in batch mode by setting the config.execution_mode to BATCH.\n"
@@ -387,7 +539,6 @@ def run_pipeline(
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
-                verbosity_level=pipeline_spec.config.actor_pool_verbosity_level,
             )
         )
 
@@ -397,36 +548,30 @@ def run_pipeline(
     autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
-    autoscaler = Autoscaler(
-        worker_allocator,
-        pipeline_spec,
-        cluster_resources,
-        pipeline_spec.config.mode_specific.autoscaler_verbosity_level,
-    )
-
-    logger.info("Starting main loop")
+    logger.debug("Starting main loop")
 
     last_stats: Optional[StreamingExecutorStats] = None
-    with monitoring.PipelineMonitor(
-        pipeline_spec.config.logging_interval_s,
-        initital_input_length,
-        pools,
-        pipeline_spec.config.monitoring_verbosity_level,
-    ) as monitor:
+    with (
+        Autoscaler(
+            worker_allocator,
+            pipeline_spec,
+            cluster_resources,
+            pipeline_spec.config.mode_specific.autoscaler_verbosity_level,
+        ) as autoscaler,
+        monitoring.PipelineMonitor(
+            pipeline_spec.config.logging_interval_s,
+            initital_input_length,
+            pools,
+        ) as monitor,
+    ):
         # This is the loop which does all the interesting stuff. It was difficult to find the correct way to iterate
         # through this which managed backpressure the correct way.
         while True:
             new_stats = StreamingExecutorTiming(time.time())
 
-            # Handle scaling the actor pools.
-            # This should get called on the first loop through.
-            if autoscale_rate_limiter.can_call():
-                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
-                    logger.info("Autoscaling...")
-                autoscaler.update(pools, stage_is_dones)
-                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
-                    logger.info("Done calculating autoscaling...")
-            new_stats.auto_scaling_end = time.time()
+            # Apply autoscale results if they are ready.
+            autoscaler.apply_autoscale_result_if_ready(pools)
+            new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
             # to clear room for new actors.
@@ -440,14 +585,18 @@ def run_pipeline(
                     pool.update()
             new_stats.pool_update_end = time.time()
 
+            # Handle scaling the actor pools.
+            # This should get called on the first loop through.
+            if autoscale_rate_limiter.can_call():
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones)
+            new_stats.auto_scaling_submit_end = time.time()
+
             # Grab stats from the pools
             pool_extra_metadatas = [deque.pop_all_deque_elements(x.task_extra_data) for x in pools]
             queue_lengths = [len(x) for x in queues]
             if monitor.update(len(input_queue), queue_lengths, pool_extra_metadatas) and (last_stats is not None):
-                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
-                    logger.info(last_stats.to_log_string())
-                if pipeline_spec.config.log_worker_allocation_layout:
-                    logger.info(f"Worker allocation:\n{worker_allocator.make_detailed_utilization_table()}")
+                logger.info(last_stats.to_log_string())
+                logger.debug(f"Worker allocation:\n{worker_allocator.make_detailed_utilization_table()}")
             new_stats.monitor_update_end = time.time()
 
             autoscaler.add_measurements(pool_extra_metadatas)
@@ -504,8 +653,7 @@ def run_pipeline(
                             break
                         else:
                             task = maybe_task
-                        if _VERBOSE:
-                            logger.info(f"Stage {idx} adding task: {task}")
+                        logger.trace(f"Stage {idx} adding task: {task}")
                         pool.add_task(actor_pool.Task([ray.put(x) for x in task.task_data], None))
                     else:
                         if (
@@ -516,8 +664,7 @@ def run_pipeline(
                             break
                         else:
                             task = maybe_task
-                        if _VERBOSE:
-                            logger.info(f"Stage {idx} adding task: {task}")
+                        logger.trace(f"Stage {idx} adding task: {task}")
                         pool.add_task(task)  # type: ignore
 
             new_stats.add_tasks_end = time.time()
@@ -546,11 +693,10 @@ def run_pipeline(
             rate_limiter.sleep()
             new_stats.sleep_end = time.time()
             last_stats = StreamingExecutorStats(new_stats)
-            if _VERBOSE:
-                logger.info(f"Input queue: {len(input_queue)}")
-                for idx, queue in enumerate(queues):
-                    logger.info(f"Queue {idx}: {len(queue)}")
-                logger.info(last_stats.to_log_string())
+            logger.debug(f"Input queue: {len(input_queue)}")
+            for idx, queue in enumerate(queues):
+                logger.debug(f"Queue {idx}: {len(queue)}")
+            logger.debug(last_stats.to_log_string())
 
     if pipeline_spec.config.return_last_stage_outputs:
         return ray.get(queues[-1].get_all_samples())

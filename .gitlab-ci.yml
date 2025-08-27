@@ -12,9 +12,10 @@ stages:
 ci:unit-tests:
   stage: ci
   image:
-    name: ghcr.io/astral-sh/uv:python3.9-bookworm
+    name: nvcr.io/nvidian/xenna_build:0.0.1
   script:
     - uv sync
+    - uv run maturin develop --release
     - uv run run_presubmit.py test
   tags:
     - cpu
@@ -23,9 +24,10 @@ ci:unit-tests:
 ci:lint:
   stage: ci
   image:
-    name: ghcr.io/astral-sh/uv:python3.9-bookworm
+    name: nvcr.io/nvidian/xenna_build:0.0.1
   script:
     - uv sync
+    - uv run maturin develop --release
     - uv run run_presubmit.py lint
   tags:
     - cpu

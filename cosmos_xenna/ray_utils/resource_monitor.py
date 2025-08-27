@@ -43,8 +43,8 @@ from typing import Optional
 import attrs
 import jinja2
 import psutil
-from loguru import logger
 
+from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import timing
 
 # Template string for system monitoring display.

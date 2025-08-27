@@ -26,7 +26,7 @@ import time
 import typing
 from typing import Optional
 
-from loguru import logger
+from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 
