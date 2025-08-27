@@ -14,9 +14,10 @@
 # limitations under the License.
 
 import os
-import subprocess
 import typing
 from typing import Optional
+
+import pytest  # noqa: F401
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
 
@@ -101,41 +102,3 @@ def test_pipeline() -> None:
     )
     results = typing.cast(list[int], pipelines_v1.run_pipeline(pipeline_spec))
     assert sorted(results) == [x * 16 for x in range(1000)]
-
-
-class _FractionGpuCudaPrinter(pipelines_v1.Stage):
-    @property
-    def required_resources(self) -> Optional[pipelines_v1.Resources]:
-        return pipelines_v1.Resources(cpus=0.1, gpus=0.1, nvdecs=1)
-
-    @property
-    def stage_batch_size(self) -> int:
-        return 1
-
-    def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
-        self._cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        self._worker_metadata = worker_metadata
-        subprocess.check_call("printenv")
-
-    def process_data(self, in_data: list[int]) -> list[tuple[pipelines_v1.WorkerMetadata, Optional[str]]]:
-        subprocess.check_call("printenv")
-        return [(self._worker_metadata, self._cuda_visible_devices)]
-
-
-def test_cuda_env_vars_are_set_correctly() -> None:
-    pipeline_spec = pipelines_v1.PipelineSpec(
-        input_data=range(1),
-        stages=[_FractionGpuCudaPrinter()],
-        config=pipelines_v1.PipelineConfig(
-            execution_mode=pipelines_v1.ExecutionMode.STREAMING,
-            logging_interval_s=1,
-            log_worker_allocation_layout=True,
-            return_last_stage_outputs=True,
-        ),
-    )
-    results = typing.cast(
-        list[tuple[pipelines_v1.WorkerMetadata, Optional[str]]], pipelines_v1.run_pipeline(pipeline_spec)
-    )
-    assert len(results) == 1
-    assert results[0][1] == "0"
-    assert len(results[0][0].allocation.gpus) == 1

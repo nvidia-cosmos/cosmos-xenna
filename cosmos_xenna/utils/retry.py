@@ -20,7 +20,7 @@ import typing
 from collections.abc import Iterable
 from typing import Callable, Optional, Type
 
-from loguru import logger
+from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 

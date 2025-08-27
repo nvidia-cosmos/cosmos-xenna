@@ -14,6 +14,12 @@
 # limitations under the License.
 
 from cosmos_xenna.pipelines.private.pipelines import run_pipeline
+from cosmos_xenna.pipelines.private.resources import (
+    NodeInfo,
+    Resources,
+    WorkerMetadata,
+    get_local_gpu_info,
+)
 from cosmos_xenna.pipelines.private.specs import (
     ExecutionMode,
     JobInfo,
@@ -23,7 +29,6 @@ from cosmos_xenna.pipelines.private.specs import (
     StageSpec,
     StreamingSpecificSpec,
 )
-from cosmos_xenna.ray_utils.resources import NodeInfo, Resources, WorkerMetadata
 from cosmos_xenna.ray_utils.runtime_envs import CondaEnv, RuntimeEnv
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
@@ -41,5 +46,6 @@ __all__ = [
     "StreamingSpecificSpec",
     "VerbosityLevel",
     "WorkerMetadata",
+    "get_local_gpu_info",
     "run_pipeline",
 ]

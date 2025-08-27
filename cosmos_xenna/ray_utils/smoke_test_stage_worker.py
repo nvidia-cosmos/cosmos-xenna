@@ -24,8 +24,9 @@ import attrs
 import pytest
 import ray
 
-from cosmos_xenna.ray_utils import cluster, resources, stage, stage_worker
-from cosmos_xenna.utils.verbosity import VerbosityLevel
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.ray_utils import cluster, stage, stage_worker
 
 
 @pytest.fixture
@@ -99,12 +100,11 @@ def test_process_data_basic(ray_cluster) -> None:
     actor = stage_worker.StageWorker.remote(
         _SimpleStage(0.0, 0.0),
         stage.Params(),
-        resources.Worker(
+        rust_resources.Worker(
             "my_worker",
             "my_stage",
-            resources.WorkerResources("my_node", 1.0, [], [], []),
+            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
-        VerbosityLevel.INFO,
     )
     node_id = ray.get(actor.setup.remote())  # type: ignore
     print(node_id)
@@ -123,12 +123,11 @@ def test_process_data_in_parallel(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _SimpleStage(0.0, 1.0),
         stage.Params(),
-        resources.Worker(
+        rust_resources.Worker(
             "my_worker",
             "my_stage",
-            resources.WorkerResources("my_node", 1.0, [], [], []),
+            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
-        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 
@@ -168,12 +167,11 @@ def test_complex_data_in_parallel(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _ComplexStage(0.0),
         stage.Params(),
-        resources.Worker(
+        rust_resources.Worker(
             "my_worker",
             "my_stage",
-            resources.WorkerResources("my_node", 1.0, [], [], []),
+            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
-        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 
@@ -195,12 +193,11 @@ def test_multiple_tasks_with_exceptions(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _ExceptionStage(),
         stage.Params(),
-        resources.Worker(
+        rust_resources.Worker(
             "my_worker",
             "my_stage",
-            resources.WorkerResources("my_node", 1.0, [], [], []),
+            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
         ),
-        VerbosityLevel.INFO,
     )
     ray.get(actor.setup.remote())  # type: ignore
 

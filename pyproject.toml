@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.1.2"
+version = "0.1.3+dev7"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -13,16 +13,13 @@ dependencies = [
     "pulp",
     "ray[default]>=2.46.0",
     "tabulate",
+    "obstore",
 ]
 
-[dependency-groups]
-dev = [
-    "plotly>=6.0.1",
-    "pyright>=1.1.399",
-    "pytest>=8.3.5",
-    "ruff>=0.11.5",
-    "typer>=0.15.2",
-]
+# project.optional-dependencies is for public consumption.
+# dependency-groups is for internal consumption.
+[project.optional-dependencies]
+gpu = ["gpustat", "pynvml"]
 examples = [
     "huggingface-hub>=0.30.2",
     "requests>=2.32.3",
@@ -30,24 +27,45 @@ examples = [
     "torchvision>=0.21.0",
     "transformers>=4.51.3",
 ]
-gpu = [
-    "gpustat",
-    "pynvml",
+
+[dependency-groups]
+gpu = ["cosmos_xenna[gpu]"]
+examples = ["cosmos_xenna[examples]"]
+dev = [
+    "maturin[patchelf]>=1.9.3",
+    "maturin-import-hook>=0.3.0",
+    "plotly>=6.0.1",
+    "py-spy>=0.4.0",
+    "ruff==0.12.7",
+    "pyright==1.1.403",
+    "pytest>=8.3.5",
+    "typer>=0.15.2",
 ]
 
 [tool.uv]
 default-groups = ["dev", "examples", "gpu"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-packages = ["cosmos_xenna"]
+[tool.maturin]
+# "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
+features = ["pyo3/extension-module"]
+module-name = "cosmos_xenna._cosmos_xenna"
+strip = true
+# [tool.hatch.build.targets.wheel]
+# packages = ["cosmos_xenna"]
 
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "INFO"
+# Don't run slow tests by default.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: marks tests as slow to run",
+]
+
 
 [tool.ruff]
 line-length = 120
@@ -199,3 +217,5 @@ reportOptionalIterable = false
 reportOptionalMemberAccess = false
 reportOptionalOperand = false
 reportOptionalSubscript = false
+# This has a lot of false positives for libraries.
+reportMissingModuleSource = false
