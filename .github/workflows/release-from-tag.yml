@@ -12,6 +12,9 @@ permissions:
   contents: write
   id-token: write
 
+env:
+  DIST_DIR: flat-dist
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -64,9 +67,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ '3.x' ]
+        python-version: [ '3.9' ] # corresponding to abi3-py39 in Cargo.toml
         conf:
           - { os: ubuntu-latest, target: x86_64,  target-triple: x86_64-unknown-linux-gnu,  manylinux: auto }
+          - { os: ubuntu-latest, target: aarch64,  target-triple: aarch64-unknown-linux-gnu,  manylinux: '2_28' }
 
     steps:
       - name: Check out source
@@ -77,42 +81,62 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build
-
-      - name: Build wheel and sdist
-        run: |
-          python -m build
+      - name: Build wheel with maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.conf.target }}
+          # -i python ensures we only build for the interpreter set up above
+          args: --release --out ${{ env.DIST_DIR }} -i python${{ matrix.python-version }}
+          manylinux: ${{ matrix.conf.manylinux }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.conf.os }}-${{ matrix.python-version }}-${{ matrix.conf.target }}
-          path: dist/*
+          path: ${{ env.DIST_DIR }}/*
+
+  build-sdist:
+    needs: release
+    runs-on: ubuntu-latest
+    name: sdist
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist with maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out ${{ env.DIST_DIR }}
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ${{ env.DIST_DIR }}/*
 
   attach-and-publish:
     needs: build-wheels
     runs-on: ubuntu-latest
     environment: pypi
     steps:
-      - name: Download all wheel artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
-
-      - name: Collect distributions
-        run: |
-          mkdir flat-dist
-          find dist -type f -maxdepth 2 -name "*.whl" -exec cp {} flat-dist/ \;
-          find dist -type f -maxdepth 2 -name "*.tar.gz" -exec cp {} flat-dist/ \;
+          merge-multiple: true
+          path: ${{ env.DIST_DIR }}
 
       - name: Attach wheels to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/**
+          files: ${{ env.DIST_DIR }}/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -122,11 +146,13 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
-          packages-dir: flat-dist
+          packages-dir: ${{ env.DIST_DIR }}
+          verbose: true
 
       - name: Publish to PyPI
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
-          packages-dir: flat-dist
+          packages-dir: ${{ env.DIST_DIR }}
+          verbose: true
