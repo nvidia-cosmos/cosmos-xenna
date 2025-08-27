@@ -23,7 +23,8 @@ from typing import Any, Generic, Optional, Sequence
 
 import attrs
 
-from cosmos_xenna.ray_utils import resources, runtime_envs, stage
+from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.ray_utils import runtime_envs, stage
 from cosmos_xenna.utils import approx
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
@@ -222,7 +223,7 @@ class Stage(abc.ABC, Generic[T, V]):
 
 
 def validate_stage(stage: Stage[Any, Any]) -> None:
-    stage.required_resources.to_shape()
+    stage.required_resources.to_rust().to_shape()
 
 
 @attrs.define
@@ -401,7 +402,7 @@ class PipelineSpec:
         stage = stage_spec.stage
         stage_info = f"   class_name: {type(stage).__name__}\n"
         stage_info += f"   required_resources: {stage.required_resources}\n"
-        stage_info += f"   shape: {stage.required_resources.to_shape()}\n"
+        stage_info += f"   shape: {stage.required_resources.to_rust().to_shape()}\n"
 
         for field in attrs.fields(StageSpec):
             if field.name != "stage":
@@ -469,7 +470,7 @@ def make_actor_pool_stage_from_stage_spec(
     return StageAndParams(
         WrappedStage(spec.stage),
         stage.Params(
-            shape=spec.stage.required_resources.to_shape(),
+            shape=spec.stage.required_resources.to_rust().to_shape(),
             stage_batch_size=spec.stage.stage_batch_size,
             slots_per_actor=spec.slots_per_actor,
             worker_max_lifetime_m=spec.worker_max_lifetime_m,

@@ -30,12 +30,12 @@ from typing import Optional
 import attrs
 import huggingface_hub
 import requests
-from loguru import logger
 from PIL import Image
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.processing_auto import AutoProcessor
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
+from cosmos_xenna.utils import python_log as logger
 
 # Switch to Phi-3.5 model
 MODEL_NAME = "microsoft/Phi-3.5-vision-instruct"

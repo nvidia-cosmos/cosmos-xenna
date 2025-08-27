@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import collections
 import copy
-import os
 import statistics
 import time
 import typing
@@ -30,14 +29,15 @@ import ray
 import ray.exceptions
 import ray.runtime_env
 import ray.util.scheduling_strategies
-from loguru import logger
 from ray import ObjectRef
 from ray.actor import ActorHandle
 from ray.util.metrics import Counter
 
-from cosmos_xenna.ray_utils import allocator, monitoring, resources, stage, stage_worker
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import allocator
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna.ray_utils import monitoring, stage, stage_worker
+from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import stats, timing
-from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -45,12 +45,11 @@ V = typing.TypeVar("V")
 
 _RATE_ESTIMATE_LOOKBACK_S = 60 * 10
 _MAX_QUEUED_TASK_METADATAS = 10000
-_VERBOSE = False
 
 
 @attrs.define
 class _ActorMetadata:
-    worker: resources.Worker
+    worker: rust_resources.Worker
 
 
 @attrs.define
@@ -101,6 +100,9 @@ class _ReadyActor(Generic[V]):
     rate_estimator: timing.RateEstimatorDuration = attrs.field(
         factory=lambda: timing.RateEstimatorDuration(_RATE_ESTIMATE_LOOKBACK_S)
     )
+    # Timestamp when this actor last transitioned to the idle state (no tasks in any slot).
+    # None indicates the actor is currently busy (has tasks in any slot).
+    last_became_idle_time: float | None = None
 
     @property
     def num_slots(self) -> int:
@@ -326,7 +328,7 @@ class ActorPool(Generic[T, V]):
         params: stage.Params,
         name: str,
         queue_params: QueueParams | None = None,
-        verbosity_level: VerbosityLevel = VerbosityLevel.INFO,
+        work_steal_idle_threshold_s: float = 1.0,
     ):
         self._name = str(name)
         self._queue_params = queue_params
@@ -334,7 +336,8 @@ class ActorPool(Generic[T, V]):
         self._params = params
         self._worker_shape = params.shape
         self._allocator = worker_allocator
-        self._verbosity_level = verbosity_level
+        # Only allow work stealing if an actor has been idle for this many seconds.
+        self._work_steal_idle_threshold_s = float(work_steal_idle_threshold_s)
 
         # State related to node-level setup (`setup_on_node`)
         self._nodes_with_completed_setups: set[str] = set()  # Nodes where setup_on_node succeeded.
@@ -367,8 +370,8 @@ class ActorPool(Generic[T, V]):
         )
         self._num_actors_tried_to_start = 0
         self._num_actors_failed_to_start = 0
-        self._actors_to_delete: collections.deque[resources.Worker] = collections.deque()
-        self._actors_to_create: collections.deque[resources.Worker] = collections.deque()
+        self._actors_to_delete: collections.deque[rust_resources.Worker] = collections.deque()
+        self._actors_to_create: collections.deque[rust_resources.Worker] = collections.deque()
         # Timestamp of last intentional actor-restart event
         self._last_actor_restart_time = time.time()
 
@@ -410,7 +413,7 @@ class ActorPool(Generic[T, V]):
         return self._name
 
     @property
-    def worker_shape(self) -> resources.WorkerShape:
+    def worker_shape(self) -> rust_resources.WorkerShape:
         return self._worker_shape
 
     @property
@@ -498,10 +501,10 @@ class ActorPool(Generic[T, V]):
             return None
         return float(statistics.median(rates))
 
-    def add_actor_to_delete(self, worker: resources.Worker) -> None:
+    def add_actor_to_delete(self, worker: rust_resources.Worker) -> None:
         self._actors_to_delete.append(worker)
 
-    def add_actor_to_create(self, worker: resources.Worker) -> None:
+    def add_actor_to_create(self, worker: rust_resources.Worker) -> None:
         self._actors_to_create.append(worker)
 
     def set_num_slots_per_actor(self, target: int) -> None:
@@ -547,10 +550,10 @@ class ActorPool(Generic[T, V]):
         ready_ids = [x.actor_ref._ray_actor_id.hex() for x in self._ready_actors.values()]  # type: ignore[attr-defined]
         return ActorIds(pending_ids, ready_ids)
 
-    def _add_actor(self, worker: resources.Worker) -> None:
+    def _add_actor(self, worker: rust_resources.Worker) -> None:
         """Creates a new actor and initiates its setup process."""
         # Prepare the runtime environment with CUDA_VISIBLE_DEVICES
-        gpu_ids = set()
+        gpu_ids: set[int] = set()
         for gpu in worker.allocation.gpus:
             gpu_ids.add(gpu.gpu_index)
         for alloc in worker.allocation.nvdecs:
@@ -558,30 +561,17 @@ class ActorPool(Generic[T, V]):
         for alloc in worker.allocation.nvencs:  # Corrected typo here
             gpu_ids.add(alloc.gpu_index)
         env_vars = {}
+        node_resources = self._allocator.totals().nodes[worker.allocation.node]
         if self._params.modify_cuda_visible_devices_env_var:
-            # Check if env var is set
-            if "XENNA_RESPECT_CUDA_VISIBLE_DEVICES" not in os.environ:
-                cuda_visible_devices = ",".join(str(x) for x in sorted(gpu_ids))
-            else:
-                # Get the visible devices for the node. We will use the gpu_index to visible device mapping.
-                actual_visible_gpus = set()
-                for gpu_id in sorted(gpu_ids):
-                    # Get the visible device for the gpu_id.
-                    actual_visible_gpu = resources.ClusterResources._get_visible_devices_node_from_gpu_index(
-                        worker.allocation.node, gpu_id
-                    )
-                    actual_visible_gpus.add(actual_visible_gpu)
-
-                cuda_visible_devices = ",".join(str(x) for x in sorted(actual_visible_gpus))
-
-            env_vars["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+            env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(
+                [str(node_resources.gpus[gpu_i].index) for gpu_i in sorted(gpu_ids)]
+            )
 
         env_vars.update(self._params.runtime_env.extra_env_vars)
         runtime_env = copy.deepcopy(self._params.runtime_env)
         runtime_env.extra_env_vars = env_vars
 
-        if _VERBOSE:
-            logger.info(f"Runtime env for stage={self.name}:{runtime_env.format()}")
+        logger.trace(f"Runtime env for stage={self.name}:{runtime_env.format()}")
         self._allocator.add_worker(worker)
 
         # Ask Ray to start the actor on the specified node
@@ -600,7 +590,6 @@ class ActorPool(Generic[T, V]):
             self._stage_interface,
             self._params,
             worker,
-            self._verbosity_level,
         )
         actor_handle = typing.cast(ActorHandle, actor)
 
@@ -616,7 +605,7 @@ class ActorPool(Generic[T, V]):
             # No setup started for this node, designate this actor for node setup
             self._add_node_setup_actor(actor_handle, worker)
 
-    def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
+    def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
         """Adds an actor to the list waiting for node setup on its target node."""
         self._actors_waiting_for_node_setup[worker.allocation.node].append(
             _ActorWaitingForNodeSetup(
@@ -625,7 +614,7 @@ class ActorPool(Generic[T, V]):
             )
         )
 
-    def _add_node_setup_actor(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
+    def _add_node_setup_actor(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
         """Designates an actor to perform node setup and adds it to the pending node state."""
         # Ask Ray to call "setup_on_node" on the actor and keep a reference to this call.
         setup_call_ref = typing.cast(ObjectRef, actor_handle.setup_on_node.remote())
@@ -635,7 +624,7 @@ class ActorPool(Generic[T, V]):
             setup_call_ref,
         )
 
-    def _add_pending_actor(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
+    def _add_pending_actor(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
         """Adds an actor to the pending state to run its individual setup."""
         # Ask Ray to call "setup" on the actor and keep a reference to this call.
         setup_call_ref = typing.cast(ObjectRef, actor_handle.setup.remote())
@@ -684,8 +673,7 @@ class ActorPool(Generic[T, V]):
             raise RuntimeError(f"Unexpected error during actor setup for stage {self.name}.") from e
         else:
             # Setup successful, move to ready state
-            if _VERBOSE:
-                logger.info(f"Actor {actor_id} setup complete. Moving to ready.")
+            logger.trace(f"Actor {actor_id} setup complete. Moving to ready.")
             new_actor = _ReadyActor(
                 actor.metadata,
                 typing.cast(ActorHandle, actor.actor_ref),
@@ -694,6 +682,8 @@ class ActorPool(Generic[T, V]):
             # Initialize slots for the newly ready actor
             for _ in range(self._slots_per_actor):
                 new_actor.slots.append(_Slot(None))
+            # Newly ready actors start in the idle state.
+            new_actor.last_became_idle_time = time.time()
             self._ready_actors[new_actor.metadata.worker.id] = new_actor
 
     def _move_pending_actors_to_ready(self) -> None:
@@ -725,8 +715,7 @@ class ActorPool(Generic[T, V]):
         try:
             # Block until node setup completes or fails
             ray.get(node_setup_actor.node_setup_call_ref)
-            if _VERBOSE:
-                logger.info(f"Node setup successful for node {node_id} by actor {node_setup_actor.metadata.worker.id}.")
+            logger.trace(f"Node setup successful for node {node_id} by actor {node_setup_actor.metadata.worker.id}.")
             self._nodes_with_completed_setups.add(node_id)
 
             # Move the node setup actor itself to pending (individual setup)
@@ -734,8 +723,7 @@ class ActorPool(Generic[T, V]):
 
             # Move all waiting actors for this node to pending
             waiting_actors = self._actors_waiting_for_node_setup.pop(node_id, [])
-            if _VERBOSE:
-                logger.info(f"Moving {len(waiting_actors)} waiting actors for node {node_id} to pending state.")
+            logger.trace(f"Moving {len(waiting_actors)} waiting actors for node {node_id} to pending state.")
             for waiting_actor in waiting_actors:
                 self._add_pending_actor(waiting_actor.actor_ref, waiting_actor.metadata.worker)
 
@@ -804,7 +792,7 @@ class ActorPool(Generic[T, V]):
         # now find the longest-running actor
         max_running_time_m = 0
         actor_id_to_delete: str | None = None
-        worker_allocation_to_restart: resources.Worker | None = None
+        worker_allocation_to_restart: rust_resources.Worker | None = None
         for actor_id, actor in self._ready_actors.items():
             # whether the actor has been running too long
             running_time_m = (time.time() - actor.start_time) / 60
@@ -841,11 +829,9 @@ class ActorPool(Generic[T, V]):
         actors_with_free_slots = [actor for actor in self._ready_actors.values() if actor.num_empty_slots > 0]
 
         if not actors_with_free_slots:
-            if _VERBOSE:
-                logger.info(
-                    f"[{self._name}] No actors with free slots available for task "
-                    f"(origin_node_id: {task.origin_node_id})"
-                )
+            logger.trace(
+                f"[{self._name}] No actors with free slots available for task (origin_node_id: {task.origin_node_id})"
+            )
             return None
 
         def penalty_key(actor: _ReadyActor) -> tuple[bool, int]:
@@ -867,20 +853,18 @@ class ActorPool(Generic[T, V]):
         # Find the actor with the minimum penalty
         best_actor = min(actors_with_free_slots, key=penalty_key)
 
-        if _VERBOSE:
-            logger.info(f"[{self._name}] Actor selection for task (origin_node_id: {task.origin_node_id}):")
-            logger.info(f"  Considered {len(actors_with_free_slots)} actors with free slots:")
-            for actor in actors_with_free_slots:
-                is_local = actor.metadata.worker.allocation.node == task.origin_node_id
-                penalty = penalty_key(actor)
-                logger.info(
-                    f"    Actor {actor.metadata.worker.id} (node: {actor.metadata.worker.allocation.node}): "
-                    f"local={is_local}, busyness={actor.num_used_slots}, penalty={penalty}"
-                )
-            logger.info(
-                f"  Selected: Actor {best_actor.metadata.worker.id} "
-                f"(node: {best_actor.metadata.worker.allocation.node})"
+        logger.trace(f"[{self._name}] Actor selection for task (origin_node_id: {task.origin_node_id}):")
+        logger.trace(f"  Considered {len(actors_with_free_slots)} actors with free slots:")
+        for actor in actors_with_free_slots:
+            is_local = actor.metadata.worker.allocation.node == task.origin_node_id
+            penalty = penalty_key(actor)
+            logger.trace(
+                f"    Actor {actor.metadata.worker.id} (node: {actor.metadata.worker.allocation.node}): "
+                f"local={is_local}, busyness={actor.num_used_slots}, penalty={penalty}"
             )
+        logger.trace(
+            f"  Selected: Actor {best_actor.metadata.worker.id} (node: {best_actor.metadata.worker.allocation.node})"
+        )
 
         # metrics
         schedule_affinity = "local" if task.origin_node_id == best_actor.metadata.worker.allocation.node else "remote"
@@ -908,16 +892,14 @@ class ActorPool(Generic[T, V]):
             raise AssertionError(f"Unknown actor with id: {actor_id} requested for deletion.")
 
         # Only delete from allocator if we successfully found and killed the actor representation
-        if self._verbosity_level >= VerbosityLevel.INFO:
-            logger.info(f"Deleting worker {actor_id} from allocator.")
+        logger.debug(f"Deleting worker {actor_id} from allocator.")
         self._allocator.delete_worker(actor_id)
 
     def _try_delete_pending_actor(self, actor_id: str) -> bool:
         """Attempts to delete an actor from the pending state."""
         if actor_id in self._pending_actors:
             actor = self._pending_actors.pop(actor_id)
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Killing pending actor {actor_id}.")
+            logger.debug(f"Killing pending actor {actor_id}.")
             actor.kill()
             # Cancel the pending setup call if possible? Ray might handle this automatically on kill.
             # ray.cancel(actor.setup_call_ref, force=True) # Might be necessary if kill is not enough
@@ -928,8 +910,7 @@ class ActorPool(Generic[T, V]):
         """Attempts to delete an actor from the ready state."""
         if actor_id in self._ready_actors:
             actor = self._ready_actors.pop(actor_id)
-            if self._verbosity_level >= VerbosityLevel.INFO:
-                logger.info(f"Killing ready actor {actor_id}.")
+            logger.debug(f"Killing ready actor {actor_id}.")
             # Return any tasks assigned to this actor back to the main queue.
             num_returned_tasks = 0
             for task_slot in actor.slots:
@@ -1037,8 +1018,9 @@ class ActorPool(Generic[T, V]):
         )
         # Store task data and future references in the chosen slot
         idle_slot.task = _SlotData(task, time.time(), future)
-        if _VERBOSE:
-            logger.info(f"Scheduled task {task.task_data} on actor {actor.metadata.worker.id}")
+        # Actor is no longer idle after scheduling a task
+        actor.last_became_idle_time = None
+        logger.trace(f"Scheduled task {task.task_data} on actor {actor.metadata.worker.id}")
 
     def _schedule_new_tasks(self) -> None:
         # TODO: This is O(n^2), can clean this up somehow...
@@ -1048,8 +1030,7 @@ class ActorPool(Generic[T, V]):
             first_task = self._task_queue[0]
             actor_id = self._pick_actor_for_task(first_task)
             if actor_id is None:
-                if _VERBOSE:
-                    logger.info("No suitable actor found for scheduling new tasks.")
+                logger.trace("No suitable actor found for scheduling new tasks.")
                 break
             self._schedule_task_on_actor(self._ready_actors[actor_id])
 
@@ -1078,6 +1059,113 @@ class ActorPool(Generic[T, V]):
         for actor_id in actors_to_kill:
             logger.info(f"Killing actor={actor_id} because stage.process_data told us to.")
             self._delete_actor(actor_id)
+
+        # Update idle timestamps for actors that became idle after processing completions
+        now = time.time()
+        for actor in self._ready_actors.values():
+            if actor.num_used_slots == 0 and actor.last_became_idle_time is None:
+                actor.last_became_idle_time = now
+
+    def _attempt_steal_one_task(self, donor: _ReadyActor, receiver: _ReadyActor) -> bool:
+        """Attempts to steal the most recently scheduled not-yet-started task from donor to receiver.
+
+        We first try to cancel the queued task inside the donor actor; only if cancellation succeeds do we
+        cancel the remote process_data call, clear the donor slot, and requeue the task in this pool.
+
+        Returns True if a task was successfully stolen and requeued, False otherwise.
+        """
+        if donor.num_used_slots <= 1:
+            logger.trace(f"Donor {donor.metadata.worker.id} has no used slots.")
+            return False
+        if receiver.num_empty_slots <= 0:
+            logger.trace(f"Receiver {receiver.metadata.worker.id} has no empty slots.")
+            return False
+
+        # Pick the most recently scheduled slot; that is most likely still queued/not started.
+        candidate_slots = [(i, s.get_task) for i, s in enumerate(donor.slots) if s.has_task]
+        if not candidate_slots:
+            logger.trace(f"Donor {donor.metadata.worker.id} has no candidate slots.")
+            return False
+        candidate_index, candidate_slotdata = max(candidate_slots, key=lambda x: x[1].scheduled_time)
+
+        task_to_steal = candidate_slotdata.task
+        cancel_ref = typing.cast(
+            ObjectRef,
+            donor.actor_ref.cancel_task.remote(stage_worker.TaskData(task_to_steal.task_data)),
+        )  # type: ignore
+        # Ask donor worker to remove the task from its internal queues if it hasn't started.
+        # Only proceed if cancellation is confirmed.
+        try:
+            did_cancel = ray.get(cancel_ref)
+
+        except Exception as e:
+            logger.trace(f"Failed to request cancel from donor {donor.metadata.worker.id}: {e}")
+            raise RuntimeError(f"Failed to request cancel from donor {donor.metadata.worker.id}") from e
+
+        if not did_cancel:
+            logger.trace(f"Donor {donor.metadata.worker.id} did not cancel task {task_to_steal.task_data}.")
+            return False
+
+        # Now cancel the remote process_data call to unblock it, clear the slot, and requeue the task.
+        try:
+            ray.cancel(candidate_slotdata.object_ref)
+        except (ray.exceptions.RayError, RuntimeError):
+            # Even if cancel fails, we already removed from internal queues; continue
+            logger.trace(f"Failed to cancel task {task_to_steal.task_data} on donor {donor.metadata.worker.id}.")
+            pass
+
+        donor.slots[candidate_index].clear_task()
+        # Requeue stolen task at the front so it is scheduled immediately (likely to receiver)
+        self._task_queue.appendleft(task_to_steal)
+        return True
+
+    def _work_steal(self) -> None:
+        """Rebalances tasks across actors by stealing queued tasks from busy actors to idle ones.
+
+        Goal: ensure at most one in-flight/queued task per actor when possible, to avoid initial idling when the
+        number of tasks is smaller than the total capacity. This only steals tasks that haven't begun processing.
+        """
+        if not self._ready_actors:
+            return
+        ready_list = list(self._ready_actors.values())
+        now = time.time()
+        idle_receivers = [
+            a
+            for a in ready_list
+            if a.num_used_slots == 0
+            and a.num_empty_slots > 0
+            and a.last_became_idle_time is not None
+            and (now - a.last_became_idle_time) >= self._work_steal_idle_threshold_s
+        ]
+        logger.trace(f"Found {len(idle_receivers)} idle receivers.")
+        if not idle_receivers:
+            return
+        donors = [a for a in ready_list if a.num_used_slots > 1]
+        logger.trace(f"Found {len(donors)} donors.")
+        if not donors:
+            return
+
+        # Try to give one task to each idle receiver if possible
+        donor_index = 0
+        for receiver in idle_receivers:
+            # Round-robin donors
+            attempts = 0
+            stolen = False
+            while attempts < len(donors) and not stolen:
+                donor = donors[donor_index % len(donors)]
+                donor_index += 1
+                attempts += 1
+                if donor is receiver:
+                    continue
+                if donor.num_used_slots <= 1:
+                    continue
+                logger.trace(
+                    f"Attempting to steal task from donor {donor.metadata.worker.id} to "
+                    f"receiver {receiver.metadata.worker.id}."
+                )
+                stolen = self._attempt_steal_one_task(donor, receiver)
+                logger.trace(f"Stolen={stolen}")
+            # If we couldn't steal for this receiver, continue to next; nothing else to do
 
     def _process_completed_task(self, actor: _ReadyActor, slot_num: int) -> bool:
         # Each slot holds a reference to a ray.remote call on StageWorker.process_data.
@@ -1127,8 +1215,7 @@ class ActorPool(Generic[T, V]):
 
     def update(self) -> None:
         """Performs one update cycle of the actor pool state machine."""
-        if _VERBOSE:
-            logger.debug(f"Starting update cycle for {self.name}")
+        logger.trace(f"Starting update cycle for {self.name}")
         # 1. Adjust slot counts on ready actors if needed
         self._maybe_resize_num_slots_per_actor()
         # 2. Check for completed node setups and advance waiting/setup actors
@@ -1143,12 +1230,17 @@ class ActorPool(Generic[T, V]):
         self._process_completed_tasks()
         # 7. Schedule new tasks onto idle slots of ready actors
         self._schedule_new_tasks()
-        if _VERBOSE:
-            logger.debug(f"Finished update cycle for {self.name}")
+        # 8. Rebalance queued tasks via work-stealing. We do this primarily to avoid idling when the number of tasks
+        # is smaller than the num_actors * slots_per_actor. In these cases, without this step, we can leave some actors
+        # idle because we eagerly schedule stasks to ready actors.
+        self._work_steal()
+        # 9. Schedule any stolen tasks.
+        self._schedule_new_tasks()
+        logger.trace(f"Finished update cycle for {self.name}")
 
     def stop(self) -> None:
         """Terminates all actors managed by this pool and cleans up resources."""
-        logger.info(f"Stopping actor pool {self.name}. Terminating all actors.")
+        logger.debug(f"Stopping actor pool {self.name}. Terminating all actors.")
         actor_ids_to_kill = set()
 
         # Collect IDs from all states
@@ -1158,7 +1250,7 @@ class ActorPool(Generic[T, V]):
         for waiting_list in self._actors_waiting_for_node_setup.values():
             actor_ids_to_kill.update(wna.metadata.worker.id for wna in waiting_list)
 
-        logger.info(f"Found {len(actor_ids_to_kill)} actor IDs across all states to terminate.")
+        logger.debug(f"Found {len(actor_ids_to_kill)} actor IDs across all states to terminate.")
 
         # Kill actors (use _delete_actor to handle state and allocator removal)
         # Make a copy as _delete_actor modifies the state dictionaries
@@ -1176,4 +1268,4 @@ class ActorPool(Generic[T, V]):
         self._completed_tasks.clear()
         self._task_queue.clear()
 
-        logger.info(f"Actor pool {self.name} stopped. All states cleared.")
+        logger.debug(f"Actor pool {self.name} stopped. All states cleared.")

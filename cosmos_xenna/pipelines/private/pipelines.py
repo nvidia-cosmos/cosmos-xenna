@@ -19,10 +19,10 @@ import copy
 import inspect
 from typing import Optional
 
-from loguru import logger
-
+from cosmos_xenna._cosmos_xenna import setup_logging
 from cosmos_xenna.pipelines.private import batch, specs, streaming
-from cosmos_xenna.ray_utils import cluster, resources
+from cosmos_xenna.ray_utils import cluster
+from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 
@@ -79,24 +79,6 @@ def _validate_method_signature(
         )
 
 
-# TODO: This likely needs to be rethought for our more complex allocation logic
-def _determine_default_execution_mode(
-    pipeline_spec: specs.PipelineSpec, cluster_resources: resources.ClusterResources
-) -> specs.ExecutionMode:
-    logger.info("Execution mode not specified, determining default...")
-    required_gpus_for_streaming = 0
-    for spec in pipeline_spec.stages:
-        assert isinstance(spec, specs.StageSpec)
-        gpus_per_worker = spec.stage.required_resources.gpus
-        if gpus_per_worker is not None:
-            required_gpus_for_streaming += gpus_per_worker
-
-    if cluster_resources.num_gpus >= required_gpus_for_streaming:
-        return specs.ExecutionMode.STREAMING
-    else:
-        return specs.ExecutionMode.BATCH
-
-
 def run_pipeline(
     pipeline_spec: specs.PipelineSpec,
 ) -> Optional[list]:
@@ -123,6 +105,8 @@ def run_pipeline(
         pipeline. NOTE: These are pulled down to the host machine. You probably do not what to return anything
         heavy-weight here.
     """
+    # Setup logging in rust.
+    setup_logging()
     # Convert the stages field into StageSpecs if needed.
     pipeline_spec = copy.deepcopy(pipeline_spec)
     pipeline_spec.stages = [x if isinstance(x, specs.StageSpec) else specs.StageSpec(x) for x in pipeline_spec.stages]
@@ -161,6 +145,7 @@ def run_pipeline(
     cluster_resources = cluster.make_cluster_resources_from_ray_nodes(
         cpu_allocation_percentage=pipeline_spec.config.cpu_allocation_percentage
     )
+    logger.info(f"Cluster resources: {cluster_resources}")
     logger.info(f"Created/connected to cluster with resources: {cluster_resources.totals()}")
     if pipeline_spec.config.execution_mode == specs.ExecutionMode.STREAMING:
         if pipeline_spec.config.mode_specific is None:
