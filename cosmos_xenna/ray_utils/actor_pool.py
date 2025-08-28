@@ -328,6 +328,7 @@ class ActorPool(Generic[T, V]):
         params: stage.Params,
         name: str,
         queue_params: QueueParams | None = None,
+        enable_work_stealing: bool = True,
         work_steal_idle_threshold_s: float = 1.0,
     ):
         self._name = str(name)
@@ -336,6 +337,7 @@ class ActorPool(Generic[T, V]):
         self._params = params
         self._worker_shape = params.shape
         self._allocator = worker_allocator
+        self._enable_work_stealing = enable_work_stealing
         # Only allow work stealing if an actor has been idle for this many seconds.
         self._work_steal_idle_threshold_s = float(work_steal_idle_threshold_s)
 
@@ -1230,12 +1232,13 @@ class ActorPool(Generic[T, V]):
         self._process_completed_tasks()
         # 7. Schedule new tasks onto idle slots of ready actors
         self._schedule_new_tasks()
-        # 8. Rebalance queued tasks via work-stealing. We do this primarily to avoid idling when the number of tasks
-        # is smaller than the num_actors * slots_per_actor. In these cases, without this step, we can leave some actors
-        # idle because we eagerly schedule stasks to ready actors.
-        self._work_steal()
-        # 9. Schedule any stolen tasks.
-        self._schedule_new_tasks()
+        if self._enable_work_stealing:
+            # 8. Rebalance queued tasks via work-stealing. We do this primarily to avoid idling when the number of
+            # tasks is smaller than the num_actors * slots_per_actor. In these cases, without this step, we can leave
+            # some actors idle because we eagerly schedule stasks to ready actors.
+            self._work_steal()
+            # 9. Schedule any stolen tasks.
+            self._schedule_new_tasks()
         logger.trace(f"Finished update cycle for {self.name}")
 
     def stop(self) -> None:
