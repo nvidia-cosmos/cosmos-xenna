@@ -299,6 +299,17 @@ class StageSpec(typing.Generic[T, V]):
 class StreamingSpecificSpec:
     # How often to run the stage auto-scaler.
     autoscale_interval_s: float = 60 * 3.0
+    # In streaming mode, when the numeber of max queued tasks exceeds `num_actors * num_slots_per_actor`,
+    # i.e. when there is no empty slot, Xenna applies a back-pressure to upstream stages to
+    # prevent memory and storage from blowout. The 2 parameters below can help tune that behavior.
+    # - This multiplier is applied as `num_actors * num_slots_per_actor * max_queued_multiplier`,
+    #   i.e. when you have enough system memory, increase this value to (e.g.) 1.5 is typically beneficial.
+    max_queued_multiplier: float = 1.0
+    # - When certain stage is super fast and hence scaled down to e.g. just 1 actor, then the
+    #   max_queued will be very small (e.g. 2 if slots_per_actor=2). This can make the pipeline
+    #   unstable that performance fluctuation can cause downstream stages to get starved.
+    #   So this parameter sets a lower bound on max_queued to prevent that.
+    max_queued_lower_bound: int = 8
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
@@ -340,6 +351,11 @@ class PipelineConfig:
     # ray to process multiple tasks per worker (default 2). This forces Ray to pre-fetch data and should make it so we
     # are very unlikely to be blocked on IO.
     slots_per_actor: int = _DEFAULT_SLOTS_PER_ACTOR
+    # When work stealing is enabled, Xenna will steal queued tasks from busy actors and give them to idle actors.
+    # Without this, Xenna can leave some nodes idle when the number of tasks supplied to the pipeline are less than
+    # num_actors * num_slots_per_actor (typically == 2); i.e. when there are very few tasks.
+    # Ideally, this would always be turned on. However, right now, work stealing can be slow for large jobs.
+    enable_work_stealing: bool = False
     # Maxmum lifetime in minutes for stage workers before getting terminated and restarted.
     worker_max_lifetime_m: int = 0
     # Interval in minutes between two over-lifetime restart within a stage's actor pool.
