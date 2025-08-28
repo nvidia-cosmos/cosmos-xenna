@@ -113,6 +113,7 @@ def run_pipeline(
             wrapped_stage.stage,
             wrapped_stage.params,
             spec.name(idx),
+            enable_work_stealing=pipeline_spec.config.enable_work_stealing,
         )
         pools.append(pool)
 

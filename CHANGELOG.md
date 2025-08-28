@@ -3,6 +3,15 @@
 
 ## Latest
 
+## [0.1.3]
+
+### Released
+- 2025-08-27
+
+### Added
+- Implemented autoscaling algorithm in Rust for better performance and scalability.
+- Added metrics for the main loop of streaming executor.
+
 ## [0.1.2]
 
 ### Released

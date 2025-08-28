@@ -26,6 +26,7 @@ from typing import Optional
 import attrs
 import ray
 import ray.util.state
+from ray.util.metrics import Gauge
 
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (
     allocator,
@@ -56,15 +57,43 @@ class StreamingExecutorTiming:
     add_tasks_end: float = 0.0
     sleep_end: float = 0.0
 
+    @property
+    def auto_scaling_apply_time(self) -> float:
+        return self.auto_scaling_apply_end - self.iteration_start
+
+    @property
+    def pool_update_time(self) -> float:
+        return self.pool_update_end - self.auto_scaling_apply_end
+
+    @property
+    def auto_scaling_submit_time(self) -> float:
+        return self.auto_scaling_submit_end - self.pool_update_end
+
+    @property
+    def monitor_update_time(self) -> float:
+        return self.monitor_update_end - self.auto_scaling_submit_end
+
+    @property
+    def add_tasks_time(self) -> float:
+        return self.add_tasks_end - self.monitor_update_end
+
+    @property
+    def sleep_time(self) -> float:
+        return self.sleep_end - self.add_tasks_end
+
+    @property
+    def total_time(self) -> float:
+        return self.sleep_end - self.iteration_start
+
     def to_log_string(self) -> str:
         stages: list[tuple[str, float]] = [
-            ("Auto Scaling Apply", self.auto_scaling_apply_end - self.iteration_start),
-            ("Pool Update", self.pool_update_end - self.auto_scaling_apply_end),
-            ("Auto Scaling Submit", self.auto_scaling_submit_end - self.pool_update_end),
-            ("Monitor Update", self.monitor_update_end - self.auto_scaling_submit_end),
-            ("Add Tasks", self.add_tasks_end - self.monitor_update_end),
-            ("Sleep", self.sleep_end - self.add_tasks_end),
-            ("Total", self.sleep_end - self.iteration_start),
+            ("Auto Scaling Apply", self.auto_scaling_apply_time),
+            ("Pool Update", self.pool_update_time),
+            ("Auto Scaling Submit", self.auto_scaling_submit_time),
+            ("Monitor Update", self.monitor_update_time),
+            ("Add Tasks", self.add_tasks_time),
+            ("Sleep", self.sleep_time),
+            ("Total", self.total_time),
         ]
 
         log_lines = ["StreamingExecutor Timing Summary:"]
@@ -82,6 +111,57 @@ class StreamingExecutorStats:
 
     def to_log_string(self) -> str:
         return self.timing.to_log_string()
+
+
+class _StreamingLoopMetrics:
+    def __init__(self) -> None:
+        self._steps = (
+            "auto_scaling_apply",
+            "pool_update",
+            "auto_scaling_submit",
+            "monitor_update",
+            "add_tasks",
+            "sleep",
+            "total",
+        )
+        # help we get avg & max within a time window
+        self._historical_stats: collections.deque[StreamingExecutorTiming] = collections.deque(maxlen=100)
+        self._metrics_update_internal_s = 60.0
+        self._last_ext_update_timestamp = 0.0
+        # define & initialize the metrics
+        self._metrics_loop_time = Gauge(
+            "pipeline_loop_time_s",
+            "Elapsed time for the main loop of streaming executor",
+            tag_keys=(
+                "step",
+                "method",
+            ),
+        )
+        for step in self._steps:
+            for method in ("avg", "max"):
+                self._metrics_loop_time.set(0.0, tags={"step": step, "method": method})
+
+    def update(self, stats: StreamingExecutorTiming) -> None:
+        """Updates the metrics with the provided stats."""
+
+        self._historical_stats.append(stats)
+        if time.time() - self._last_ext_update_timestamp > self._metrics_update_internal_s:
+            # update to exported metrics
+            try:
+                for step in self._steps:
+                    avg_time = sum(getattr(x, f"{step}_time") for x in self._historical_stats) / len(
+                        self._historical_stats
+                    )
+                    max_time = max(getattr(x, f"{step}_time") for x in self._historical_stats)
+                    self._metrics_loop_time.set(avg_time, tags={"step": step, "method": "avg"})
+                    self._metrics_loop_time.set(max_time, tags={"step": step, "method": "max"})
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Failed to update external metrics: {e}")
+                # suppress the error for some longer period
+                self._last_ext_update_timestamp = time.time() + self._metrics_update_internal_s * 10
+            else:
+                # set the timestamp
+                self._last_ext_update_timestamp = time.time()
 
 
 @attrs.define
@@ -539,6 +619,7 @@ def run_pipeline(
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
+                enable_work_stealing=pipeline_spec.config.enable_work_stealing,
             )
         )
 
@@ -550,6 +631,7 @@ def run_pipeline(
 
     logger.debug("Starting main loop")
 
+    streaming_loop_metrics = _StreamingLoopMetrics()
     last_stats: Optional[StreamingExecutorStats] = None
     with (
         Autoscaler(
@@ -595,8 +677,12 @@ def run_pipeline(
             pool_extra_metadatas = [deque.pop_all_deque_elements(x.task_extra_data) for x in pools]
             queue_lengths = [len(x) for x in queues]
             if monitor.update(len(input_queue), queue_lengths, pool_extra_metadatas) and (last_stats is not None):
-                logger.info(last_stats.to_log_string())
+                if pipeline_spec.config.mode_specific.executor_verbosity_level >= verbosity.VerbosityLevel.INFO:
+                    logger.info(last_stats.to_log_string())
                 logger.debug(f"Worker allocation:\n{worker_allocator.make_detailed_utilization_table()}")
+            # update streaming loop timing metrics
+            if last_stats is not None:
+                streaming_loop_metrics.update(last_stats.timing)
             new_stats.monitor_update_end = time.time()
 
             autoscaler.add_measurements(pool_extra_metadatas)
@@ -637,7 +723,15 @@ def run_pipeline(
                     if not is_last_stage:
                         next_stage_batch_size = pipeline_spec.stages[idx + 1].stage.stage_batch_size  # type: ignore
 
-                    max_queued = max(pool.num_ready_actors * pool.slots_per_actor, next_stage_batch_size)
+                    max_queued = max(
+                        int(
+                            pool.num_ready_actors
+                            * pool.slots_per_actor
+                            * pipeline_spec.config.mode_specific.max_queued_multiplier
+                        ),
+                        pipeline_spec.config.mode_specific.max_queued_lower_bound,
+                        next_stage_batch_size,
+                    )
 
                     if num_tasks_in_progress + num_tasks_completed >= max_queued:
                         break
