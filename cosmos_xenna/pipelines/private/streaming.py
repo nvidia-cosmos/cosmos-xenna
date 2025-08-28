@@ -723,7 +723,15 @@ def run_pipeline(
                     if not is_last_stage:
                         next_stage_batch_size = pipeline_spec.stages[idx + 1].stage.stage_batch_size  # type: ignore
 
-                    max_queued = max(pool.num_ready_actors * pool.slots_per_actor, next_stage_batch_size)
+                    max_queued = max(
+                        int(
+                            pool.num_ready_actors
+                            * pool.slots_per_actor
+                            * pipeline_spec.config.mode_specific.max_queued_multiplier
+                        ),
+                        pipeline_spec.config.mode_specific.max_queued_lower_bound,
+                        next_stage_batch_size,
+                    )
 
                     if num_tasks_in_progress + num_tasks_completed >= max_queued:
                         break

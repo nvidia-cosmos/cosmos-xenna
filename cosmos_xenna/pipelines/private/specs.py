@@ -299,6 +299,8 @@ class StageSpec(typing.Generic[T, V]):
 class StreamingSpecificSpec:
     # How often to run the stage auto-scaler.
     autoscale_interval_s: float = 60 * 3.0
+    max_queued_multiplier: float = 1.0
+    max_queued_lower_bound: int = 16
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
