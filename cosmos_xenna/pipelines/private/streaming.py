@@ -155,7 +155,7 @@ class _StreamingLoopMetrics:
                     max_time = max(getattr(x, f"{step}_time") for x in self._historical_stats)
                     self._metrics_loop_time.set(avg_time, tags={"step": step, "method": "avg"})
                     self._metrics_loop_time.set(max_time, tags={"step": step, "method": "max"})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to update external metrics: {e}")
                 # suppress the error for some longer period
                 self._last_ext_update_timestamp = time.time() + self._metrics_update_internal_s * 10
