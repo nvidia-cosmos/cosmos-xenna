@@ -340,6 +340,8 @@ class PipelineConfig:
     # ray to process multiple tasks per worker (default 2). This forces Ray to pre-fetch data and should make it so we
     # are very unlikely to be blocked on IO.
     slots_per_actor: int = _DEFAULT_SLOTS_PER_ACTOR
+    # Whether to enable work stealing
+    enable_work_stealing: bool = True
     # Maxmum lifetime in minutes for stage workers before getting terminated and restarted.
     worker_max_lifetime_m: int = 0
     # Interval in minutes between two over-lifetime restart within a stage's actor pool.

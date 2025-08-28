@@ -619,6 +619,7 @@ def run_pipeline(
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
+                enable_work_stealing=pipeline_spec.config.enable_work_stealing,
             )
         )
 
