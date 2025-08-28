@@ -1233,7 +1233,7 @@ class ActorPool(Generic[T, V]):
         # 8. Rebalance queued tasks via work-stealing. We do this primarily to avoid idling when the number of tasks
         # is smaller than the num_actors * slots_per_actor. In these cases, without this step, we can leave some actors
         # idle because we eagerly schedule stasks to ready actors.
-        self._work_steal()
+        # self._work_steal()
         # 9. Schedule any stolen tasks.
         self._schedule_new_tasks()
         logger.trace(f"Finished update cycle for {self.name}")
