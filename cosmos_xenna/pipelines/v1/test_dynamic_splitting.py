@@ -34,7 +34,7 @@ class Stage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
 
     def process_data(self, in_data: list[int]) -> list[int]:
         num_out = int(self._num_returns_per_input * len(in_data))

@@ -146,7 +146,7 @@ def run_pipeline(
         cpu_allocation_percentage=pipeline_spec.config.cpu_allocation_percentage
     )
     logger.info(f"Cluster resources: {cluster_resources}")
-    logger.info(f"Created/connected to cluster with resources: {cluster_resources.totals()}")
+    logger.info(f"Created/connected to cluster with resources: {cluster_resources.total_pool()}")
     if pipeline_spec.config.execution_mode == specs.ExecutionMode.STREAMING:
         if pipeline_spec.config.mode_specific is None:
             pipeline_spec.config.mode_specific = specs.StreamingSpecificSpec()

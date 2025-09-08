@@ -28,13 +28,14 @@ import ray
 import ray.util.state
 from ray.util.metrics import Gauge
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (
+from cosmos_xenna.pipelines.private import (
     allocator,
     autoscaling_algorithms,
     data_structures,
+    monitoring,
     resources,
+    specs,
 )
-from cosmos_xenna.pipelines.private import monitoring, specs
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -197,7 +198,7 @@ def _make_problem_from_pipeline_spec(
             data_structures.ProblemStage(
                 stage.name(idx),
                 stage.stage.stage_batch_size,
-                stage.stage.required_resources.to_rust().to_shape(),
+                stage.stage.required_resources.to_worker_shape(),
                 requested_num_workers=num_workers,
                 over_provision_factor=stage.over_provision_factor,
             )
@@ -224,7 +225,7 @@ def make_problem_worker_state_from_worker_state(state: resources.Worker) -> data
     Returns:
         A new ProblemWorkerState instance.
     """
-    return data_structures.ProblemWorkerState(state.id, state.allocation)
+    return data_structures.ProblemWorkerState.make(state.id, state.allocation)
 
 
 class Autoscaler:
@@ -370,13 +371,11 @@ class Autoscaler:
 
 
 def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resources: resources.ClusterResources) -> None:
-    cluster_resource_totals = cluster_resources.totals()
+    cluster_resource_totals = cluster_resources.total_pool()
 
     required_resources = resources.PoolOfResources(
         cpus=0.0,
         gpus=0.0,
-        nvdecs=0,
-        nvencs=0,
     )
 
     for stage in pipeline_spec.stages:
@@ -388,10 +387,7 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         else:
             num_required = 1
 
-        resources_per_worker = stage.stage.required_resources.to_rust().to_pool(
-            cluster_resources.calc_num_nvdecs_per_gpu(),
-            cluster_resources.calc_num_nvencs_per_gpu(),
-        )
+        resources_per_worker = stage.stage.required_resources.to_pool()
         required_resources = required_resources.add(resources_per_worker.multiply_by(num_required))
 
     summary_string = (
@@ -408,16 +404,6 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         raise ValueError(
             f"Not enough GPU resources to run pipeline in streaming mode. Pipeline requires "
             f"{required_resources.gpus} but only {cluster_resource_totals.gpus} are available.\n{summary_string}"
-        )
-    if approx.float_lt(cluster_resource_totals.nvdecs, required_resources.nvdecs):
-        raise ValueError(
-            f"Not enough NVDEC resources to run pipeline in streaming mode. Pipeline requires "
-            f"{required_resources.nvdecs} but only {cluster_resource_totals.nvdecs} are available.\n{summary_string}"
-        )
-    if approx.float_lt(cluster_resource_totals.nvencs, required_resources.nvencs):
-        raise ValueError(
-            f"Not enough NVENC resources to run pipeline in streaming mode. Pipeline requires "
-            f"{required_resources.nvencs} but only {cluster_resource_totals.nvencs} are available.\n{summary_string}"
         )
 
 
@@ -599,7 +585,7 @@ def run_pipeline(
     _verify_enough_resources(pipeline_spec, cluster_resources)
     assert isinstance(pipeline_spec.config.mode_specific, specs.StreamingSpecificSpec)
     # Create a worker allocator to keep track of which workers are allocated across the cluster
-    worker_allocator = allocator.WorkerAllocator(cluster_resources)
+    worker_allocator = allocator.WorkerAllocator.make(cluster_resources)
 
     input_queue = Queue()
     input_queue.by_node_id[None].extend(pipeline_spec.input_data)
@@ -613,13 +599,16 @@ def run_pipeline(
         assert isinstance(stage, specs.StageSpec)
         assert stage.slots_per_actor is not None
         wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, stage, idx)
+        pool_params = actor_pool.PoolParams(
+            enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+        )
         pools.append(
             actor_pool.ActorPool(
                 worker_allocator,
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
-                enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+                pool_params=pool_params,
             )
         )
 
