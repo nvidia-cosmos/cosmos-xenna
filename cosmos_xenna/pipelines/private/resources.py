@@ -23,13 +23,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import attrs
 import ray
 import ray.util.scheduling_strategies
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust  # type: ignore
 from cosmos_xenna.utils import python_log as logger
 
 try:
@@ -41,27 +41,169 @@ except ImportError:
     HAS_NVML = False
 
 
-CICD_ENV_VAR = "IS_RUNNING_IN_CICD"
-
-
 class AllocationError(Exception):
     pass
 
 
 @attrs.define
+class PoolOfResources:
+    cpus: float
+    gpus: float
+
+    def add(self, other: PoolOfResources) -> PoolOfResources:
+        return PoolOfResources(cpus=self.cpus + other.cpus, gpus=self.gpus + other.gpus)
+
+    def multiply_by(self, other: int) -> PoolOfResources:
+        return PoolOfResources(cpus=self.cpus * other, gpus=self.gpus * other)
+
+
+class WorkerShape:
+    def __init__(self, rust_worker_shape: rust.WorkerShape):
+        self._r = rust_worker_shape
+
+    @property
+    def rust(self) -> rust.WorkerShape:
+        return self._r
+
+    def get_num_cpus(self) -> float:
+        return self._r.get_num_cpus()
+
+    def get_num_gpus(self) -> float:
+        return self._r.get_num_gpus()
+
+    def __reduce__(self) -> Any:
+        """Make the class pickleable by serializing the Rust object to a string."""
+        # Serialize the Rust object to a string
+        serialized = self._r.serialize()
+        # Return a tuple: (callable, args) where callable reconstructs the object
+        return (self._reconstruct, (serialized,))
+
+    @classmethod
+    def _reconstruct(cls, serialized: str) -> WorkerShape:
+        """Reconstruct a WorkerShape from a serialized string."""
+        # Deserialize the string back to a Rust WorkerShape
+        rust_worker_shape = rust.WorkerShape.deserialize(serialized)
+        # Create a new Python WorkerShape instance
+        return cls(rust_worker_shape)
+
+
+class Worker:
+    @classmethod
+    def make(cls, id: str, stage_name: str, allocation: WorkerResources) -> Worker:
+        return cls(rust.Worker(id, stage_name, allocation.to_rust()))
+
+    def __init__(self, rust_worker: rust.Worker):
+        self._r = rust_worker
+
+    @property
+    def id(self) -> str:
+        return self._r.id
+
+    @property
+    def stage_name(self) -> str:
+        return self._r.stage_name
+
+    @property
+    def allocation(self) -> WorkerResources:
+        return WorkerResources.from_rust(self._r.allocation)
+
+    @property
+    def rust(self) -> rust.Worker:
+        return self._r
+
+    def __reduce__(self) -> Any:
+        """Make the class pickleable by serializing the Rust object to a string."""
+        # Serialize the Rust object to a string
+        serialized = self._r.serialize()
+        # Return a tuple: (callable, args) where callable reconstructs the object
+        return (self._reconstruct, (serialized,))
+
+    @classmethod
+    def _reconstruct(cls, serialized: str) -> Worker:
+        """Reconstruct a Worker from a serialized string."""
+        # Deserialize the string back to a Rust Worker
+        rust_worker = rust.Worker.deserialize(serialized)
+        # Create a new Python Worker instance
+        return cls(rust_worker)
+
+
+@attrs.define
+class GpuResources:
+    index: int
+    uuid_: uuid.UUID
+    used_fraction: float
+
+    @classmethod
+    def from_rust(cls, rust_gpu_resources: rust.GpuResources) -> GpuResources:
+        return GpuResources(
+            index=rust_gpu_resources.index,
+            uuid_=rust_gpu_resources.uuid_,
+            used_fraction=rust_gpu_resources.used_fraction,
+        )
+
+    def to_rust(self) -> rust.GpuResources:
+        return rust.GpuResources(
+            index=self.index,
+            uuid_=self.uuid_,
+            used_fraction=self.used_fraction,
+        )
+
+
+@attrs.define
+class GpuAllocation:
+    index: int
+    used_fraction: float
+
+    @classmethod
+    def from_rust(cls, rust_gpu_allocation: rust.GPUAllocation) -> GpuAllocation:
+        return GpuAllocation(
+            index=rust_gpu_allocation.index,
+            used_fraction=rust_gpu_allocation.used_fraction,
+        )
+
+    def to_rust(self) -> rust.GPUAllocation:
+        return rust.GPUAllocation(
+            index=self.index,
+            used_fraction=self.used_fraction,
+        )
+
+
+@attrs.define
+class WorkerResources:
+    node: str
+    cpus: float
+    gpus: list[GpuAllocation]
+
+    @staticmethod
+    def from_rust(r: rust.WorkerMetadata) -> WorkerResources:
+        return WorkerResources(
+            r.node,
+            r.cpus,
+            [GpuAllocation.from_rust(x) for x in r.gpus],
+        )
+
+    def to_rust(self) -> rust.WorkerResources:
+        return rust.WorkerResources(
+            node=self.node,
+            cpus=self.cpus,
+            gpus=[x.to_rust() for x in self.gpus],
+        )
+
+
+@attrs.define
 class WorkerMetadata:
     worker_id: str
-    allocation: rust_resources.WorkerResources
+    allocation: WorkerResources
 
     @staticmethod
     def make_dummy() -> WorkerMetadata:
         return WorkerMetadata(
             worker_id="debug_worker",
-            allocation=rust_resources.WorkerResources(node="debug_node", cpus=1.0, gpus=[]),
+            allocation=rust.WorkerResources(node="debug_node", cpus=1.0, gpus=[]),
         )
 
     @staticmethod
-    def from_rust(rust_worker_metadata: rust_resources.WorkerMetadata) -> WorkerMetadata:
+    def from_rust(rust_worker_metadata: rust.WorkerMetadata) -> WorkerMetadata:
         return WorkerMetadata(
             worker_id=rust_worker_metadata.worker_id,
             allocation=rust_worker_metadata.allocation,
@@ -73,7 +215,7 @@ class NodeInfo:
     node_id: str
 
     @staticmethod
-    def from_rust(rust_node_info: rust_resources.NodeInfo) -> NodeInfo:
+    def from_rust(rust_node_info: rust.NodeInfo) -> NodeInfo:
         return NodeInfo(node_id=rust_node_info.node_id)
 
 
@@ -89,62 +231,76 @@ class Resources:
 
     cpus: float = 0.0
     gpus: Union[float, int] = 0
-    nvdecs: int = 0
-    nvencs: int = 0
-    entire_gpu: bool = False
 
     def to_dict(self) -> dict[str, float]:
-        return {"cpu": self.cpus, "gpu": self.gpus, "nvdecs": self.nvdecs, "nvencs": self.nvencs}
+        return {"cpu": self.cpus, "gpu": self.gpus}
 
-    def to_rust(self) -> rust_resources.Resources:
-        return rust_resources.Resources(
+    def to_rust(self) -> rust.Resources:
+        return rust.Resources(
             cpus=self.cpus,
             gpus=self.gpus,
-            nvdecs=self.nvdecs,
-            nvencs=self.nvencs,
-            entire_gpu=self.entire_gpu,
+        )
+
+    def to_worker_shape(self) -> WorkerShape:
+        return WorkerShape(self.to_rust().to_shape())
+
+    def to_pool(self) -> PoolOfResources:
+        return PoolOfResources(cpus=self.cpus, gpus=self.gpus)
+
+    def __repr__(self) -> str:
+        return repr(self.to_rust())
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@attrs.define
+class NodeResources:
+    used_cpus: float
+    total_cpus: float
+    gpus: list[GpuResources]
+    name: Optional[str]
+
+    @staticmethod
+    def from_rust(rust_node_resources: rust.NodeResources) -> NodeResources:
+        return NodeResources(
+            used_cpus=rust_node_resources.used_cpus,
+            total_cpus=rust_node_resources.total_cpus,
+            gpus=[GpuResources.from_rust(x) for x in rust_node_resources.gpus],
+            name=rust_node_resources.name,
+        )
+
+    def to_rust(self) -> rust.NodeResources:
+        return rust.NodeResources(
+            used_cpus=self.used_cpus,
+            total_cpus=self.total_cpus,
+            gpus=[x.to_rust() for x in self.gpus],
+            name=self.name,
         )
 
 
 @attrs.define
-class GpuResources:
-    index: int
-    uuid_: uuid.UUID
-    num_nvdecs: int = 0
-    num_nvencs: int = 0
+class ClusterResources:
+    nodes: dict[str, NodeResources]
 
-    def to_rust(self) -> rust_resources.GpuResources:
-        return rust_resources.GpuResources.make_from_num_codecs(
-            gpu_fraction_available=1.0,
-            num_nvdecs=self.num_nvdecs,
-            num_nvencs=self.num_nvencs,
+    @staticmethod
+    def from_rust(rust_cluster_resources: rust.ClusterResources) -> ClusterResources:
+        return ClusterResources(
+            nodes={k: NodeResources.from_rust(v) for k, v in rust_cluster_resources.nodes.items()},
         )
 
-
-def _make_nvdecs_and_nvencs_from_gpu_name(index: int, uuid_: uuid.UUID, gpu_name: str) -> tuple[int, int]:
-    """This is a hack which determines the number of nvdec/nvencs per gpu based on the GPU name.
-
-    Ideally, we'd have a better source for this data, but we couldn't find a good one.
-    """
-    if "H100" in gpu_name:
-        return 7, 0
-    elif "A100" in gpu_name:
-        return 7, 0
-    elif "L40" in gpu_name:
-        return 3, 3
-    elif "L4" in gpu_name:
-        return 4, 2
-    elif "RTX 6000" in gpu_name:
-        return 3, 3
-    elif "RTX A6000" in gpu_name:
-        return 3, 3
-    elif "NVIDIA" in gpu_name:
-        return 0, 0
-    else:
-        raise ValueError(
-            f"Unknown gpu type: {gpu_name}. Likely it needs to be added to "
-            "cosmos_xenna.ray_utils.cluster._make_gpu_resources_from_gpu_name"
+    def total_pool(self) -> PoolOfResources:
+        return PoolOfResources(
+            cpus=sum(node.total_cpus for node in self.nodes.values()),
+            gpus=sum(len(node.gpus) for node in self.nodes.values()),
         )
+
+    @property
+    def num_nodes(self) -> int:
+        return len(self.nodes)
+
+    def to_rust(self) -> rust.ClusterResources:
+        return rust.ClusterResources(nodes={k: v.to_rust() for k, v in self.nodes.items()})
 
 
 @attrs.define
@@ -152,8 +308,6 @@ class GpuInfo:
     index: int
     name: str
     uuid_: uuid.UUID
-    num_nvdecs: int = 0
-    num_nvencs: int = 0
 
 
 @attrs.define
@@ -290,21 +444,6 @@ def _respect_cuda_visible_devices(gpus: list[GpuInfo]) -> list[GpuInfo]:
     return filter_gpus_by_cuda_visible_devices(gpus, cuda_visible_devices)
 
 
-def _get_nvdecs_and_nvencs_from_gpu_infos(gpu_infos: list[GpuInfo]) -> tuple[int, int]:
-    # HACK: when running in CI/CD, we ignore 'NVIDIA DGX Display' gpus
-    # This hack is incomplete. We also need to make sure the cuda env vars are set correctly.
-    if CICD_ENV_VAR in os.environ:
-        logger.info("Running in CI/CD. Ignoring 'NVIDIA DGX Display' gpus")
-        gpu_infos = [x for x in gpu_infos if "NVIDIA DGX Display" not in x.name]
-
-    unique_names = set([str(x.name) for x in gpu_infos])
-    if len(unique_names) != 1:
-        raise ValueError(f"Running on a node with multiple gpu types: {unique_names}. This is not supported as of now.")
-    name = next(iter(unique_names))
-    logger.debug(f"Gpu with name {name} found. Looking up nvdecs and nvencs...")
-    return _make_nvdecs_and_nvencs_from_gpu_name(gpu_infos[0].index, gpu_infos[0].uuid_, name)
-
-
 @ray.remote
 def _get_node_info_from_current_node() -> ResourceInfoFromNode:
     """Get the resources for a node."""
@@ -315,18 +454,17 @@ def _get_node_info_from_current_node() -> ResourceInfoFromNode:
     gpus = _respect_cuda_visible_devices(get_local_gpu_info())
     if not gpus:
         return ResourceInfoFromNode(node_id=node_id, cpus=num_cpus, gpus=[])
-    nvdecs, nvencs = _get_nvdecs_and_nvencs_from_gpu_infos(gpus)
     return ResourceInfoFromNode(
         node_id=node_id,
         cpus=num_cpus,
-        gpus=[GpuInfo(index=x.index, name=x.name, uuid_=x.uuid_, num_nvdecs=nvdecs, num_nvencs=nvencs) for x in gpus],
+        gpus=[GpuInfo(index=x.index, name=x.name, uuid_=x.uuid_) for x in gpus],
     )
 
 
 def make_cluster_resources_for_ray_cluster(
     cpu_allocation_percentage: float = 1.0,
     nodes: Optional[list] = None,
-) -> rust_resources.ClusterResources:
+) -> ClusterResources:
     """
     Make a ClusterResources object for a ray cluster.
 
@@ -395,20 +533,19 @@ def make_cluster_resources_for_ray_cluster(
     logger.debug(f"Node info futures completed. Results: {infos}")
 
     for node_id, info in zip(alive_nodes, infos):
-        out_dict[str(node_id)] = rust_resources.NodeResources(
-            cpus=int(info.cpus * cpu_allocation_percentage),
+        out_dict[str(node_id)] = NodeResources(
+            used_cpus=0.0,
+            total_cpus=int(info.cpus * cpu_allocation_percentage),
             gpus=[
-                rust_resources.GpuResources(
+                GpuResources(
                     index=x.index,
                     uuid_=x.uuid_,
-                    gpu_fraction=1.0,
-                    nvdecs=list(range(x.num_nvdecs)),
-                    nvencs=list(range(x.num_nvencs)),
+                    used_fraction=0.0,
                 )
                 for x in info.gpus
             ],
             name=str(node_id),
         )
 
-    out = rust_resources.ClusterResources(out_dict)
+    out = ClusterResources(out_dict)
     return out

@@ -20,7 +20,6 @@ from typing import Any, Optional
 
 import attrs
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import runtime_envs
 
@@ -48,13 +47,13 @@ def open_context(openable: Optional[Openable]) -> Iterator[None]:
             openable.close()
 
 
-def make_cpu_worker_shape(num_cpus: float = 1.0) -> rust_resources.WorkerShape:
-    return resources.Resources(cpus=num_cpus).to_rust().to_shape()
+def make_cpu_worker_shape(num_cpus: float = 1.0) -> resources.WorkerShape:
+    return resources.Resources(cpus=num_cpus).to_worker_shape()
 
 
 @attrs.define
 class Params:
-    shape: rust_resources.WorkerShape = attrs.field(factory=make_cpu_worker_shape)
+    shape: resources.WorkerShape = attrs.field(factory=make_cpu_worker_shape)
     stage_batch_size: int = 1
     slots_per_actor: int = 2
     # Maxmum lifetime in minutes before we internally terminate and restart a worker. 0 means disabled.

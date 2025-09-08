@@ -20,13 +20,14 @@ import typing
 
 import ray
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (
+from cosmos_xenna.pipelines.private import (
     allocator,
     autoscaling_algorithms,
     data_structures,
+    monitoring,
     resources,
+    specs,
 )
-from cosmos_xenna.pipelines.private import monitoring, specs
 from cosmos_xenna.ray_utils import actor_pool
 from cosmos_xenna.utils import deque, grouping, timing
 from cosmos_xenna.utils import python_log as logger
@@ -89,7 +90,7 @@ def run_pipeline(
     """Runs a pipeline under BATCH mode."""
     # Create a worker allocator to keep track of which workers are allocated across the cluster
     # We will not use this directly, but it is used by the actor pools
-    worker_allocator = allocator.WorkerAllocator(cluster_resources)
+    worker_allocator = allocator.WorkerAllocator.make(cluster_resources)
     worker_id_factory = autoscaling_algorithms.WorkerIdFactory()
     logger.info("Putting all inputs into ray memory store.")
     assert isinstance(pipeline_spec.stages[0], specs.StageSpec)
@@ -108,12 +109,15 @@ def run_pipeline(
     for idx, spec in enumerate(pipeline_spec.stages):
         assert isinstance(spec, specs.StageSpec)
         wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, spec, idx)
+        pool_params = actor_pool.PoolParams(
+            enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+        )
         pool = actor_pool.ActorPool(
             worker_allocator,
             wrapped_stage.stage,
             wrapped_stage.params,
             spec.name(idx),
-            enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+            pool_params=pool_params,
         )
         pools.append(pool)
 

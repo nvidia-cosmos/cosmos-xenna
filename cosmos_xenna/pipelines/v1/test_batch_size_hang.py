@@ -38,7 +38,7 @@ class FirstFanOutStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
 
     def process_data(self, samples: list[_Sample]) -> list[_Sample]:
         """Download images from URLs, using a cache."""
@@ -52,7 +52,7 @@ class BatchStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
 
     def process_data(self, samples: list[_Sample]) -> list[_Sample]:
         """Download images from URLs, using a cache."""
@@ -66,7 +66,7 @@ class SimpleStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=5.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=5.0, gpus=0.0)
 
     def process_data(self, samples: list[_Sample]) -> list[_Sample]:
         return samples

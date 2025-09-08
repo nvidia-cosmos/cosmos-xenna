@@ -390,8 +390,6 @@ impl AllocationResult {
                 "Input samples thpt",        // Normalized total throughput
                 "CPUs",                      // Total CPU resources used
                 "GPUs",                      // Total GPU resources used
-                "NVDECs",                    // Total NVDEC resources used
-                "NVENCs",                    // Total NVENC resources used
             ]);
 
         // Add a row for each stage with its allocation details
@@ -412,8 +410,6 @@ impl AllocationResult {
                 format!("{:.6}", s.total_throughput() * in_samples_per_sample),
                 format!("{:.3}", r.cpus),
                 format!("{:.3}", r.gpus),
-                format!("{:.3}", r.nvdecs),
-                format!("{:.3}", r.nvencs),
             ]);
         }
 
@@ -535,8 +531,6 @@ pub fn solve_allocation(problem: AllocationProblem) -> Result<AllocationResult, 
     let mut manual_resources_used = resources::PoolOfResources {
         cpus: 0.0,
         gpus: 0.0,
-        nvdecs: 0.0,
-        nvencs: 0.0,
     };
 
     for s in &manual_stages {
@@ -736,15 +730,11 @@ fn solve_allocation_with_no_manual_stages(
     // Build expressions for total resource consumption across all stages
     let mut sum_cpus: Expression = 0.0.into();
     let mut sum_gpus: Expression = 0.0.into();
-    let mut sum_nvdecs: Expression = 0.0.into();
-    let mut sum_nvencs: Expression = 0.0.into();
 
     for (i, stage) in problem.stages.iter().enumerate() {
         // For each stage, add: (number of workers) * (resources per worker)
         sum_cpus = sum_cpus + x_vars[i] * stage.resources_per_worker.cpus as f64;
         sum_gpus = sum_gpus + x_vars[i] * stage.resources_per_worker.gpus as f64;
-        sum_nvdecs = sum_nvdecs + x_vars[i] * stage.resources_per_worker.nvdecs as f64;
-        sum_nvencs = sum_nvencs + x_vars[i] * stage.resources_per_worker.nvencs as f64;
     }
 
     // Add resource capacity constraints for each resource type
@@ -753,12 +743,6 @@ fn solve_allocation_with_no_manual_stages(
     ));
     model = model.with(constraint!(
         sum_gpus <= problem.cluster_resources.gpus as f64 + numeric_epsilon
-    ));
-    model = model.with(constraint!(
-        sum_nvdecs <= problem.cluster_resources.nvdecs as f64 + numeric_epsilon
-    ));
-    model = model.with(constraint!(
-        sum_nvencs <= problem.cluster_resources.nvencs as f64 + numeric_epsilon
     ));
 
     // Solve the mixed-integer linear programming problem
@@ -863,13 +847,8 @@ pub fn calculate_input_samples_per_sample(
 mod tests {
     use super::*;
 
-    fn pool(cpus: f32, gpus: f32, nvdecs: f32, nvencs: f32) -> resources::PoolOfResources {
-        resources::PoolOfResources {
-            cpus,
-            gpus,
-            nvdecs,
-            nvencs,
-        }
+    fn pool(cpus: f32, gpus: f32) -> resources::PoolOfResources {
+        resources::PoolOfResources { cpus, gpus }
     }
 
     fn stage(
@@ -910,8 +889,8 @@ mod tests {
         // Test basic allocation with a single stage
         // Expected: All available resources go to the single stage
         let problem = AllocationProblem {
-            stages: vec![stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None)],
-            cluster_resources: pool(5.0, 0.0, 0.0, 0.0),
+            stages: vec![stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None)],
+            cluster_resources: pool(5.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         // With 5 CPUs available and 1 CPU per worker, we should get 5 workers
@@ -925,10 +904,10 @@ mod tests {
         // Expected: Resources split evenly to balance throughput
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 1.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(6.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(6.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         // With equal speeds, resources split evenly: 3 workers each
@@ -942,10 +921,10 @@ mod tests {
         // Expected: Slower stage gets more workers to balance throughput
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None), // Slower: 1 batch/sec/worker
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None), // Faster: 2 batch/sec/worker
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None), // Slower: 1 batch/sec/worker
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), None), // Faster: 2 batch/sec/worker
             ],
-            cluster_resources: pool(6.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(6.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         // Stage A needs more workers since it's slower: 4 workers @ 1.0 = 4.0 throughput
@@ -957,11 +936,11 @@ mod tests {
     fn test_three_stage_multiple_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(0.5, 1.0, 0.0, 0.0), None),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 2.0, 0.0, 0.0), None),
-                stage("C", 3.0, 1.0, 1, pool(1.5, 3.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(0.5, 1.0), None),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 2.0), None),
+                stage("C", 3.0, 1.0, 1, pool(1.5, 3.0), None),
             ],
-            cluster_resources: pool(10.0, 20.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 20.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[6, 3, 2], Some(6.0), 1e-6);
@@ -971,10 +950,10 @@ mod tests {
     fn test_minimum_one_worker_per_stage() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 10.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 10.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(3.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(3.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[2, 1], Some(2.0), 1e-6);
@@ -984,10 +963,10 @@ mod tests {
     fn test_resource_limited_allocation() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(2.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0), None),
+                stage("B", 1.0, 1.0, 1, pool(2.0, 1.0), None),
             ],
-            cluster_resources: pool(10.0, 10.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 10.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[3, 3], Some(3.0), 1e-1);
@@ -996,8 +975,8 @@ mod tests {
     #[test]
     fn test_infeasible_problem() {
         let problem = AllocationProblem {
-            stages: vec![stage("A", 1.0, 1.0, 1, pool(2.0, 0.0, 0.0, 0.0), None)],
-            cluster_resources: pool(1.0, 0.0, 0.0, 0.0),
+            stages: vec![stage("A", 1.0, 1.0, 1, pool(2.0, 0.0), None)],
+            cluster_resources: pool(1.0, 0.0),
         };
         let err = solve_allocation(problem).unwrap_err();
         match err {
@@ -1010,10 +989,10 @@ mod tests {
     fn test_manual_and_auto_stages() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(3)),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), Some(3)),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(10.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[3, 7], Some(3.0), 1e-1);
@@ -1025,10 +1004,10 @@ mod tests {
     fn test_extreme_speed_differences() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 0.1, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 100.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 0.1, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 100.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(20.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(20.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[19, 1], Some(1.9), 1e-1);
@@ -1038,10 +1017,10 @@ mod tests {
     fn test_one_stage_dominates_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(0.1, 0.1, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(10.0, 10.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(0.1, 0.1), None),
+                stage("B", 1.0, 1.0, 1, pool(10.0, 10.0), None),
             ],
-            cluster_resources: pool(100.0, 100.0, 0.0, 0.0),
+            cluster_resources: pool(100.0, 100.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[9, 9], Some(9.0), 1e-1);
@@ -1051,10 +1030,10 @@ mod tests {
     fn test_zero_speed_stage() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 0.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 0.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(100.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(100.0, 0.0),
         };
         let err = solve_allocation(problem).unwrap_err();
         match err {
@@ -1067,10 +1046,10 @@ mod tests {
     fn test_very_small_resource_requirement() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(0.001, 0.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(0.001, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(0.001, 0.0), None),
+                stage("B", 1.0, 1.0, 1, pool(0.001, 0.0), None),
             ],
-            cluster_resources: pool(1.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(1.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         println!("result: {}", result.to_debug_str());
@@ -1081,10 +1060,10 @@ mod tests {
     fn test_very_large_resource_requirement() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1e6, 0.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(1e6, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1e6, 0.0), None),
+                stage("B", 1.0, 1.0, 1, pool(1e6, 0.0), None),
             ],
-            cluster_resources: pool(3e6 as f32, 0.0, 0.0, 0.0),
+            cluster_resources: pool(3e6 as f32, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[1, 1], Some(1.0), 1e-1);
@@ -1094,10 +1073,10 @@ mod tests {
     fn test_exact_resource_match() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(2.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0), None),
+                stage("B", 1.0, 1.0, 1, pool(2.0, 1.0), None),
             ],
-            cluster_resources: pool(9.0, 9.0, 0.0, 0.0),
+            cluster_resources: pool(9.0, 9.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[3, 3], Some(3.0), 1e-1);
@@ -1107,10 +1086,10 @@ mod tests {
     fn test_fractional_resource_requirements() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(0.3, 0.7, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(0.7, 0.3, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(0.3, 0.7), None),
+                stage("B", 1.0, 1.0, 1, pool(0.7, 0.3), None),
             ],
-            cluster_resources: pool(10.0, 10.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 10.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[10, 10], Some(10.0), 1e-1);
@@ -1120,10 +1099,10 @@ mod tests {
     fn test_overallocation_limited_by_single_resource() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.1, 0.0, 0.0), None),
-                stage("B", 1.0, 1.0, 1, pool(1.0, 0.1, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.1), None),
+                stage("B", 1.0, 1.0, 1, pool(1.0, 0.1), None),
             ],
-            cluster_resources: pool(300.0, 15.0, 0.0, 0.0),
+            cluster_resources: pool(300.0, 15.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         println!("result: {}", result.to_debug_str());
@@ -1133,8 +1112,8 @@ mod tests {
     #[test]
     fn test_single_manual_stage() {
         let problem = AllocationProblem {
-            stages: vec![stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(5))],
-            cluster_resources: pool(10.0, 0.0, 0.0, 0.0),
+            stages: vec![stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), Some(5))],
+            cluster_resources: pool(10.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[5], Some(5.0), 1e-6);
@@ -1145,11 +1124,11 @@ mod tests {
     fn test_multiple_manual_stages() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(2)),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(3)),
-                stage("C", 3.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), Some(2)),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), Some(3)),
+                stage("C", 3.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(10.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[2, 3, 5], Some(2.0), 1e-1);
@@ -1162,10 +1141,10 @@ mod tests {
     fn test_manual_stages_exceed_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(2.0, 0.0, 0.0, 0.0), Some(3)),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(5)),
+                stage("A", 1.0, 1.0, 1, pool(2.0, 0.0), Some(3)),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), Some(5)),
             ],
-            cluster_resources: pool(10.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 0.0),
         };
         let err = solve_allocation(problem).unwrap_err();
         match err {
@@ -1178,11 +1157,11 @@ mod tests {
     fn test_manual_stages_use_all_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(2.0, 0.0, 0.0, 0.0), Some(3)),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), Some(4)),
-                stage("C", 3.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(2.0, 0.0), Some(3)),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), Some(4)),
+                stage("C", 3.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(10.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 0.0),
         };
         let err = solve_allocation(problem).unwrap_err();
         match err {
@@ -1195,11 +1174,11 @@ mod tests {
     fn test_manual_stages_with_multiple_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0, 0.0, 0.0), Some(2)),
-                stage("B", 2.0, 1.0, 1, pool(2.0, 1.0, 0.0, 0.0), None),
-                stage("C", 3.0, 1.0, 1, pool(1.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 2.0), Some(2)),
+                stage("B", 2.0, 1.0, 1, pool(2.0, 1.0), None),
+                stage("C", 3.0, 1.0, 1, pool(1.0, 1.0), None),
             ],
-            cluster_resources: pool(10.0, 10.0, 0.0, 0.0),
+            cluster_resources: pool(10.0, 10.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[2, 3, 2], Some(2.0), 1e-1);
@@ -1212,10 +1191,10 @@ mod tests {
     fn test_dont_overallocate() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 10.0, 1.0, 1, pool(1.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 10.0, 1.0, 1, pool(1.0, 1.0), None),
             ],
-            cluster_resources: pool(10000.0, 8.0, 0.0, 0.0),
+            cluster_resources: pool(10000.0, 8.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[80, 8], Some(80.0), 1e-1);
@@ -1225,11 +1204,11 @@ mod tests {
     fn test_dont_overallocate_multiple_stages() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("C", 3.0, 1.0, 1, pool(1.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("C", 3.0, 1.0, 1, pool(1.0, 1.0), None),
             ],
-            cluster_resources: pool(1000.0, 10.0, 0.0, 0.0),
+            cluster_resources: pool(1000.0, 10.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[30, 15, 10], Some(30.0), 1e-1);
@@ -1239,10 +1218,10 @@ mod tests {
     fn test_dont_overallocate_limited_by_resources() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 2.0, 1.0, 1, pool(2.0, 1.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 2.0, 1.0, 1, pool(2.0, 1.0), None),
             ],
-            cluster_resources: pool(60.0, 10.0, 0.0, 0.0),
+            cluster_resources: pool(60.0, 10.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[20, 10], Some(20.0), 1e-1);
@@ -1252,11 +1231,11 @@ mod tests {
     fn test_unbalanced_batching() {
         let problem = AllocationProblem {
             stages: vec![
-                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("B", 1.0, 1000.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
-                stage("C", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 1, pool(1.0, 0.0), None),
+                stage("B", 1.0, 1000.0, 1, pool(1.0, 0.0), None),
+                stage("C", 1.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(1000.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(1000.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[1, 1, 998], None, 1e-1);
@@ -1267,11 +1246,11 @@ mod tests {
         let problem = AllocationProblem {
             stages: vec![
                 // Stage A: 1 bps, batch size 10
-                stage("A", 1.0, 1.0, 10, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 1.0, 1.0, 10, pool(1.0, 0.0), None),
                 // Stage B: 1 bps, batch size 1
-                stage("B", 1.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("B", 1.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(1000.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(1000.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[500, 500], None, 1e-1);
@@ -1282,15 +1261,15 @@ mod tests {
         let problem = AllocationProblem {
             stages: vec![
                 // A: 2 bps, returns 1000, batch size 10
-                stage("A", 2.0, 1000.0, 10, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("A", 2.0, 1000.0, 10, pool(1.0, 0.0), None),
                 // B: 2 bps, returns 1, batch size 1
-                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("B", 2.0, 1.0, 1, pool(1.0, 0.0), None),
                 // C: 2 bps, returns 10, batch size 1000
-                stage("C", 2.0, 10.0, 1000, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("C", 2.0, 10.0, 1000, pool(1.0, 0.0), None),
                 // D: 2 bps, returns 1, batch size 1
-                stage("D", 2.0, 1.0, 1, pool(1.0, 0.0, 0.0, 0.0), None),
+                stage("D", 2.0, 1.0, 1, pool(1.0, 0.0), None),
             ],
-            cluster_resources: pool(1000.0, 0.0, 0.0, 0.0),
+            cluster_resources: pool(1000.0, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[1, 988, 1, 10], None, 1e-1);

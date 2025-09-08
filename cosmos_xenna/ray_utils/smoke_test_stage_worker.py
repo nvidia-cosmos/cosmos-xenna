@@ -24,7 +24,6 @@ import attrs
 import pytest
 import ray
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import cluster, stage, stage_worker
 
@@ -100,10 +99,10 @@ def test_process_data_basic(ray_cluster) -> None:
     actor = stage_worker.StageWorker.remote(
         _SimpleStage(0.0, 0.0),
         stage.Params(),
-        rust_resources.Worker(
+        resources.Worker.make(
             "my_worker",
             "my_stage",
-            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
+            resources.WorkerResources("my_node", 1.0, []),
         ),
     )
     node_id = ray.get(actor.setup.remote())  # type: ignore
@@ -123,10 +122,10 @@ def test_process_data_in_parallel(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _SimpleStage(0.0, 1.0),
         stage.Params(),
-        rust_resources.Worker(
+        resources.Worker.make(
             "my_worker",
             "my_stage",
-            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
+            resources.WorkerResources("my_node", 1.0, []),
         ),
     )
     ray.get(actor.setup.remote())  # type: ignore
@@ -167,10 +166,10 @@ def test_complex_data_in_parallel(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _ComplexStage(0.0),
         stage.Params(),
-        rust_resources.Worker(
+        resources.Worker.make(
             "my_worker",
             "my_stage",
-            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
+            resources.WorkerResources("my_node", 1.0, []),
         ),
     )
     ray.get(actor.setup.remote())  # type: ignore
@@ -193,10 +192,10 @@ def test_multiple_tasks_with_exceptions(ray_cluster) -> None:
     actor = stage_worker.StageWorker.options(max_concurrency=1000).remote(
         _ExceptionStage(),
         stage.Params(),
-        rust_resources.Worker(
+        resources.Worker.make(
             "my_worker",
             "my_stage",
-            rust_resources.WorkerResources("my_node", 1.0, [], [], []),
+            resources.WorkerResources("my_node", 1.0, []),
         ),
     )
     ray.get(actor.setup.remote())  # type: ignore

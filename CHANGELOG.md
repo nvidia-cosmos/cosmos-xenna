@@ -3,6 +3,14 @@
 
 ## Latest
 
+## [0.1.4]
+
+### Released
+- 2025-09-05
+
+### Added
+- Refactored the autoscaling code to reduce clones for better performance.
+
 ## [0.1.3]
 
 ### Released

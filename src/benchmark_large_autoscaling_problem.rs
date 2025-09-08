@@ -29,8 +29,6 @@ fn make_cluster(
     num_nodes: usize,
     cpus_per_node: usize,
     gpus_per_node: usize,
-    nvdecs_per_gpu: u8,
-    nvencs_per_gpu: u8,
     heterogeneous: bool,
 ) -> rds::ClusterResources {
     let mut nodes: std::collections::HashMap<String, rds::NodeResources> =
@@ -44,17 +42,20 @@ fn make_cluster(
         }
         let mut gpu_vec: Vec<rds::GpuResources> = Vec::new();
         for _ in 0..gpus {
-            gpu_vec.push(rds::GpuResources::make_from_num_codecs(
-                i as u8,
-                uuid::Uuid::new_v4(),
-                1.0,
-                nvdecs_per_gpu,
-                nvencs_per_gpu,
-            ));
+            gpu_vec.push(rds::GpuResources {
+                index: i as u8,
+                uuid_: uuid::Uuid::new_v4(),
+                used_fraction: rds::FixedUtil::ZERO,
+            });
         }
         nodes.insert(
             format!("node{}", i),
-            rds::NodeResources::new(cpus, Some(gpu_vec), None),
+            rds::NodeResources {
+                used_cpus: rds::FixedUtil::ZERO,
+                total_cpus: rds::FixedUtil::from_num(cpus),
+                gpus: gpu_vec,
+                name: None,
+            },
         );
     }
     rds::ClusterResources::new(Some(nodes))
@@ -89,14 +90,12 @@ fn estimates_from_speeds(speeds: &[Option<f64>]) -> Estimates {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let num_nodes = 200;
+    let num_nodes = 1000;
     // Create a cluster with plenty of resources
     let cluster = make_cluster(
         num_nodes, // 100 nodes
         240,       // 240 CPUs per node
         8,         // 8 GPUs per node
-        4,         // 4 NVDECs per GPU
-        4,         // 4 NVENCS per GPU
         false,
     );
 
@@ -108,9 +107,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 1.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: Some((num_nodes * 4) as usize),
         over_provision_factor: None,
     });
@@ -121,9 +123,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 1.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -135,9 +140,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 4.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 4.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -148,14 +156,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
-                num_gpus: 0.25,
-                num_cpus: 1.0,
-                num_nvdecs: 0,
-                num_nvencs: 0,
-            }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.25,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -166,9 +172,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 6.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 6.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -179,9 +188,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 4.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 4.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -192,9 +204,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 1.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -205,14 +220,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
-                num_gpus: 0.25,
-                num_cpus: 1.0,
-                num_nvdecs: 0,
-                num_nvencs: 0,
-            }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.25,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -223,9 +236,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 4.0 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 4.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -236,12 +252,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::EntireGpu(rds::EntireGpu {
-                num_gpus: 1,
-                num_cpus: 1.0,
-            }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 1.0,
+            cpus: 1.0,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
     });
@@ -252,9 +268,12 @@ fn main() {
     stages.push(ds::ProblemStage {
         name: format!("stage_{}", cur_stage_idx),
         stage_batch_size: 1,
-        worker_shape: rds::WorkerShapeWrapper {
-            inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 0.25 }),
-        },
+        worker_shape: rds::Resources {
+            gpus: 0.0,
+            cpus: 0.25,
+        }
+        .to_shape()
+        .unwrap(),
         requested_num_workers: Some((num_nodes * 8) as usize),
         over_provision_factor: None,
     });
@@ -310,7 +329,7 @@ fn main() {
         "Ran large autoscaling problem: stages={} nodes={} gpus={} cpus={}",
         problem.stages.len(),
         problem.cluster_resources.num_nodes(),
-        problem.cluster_resources.num_gpus(),
-        problem.cluster_resources.num_cpus()
+        problem.cluster_resources.num_total_gpus(),
+        problem.cluster_resources.num_total_cpus()
     );
 }

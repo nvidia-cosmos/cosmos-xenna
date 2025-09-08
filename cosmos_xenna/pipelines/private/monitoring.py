@@ -392,7 +392,7 @@ class PipelineMonitor:
         self._metrics_input_tasks = Gauge(
             "pipeline_input_tasks",
             "Number of total input tasks",
-            tag_keys=None,
+            tag_keys=("xenna_user", "xenna_job_name", "xenna_job_id"),
         )
         self._metrics_finished_tasks = Gauge(
             "pipeline_finished_tasks",
@@ -451,7 +451,14 @@ class PipelineMonitor:
         )
 
         # set initial values
-        self._metrics_input_tasks.set(self._initital_input_length)
+        self._metrics_input_tasks.set(
+            self._initital_input_length,
+            tags={
+                "xenna_user": os.getenv("SLURM_JOB_USER", "unknown"),
+                "xenna_job_name": os.getenv("SLURM_JOB_NAME", "unknown"),
+                "xenna_job_id": os.getenv("SLURM_JOB_ID", "unknown"),
+            }
+        )
         for pool in self._actor_pools:
             self._metrics_actor_resource_request.set(
                 pool.worker_shape.get_num_cpus(),

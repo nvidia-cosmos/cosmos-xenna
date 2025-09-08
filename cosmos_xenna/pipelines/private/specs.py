@@ -103,7 +103,7 @@ class Stage(abc.ABC, Generic[T, V]):
 
         1. CPU-Only Shape:
             - Set cpus > 0
-            - Leave gpus = 0, nvdecs = 0, nvencs = 0
+            - Leave gpus = 0
             Example: Resources(cpus=2.0)
             Allocation behavior:
                 - Only allocated CPU cores, no GPU resources
@@ -112,59 +112,27 @@ class Stage(abc.ABC, Generic[T, V]):
                 - Ray/Yotta does not actually keep track of what particular cores are assigned to particular workers.
                   Instead, for each node, the cpus are treated as a big pool.
 
-        # TODO: For a single worker, codecs should probably all come from the same GPU.
-        2. Codec-Only Shape (for video encoding/decoding):
-            - Set cpus ≥ 0
-            - Set nvdecs/nvencs > 0 as needed
-            - Leave gpus = 0
-            Example: Resources(cpus=1.0, nvdecs=2, nvencs=1)
-            Allocation behavior:
-                - Gets allocated specific codec units (nvdec/nvenc) from one or more GPUs
-                - All requested codec units (nvdecs/nvencs) must be satisfied exactly
-                - Can get codecs from multiple GPUs if needed
-                - Does not get allocated any GPU compute capacity
-                - Codec units are allocated exclusively (not shared)
-                - System finds optimal distribution of codec units across available GPUs
-
-        3. Fractional GPU Shape (sharing GPUs):
+        2. Fractional GPU Shape (sharing GPUs):
             - Set gpus to value between 0 and 1 exclusive
-            - Optionally set cpus, nvdecs, nvencs
-            Example: Resources(cpus=1.0, gpus=0.5, nvdecs=1)
+            - Optionally set cpus
+            Example: Resources(cpus=1.0, gpus=0.5)
             Allocation behavior:
                 - Gets allocated fraction of a single GPU's compute capacity
                 - Multiple workers can share same GPU up to 100% total utilization
-                - If codecs requested, they must come from the same GPU as compute
-                - Codec units still allocated exclusively (not shared)
-                - System tries to minimize fragmentation when choosing which GPU to use
 
-        4. Whole Numbered GPU Shape:
+        3. Whole Numbered GPU Shape:
             - Set gpus to integer ≥ 1
-            - Optionally set cpus, nvdecs, nvencs
-            - entire_gpu must be False
-            Example: Resources(cpus=1.0, gpus=2, nvdecs=2)
+            - Optionally set cpus
+            Example: Resources(cpus=1.0, gpus=2)
             Allocation behavior:
                 - Gets allocated requested number of whole GPUs
                 - Each GPU is allocated exclusively (not shared)
-                - For each GPU, requested codec units (nvdecs/nvencs) are allocated
-                - Codec count is per GPU, e.g. nvdecs=2 with gpus=2 allocates 4 total nvdecs
                 - System optimizes GPU selection to minimize fragmentation
-
-        5. Entire GPU Shape:
-            - Set gpus to integer ≥ 1
-            - Set entire_gpu=True
-            - nvdecs/nvencs will be automatically allocated
-            Example: Resources(cpus=1.0, gpus=1, entire_gpu=True)
-            Allocation behavior:
-                - Gets allocated requested number of complete GPUs
-                - Each GPU is allocated exclusively (not shared)
-                - Automatically gets ALL nvdecs and nvencs from each allocated GPU
-                - Only allocates to completely unused GPUs
-                - Most restrictive allocation type but guarantees exclusive access
 
         Resource Allocation Strategy:
         The system uses a fragmentation-aware allocation strategy that:
         - Minimizes resource fragmentation across the cluster
-        - Tries to keep related resources (GPU compute + codecs) together
+        - Tries to keep related resources (GPU compute) together
         - Prefers allocations that maintain flexibility for future requests
         - Can reuse recently freed allocations to prevent thrashing
         - Balances load across available nodes while respecting constraints
@@ -223,7 +191,7 @@ class Stage(abc.ABC, Generic[T, V]):
 
 
 def validate_stage(stage: Stage[Any, Any]) -> None:
-    stage.required_resources.to_rust().to_shape()
+    stage.required_resources.to_worker_shape()
 
 
 @attrs.define
@@ -418,7 +386,7 @@ class PipelineSpec:
         stage = stage_spec.stage
         stage_info = f"   class_name: {type(stage).__name__}\n"
         stage_info += f"   required_resources: {stage.required_resources}\n"
-        stage_info += f"   shape: {stage.required_resources.to_rust().to_shape()}\n"
+        stage_info += f"   shape: {stage.required_resources.to_worker_shape()}\n"
 
         for field in attrs.fields(StageSpec):
             if field.name != "stage":
@@ -472,11 +440,7 @@ def make_actor_pool_stage_from_stage_spec(
     assert spec.ignore_failures is not None
     assert spec.reset_workers_on_failure is not None
 
-    if (
-        approx.float_gt(spec.stage.required_resources.gpus, 0.0)
-        or approx.float_gt(spec.stage.required_resources.nvdecs, 0.0)
-        or approx.float_gt(spec.stage.required_resources.nvencs, 0.0)
-    ):
+    if approx.float_gt(spec.stage.required_resources.gpus, 0.0):
         modify_cuda_visible_devices_env_var = True
     else:
         # This is a little confusing. If the stage requires no GPUs, we don't want to modify the CUDA_VISIBLE_DEVICES.
@@ -486,7 +450,7 @@ def make_actor_pool_stage_from_stage_spec(
     return StageAndParams(
         WrappedStage(spec.stage),
         stage.Params(
-            shape=spec.stage.required_resources.to_rust().to_shape(),
+            shape=spec.stage.required_resources.to_worker_shape(),
             stage_batch_size=spec.stage.stage_batch_size,
             slots_per_actor=spec.slots_per_actor,
             worker_max_lifetime_m=spec.worker_max_lifetime_m,

@@ -19,7 +19,6 @@ import loguru
 import ray.runtime_context
 from loguru import logger
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
 from cosmos_xenna.pipelines.private import resources
 
 API_LIMIT = 40000
@@ -27,7 +26,7 @@ API_LIMIT = 40000
 
 def make_cluster_resources_from_ray_nodes(
     cpu_allocation_percentage: float = 1.0,
-) -> rust_resources.ClusterResources:
+) -> resources.ClusterResources:
     """Make a ClusterResources object from the current ray nodes."""
     return resources.make_cluster_resources_for_ray_cluster(cpu_allocation_percentage)
 

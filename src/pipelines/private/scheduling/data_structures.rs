@@ -24,6 +24,7 @@ use crate::utils::module_builders::ImportablePyModuleBuilder;
 use super::resources;
 use comfy_table::{ContentArrangement, Table};
 use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 // --------------------
@@ -46,7 +47,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 pub struct ProblemStage {
     pub name: String,
     pub stage_batch_size: usize,
-    pub worker_shape: resources::WorkerShapeWrapper,
+    pub worker_shape: resources::WorkerShape,
     pub requested_num_workers: Option<usize>,
     pub over_provision_factor: Option<f32>,
 }
@@ -58,7 +59,7 @@ impl ProblemStage {
     pub fn new(
         name: String,
         stage_batch_size: usize,
-        worker_shape: resources::WorkerShapeWrapper,
+        worker_shape: resources::WorkerShape,
         requested_num_workers: Option<usize>,
         over_provision_factor: Option<f32>,
     ) -> Self {
@@ -78,7 +79,7 @@ impl ProblemStage {
 /// * `id` - Unique identifier for the worker.
 /// * `resources` - Current resource allocation for this worker.
 #[pyclass(get_all, set_all)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProblemWorkerState {
     pub id: String,
     pub resources: resources::WorkerResources,
@@ -119,6 +120,15 @@ impl ProblemWorkerState {
             stage_name.to_string(),
             self.resources.clone(),
         )
+    }
+
+    pub fn serialize(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    #[staticmethod]
+    pub fn deserialize(data: &str) -> Self {
+        serde_json::from_str(data).unwrap()
     }
 }
 
@@ -190,15 +200,7 @@ impl Display for ProblemState {
         let mut table = Table::new();
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                "Stage",
-                "Worker ID",
-                "Node",
-                "CPUs",
-                "GPUs",
-                "NVDECs",
-                "NVENCs",
-            ]);
+            .set_header(vec!["Stage", "Worker ID", "Node", "CPUs", "GPUs"]);
 
         for (stage_idx, stage) in self.stages.iter().enumerate() {
             for w in &stage.workers {
@@ -206,21 +208,7 @@ impl Display for ProblemState {
                     .resources
                     .gpus
                     .iter()
-                    .map(|g| format!("{}:{:.2}", g.gpu_index, g.fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvdec_alloc = w
-                    .resources
-                    .nvdecs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvenc_alloc = w
-                    .resources
-                    .nvencs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
+                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -230,8 +218,6 @@ impl Display for ProblemState {
                     w.resources.node.clone(),
                     format!("{:.2}", w.resources.cpus),
                     gpu_alloc,
-                    nvdec_alloc,
-                    nvenc_alloc,
                 ]);
             }
         }
@@ -257,7 +243,10 @@ pub struct Problem {
 #[pymethods]
 impl Problem {
     #[new]
-    pub fn new(cluster_resources: resources::ClusterResources, stages: Vec<ProblemStage>) -> Self {
+    pub fn py_new(
+        cluster_resources: resources::ClusterResources,
+        stages: Vec<ProblemStage>,
+    ) -> Self {
         Self {
             cluster_resources,
             stages,
@@ -332,16 +321,7 @@ impl Display for Solution {
         let mut table = Table::new();
         table
             .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                "Stage",
-                "Action",
-                "Worker ID",
-                "Node",
-                "CPUs",
-                "GPUs",
-                "NVDECs",
-                "NVENCs",
-            ]);
+            .set_header(vec!["Stage", "Action", "Worker ID", "Node", "CPUs", "GPUs"]);
 
         for (stage_idx, stage) in self.stages.iter().enumerate() {
             for w in &stage.new_workers {
@@ -349,21 +329,7 @@ impl Display for Solution {
                     .resources
                     .gpus
                     .iter()
-                    .map(|g| format!("{}:{:.2}", g.gpu_index, g.fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvdec_alloc = w
-                    .resources
-                    .nvdecs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvenc_alloc = w
-                    .resources
-                    .nvencs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
+                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
                     .collect::<Vec<_>>()
                     .join(", ");
                 table.add_row(vec![
@@ -373,8 +339,6 @@ impl Display for Solution {
                     w.resources.node.clone(),
                     format!("{:.2}", w.resources.cpus),
                     gpu_alloc,
-                    nvdec_alloc,
-                    nvenc_alloc,
                 ]);
             }
             for w in &stage.deleted_workers {
@@ -382,21 +346,7 @@ impl Display for Solution {
                     .resources
                     .gpus
                     .iter()
-                    .map(|g| format!("{}:{:.2}", g.gpu_index, g.fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvdec_alloc = w
-                    .resources
-                    .nvdecs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let nvenc_alloc = w
-                    .resources
-                    .nvencs
-                    .iter()
-                    .map(|n| format!("{}.{}:{:.2}", n.gpu_index, n.codec_index, 1.0))
+                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
                     .collect::<Vec<_>>()
                     .join(", ");
                 table.add_row(vec![
@@ -406,8 +356,6 @@ impl Display for Solution {
                     w.resources.node.clone(),
                     format!("{:.2}", w.resources.cpus),
                     gpu_alloc,
-                    nvdec_alloc,
-                    nvenc_alloc,
                 ]);
             }
         }

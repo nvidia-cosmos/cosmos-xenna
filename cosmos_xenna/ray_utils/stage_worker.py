@@ -79,7 +79,6 @@ import ray
 import ray.experimental
 from ray.util.metrics import Gauge
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import stage
 from cosmos_xenna.utils import gpu, retry
@@ -300,7 +299,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self,
         stage_interface: stage.Interface,
         params: stage.Params,
-        worker: rust_resources.Worker,
+        worker: resources.Worker,
     ) -> None:
         """Initializes the StageWorker actor.
 
@@ -361,7 +360,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         yield
 
-    @ray.method(retry_exceptions=False)
+    @ray.method(retry_exceptions=False)  # type: ignore
     def setup_on_node(self) -> str:
         """Setup the actor per node.
 
@@ -391,7 +390,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
             logger.debug(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
             return node_location
 
-    @ray.method(retry_exceptions=False)
+    @ray.method(retry_exceptions=False)  # type: ignore
     def setup(self) -> str:
         """Sets up the worker by calling the stage's setup method.
 
@@ -426,17 +425,17 @@ class StageWorker(abc.ABC, Generic[T, V]):
             # metrics
             for gpu_alloc in self._worker.allocation.gpus:
                 self._metrics_gpu_alloc.set(
-                    gpu_alloc.fraction,
+                    gpu_alloc.used_fraction,
                     tags={
                         "stage": self._params.name,
                         "ActorId": self._worker.id,
-                        "GpuIndex": str(gpu_alloc.gpu_index),
+                        "GpuIndex": str(gpu_alloc.index),
                     },
                 )
 
             return node_location
 
-    @ray.method(num_returns="dynamic", retry_exceptions=False)
+    @ray.method(num_returns="dynamic", retry_exceptions=False)  # type: ignore
     def process_data(self, task_data: TaskData[T]) -> Generator[Union[V, TaskResultMetadata], None, None]:
         """Submits a task for asynchronous processing by the worker's internal threads.
 
@@ -482,7 +481,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
             yield result.extras
             yield from result.out_data
 
-    @ray.method(retry_exceptions=False)
+    @ray.method(retry_exceptions=False)  # type: ignore
     def cancel_task(self, task_data: TaskData[T]) -> bool:
         """Attempts to cancel a task that has been submitted but not yet started.
 
