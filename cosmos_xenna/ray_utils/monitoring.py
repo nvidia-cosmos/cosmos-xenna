@@ -17,19 +17,19 @@ from typing import Optional
 
 import attrs
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna.pipelines.private import resources
 
 
 @attrs.define
 class PendingActorStats:
     id: str
-    resources: rust_resources.WorkerResources
+    resources: resources.WorkerResources
 
 
 @attrs.define
 class ReadyActorStats:
     id: str
-    resources: rust_resources.WorkerResources
+    resources: resources.WorkerResources
     speed_tasks_per_second: Optional[float]
     num_used_slots: int
     max_num_slots: int
@@ -62,7 +62,7 @@ class SlotStats:
 @attrs.define
 class ActorPoolStats:
     name: str
-    shape: rust_resources.WorkerShape
+    shape: resources.WorkerShape
     actor_stats: ActorStats
     task_stats: TaskStats
     slot_stats: SlotStats

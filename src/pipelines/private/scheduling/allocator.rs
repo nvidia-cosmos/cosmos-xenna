@@ -43,7 +43,7 @@ use thiserror::Error;
 
 use crate::utils::module_builders::ImportablePyModuleBuilder;
 
-use super::resources::{AllocationError, ClusterResources, NodeResources, Worker};
+use super::resources::{AllocationError, ClusterResources, Worker};
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -80,8 +80,6 @@ pub enum WorkerAllocatorError {
     WorkerNotFound(String),
     #[error("Allocation error: {0}")]
     Allocation(#[from] AllocationError),
-    #[error("Cluster is over-allocated: {0}")]
-    OverAllocated(String),
 }
 
 /// Manages resource allocation for distributed pipeline workers across nodes.
@@ -103,10 +101,9 @@ pub enum WorkerAllocatorError {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct WorkerAllocator {
-    cluster_resources: ClusterResources,
+    pub cluster_resources: ClusterResources,
     nodes_state: HashMap<String, NodeWorkers>,
-    stages_state: HashMap<String, StageWorkers>,
-    available_resources: ClusterResources,
+    pub stages_state: HashMap<String, StageWorkers>,
 }
 
 impl WorkerAllocator {
@@ -125,7 +122,6 @@ impl WorkerAllocator {
         }
 
         let mut this = Self {
-            available_resources: cluster_resources.clone(),
             cluster_resources,
             nodes_state,
             stages_state: HashMap::new(),
@@ -133,24 +129,12 @@ impl WorkerAllocator {
 
         if let Some(initial_workers) = workers {
             this.add_workers(initial_workers.into_iter())?;
-        } else {
-            // Ensure available_resources is consistent
-            this.recalculate_available_resources()?;
         }
-
         Ok(this)
     }
 
     pub fn num_nodes(&self) -> usize {
         self.nodes_state.len()
-    }
-
-    pub fn totals(&self) -> &ClusterResources {
-        &self.cluster_resources
-    }
-
-    pub fn available_resources(&self) -> &ClusterResources {
-        &self.available_resources
     }
 
     fn ensure_worker_id_absent(&self, worker_id: &str) -> Result<(), WorkerAllocatorError> {
@@ -174,16 +158,17 @@ impl WorkerAllocator {
     /// Returns `WorkerAllocatorError::DuplicateWorkerId` if worker ID already exists.
     /// Returns `WorkerAllocatorError::OverAllocated` if adding worker would exceed available resources.
     pub fn add_worker(&mut self, worker: Worker) -> Result<(), WorkerAllocatorError> {
-        worker.allocation.validate();
         self.ensure_worker_id_absent(&worker.id)?;
 
-        // Ensure node exists; do not create implicitly
-        let Some(container) = self.nodes_state.get_mut(&worker.allocation.node) else {
-            return Err(WorkerAllocatorError::Allocation(
-                AllocationError::NodeNotFound(worker.allocation.node.clone()),
-            ));
-        };
-        container.by_id.insert(worker.id.clone(), worker.clone());
+        // Allocate resources on the node
+        self.cluster_resources.allocate(&worker.allocation)?;
+
+        // Track via node state
+        let node_state = self
+            .nodes_state
+            .get_mut(&worker.allocation.node)
+            .expect("node exists");
+        node_state.by_id.insert(worker.id.clone(), worker.clone());
 
         // Track in stage index
         self.stages_state
@@ -191,8 +176,6 @@ impl WorkerAllocator {
             .or_default()
             .by_id
             .insert(worker.id.clone(), worker);
-
-        self.recalculate_available_resources()?;
         Ok(())
     }
 
@@ -208,40 +191,36 @@ impl WorkerAllocator {
     where
         I: IntoIterator<Item = Worker>,
     {
-        // Validate first (IDs and allocations)
-        let mut to_insert: Vec<Worker> = Vec::new();
+        // Collect workers so we can pre-validate and also roll back if needed
+        let workers_vec: Vec<Worker> = workers.into_iter().collect();
+
+        // Fast duplicate detection within the provided batch
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for w in workers {
-            w.allocation.validate();
-            self.ensure_worker_id_absent(&w.id)?;
-            // Detect duplicates within the same batch
+        for w in &workers_vec {
             if !seen_ids.insert(w.id.clone()) {
                 return Err(WorkerAllocatorError::DuplicateWorkerId(w.id.clone()));
             }
-            if !self.nodes_state.contains_key(&w.allocation.node) {
-                return Err(WorkerAllocatorError::Allocation(
-                    AllocationError::NodeNotFound(w.allocation.node.clone()),
-                ));
+        }
+
+        // Ensure none of these IDs already exist in the allocator
+        for w in &workers_vec {
+            self.ensure_worker_id_absent(&w.id)?;
+        }
+
+        // Try to add each worker; if any fail, roll back previously added ones
+        let mut added_ids: Vec<String> = Vec::new();
+        for w in workers_vec {
+            let id = w.id.clone();
+            if let Err(e) = self.add_worker(w) {
+                // Rollback already-added workers
+                for added_id in added_ids.iter() {
+                    let _ = self.remove_worker(added_id);
+                }
+                return Err(e);
             }
-            to_insert.push(w);
+            added_ids.push(id);
         }
 
-        // Insert
-        for worker in to_insert.into_iter() {
-            let container = self
-                .nodes_state
-                .get_mut(&worker.allocation.node)
-                .expect("validated above that node exists");
-            container.by_id.insert(worker.id.clone(), worker.clone());
-
-            self.stages_state
-                .entry(worker.stage_name.clone())
-                .or_default()
-                .by_id
-                .insert(worker.id.clone(), worker);
-        }
-
-        self.recalculate_available_resources()?;
         Ok(())
     }
 
@@ -270,56 +249,50 @@ impl WorkerAllocator {
         None
     }
 
-    pub fn delete_worker(&mut self, worker_id: &str) -> Result<Worker, WorkerAllocatorError> {
+    pub fn remove_worker(&mut self, worker_id: &str) -> Result<Worker, WorkerAllocatorError> {
         let worker = self.get_worker(worker_id)?;
-        if let Some(container) = self.nodes_state.get_mut(&worker.allocation.node) {
-            container.by_id.remove(worker_id);
-        }
-        if let Some(stage_map) = self.stages_state.get_mut(&worker.stage_name) {
-            stage_map.by_id.remove(worker_id);
-        }
-        self.recalculate_available_resources()?;
+        self.cluster_resources
+            .release_allocation(&worker.allocation)?;
+
+        let node_state = self
+            .nodes_state
+            .get_mut(&worker.allocation.node)
+            .expect("node exists");
+        node_state.by_id.remove(worker_id);
+
+        let stage_state = self
+            .stages_state
+            .get_mut(&worker.stage_name)
+            .expect("stage exists");
+        stage_state.by_id.remove(worker_id);
+
         Ok(worker)
     }
 
     pub fn delete_workers(&mut self, worker_ids: &[String]) -> Result<(), WorkerAllocatorError> {
-        // Collect workers first to avoid partial state if any are missing
-        let mut workers: Vec<Worker> = Vec::with_capacity(worker_ids.len());
-        {
-            let mut seen: HashSet<&str> = HashSet::new();
-            for id in worker_ids {
-                if !seen.insert(id.as_str()) {
-                    // Duplicates in input are not allowed, mirror Python assertion
-                    return Err(WorkerAllocatorError::DuplicateWorkerId(id.clone()));
+        // Delete each worker; if any fail, re-add those already deleted and return the error
+        let mut deleted_workers: Vec<Worker> = Vec::new();
+        for worker_id in worker_ids {
+            match self.remove_worker(worker_id) {
+                Ok(w) => deleted_workers.push(w),
+                Err(e) => {
+                    // Rollback previously deleted workers
+                    for w in deleted_workers.into_iter() {
+                        let _ = self.add_worker(w);
+                    }
+                    return Err(e);
                 }
-                workers.push(self.get_worker(id)?);
             }
         }
-
-        for worker in workers.into_iter() {
-            if let Some(container) = self.nodes_state.get_mut(&worker.allocation.node) {
-                container.by_id.remove(&worker.id);
-            }
-            if let Some(stage_map) = self.stages_state.get_mut(&worker.stage_name) {
-                stage_map.by_id.remove(&worker.id);
-            }
-        }
-        self.recalculate_available_resources()?;
         Ok(())
     }
 
-    /// Retrieves all workers assigned to a pipeline stage.
-    ///
-    /// # Arguments
-    /// * `stage_name` - Name of the pipeline stage.
-    ///
-    /// # Returns
-    /// List of Worker instances assigned to the stage.
-    pub fn get_workers_in_stage(&self, stage_name: &str) -> Vec<Worker> {
-        self.stages_state
-            .get(stage_name)
-            .map(|s| s.by_id.values().cloned().collect())
-            .unwrap_or_default()
+    pub fn get_mut_cluster_resources(&mut self) -> &mut ClusterResources {
+        &mut self.cluster_resources
+    }
+
+    pub fn get_cluster_resources(&self) -> &ClusterResources {
+        &self.cluster_resources
     }
 
     pub fn get_workers(&self) -> Vec<Worker> {
@@ -336,45 +309,6 @@ impl WorkerAllocator {
             out.insert(stage.clone(), workers.by_id.len());
         }
         out
-    }
-
-    /// Updates tracking of remaining available resources across nodes.
-    ///
-    /// This method recalculates available resources by subtracting all allocated
-    /// resources from the total available resources. It tracks CPU, GPU, NVDEC,
-    /// and NVENC allocations.
-    ///
-    /// # Errors
-    /// Returns `WorkerAllocatorError::OverAllocated` if current allocation exceeds available resources.
-    fn recalculate_available_resources(&mut self) -> Result<(), WorkerAllocatorError> {
-        // Start from the full cluster resources
-        let mut remaining = self.cluster_resources.clone();
-
-        // Subtract all allocations
-        for node_workers in self.nodes_state.values() {
-            for worker in node_workers.by_id.values() {
-                // Allocate on the correct node
-                let Some(node) = remaining.nodes.get_mut(&worker.allocation.node) else {
-                    return Err(
-                        AllocationError::NodeNotFound(worker.allocation.node.clone()).into(),
-                    );
-                };
-                Self::allocate_on_node(node, &worker).map_err(WorkerAllocatorError::Allocation)?;
-            }
-        }
-
-        if remaining.is_overallocated() {
-            return Err(WorkerAllocatorError::OverAllocated(
-                remaining.make_overallocated_message(&self.cluster_resources),
-            ));
-        }
-
-        self.available_resources = remaining;
-        Ok(())
-    }
-
-    fn allocate_on_node(node: &mut NodeResources, worker: &Worker) -> Result<(), AllocationError> {
-        node.allocate(&worker.allocation)
     }
 
     /// Returns worker IDs sorted by their node's CPU utilization.
@@ -421,32 +355,14 @@ impl WorkerAllocator {
     /// HashMap mapping node IDs to CPU utilization ratios for each node.
     pub fn calculate_node_cpu_utilizations(&self) -> HashMap<String, f32> {
         let mut utilizations: HashMap<String, f32> = HashMap::new();
-        let node_ids: HashSet<String> = self
-            .cluster_resources
-            .nodes
-            .keys()
-            .cloned()
-            .chain(self.available_resources.nodes.keys().cloned())
-            .collect();
 
-        for node_id in node_ids {
-            let total = self
-                .cluster_resources
-                .nodes
-                .get(&node_id)
-                .expect("node id must exist in cluster_resources");
-            let remaining = self
-                .available_resources
-                .nodes
-                .get(&node_id)
-                .expect("node id must exist in available_resources");
-            let used_cpus = total.cpus - remaining.cpus;
-            let utilization = if total.cpus > 0.0 {
-                used_cpus / total.cpus
+        for (node_id, node) in self.cluster_resources.nodes.iter() {
+            let utilization = if node.total_cpus > 0.0 {
+                node.used_cpus.to_num::<f32>() / node.total_cpus.to_num::<f32>()
             } else {
                 0.0
             };
-            utilizations.insert(node_id, utilization);
+            utilizations.insert(node_id.clone(), utilization);
         }
         utilizations
     }
@@ -459,75 +375,28 @@ impl WorkerAllocator {
     /// # Returns
     /// Formatted string containing the utilization table.
     pub fn make_detailed_utilization_table(&self) -> String {
-        let mut node_ids: Vec<String> = self.cluster_resources.nodes.keys().cloned().collect();
-        for nid in self.nodes_state.keys() {
-            if !node_ids.contains(nid) {
-                node_ids.push(nid.clone());
-            }
-        }
-
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL)
             .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                Cell::new("Component"),
-                Cell::new("Utilization"),
-                Cell::new("NVDEC"),
-                Cell::new("NVENC"),
-            ]);
+            .set_header(vec![Cell::new("Component"), Cell::new("Utilization")]);
 
-        for (node_index, node_id) in node_ids.iter().enumerate() {
-            let total = self
-                .cluster_resources
-                .nodes
-                .get(node_id)
-                .expect("node id must exist in cluster_resources");
-            let node_workers = self.nodes_state.get(node_id);
-
-            let mut cpu_usage: f32 = 0.0;
-            let mut gpu_usage: Vec<f32> = vec![0.0; total.gpus.len()];
-            let mut nvdec_usage: Vec<f32> = vec![0.0; total.gpus.len()];
-            let mut nvenc_usage: Vec<f32> = vec![0.0; total.gpus.len()];
-
-            if let Some(nw) = node_workers {
-                for worker in nw.by_id.values() {
-                    cpu_usage += worker.allocation.cpus;
-                    for gpu in &worker.allocation.gpus {
-                        if let Some(slot) = gpu_usage.get_mut(gpu.gpu_index) {
-                            *slot += gpu.fraction;
-                        }
-                    }
-                    for nvdec in &worker.allocation.nvdecs {
-                        if let Some(slot) = nvdec_usage.get_mut(nvdec.gpu_index) {
-                            *slot += 1.0;
-                        }
-                    }
-                    for nvenc in &worker.allocation.nvencs {
-                        if let Some(slot) = nvenc_usage.get_mut(nvenc.gpu_index) {
-                            *slot += 1.0;
-                        }
-                    }
-                }
-            }
-
-            let cpu_bar = create_bar_chart(cpu_usage, total.cpus, 20);
+        for (node_index, node_resources) in self.cluster_resources.nodes.values().enumerate() {
+            let cpu_bar = create_bar_chart(
+                node_resources.used_cpus.to_num::<f32>(),
+                node_resources.total_cpus.to_num::<f32>(),
+                20,
+            );
             table.add_row(vec![
                 Cell::new(format!("Node {}", node_index)),
                 Cell::new(format!("CPUs: {}", cpu_bar)),
-                Cell::new(""),
-                Cell::new(""),
             ]);
 
-            for (i, gpu) in total.gpus.iter().enumerate() {
-                let gpu_bar = create_bar_chart(gpu_usage[i], 1.0, 20);
-                let nvdec_bar = create_bar_chart(nvdec_usage[i], gpu.num_nvdecs() as f32, 20);
-                let nvenc_bar = create_bar_chart(nvenc_usage[i], gpu.num_nvencs() as f32, 20);
+            for (i, gpu) in node_resources.gpus.iter().enumerate() {
+                let gpu_bar = create_bar_chart(gpu.used_fraction.to_num::<f32>(), 1.0, 20);
                 table.add_row(vec![
                     Cell::new(format!("  GPU {}", i)),
                     Cell::new(format!("GPU: {}", gpu_bar)),
-                    Cell::new(format!("NVDEC: {}", nvdec_bar)),
-                    Cell::new(format!("NVENC: {}", nvenc_bar)),
                 ]);
             }
         }
@@ -570,14 +439,39 @@ impl WorkerAllocator {
         Self::new(cluster_resources, None).expect("failed to initialize WorkerAllocator")
     }
 
-    #[pyo3(name = "totals")]
-    pub fn py_totals(&self) -> ClusterResources {
-        self.totals().clone()
+    // #[pyo3(name = "totals")]
+    // pub fn py_totals(&self) -> ClusterResources {
+    //     self.totals().clone()
+    // }
+
+    // #[pyo3(name = "available_resources")]
+    // pub fn py_available_resources(&self) -> ClusterResources {
+    //     self.available_resources().clone()
+    // }
+
+    pub fn get_gpu_index(&self, node_id: &str, gpu_offset: usize) -> usize {
+        self.cluster_resources
+            .nodes
+            .get(node_id)
+            .expect("node not found")
+            .gpus
+            .get(gpu_offset)
+            .expect("gpu not found")
+            .index as usize
     }
 
-    #[pyo3(name = "available_resources")]
-    pub fn py_available_resources(&self) -> ClusterResources {
-        self.available_resources().clone()
+    /// Retrieves all workers assigned to a pipeline stage.
+    ///
+    /// # Arguments
+    /// * `stage_name` - Name of the pipeline stage.
+    ///
+    /// # Returns
+    /// List of Worker instances assigned to the stage.
+    pub fn get_workers_in_stage(&self, stage_name: &str) -> Vec<Worker> {
+        self.stages_state
+            .get(stage_name)
+            .map(|s| s.by_id.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     #[pyo3(name = "num_nodes")]
@@ -597,9 +491,9 @@ impl WorkerAllocator {
         Ok(())
     }
 
-    #[pyo3(name = "delete_worker")]
-    pub fn py_delete_worker(&mut self, worker_id: String) -> PyResult<Worker> {
-        self.delete_worker(&worker_id).map_err(Into::into)
+    #[pyo3(name = "remove_worker")]
+    pub fn py_remove_worker(&mut self, worker_id: String) -> PyResult<Worker> {
+        self.remove_worker(&worker_id).map_err(Into::into)
     }
 
     #[pyo3(name = "delete_workers")]
@@ -610,11 +504,6 @@ impl WorkerAllocator {
     #[pyo3(name = "get_worker")]
     pub fn py_get_worker(&self, worker_id: String) -> Option<Worker> {
         self.get_worker_if_exists(&worker_id)
-    }
-
-    #[pyo3(name = "get_workers_in_stage")]
-    pub fn py_get_workers_in_stage(&self, stage_name: String) -> Vec<Worker> {
-        self.get_workers_in_stage(&stage_name)
     }
 
     #[pyo3(name = "get_workers")]
@@ -669,25 +558,33 @@ mod tests {
 
     fn make_simple_cluster() -> rds::ClusterResources {
         let mut nodes: HashMap<String, rds::NodeResources> = HashMap::new();
-        let node0 = rds::NodeResources::new(
-            8.0,
-            Some(vec![
-                rds::GpuResources::new(0, uuid::Uuid::new_v4(), 1.0, vec![0, 1], vec![0, 1]),
-                rds::GpuResources::new(1, uuid::Uuid::new_v4(), 1.0, vec![0, 1], vec![0, 1]),
-            ]),
-            None,
-        );
-        let node1 = rds::NodeResources::new(
-            4.0,
-            Some(vec![rds::GpuResources::new(
-                0,
-                uuid::Uuid::new_v4(),
-                1.0,
-                vec![0],
-                vec![1],
-            )]),
-            None,
-        );
+        let node0 = rds::NodeResources {
+            used_cpus: rds::FixedUtil::ZERO,
+            total_cpus: rds::FixedUtil::from_num(8.0),
+            gpus: vec![
+                rds::GpuResources {
+                    index: 0,
+                    uuid_: uuid::Uuid::new_v4(),
+                    used_fraction: rds::FixedUtil::ZERO,
+                },
+                rds::GpuResources {
+                    index: 1,
+                    uuid_: uuid::Uuid::new_v4(),
+                    used_fraction: rds::FixedUtil::ZERO,
+                },
+            ],
+            name: None,
+        };
+        let node1 = rds::NodeResources {
+            used_cpus: rds::FixedUtil::ZERO,
+            total_cpus: rds::FixedUtil::from_num(4.0),
+            gpus: vec![rds::GpuResources {
+                index: 0,
+                uuid_: uuid::Uuid::new_v4(),
+                used_fraction: rds::FixedUtil::ZERO,
+            }],
+            name: None,
+        };
         nodes.insert("0".to_string(), node0);
         nodes.insert("1".to_string(), node1);
         rds::ClusterResources::new(Some(nodes))
@@ -700,9 +597,16 @@ mod tests {
     fn wr(node: &str, cpus: f32, gpus: Vec<(usize, f32)>) -> rds::WorkerResources {
         let gpu_allocs: Vec<rds::GPUAllocation> = gpus
             .into_iter()
-            .map(|(idx, frac)| rds::GPUAllocation::new(idx, frac))
+            .map(|(idx, frac)| rds::GPUAllocation {
+                index: idx,
+                used_fraction: rds::FixedUtil::from_num(frac),
+            })
             .collect();
-        rds::WorkerResources::new(node.to_string(), cpus, Some(gpu_allocs), None, None)
+        rds::WorkerResources {
+            node: node.to_string(),
+            cpus: rds::FixedUtil::from_num(cpus),
+            gpus: gpu_allocs,
+        }
     }
 
     #[test]
@@ -762,20 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_remaining_resources() {
-        let mut allocator = make_allocator();
-        let workers = vec![
-            rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)])),
-            rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![])),
-        ];
-        allocator.add_workers(workers).expect("add workers");
-        let remaining = allocator.available_resources().clone();
-        assert_eq!(remaining.nodes.get("0").unwrap().cpus, 6.0);
-        assert!((remaining.nodes.get("0").unwrap().gpus[0].gpu_fraction - 0.5).abs() < 1e-6);
-        assert_eq!(remaining.nodes.get("1").unwrap().cpus, 3.0);
-    }
-
-    #[test]
     fn test_make_detailed_utilization_table() {
         let mut allocator = make_allocator();
         let workers = vec![
@@ -794,7 +684,7 @@ mod tests {
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 10.0, vec![]));
         let err = allocator.add_worker(worker).unwrap_err();
         match err {
-            WorkerAllocatorError::OverAllocated(_) => {}
+            WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
         }
     }
@@ -808,7 +698,7 @@ mod tests {
         ];
         let err = allocator.add_workers(workers).unwrap_err();
         match err {
-            WorkerAllocatorError::OverAllocated(_) => {}
+            WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
         }
     }
@@ -821,7 +711,7 @@ mod tests {
         allocator.add_worker(w1).expect("add first");
         let err = allocator.add_worker(w2).unwrap_err();
         match err {
-            WorkerAllocatorError::OverAllocated(_) => {}
+            WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
         }
     }
@@ -833,35 +723,29 @@ mod tests {
             rds::Worker::new(
                 "1".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "0".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 1.0)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "0".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 1.0)],
+                },
             ),
             rds::Worker::new(
                 "2".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "1".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 0.7)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "1".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 0.7)],
+                },
             ),
             rds::Worker::new(
                 "2".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "1".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 0.31)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "1".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 0.31)],
+                },
             ),
         ];
         let err = allocator.add_workers(workers).unwrap_err();
@@ -878,40 +762,34 @@ mod tests {
             rds::Worker::new(
                 "1".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "0".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 1.0)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "0".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 1.0)],
+                },
             ),
             rds::Worker::new(
                 "2".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "1".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 0.7)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "1".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 0.7)],
+                },
             ),
             rds::Worker::new(
                 "3".into(),
                 "1".into(),
-                rds::WorkerResources::new(
-                    "1".into(),
-                    0.0,
-                    Some(vec![rds::GPUAllocation::new(0, 0.31)]),
-                    None,
-                    None,
-                ),
+                rds::WorkerResources {
+                    node: "1".into(),
+                    cpus: rds::FixedUtil::ZERO,
+                    gpus: vec![rds::GPUAllocation::new(0, 0.31)],
+                },
             ),
         ];
         let err = allocator.add_workers(workers).unwrap_err();
         match err {
-            WorkerAllocatorError::OverAllocated(_) => {}
+            WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
         }
     }
@@ -922,17 +800,15 @@ mod tests {
         let worker = rds::Worker::new(
             "w1".into(),
             "stage1".into(),
-            rds::WorkerResources::new(
-                "0".into(),
-                1.0,
-                Some(vec![rds::GPUAllocation::new(0, 1.5)]),
-                None,
-                None,
-            ),
+            rds::WorkerResources {
+                node: "0".into(),
+                cpus: rds::FixedUtil::from_num(1.0),
+                gpus: vec![rds::GPUAllocation::new(0, 1.5)],
+            },
         );
         let err = allocator.add_worker(worker).unwrap_err();
         match err {
-            WorkerAllocatorError::OverAllocated(_) => {}
+            WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
         }
     }
@@ -962,7 +838,7 @@ mod tests {
         let mut allocator = make_allocator();
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
         allocator.add_worker(worker).expect("add");
-        allocator.delete_worker("w1").expect("delete");
+        allocator.remove_worker("w1").expect("delete");
         assert!(allocator.get_worker("w1").is_err());
     }
 
@@ -996,51 +872,6 @@ mod tests {
         assert_eq!(v.len(), 2);
         let ids: std::collections::HashSet<_> = v.iter().map(|(_, id)| id.as_str()).collect();
         assert!(ids.contains("w1") && ids.contains("w3"));
-    }
-
-    #[test]
-    fn test_overallocation_with_nvdec_nvenc() {
-        let mut allocator = make_allocator();
-        let w1 = rds::Worker::new(
-            "w1".into(),
-            "stage1".into(),
-            rds::WorkerResources::new(
-                "0".into(),
-                1.0,
-                Some(vec![rds::GPUAllocation::new(0, 0.5)]),
-                Some(vec![
-                    rds::CodecAllocation::new(0, 0),
-                    rds::CodecAllocation::new(0, 1),
-                ]),
-                Some(vec![
-                    rds::CodecAllocation::new(0, 0),
-                    rds::CodecAllocation::new(0, 1),
-                ]),
-            ),
-        );
-        let w2 = rds::Worker::new(
-            "w2".into(),
-            "stage2".into(),
-            rds::WorkerResources::new(
-                "0".into(),
-                1.0,
-                Some(vec![rds::GPUAllocation::new(0, 0.5)]),
-                Some(vec![
-                    rds::CodecAllocation::new(0, 0),
-                    rds::CodecAllocation::new(0, 1),
-                ]),
-                Some(vec![
-                    rds::CodecAllocation::new(0, 0),
-                    rds::CodecAllocation::new(0, 1),
-                ]),
-            ),
-        );
-        let err = allocator.add_workers(vec![w1, w2]).unwrap_err();
-        match err {
-            WorkerAllocatorError::Allocation(AllocationError::NvdecUnavailable { .. }) => {}
-            WorkerAllocatorError::Allocation(AllocationError::NvencUnavailable { .. }) => {}
-            _ => panic!("unexpected error variant: {err:?}"),
-        }
     }
 
     #[test]

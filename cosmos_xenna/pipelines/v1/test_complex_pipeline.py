@@ -17,7 +17,7 @@ import os
 import typing
 from typing import Optional
 
-import pytest  # noqa: F401
+import pytest
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
 
@@ -41,7 +41,7 @@ class _CpuStage(pipelines_v1.Stage):
 class _NvdecStage(pipelines_v1.Stage):
     @property
     def required_resources(self) -> Optional[pipelines_v1.Resources]:
-        return pipelines_v1.Resources(cpus=1.0, nvdecs=1)
+        return pipelines_v1.Resources(cpus=1.0)
 
     @property
     def stage_batch_size(self) -> int:
@@ -57,7 +57,7 @@ class _NvdecStage(pipelines_v1.Stage):
 class _NvencStage(pipelines_v1.Stage):
     @property
     def required_resources(self) -> Optional[pipelines_v1.Resources]:
-        return pipelines_v1.Resources(cpus=1.0, nvencs=1)
+        return pipelines_v1.Resources(cpus=1.0)
 
     @property
     def stage_batch_size(self) -> int:
@@ -73,7 +73,7 @@ class _NvencStage(pipelines_v1.Stage):
 class _FractionalGpuStage(pipelines_v1.Stage):
     @property
     def required_resources(self) -> Optional[pipelines_v1.Resources]:
-        return pipelines_v1.Resources(cpus=0.1, gpus=0.1, nvdecs=1)
+        return pipelines_v1.Resources(cpus=0.1, gpus=0.1)
 
     @property
     def stage_batch_size(self) -> int:
@@ -90,6 +90,11 @@ class _FractionalGpuStage(pipelines_v1.Stage):
 
 
 def test_pipeline() -> None:
+    # Skip test if no GPUs are available
+    gpu_infos = pipelines_v1.get_local_gpu_info()
+    if not gpu_infos:
+        pytest.skip("No GPUs available on this machine")
+
     pipeline_spec = pipelines_v1.PipelineSpec(
         input_data=range(1000),
         stages=[_CpuStage(), _NvdecStage(), _NvencStage(), _FractionalGpuStage()],

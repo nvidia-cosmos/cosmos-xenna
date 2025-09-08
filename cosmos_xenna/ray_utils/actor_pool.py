@@ -33,8 +33,7 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 from ray.util.metrics import Counter
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import allocator
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust_resources
+from cosmos_xenna.pipelines.private import allocator, resources
 from cosmos_xenna.ray_utils import monitoring, stage, stage_worker
 from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import stats, timing
@@ -49,7 +48,7 @@ _MAX_QUEUED_TASK_METADATAS = 10000
 
 @attrs.define
 class _ActorMetadata:
-    worker: rust_resources.Worker
+    worker: resources.Worker
 
 
 @attrs.define
@@ -226,6 +225,14 @@ class QueueParams:
 
 
 @attrs.define
+class PoolParams:
+    # Enable/disable whole work stealing feature
+    enable_work_stealing: bool = False
+    # Only allow work stealing if an actor has been idle for this many seconds.
+    work_steal_idle_threshold_s: float = 1.0
+
+
+@attrs.define
 class ActorIds:
     """A list of actor IDs for this pool."""
 
@@ -328,18 +335,15 @@ class ActorPool(Generic[T, V]):
         params: stage.Params,
         name: str,
         queue_params: QueueParams | None = None,
-        enable_work_stealing: bool = True,
-        work_steal_idle_threshold_s: float = 1.0,
+        pool_params: PoolParams | None = None,
     ):
         self._name = str(name)
         self._queue_params = queue_params
+        self._pool_params = pool_params if pool_params is not None else PoolParams()
         self._stage_interface = stage_interface
         self._params = params
         self._worker_shape = params.shape
         self._allocator = worker_allocator
-        self._enable_work_stealing = enable_work_stealing
-        # Only allow work stealing if an actor has been idle for this many seconds.
-        self._work_steal_idle_threshold_s = float(work_steal_idle_threshold_s)
 
         # State related to node-level setup (`setup_on_node`)
         self._nodes_with_completed_setups: set[str] = set()  # Nodes where setup_on_node succeeded.
@@ -372,8 +376,8 @@ class ActorPool(Generic[T, V]):
         )
         self._num_actors_tried_to_start = 0
         self._num_actors_failed_to_start = 0
-        self._actors_to_delete: collections.deque[rust_resources.Worker] = collections.deque()
-        self._actors_to_create: collections.deque[rust_resources.Worker] = collections.deque()
+        self._actors_to_delete: collections.deque[resources.Worker] = collections.deque()
+        self._actors_to_create: collections.deque[resources.Worker] = collections.deque()
         # Timestamp of last intentional actor-restart event
         self._last_actor_restart_time = time.time()
 
@@ -415,7 +419,7 @@ class ActorPool(Generic[T, V]):
         return self._name
 
     @property
-    def worker_shape(self) -> rust_resources.WorkerShape:
+    def worker_shape(self) -> resources.WorkerShape:
         return self._worker_shape
 
     @property
@@ -503,10 +507,10 @@ class ActorPool(Generic[T, V]):
             return None
         return float(statistics.median(rates))
 
-    def add_actor_to_delete(self, worker: rust_resources.Worker) -> None:
+    def add_actor_to_delete(self, worker: resources.Worker) -> None:
         self._actors_to_delete.append(worker)
 
-    def add_actor_to_create(self, worker: rust_resources.Worker) -> None:
+    def add_actor_to_create(self, worker: resources.Worker) -> None:
         self._actors_to_create.append(worker)
 
     def set_num_slots_per_actor(self, target: int) -> None:
@@ -552,21 +556,16 @@ class ActorPool(Generic[T, V]):
         ready_ids = [x.actor_ref._ray_actor_id.hex() for x in self._ready_actors.values()]  # type: ignore[attr-defined]
         return ActorIds(pending_ids, ready_ids)
 
-    def _add_actor(self, worker: rust_resources.Worker) -> None:
+    def _add_actor(self, worker: resources.Worker) -> None:
         """Creates a new actor and initiates its setup process."""
         # Prepare the runtime environment with CUDA_VISIBLE_DEVICES
         gpu_ids: set[int] = set()
         for gpu in worker.allocation.gpus:
-            gpu_ids.add(gpu.gpu_index)
-        for alloc in worker.allocation.nvdecs:
-            gpu_ids.add(alloc.gpu_index)
-        for alloc in worker.allocation.nvencs:  # Corrected typo here
-            gpu_ids.add(alloc.gpu_index)
+            gpu_ids.add(gpu.index)
         env_vars = {}
-        node_resources = self._allocator.totals().nodes[worker.allocation.node]
         if self._params.modify_cuda_visible_devices_env_var:
             env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(
-                [str(node_resources.gpus[gpu_i].index) for gpu_i in sorted(gpu_ids)]
+                [str(self._allocator.get_gpu_index(worker.allocation.node, gpu_i)) for gpu_i in sorted(gpu_ids)]
             )
 
         env_vars.update(self._params.runtime_env.extra_env_vars)
@@ -607,7 +606,7 @@ class ActorPool(Generic[T, V]):
             # No setup started for this node, designate this actor for node setup
             self._add_node_setup_actor(actor_handle, worker)
 
-    def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
+    def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
         """Adds an actor to the list waiting for node setup on its target node."""
         self._actors_waiting_for_node_setup[worker.allocation.node].append(
             _ActorWaitingForNodeSetup(
@@ -616,7 +615,7 @@ class ActorPool(Generic[T, V]):
             )
         )
 
-    def _add_node_setup_actor(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
+    def _add_node_setup_actor(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
         """Designates an actor to perform node setup and adds it to the pending node state."""
         # Ask Ray to call "setup_on_node" on the actor and keep a reference to this call.
         setup_call_ref = typing.cast(ObjectRef, actor_handle.setup_on_node.remote())
@@ -626,7 +625,7 @@ class ActorPool(Generic[T, V]):
             setup_call_ref,
         )
 
-    def _add_pending_actor(self, actor_handle: ActorHandle, worker: rust_resources.Worker) -> None:
+    def _add_pending_actor(self, actor_handle: ActorHandle, worker: resources.Worker) -> None:
         """Adds an actor to the pending state to run its individual setup."""
         # Ask Ray to call "setup" on the actor and keep a reference to this call.
         setup_call_ref = typing.cast(ObjectRef, actor_handle.setup.remote())
@@ -652,7 +651,7 @@ class ActorPool(Generic[T, V]):
                 self._num_actors_failed_to_start,
                 self._params.max_setup_failure_percentage / 100.0,
             )
-            self._allocator.delete_worker(actor.metadata.worker.id)  # Ensure worker is marked as deleted
+            self._allocator.remove_worker(actor.metadata.worker.id)  # Ensure worker is marked as deleted
             if should_fail_pipeline:
                 logger.error(
                     f"Significant setup failure rate detected ({self._num_actors_failed_to_start}/"
@@ -669,7 +668,7 @@ class ActorPool(Generic[T, V]):
             # Catch other potential exceptions during ray.get
             self._num_actors_failed_to_start += 1
             logger.error(f"Unexpected error getting setup result for actor {actor_id}: {e}")
-            self._allocator.delete_worker(actor.metadata.worker.id)
+            self._allocator.remove_worker(actor.metadata.worker.id)
             # Decide whether to raise based on threshold, similar to above
             # This might indicate a deeper Ray issue rather than just actor setup code failure
             raise RuntimeError(f"Unexpected error during actor setup for stage {self.name}.") from e
@@ -733,7 +732,7 @@ class ActorPool(Generic[T, V]):
             logger.error(
                 f"Node setup failed for node {node_id} by actor {node_setup_actor.metadata.worker.id}. Error: {e}"
             )
-            self._allocator.delete_worker(node_setup_actor.metadata.worker.id)
+            self._allocator.remove_worker(node_setup_actor.metadata.worker.id)
             # TODO: Handle cleanup and retries.
             # Promote the next waiting actor (if any) to retry node setup
             # waiting_actors = self._actors_waiting_for_node_setup.pop(node_id, [])
@@ -755,7 +754,7 @@ class ActorPool(Generic[T, V]):
                 f"Unexpected error getting node setup result for node {node_id}, "
                 f"actor {node_setup_actor.metadata.worker.id}: {e}"
             )
-            self._allocator.delete_worker(node_setup_actor.metadata.worker.id)
+            self._allocator.remove_worker(node_setup_actor.metadata.worker.id)
             # Handle unexpected errors similarly - potentially promote another waiter or fail
             raise RuntimeError(f"Unexpected error during node setup for stage {self.name}.") from e
 
@@ -794,7 +793,7 @@ class ActorPool(Generic[T, V]):
         # now find the longest-running actor
         max_running_time_m = 0
         actor_id_to_delete: str | None = None
-        worker_allocation_to_restart: rust_resources.Worker | None = None
+        worker_allocation_to_restart: resources.Worker | None = None
         for actor_id, actor in self._ready_actors.items():
             # whether the actor has been running too long
             running_time_m = (time.time() - actor.start_time) / 60
@@ -895,7 +894,7 @@ class ActorPool(Generic[T, V]):
 
         # Only delete from allocator if we successfully found and killed the actor representation
         logger.debug(f"Deleting worker {actor_id} from allocator.")
-        self._allocator.delete_worker(actor_id)
+        self._allocator.remove_worker(actor_id)
 
     def _try_delete_pending_actor(self, actor_id: str) -> bool:
         """Attempts to delete an actor from the pending state."""
@@ -1137,7 +1136,7 @@ class ActorPool(Generic[T, V]):
             if a.num_used_slots == 0
             and a.num_empty_slots > 0
             and a.last_became_idle_time is not None
-            and (now - a.last_became_idle_time) >= self._work_steal_idle_threshold_s
+            and (now - a.last_became_idle_time) >= self._pool_params.work_steal_idle_threshold_s
         ]
         logger.trace(f"Found {len(idle_receivers)} idle receivers.")
         if not idle_receivers:
@@ -1232,7 +1231,7 @@ class ActorPool(Generic[T, V]):
         self._process_completed_tasks()
         # 7. Schedule new tasks onto idle slots of ready actors
         self._schedule_new_tasks()
-        if self._enable_work_stealing:
+        if self._pool_params.enable_work_stealing:
             # 8. Rebalance queued tasks via work-stealing. We do this primarily to avoid idling when the number of
             # tasks is smaller than the num_actors * slots_per_actor. In these cases, without this step, we can leave
             # some actors idle because we eagerly schedule stasks to ready actors.

@@ -35,7 +35,7 @@ class _ProcessStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
 
     def setup(self, worker_metadata: resources.WorkerMetadata) -> None:
         pass
