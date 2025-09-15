@@ -3,6 +3,14 @@
 
 ## Latest
 
+## [0.1.5]
+
+### Released
+- 2025-09-15
+
+### Fixed
+- Fixed a bug when autoscaler tries to allocate workers for finished stages.
+
 ## [0.1.4]
 
 ### Released
@@ -49,3 +57,4 @@
 
 ### Added
 - Initial version
+

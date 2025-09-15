@@ -125,6 +125,7 @@ def run_pipeline(
         pipeline_spec.config.logging_interval_s,
         initial_input_len,
         pools,
+        pipeline_spec.config.monitoring_verbosity_level,
     ) as monitor:
         for idx, (spec, pool) in enumerate(zip(pipeline_spec.stages, pools)):
             assert isinstance(spec, specs.StageSpec)

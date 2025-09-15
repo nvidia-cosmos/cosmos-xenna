@@ -332,6 +332,7 @@ struct StageInternal {
     num_input_samples_per_sample: Option<f64>,
     shape: rds::WorkerShape,
     requested_num_workers: Option<usize>,
+    is_finished: bool,
 }
 
 impl StageInternal {
@@ -840,6 +841,7 @@ pub fn run_fragmentation_autoscaler(
             num_input_samples_per_sample: None,
             shape: stage_problem.worker_shape.clone().into(),
             requested_num_workers: stage_problem.requested_num_workers,
+            is_finished: stage_state.is_finished,
         });
     }
 
@@ -909,6 +911,10 @@ pub fn run_fragmentation_autoscaler(
     log::debug!("Phase 1: satisfy manually requested counts");
     let phase1_start = std::time::Instant::now();
     for stage in &mut stages {
+        // Skip finished stages
+        if stage.is_finished {
+            continue;
+        }
         if let Some(req) = stage.requested_num_workers {
             trace!(
                 "Phase 1: satisfy manually requested counts for stage {}. Requested={}, Current={}",
@@ -956,7 +962,8 @@ pub fn run_fragmentation_autoscaler(
     // every non-manual stage. This may also panic if a single worker cannot fit.
     let phase2_start = std::time::Instant::now();
     for stage in &mut stages {
-        if stage.requested_num_workers.is_some() {
+        // Skip finished stages and manually-requested stages
+        if stage.is_finished || stage.requested_num_workers.is_some() {
             continue;
         }
         if stage.current_workers < 1 {
@@ -971,7 +978,14 @@ pub fn run_fragmentation_autoscaler(
                 &mut current_workers_per_stage,
                 &mut workers_to_remove,
             ) {
-                panic!("Unable to allocate minimum worker for stage {}", stage.name);
+                panic!(
+                    concat!(
+                        "Unable to allocate minimum worker for stage {}: requested={} current={}; ",
+                        "cluster resources: cpu={}/{} gpu={}/{}"
+                    ),
+                    stage.name, stage.requested_num_workers.unwrap_or(0), stage.current_workers,
+                    cluster.num_used_cpus(), cluster.num_total_cpus(), cluster.num_used_gpus(), cluster.num_total_gpus()
+                );
             }
         }
     }
@@ -988,7 +1002,7 @@ pub fn run_fragmentation_autoscaler(
     // stage whose throughput remains above the current minimum after removal.
     let mut active: Vec<StageInternal> = stages
         .iter()
-        .filter(|s| s.requested_num_workers.is_none() && s.speed_per_worker.is_some())
+        .filter(|s| s.requested_num_workers.is_none() && s.speed_per_worker.is_some() && !s.is_finished)
         .cloned()
         .collect();
 
