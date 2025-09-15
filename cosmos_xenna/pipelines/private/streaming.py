@@ -633,6 +633,7 @@ def run_pipeline(
             pipeline_spec.config.logging_interval_s,
             initital_input_length,
             pools,
+            pipeline_spec.config.monitoring_verbosity_level,
         ) as monitor,
     ):
         # This is the loop which does all the interesting stuff. It was difficult to find the correct way to iterate

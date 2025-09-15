@@ -61,6 +61,7 @@ from cosmos_xenna.pipelines.private.monitoring_types import (
 from cosmos_xenna.ray_utils import actor_pool, resource_monitor, stage_worker
 from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import timing
+from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 
 @attrs.define
@@ -268,10 +269,12 @@ class PipelineMonitor:
         log_interval_s: float,
         initial_input_len: int,
         actor_pools: list[actor_pool.ActorPool],
+        verbosity_level: VerbosityLevel = VerbosityLevel.INFO,
     ) -> None:
         self._actor_pools = list(actor_pools)
         self._log_interval_s = float(log_interval_s)
         self._initital_input_length = int(initial_input_len)
+        self._verbosity_level = verbosity_level
         self._opened = False
 
     def __enter__(self) -> PipelineMonitor:
@@ -328,7 +331,8 @@ class PipelineMonitor:
         stats.pipeline.cluster.actors = []
         # Maybe log the current state.
         if self._log_rate_limiter.can_call():
-            self._print_state(stats.pipeline)
+            if self._verbosity_level >= VerbosityLevel.INFO:
+                self._print_state(stats.pipeline)
             return True
         else:
             return False
@@ -457,7 +461,7 @@ class PipelineMonitor:
                 "xenna_user": os.getenv("SLURM_JOB_USER", "unknown"),
                 "xenna_job_name": os.getenv("SLURM_JOB_NAME", "unknown"),
                 "xenna_job_id": os.getenv("SLURM_JOB_ID", "unknown"),
-            }
+            },
         )
         for pool in self._actor_pools:
             self._metrics_actor_resource_request.set(
