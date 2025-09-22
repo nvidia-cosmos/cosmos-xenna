@@ -72,7 +72,7 @@ We use Ruff and PyRight for static analysis. Using the default VSCode settings a
 these should auto-run in VSCode. They can be run manually with:
 
 ```bash
-uv run run_presubmit.py default
+./run_presubmit.py default
 ```
 
 ### Adding dependencies
