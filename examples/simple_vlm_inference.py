@@ -75,7 +75,7 @@ class _DownloadStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0, nvdecs=0, nvencs=0)
+        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
 
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         logger.info("Initializing download stage...")
@@ -118,7 +118,7 @@ class _InferenceStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=2.0, gpus=1.0, entire_gpu=True)
+        return pipelines_v1.Resources(cpus=2.0, gpus=1.0)
 
     def setup_on_node(self, node_info: pipelines_v1.NodeInfo, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Cache this model on the node. You can assume that this only gets called once per node.

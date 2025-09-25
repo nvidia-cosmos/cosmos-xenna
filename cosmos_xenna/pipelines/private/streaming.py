@@ -266,7 +266,10 @@ class Autoscaler:
         """
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler()
+        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
+            pipeline_spec.config.mode_specific.autoscale_speed_estimation_window_duration_s,
+            pipeline_spec.config.mode_specific.autoscale_speed_estimation_min_data_points,
+        )
         self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None

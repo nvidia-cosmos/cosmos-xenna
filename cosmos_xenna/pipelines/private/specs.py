@@ -267,6 +267,11 @@ class StageSpec(typing.Generic[T, V]):
 class StreamingSpecificSpec:
     # How often to run the stage auto-scaler.
     autoscale_interval_s: float = 60 * 3.0
+    # Window size with which the auto-scaler estimates the processing speed of each stage.
+    # Making it larger makes the estimate more stable, but also less responsive to changes.
+    autoscale_speed_estimation_window_duration_s: float = 60 * 3.0
+    # Minimum number of data points to keep even if they are outside the window.
+    autoscale_speed_estimation_min_data_points: int = 5
     # In streaming mode, when the numeber of max queued tasks exceeds `num_actors * num_slots_per_actor`,
     # i.e. when there is no empty slot, Xenna applies a back-pressure to upstream stages to
     # prevent memory and storage from blowout. The 2 parameters below can help tune that behavior.
