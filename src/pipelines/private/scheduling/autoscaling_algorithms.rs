@@ -341,7 +341,7 @@ impl StageInternal {
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
-        (self.current_workers as f64) * s * k * (self.stage_batch_size as f64)
+        (self.current_workers as f64) * s / k * (self.stage_batch_size as f64)
     }
 
     fn throughput_if_one_removed(&self) -> f64 {
@@ -349,7 +349,7 @@ impl StageInternal {
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
-        ((self.current_workers.saturating_sub(1)) as f64) * s * k * (self.stage_batch_size as f64)
+        ((self.current_workers.saturating_sub(1)) as f64) * s / k * (self.stage_batch_size as f64)
     }
 
     fn throughput_if_one_added(&self) -> f64 {
@@ -357,7 +357,7 @@ impl StageInternal {
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
-        ((self.current_workers + 1) as f64) * s * k * (self.stage_batch_size as f64)
+        ((self.current_workers + 1) as f64) * s / k * (self.stage_batch_size as f64)
     }
 }
 
@@ -1187,6 +1187,7 @@ pub fn run_fragmentation_autoscaler(
 pub struct FragmentationBasedAutoscaler {
     worker_id_factory: WorkerIdFactory,
     speed_estimation_window_duration_s: f64,
+    speed_estimation_min_data_points: usize,
     speed_calculator: Option<SpeedAndNumberOfReturnsEstimator>,
     problem: Option<ds::Problem>,
 }
@@ -1196,6 +1197,7 @@ impl Default for FragmentationBasedAutoscaler {
         Self {
             worker_id_factory: WorkerIdFactory::new(),
             speed_estimation_window_duration_s: 60.0 * 3.0,
+            speed_estimation_min_data_points: 5,
             speed_calculator: None,
             problem: None,
         }
@@ -1205,8 +1207,15 @@ impl Default for FragmentationBasedAutoscaler {
 #[pymethods]
 impl FragmentationBasedAutoscaler {
     #[new]
-    fn new() -> Self {
-        Self::default()
+    #[pyo3(signature = (speed_estimation_window_duration_s = 180.0, speed_estimation_min_data_points = 5))]
+    fn new(speed_estimation_window_duration_s: f64, speed_estimation_min_data_points: usize) -> Self {
+        Self {
+            worker_id_factory: WorkerIdFactory::new(),
+            speed_estimation_window_duration_s,
+            speed_estimation_min_data_points,
+            speed_calculator: None,
+            problem: None,
+        }
     }
 
     fn name(&self) -> &str {
@@ -1218,7 +1227,7 @@ impl FragmentationBasedAutoscaler {
         self.speed_calculator = Some(SpeedAndNumberOfReturnsEstimator::new(
             problem.stages.len(),
             self.speed_estimation_window_duration_s,
-            5,
+            self.speed_estimation_min_data_points,
         ));
     }
 

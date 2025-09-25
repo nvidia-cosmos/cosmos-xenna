@@ -3,6 +3,14 @@
 
 ## Latest
 
+## [0.1.6]
+
+### Released
+- 2025-09-25
+
+### Fixed
+- Fixed a bug in autoscaler in case of dynamic split.
+
 ## [0.1.5]
 
 ### Released

@@ -30,8 +30,15 @@ class WorkerIdFactory:
 
 
 class FragmentationBasedAutoscaler:
-    def __init__(self) -> None:
-        self._rust_autoscaler = rust.FragmentationBasedAutoscaler()
+    def __init__(
+        self,
+        speed_estimation_window_duration_s: float = 60 * 3.0,
+        speed_estimation_min_data_points: int = 5,
+    ) -> None:
+        self._rust_autoscaler = rust.FragmentationBasedAutoscaler(
+            speed_estimation_window_duration_s,
+            speed_estimation_min_data_points,
+        )
 
     def setup(self, problem: data_structures.Problem) -> None:
         self._rust_autoscaler.setup(problem.rust)
