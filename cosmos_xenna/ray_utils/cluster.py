@@ -89,5 +89,6 @@ def init_or_connect_to_cluster(
         log_to_driver=log_to_driver,
         _metrics_export_port=ray_metrics_port,
     )
+    logger.info("Initialized Ray cluster.")
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context

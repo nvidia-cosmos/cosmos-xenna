@@ -139,7 +139,6 @@ def run_pipeline(
     if pipeline_spec.config.monitoring_verbosity_level >= VerbosityLevel.INFO:
         logger.info(pipeline_spec)
 
-    logger.info("Initialized Ray cluster.")
     cluster.init_or_connect_to_cluster()
 
     cluster_resources = cluster.make_cluster_resources_from_ray_nodes(
