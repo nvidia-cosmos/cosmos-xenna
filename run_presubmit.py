@@ -1,3 +1,4 @@
+#!/usr/bin/env -S uv run --script
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -12,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import datetime
 import subprocess
@@ -127,11 +129,19 @@ def _find_target_files() -> list[Path]:
 def _check_file_header(file_path: Path, expected_header: str) -> bool:
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            header_lines = [next(f) for _ in range(len(expected_header.splitlines()))]
-            actual_header = "".join(header_lines)
-            return actual_header.strip() == expected_header.strip()
-    except StopIteration:  # File is shorter than header
-        return False
+            lines = f.readlines()
+
+        # Skip shebang line if present
+        start_line = 1 if lines and lines[0].startswith("#!") else 0
+
+        # Extract the header portion
+        expected_line_count = len(expected_header.splitlines())
+        if len(lines) < start_line + expected_line_count:
+            return False
+
+        actual_header_lines = lines[start_line : start_line + expected_line_count]
+        actual_header = "".join(actual_header_lines)
+        return actual_header.strip() == expected_header.strip()
     except FileNotFoundError:
         typer.echo(f"File not found: {file_path}", err=True)
         return False

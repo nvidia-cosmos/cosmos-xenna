@@ -2,7 +2,7 @@
     "python.analysis.autoFormatStrings": true,
     "editor.formatOnSave": true,
     "git.detectSubmodules": false,
-    "python.languageServer": "Pylance",
+    "python.languageServer": "None",
     "[python]": {
         "editor.codeActionsOnSave": {
             "source.fixAll": "explicit"

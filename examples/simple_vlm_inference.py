@@ -79,7 +79,7 @@ class _DownloadStage(pipelines_v1.Stage):
 
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         logger.info("Initializing download stage...")
-        # Optional: Initialize a requests session for potential performance improvements
+        # Initialize requests session for performance
         self.session = requests.Session()
         self._cache: dict[str, bytes] = {}  # Initialize cache
 
@@ -238,8 +238,11 @@ def main() -> None:
     logger.info(pipeline_spec)
     outputs = pipelines_v1.run_pipeline(pipeline_spec)
     logger.info("\nPipeline finished. Got the following outputs:")
-    for output in outputs:
-        logger.info(output)
+    if outputs:
+        for output in outputs:
+            logger.info(output)
+    else:
+        logger.info("No outputs returned.")
 
 
 if __name__ == "__main__":
