@@ -53,7 +53,7 @@ from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import timing
 
 _MAIN_LOOP_FREQ_HZ = 10
-_DISPLAY_FREQ_HZ = 1.0
+_DEFAULT_DISPLAY_RATE_S = 5.0
 
 
 @attrs.define
@@ -295,6 +295,8 @@ class NodeWorker:
         object_store_config_by_profile: models.ObjectStoreConfigByProfile,
         download_catalog: models._DownloadCatalog,
         parallelism: int,
+        p2p_retry_config: RetryConfig,
+        object_store_retry_config: RetryConfig,
         is_test: bool = False,
     ):
         object_stores_by_profile = rust_models.ObjectStoreByProfile(
@@ -307,7 +309,11 @@ class NodeWorker:
             node_parallelism=parallelism,
             download_catalog=download_catalog.to_rust(),
             object_store_by_profile=object_stores_by_profile,
+            p2p_retry_config=p2p_retry_config.to_rust(),
+            object_store_retry_config=object_store_retry_config.to_rust(),
         )
+        self._p2p_retry_config = p2p_retry_config
+        self._object_store_retry_config = object_store_retry_config
         self._is_test = is_test
         self._node_id = node_id
         self._last_network_io_counters: typing.Any = None
@@ -539,19 +545,21 @@ class _Scheduler:
             s3_slots_used += len(status_by_node[node_id].downloading_s3_chunks)
 
         # Get all chunks that still need to be downloaded
-        chunks_needing_download: list[models._DownloadChunk] = []
+        # Use a dict keyed by chunk_id to automatically deduplicate
+        chunks_needing_download: dict[uuid.UUID, models._DownloadChunk] = {}
         all_available_or_downloading_chunks = set()
         for status in status_by_node.values():
             all_available_or_downloading_chunks.update(status.available_chunks)
             all_available_or_downloading_chunks.update(status.downloading_s3_chunks)
+            all_available_or_downloading_chunks.update(status.writing_chunks)
 
         for chunk in self._download_catalog.chunks:
-            # Skip if any node already has the complete object
+            # Skip if any node already has this chunk available or is downloading/writing it
             if chunk.chunk_id not in all_available_or_downloading_chunks:
-                chunks_needing_download.append(chunk)
+                chunks_needing_download[chunk.chunk_id] = chunk
 
         # Assign chunks to nodes
-        for chunk in chunks_needing_download:
+        for chunk in chunks_needing_download.values():
             if s3_slots_used >= self._total_s3_download_slots:
                 break
 
@@ -620,12 +628,14 @@ class _Scheduler:
                     # A node needs this chunk if:
                     # 1. It doesn't already have it available
                     # 2. It's not already downloading it (S3 or P2P)
-                    # 3. It doesn't have the complete parent object
-                    # 4. The object is actually needed (not marked as unneeded)
+                    # 3. It's not currently being written to disk
+                    # 4. It doesn't have the complete parent object
+                    # 5. The object is actually needed (not marked as unneeded)
                     needs_chunk = (
                         chunk.chunk_id not in status.available_chunks
                         and chunk.chunk_id not in status.downloading_p2p_chunks
                         and chunk.chunk_id not in status.downloading_s3_chunks
+                        and chunk.chunk_id not in status.writing_chunks
                         and chunk.parent_object_id not in status.completed_or_cached_objects
                         and chunk.parent_object_id not in status.unneeded_objects
                     )
@@ -652,6 +662,7 @@ class _Scheduler:
                     chunk.chunk_id not in status.available_chunks
                     and chunk.chunk_id not in status.downloading_p2p_chunks
                     and chunk.chunk_id not in status.downloading_s3_chunks
+                    and chunk.chunk_id not in status.writing_chunks
                     and chunk.parent_object_id not in status.completed_or_cached_objects
                     and chunk.parent_object_id not in status.unneeded_objects
                 )
@@ -762,6 +773,7 @@ def _display_progress(
         "Chunks Cached",
         "S3 DL",
         "P2P DL",
+        "Writing",
         "Uploads",
         "Unpacking",
         "Assembling",
@@ -788,6 +800,7 @@ def _display_progress(
         node_status = "In progress" if not is_dones[i] else "Done"
         s3_downloads = len(status.downloading_s3_chunks)
         p2p_downloads = len(status.downloading_p2p_chunks)
+        writing = status.num_active_file_writing_tasks
         uploads = status.num_active_uploads
         unpacking = status.num_active_unpacking_tasks
         assembling = status.num_active_assembling_tasks
@@ -804,12 +817,13 @@ def _display_progress(
 
         data.append(
             [
-                status.node_id,
+                str(status.node_id)[:10],
                 node_status,
                 node_objects_progress,
                 node_chunks_progress,
                 s3_downloads,
                 p2p_downloads,
+                writing,
                 uploads,
                 unpacking,
                 assembling,
@@ -824,45 +838,140 @@ def _display_progress(
     logger.info(f"Xenna P2P File Distribution ({loop_rate:.2f} Hz){extra_display_msg}\n{table}")
 
 
+@attrs.define
+class RetryConfig:
+    num_retries: int = 5
+    base_delay_millis: int = 200
+
+    def to_rust(self) -> rust_models.RetryConfig:
+        return rust_models.RetryConfig(self.num_retries, self.base_delay_millis)
+
+
 def download_distributed(
     download_requests: list[models.DownloadRequest],
     object_store_config: models.ObjectStoreConfig | models.ObjectStoreConfigByProfile,
     chunk_size_bytes: Optional[int] = None,
     node_parallelism: Optional[int] = None,
-    object_store_parallelism: int = 1000,
+    object_store_parallelism: int = 100,
+    p2p_retry_config: Optional[RetryConfig] = None,
+    object_store_retry_config: Optional[RetryConfig] = None,
     verbose: bool = False,
     testing_info: Optional[models.SingleNodeTestingInfo] = None,
+    display_rate_s: float = _DEFAULT_DISPLAY_RATE_S,
 ) -> None:
-    """Orchestrates a distributed download across a Ray cluster.
+    """Orchestrates a distributed download across a Ray cluster using P2P file sharing.
 
-    This function coordinates the download of S3 objects, handling chunking,
-    peer-to-peer transfers, and caching. It simplifies the process of fetching
-    large datasets by distributing the workload across all available nodes in
-    the Ray cluster.
+    This is the main entry point for the distributed file download system. It coordinates
+    the download of object store files across all nodes in a Ray cluster,
+    using intelligent chunking and peer-to-peer transfers to minimize bandwidth usage
+    and maximize download speed.
+
+    The system uses the Rust object_store crate for high-performance access to various
+    storage backends (S3, GCS, Azure, local filesystem) with a consistent API.
+
+    **How it works:**
+    1. **Catalog Creation**: Analyzes all download requests and creates a catalog of
+       objects and chunks to download
+    2. **Worker Setup**: Deploys NodeWorker actors on each cluster node to handle
+       local downloads and P2P serving
+    3. **Intelligent Scheduling**: Uses a BitTorrent-inspired scheduler to optimize
+       which nodes download which chunks and from where (S3 vs peers)
+    4. **P2P Distribution**: Each chunk is downloaded from S3 only once, then shared
+       between nodes via HTTP for maximum efficiency
+    5. **File Assembly**: Chunks are assembled into complete files with validation
+    6. **Optional Unpacking**: Archives are automatically extracted if requested
+
+    **Key Benefits:**
+    - **Cost Efficient**: Each chunk downloaded from S3 only once across entire cluster
+    - **Fast**: Parallel downloads with intelligent load balancing
+    - **Reliable**: Automatic retries, validation, and error handling
+    - **Smart Caching**: Avoids re-downloading unchanged files
 
     Args:
         download_requests: A list of `DownloadRequest` objects, each specifying
-            an S3 object or prefix to download.
-        client_factory: A factory for creating S3 client instances.
+            an object or prefix to download. Can include single files, archives
+            to extract, or entire directory prefixes.
+        object_store_config: Authentication and connection configuration for the
+            object store using the object_store crate. Can be a single config or
+            profile-based config for multiple object stores. The URI in the config
+            serves as the base URI, and download request URIs are relative paths
+            within this base.
         chunk_size_bytes: The size (in bytes) for file chunks. Defaults to 100MB.
-        node_parallelism: The maximum number of concurrent downloads
-            a single node will handle. Defaults to 10.
-        s3_parallelism: The maximum number of concurrent downloads
-            from S3. Defaults to 1000.
-        verbose: If True, enables detailed logging from worker nodes.
-        testing_info: If provided, runs in a single-node test mode that
-            simulates a multi-node environment.
+            Smaller chunks provide better parallelism but more overhead.
+            Recommended: 50-200MB depending on file sizes.
+        node_parallelism: The maximum number of concurrent downloads per node.
+            Defaults to 10x CPU count. Higher values increase speed but may
+            overwhelm individual nodes.
+        object_store_parallelism: The maximum number of concurrent connections
+            to the object store across all nodes. Defaults to 1000. Higher values
+            increase speed but may hit rate limits.
+        verbose: If True, enables detailed progress logging and performance metrics.
+            Useful for monitoring large downloads or debugging performance issues.
+        testing_info: If provided, runs in a single-node test mode that simulates
+            a multi-node environment. Used for testing and development.
+        display_rate_s: The rate at which to display progress. Defaults to once every 5.0 seconds.
+
+    Raises:
+        RuntimeError: If Ray is not initialized or no nodes are available
+        ValueError: If download requests are invalid or object store config is incorrect
+        FileNotFoundError: If requested objects don't exist in the object store
+        PermissionError: If authentication fails or access is denied
+
+    Example:
+        >>> import ray
+        >>> from cosmos_xenna.file_distribution import *
+        >>> # Initialize Ray cluster
+        >>> ray.init(address="ray://head-node:10001")
+        >>> # Configure S3 authentication
+        >>> s3_config = ObjectStoreConfig.make_for_s3(
+        ...     bucket="my-models", access_key_id="AKIA...", secret_access_key="...", region="us-west-2"
+        ... )
+        >>> # Define what to download
+        >>> requests = [
+        ...     DownloadRequest(
+        ...         value=ObjectDownloadRequest(
+        ...             uri="models/bert-base/pytorch_model.bin", destination=pathlib.Path("/tmp/model.bin")
+        ...         )
+        ...     ),
+        ...     DownloadRequest(
+        ...         value=ObjectDownloadRequest(
+        ...             uri="datasets/train.tar.gz",
+        ...             destination=pathlib.Path("/tmp/train.tar.gz"),
+        ...             unpack_options=UnpackOptions(
+        ...                 destination=pathlib.Path("/tmp/train/"),
+        ...             ),
+        ...         )
+        ...     ),
+        ... ]
+        >>> # Download to all cluster nodes
+        >>> download_distributed(
+        ...     download_requests=requests,
+        ...     object_store_config=s3_config,
+        ...     chunk_size_bytes=50 * 1024 * 1024,  # 50MB chunks
+        ...     verbose=True,
+        ... )
+
+    See Also:
+        - cosmos_xenna/file_distribution/README.md for detailed documentation
+        - DownloadRequest for specifying what to download
+        - ObjectStoreConfig for authentication setup
     """
     if node_parallelism is None:
-        node_parallelism = os.cpu_count() * 10
+        node_parallelism = os.cpu_count() * 2
 
     if chunk_size_bytes is None:
-        chunk_size_bytes = 1024 * 1024 * 100  # 100MB
+        chunk_size_bytes = 100 * 1024 * 1024  # 100MB
 
     if testing_info is None:
         nodes = [str(node["NodeID"]) for node in ray.nodes()]
     else:
         nodes = [str(x) for x in range(testing_info.num_fake_nodes)]
+
+    if p2p_retry_config is None:
+        p2p_retry_config = RetryConfig()
+
+    if object_store_retry_config is None:
+        object_store_retry_config = RetryConfig()
 
     if not ray.is_initialized():
         raise RuntimeError(
@@ -899,6 +1008,8 @@ def download_distributed(
                 object_store_config_by_profile,
                 download_catalog,
                 node_parallelism,
+                p2p_retry_config,
+                object_store_retry_config,
             )
         else:
             worker = node_worker_cls.options().remote(
@@ -906,6 +1017,8 @@ def download_distributed(
                 object_store_config_by_profile,
                 download_catalog,
                 node_parallelism,
+                p2p_retry_config,
+                object_store_retry_config,
                 is_test=True,  # type: ignore
             )
         workers_by_node[node] = worker
@@ -919,7 +1032,7 @@ def download_distributed(
         _ray_wait_with_progress([worker.start.remote() for worker in workers_by_node.values()], "Starting workers")
 
         rate_limiter = timing.RateLimiter(_MAIN_LOOP_FREQ_HZ)
-        display_rate_checker = timing.RateLimitChecker(_DISPLAY_FREQ_HZ)
+        display_rate_checker = timing.RateLimitChecker(1.0 / display_rate_s)
         scheduler = _Scheduler(
             list(workers_by_node.keys()),
             download_catalog,

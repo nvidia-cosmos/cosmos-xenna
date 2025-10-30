@@ -361,11 +361,26 @@ impl StageInternal {
     }
 }
 
-fn make_workers_from_problem_state(state: &ds::ProblemState) -> Vec<rds::Worker> {
+enum WorkerOrWorkerGroup {
+    Worker(rds::Worker),
+    WorkerGroup(rds::WorkerGroup),
+}
+
+fn make_workers_from_problem_state(
+    problem: &ds::Problem,
+    state: &ds::ProblemState,
+) -> Vec<WorkerOrWorkerGroup> {
     let mut out = Vec::new();
-    for stage in &state.stages {
-        for w in &stage.workers {
-            out.push(w.to_worker(&stage.stage_name));
+    assert_eq!(problem.stages.len(), state.stages.len());
+    for (stage, stage_state) in std::iter::zip(&problem.stages, &state.stages) {
+        for w in &stage_state.worker_groups {
+            if let rds::WorkerShape::SpmdNodeMultiple(_) = &stage.worker_shape {
+                out.push(WorkerOrWorkerGroup::WorkerGroup(
+                    w.to_worker_group(stage.name.clone()),
+                ));
+            } else {
+                out.push(WorkerOrWorkerGroup::Worker(w.to_worker(stage.name.clone())));
+            }
         }
     }
     out
@@ -604,68 +619,107 @@ impl AutoscalerOpMetrics {
     }
 }
 
+// A collection of state that is shared between the add and remove functions.
+struct AutoscaleContext<'a> {
+    cluster: rds::ClusterResources,
+    worker_id_factory: &'a mut WorkerIdFactory,
+    workers_to_add_map: HashMap<String, Vec<rds::Worker>>,
+    workers_to_remove_map: HashMap<String, HashMap<String, rds::Worker>>,
+    worker_groups_to_add_map: HashMap<String, Vec<rds::WorkerGroup>>,
+    worker_groups_to_remove_map: HashMap<String, Vec<rds::WorkerGroup>>,
+    current_workers_per_stage: HashMap<String, HashMap<String, rds::Worker>>,
+    current_worker_groups_per_stage: HashMap<String, HashMap<String, rds::WorkerGroup>>,
+}
+
 // Attempt to add a worker to a using fragmentation-aware search and record
 // the side effects locally if successful.
 fn add_worker_fn(
     stage: &mut StageInternal,
-    cluster: &mut rds::ClusterResources,
     workload_estimate: &frag::Workload,
-    workers_to_add_map: &mut HashMap<String, Vec<rds::Worker>>,
-    worker_id_factory: &mut WorkerIdFactory,
     worker_reuse_fragmentation_equivalent: f32,
     metrics: &mut AutoscalerOpMetrics,
-    current_workers_per_stage: &mut HashMap<String, HashMap<String, rds::Worker>>,
-    workers_to_remove_map: &mut HashMap<String, HashMap<String, rds::Worker>>,
+    c: &mut AutoscaleContext<'_>,
 ) -> bool {
     let t0 = std::time::Instant::now();
-    // Prepare a slice of reusable workers for this stage if we have pending removals
-    let reusable_workers = workers_to_remove_map.get(&stage.name).unwrap();
-    let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
-        cluster,
-        workload_estimate,
-        &stage.shape,
-        Some(reusable_workers),
-        worker_reuse_fragmentation_equivalent,
-    );
-    let mut ok = false;
-    if allocation.did_allocate {
-        if let Some(reused) = allocation.reused_worker.clone() {
-            // Reuse a previously deleted worker
-            cluster
-                .allocate(&reused.allocation)
-                .expect("re-allocate reused worker");
-            current_workers_per_stage
-                .get_mut(&stage.name)
-                .expect("stage exists")
-                .insert(reused.id.clone(), reused.clone());
-            workers_to_remove_map
-                .get_mut(&stage.name)
-                .expect("stage exists")
-                .remove(&reused.id);
-            stage.current_workers += 1;
-            ok = true;
-        } else if let Some(resources) = allocation.resources.clone() {
-            // Fresh allocation
-            let worker = rds::Worker::new(
-                worker_id_factory.make_new_id(),
-                stage.name.clone(),
-                resources,
+    let mut ok: bool = false;
+    match stage.shape {
+        // SPMDNodeMultiple is a special case and goes through a different code path.
+        rds::WorkerShape::SpmdNodeMultiple(shape) => {
+            // TODO: Pipe in worker_groups_to_remove_map so that we can reuse workers.
+            let result = frag::find_best_allocation_for_spmd_node_multiple(&c.cluster, &shape);
+            if result.worker_allocations.len() > 0 {
+                ok = true;
+                // Create the worker group
+                let worker_group = rds::WorkerGroup {
+                    id: c.worker_id_factory.make_new_id(),
+                    stage_name: stage.name.clone(),
+                    allocations: result.worker_allocations,
+                };
+                c.cluster
+                    .allocate_multiple(&worker_group.allocations)
+                    .expect("allocate worker group");
+                c.current_worker_groups_per_stage
+                    .get_mut(&stage.name)
+                    .expect("stage exists")
+                    .insert(worker_group.id.clone(), worker_group.clone());
+                c.worker_groups_to_add_map
+                    .get_mut(&stage.name)
+                    .expect("stage exists")
+                    .push(worker_group);
+                stage.current_workers += 1;
+            }
+        }
+        _ => {
+            // Prepare a slice of reusable workers for this stage if we have pending removals
+            let reusable_workers = c.workers_to_remove_map.get(&stage.name).unwrap();
+            let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
+                &mut c.cluster,
+                workload_estimate,
+                &stage.shape,
+                Some(reusable_workers),
+                worker_reuse_fragmentation_equivalent,
             );
-            cluster
-                .allocate(&worker.allocation)
-                .expect("allocate worker");
-            current_workers_per_stage
-                .get_mut(&stage.name)
-                .expect("stage exists")
-                .insert(worker.id.clone(), worker.clone());
-            workers_to_add_map
-                .entry(stage.name.clone())
-                .or_default()
-                .push(worker);
-            stage.current_workers += 1;
-            ok = true;
+            if allocation.did_allocate {
+                if let Some(reused) = allocation.reused_worker.clone() {
+                    // Reuse a previously deleted worker
+                    c.cluster
+                        .allocate(&reused.allocation)
+                        .expect("re-allocate reused worker");
+                    c.current_workers_per_stage
+                        .get_mut(&stage.name)
+                        .expect("stage exists")
+                        .insert(reused.id.clone(), reused.clone());
+                    c.workers_to_remove_map
+                        .get_mut(&stage.name)
+                        .expect("stage exists")
+                        .remove(&reused.id);
+                    stage.current_workers += 1;
+                    ok = true;
+                } else if let Some(resources) = allocation.resources.clone() {
+                    // Fresh allocation
+                    let worker = rds::Worker::new(
+                        c.worker_id_factory.make_new_id(),
+                        stage.name.clone(),
+                        resources,
+                    );
+                    c.cluster
+                        .allocate(&worker.allocation)
+                        .expect("allocate worker");
+                    c.current_workers_per_stage
+                        .get_mut(&stage.name)
+                        .expect("stage exists")
+                        .insert(worker.id.clone(), worker.clone());
+                    c.workers_to_add_map
+                        .entry(stage.name.clone())
+                        .or_default()
+                        .push(worker);
+                    stage.current_workers += 1;
+                    ok = true;
+                }
+            }
         }
     }
+
     let elapsed = t0.elapsed().as_secs_f64();
     metrics.record_add(elapsed);
     ok
@@ -675,38 +729,68 @@ fn add_worker_fn(
 // the fragmentation-aware heuristic; update local bookkeeping.
 fn remove_best_worker_fn(
     stage: &mut StageInternal,
-    cluster: &mut rds::ClusterResources,
-    workers_to_remove_map: &mut HashMap<String, HashMap<String, rds::Worker>>,
     workload_estimate: &frag::Workload,
     metrics: &mut AutoscalerOpMetrics,
-    current_workers_per_stage: &mut HashMap<String, HashMap<String, rds::Worker>>,
+    c: &mut AutoscaleContext<'_>,
 ) {
     let t0 = std::time::Instant::now();
-    // Get references to workers in this stage without cloning
-    let worker_map = current_workers_per_stage
-        .get(&stage.name)
-        .expect("stage exists");
-    // Choose deletion using the fragmentation heuristic
-    let chosen_worker_id = frag::find_worker_to_delete_using_fragmentation_gradient_descent(
-        cluster,
-        &workload_estimate,
-        worker_map,
-    );
-    let worker = worker_map
-        .get(&chosen_worker_id)
-        .expect("worker exists")
-        .clone();
-    cluster
-        .release_allocation(&worker.allocation)
-        .expect("release worker");
-    let list = current_workers_per_stage
-        .get_mut(&stage.name)
-        .expect("stage exists");
-    list.remove(&worker.id);
-    workers_to_remove_map
-        .get_mut(&stage.name)
-        .expect("stage exists")
-        .insert(worker.id.clone(), worker.clone());
+    match stage.shape {
+        // SPMDNodeMultiple is a special case and goes through a different code path.
+        rds::WorkerShape::SpmdNodeMultiple(shape) => {
+            let worker_groups = c.current_worker_groups_per_stage.get(&stage.name).unwrap();
+            let chosen_worker_id = frag::find_worker_group_to_delete_for_spmd_node_multiple(
+                &mut c.cluster,
+                &shape,
+                &worker_groups,
+            );
+            let worker_group = c
+                .current_worker_groups_per_stage
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .remove(&chosen_worker_id)
+                .expect("worker group exists");
+            c.cluster
+                .release_allocations(&worker_group.allocations)
+                .expect("release worker group");
+            c.worker_groups_to_remove_map
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .push(worker_group);
+            c.current_worker_groups_per_stage
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .remove(&chosen_worker_id);
+        }
+        _ => {
+            // Get references to workers in this stage without cloning
+            let worker_map = c
+                .current_workers_per_stage
+                .get(&stage.name)
+                .expect("stage exists");
+            // Choose deletion using the fragmentation heuristic
+            let chosen_worker_id = frag::find_worker_to_delete_using_fragmentation_gradient_descent(
+                &mut c.cluster,
+                &workload_estimate,
+                worker_map,
+            );
+            let worker = worker_map
+                .get(&chosen_worker_id)
+                .expect("worker exists")
+                .clone();
+            c.cluster
+                .release_allocation(&worker.allocation)
+                .expect("release worker");
+            c.workers_to_remove_map
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .insert(worker.id.clone(), worker.clone());
+            c.current_workers_per_stage
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .remove(&chosen_worker_id);
+        }
+    }
+
     stage.current_workers = stage.current_workers.saturating_sub(1);
     let elapsed = t0.elapsed().as_secs_f64();
     metrics.record_remove(elapsed);
@@ -780,6 +864,27 @@ fn remove_best_worker_fn(
 ///
 /// Examples
 /// ```rust
+/// use _cosmos_xenna::pipelines::private::scheduling::autoscaling_algorithms::{run_fragmentation_autoscaler, WorkerIdFactory, Estimates, Estimate};
+/// use _cosmos_xenna::pipelines::private::scheduling::data_structures::{Problem, ProblemState};
+/// use _cosmos_xenna::pipelines::private::scheduling::resources::{ClusterResources, NodeResources, GpuResources, WorkerShape, CpuOnly};
+/// use std::collections::HashMap;
+///
+/// // Create a simple problem for demonstration
+/// let cluster_resources = ClusterResources {
+///     nodes: HashMap::new(),
+/// };
+/// let problem = Problem {
+///     cluster_resources,
+///     stages: vec![],
+/// };
+/// let state = ProblemState {
+///     stages: vec![],
+/// };
+/// let estimates = Estimates {
+///     stages: vec![],
+/// };
+/// let mut worker_id_factory = WorkerIdFactory::new();
+///
 /// // Rust (internal usage)
 /// let solution = run_fragmentation_autoscaler(
 ///     &problem,
@@ -812,19 +917,39 @@ pub fn run_fragmentation_autoscaler(
     let mut cluster = problem.cluster_resources.clone();
     let mut current_workers_per_stage: HashMap<String, HashMap<String, rds::Worker>> =
         HashMap::new();
-    // Pre-initialize all stages with empty vectors
+    let mut current_worker_groups_per_stage: HashMap<String, HashMap<String, rds::WorkerGroup>> =
+        HashMap::new();
+    // Ensure all stages have entries in both maps for consistency
     for s in &problem.stages {
-        current_workers_per_stage.insert(s.name.clone(), HashMap::new());
+        current_workers_per_stage
+            .entry(s.name.clone())
+            .or_insert_with(HashMap::new);
+        current_worker_groups_per_stage
+            .entry(s.name.clone())
+            .or_insert_with(HashMap::new);
     }
     // Seed with existing workers
-    for w in make_workers_from_problem_state(state) {
-        cluster
-            .allocate(&w.allocation)
-            .expect("allocate existing worker");
-        current_workers_per_stage
-            .get_mut(&w.stage_name)
-            .expect("stage exists")
-            .insert(w.id.clone(), w);
+    for w in make_workers_from_problem_state(problem, state) {
+        match w {
+            WorkerOrWorkerGroup::WorkerGroup(w) => {
+                cluster
+                    .allocate_multiple(&w.allocations)
+                    .expect("allocate existing worker");
+                current_worker_groups_per_stage
+                    .get_mut(&w.stage_name)
+                    .expect("stage exists")
+                    .insert(w.id.clone(), w);
+            }
+            WorkerOrWorkerGroup::Worker(w) => {
+                cluster
+                    .allocate(&w.allocation)
+                    .expect("allocate existing worker");
+                current_workers_per_stage
+                    .get_mut(&w.stage_name)
+                    .expect("stage exists")
+                    .insert(w.id.clone(), w);
+            }
+        }
     }
     // Prepare an internal per-stage snapshot that merges static shape/problem data,
     // dynamic state (current workers), and the latest performance/returns estimates.
@@ -890,10 +1015,25 @@ pub fn run_fragmentation_autoscaler(
         2,
     );
 
-    let mut workers_to_add: HashMap<String, Vec<rds::Worker>> = HashMap::new();
-    let mut workers_to_remove: HashMap<String, HashMap<String, rds::Worker>> = HashMap::new();
+    let mut c = AutoscaleContext {
+        cluster,
+        worker_id_factory,
+        workers_to_add_map: HashMap::new(),
+        workers_to_remove_map: HashMap::new(),
+        worker_groups_to_add_map: HashMap::new(),
+        worker_groups_to_remove_map: HashMap::new(),
+        current_workers_per_stage,
+        current_worker_groups_per_stage,
+    };
+    // Initialize the context
     for s in &problem.stages {
-        workers_to_remove.insert(s.name.clone(), HashMap::new());
+        c.workers_to_add_map.insert(s.name.clone(), Vec::new());
+        c.worker_groups_to_add_map
+            .insert(s.name.clone(), Vec::new());
+        c.workers_to_remove_map
+            .insert(s.name.clone(), HashMap::new());
+        c.worker_groups_to_remove_map
+            .insert(s.name.clone(), Vec::new());
     }
     // Trade-off constant for the allocator search: encourages solutions that
     // reuse existing packing by treating reuse as worth this much fragmentation.
@@ -923,14 +1063,10 @@ pub fn run_fragmentation_autoscaler(
             while stage.current_workers < req {
                 if !add_worker_fn(
                     stage,
-                    &mut cluster,
                     &workload_estimate,
-                    &mut workers_to_add,
-                    worker_id_factory,
                     worker_reuse_fragmentation_equivalent,
                     &mut metrics,
-                    &mut current_workers_per_stage,
-                    &mut workers_to_remove,
+                    &mut c,
                 ) {
                     panic!(
                         "Unable to allocate requested workers for stage {}. Requested={}, Current={}",
@@ -939,21 +1075,14 @@ pub fn run_fragmentation_autoscaler(
                 }
             }
             while stage.current_workers > req {
-                remove_best_worker_fn(
-                    stage,
-                    &mut cluster,
-                    &mut workers_to_remove,
-                    &workload_estimate,
-                    &mut metrics,
-                    &mut current_workers_per_stage,
-                );
+                remove_best_worker_fn(stage, &workload_estimate, &mut metrics, &mut c);
             }
         }
     }
     let phase1_duration_s = phase1_start.elapsed().as_secs_f64();
     log::debug!(
         "End of phase 1: {}\n{}\nphase_duration_s={:.6}",
-        format_summary(&workers_to_add, &HashMap::new()),
+        format_summary(&c.workers_to_add_map, &HashMap::new()),
         metrics.cumulative_str(),
         phase1_duration_s
     );
@@ -969,22 +1098,23 @@ pub fn run_fragmentation_autoscaler(
         if stage.current_workers < 1 {
             if !add_worker_fn(
                 stage,
-                &mut cluster,
                 &workload_estimate,
-                &mut workers_to_add,
-                worker_id_factory,
                 worker_reuse_fragmentation_equivalent,
                 &mut metrics,
-                &mut current_workers_per_stage,
-                &mut workers_to_remove,
+                &mut c,
             ) {
                 panic!(
                     concat!(
                         "Unable to allocate minimum worker for stage {}: requested={} current={}; ",
                         "cluster resources: cpu={}/{} gpu={}/{}"
                     ),
-                    stage.name, stage.requested_num_workers.unwrap_or(0), stage.current_workers,
-                    cluster.num_used_cpus(), cluster.num_total_cpus(), cluster.num_used_gpus(), cluster.num_total_gpus()
+                    stage.name,
+                    stage.requested_num_workers.unwrap_or(0),
+                    stage.current_workers,
+                    c.cluster.num_used_cpus(),
+                    c.cluster.num_total_cpus(),
+                    c.cluster.num_used_gpus(),
+                    c.cluster.num_total_gpus()
                 );
             }
         }
@@ -992,7 +1122,7 @@ pub fn run_fragmentation_autoscaler(
     let phase2_duration_s = phase2_start.elapsed().as_secs_f64();
     log::debug!(
         "End of phase 2: {}\n{}\nphase_duration_s={:.6}",
-        format_summary(&workers_to_add, &HashMap::new()),
+        format_summary(&c.workers_to_add_map, &HashMap::new()),
         metrics.cumulative_str(),
         phase2_duration_s
     );
@@ -1002,7 +1132,9 @@ pub fn run_fragmentation_autoscaler(
     // stage whose throughput remains above the current minimum after removal.
     let mut active: Vec<StageInternal> = stages
         .iter()
-        .filter(|s| s.requested_num_workers.is_none() && s.speed_per_worker.is_some() && !s.is_finished)
+        .filter(|s| {
+            s.requested_num_workers.is_none() && s.speed_per_worker.is_some() && !s.is_finished
+        })
         .cloned()
         .collect();
 
@@ -1020,14 +1152,10 @@ pub fn run_fragmentation_autoscaler(
             // First, try to allocate one more worker to the slowest stage directly.
             if add_worker_fn(
                 &mut active[min_idx],
-                &mut cluster,
                 &workload_estimate,
-                &mut workers_to_add,
-                worker_id_factory,
                 worker_reuse_fragmentation_equivalent,
                 &mut metrics,
-                &mut current_workers_per_stage,
-                &mut workers_to_remove,
+                &mut c,
             ) {
                 continue;
             }
@@ -1059,18 +1187,16 @@ pub fn run_fragmentation_autoscaler(
             let donor_idx = removable[0];
             remove_best_worker_fn(
                 &mut active[donor_idx],
-                &mut cluster,
-                &mut workers_to_remove,
                 &workload_estimate,
                 &mut metrics,
-                &mut current_workers_per_stage,
+                &mut c,
             );
         }
     }
     let phase3_duration_s = phase3_start.elapsed().as_secs_f64();
     log::debug!(
         "End of phase 3: {}\n{}\nphase_duration_s={:.6}",
-        format_summary(&workers_to_add, &HashMap::new()),
+        format_summary(&c.workers_to_add_map, &HashMap::new()),
         metrics.cumulative_str(),
         phase3_duration_s
     );
@@ -1113,14 +1239,10 @@ pub fn run_fragmentation_autoscaler(
             for idx in sorted {
                 if add_worker_fn(
                     &mut active[idx],
-                    &mut cluster,
                     &workload_estimate,
-                    &mut workers_to_add,
-                    worker_id_factory,
                     worker_reuse_fragmentation_equivalent,
                     &mut metrics,
-                    &mut current_workers_per_stage,
-                    &mut workers_to_remove,
+                    &mut c,
                 ) {
                     allocated_any = true;
                     break;
@@ -1137,7 +1259,7 @@ pub fn run_fragmentation_autoscaler(
     let phase4_duration_s = phase4_start.elapsed().as_secs_f64();
     log::debug!(
         "End of phase 4: {}\n{}\nphase_duration_s={:.6}",
-        format_summary(&workers_to_add, &HashMap::new()),
+        format_summary(&c.workers_to_add_map, &HashMap::new()),
         metrics.cumulative_str(),
         phase4_duration_s
     );
@@ -1151,11 +1273,31 @@ pub fn run_fragmentation_autoscaler(
         .collect();
 
     for (idx, stage_problem) in problem.stages.iter().enumerate() {
-        if let Some(stage) = out.stages.get_mut(idx) {
-            let added = workers_to_add
+        let stage = &mut out.stages[idx];
+        if let rds::WorkerShape::SpmdNodeMultiple(_) = &stage_problem.worker_shape {
+            let added = c
+                .worker_groups_to_add_map
                 .remove(&stage_problem.name)
                 .unwrap_or_default();
-            let deleted_map = workers_to_remove
+            let deleted = c
+                .worker_groups_to_remove_map
+                .remove(&stage_problem.name)
+                .unwrap_or_default();
+            stage.new_workers = added
+                .iter()
+                .map(|w| ds::ProblemWorkerGroupState::make_from_worker_group_state(w.clone()))
+                .collect();
+            stage.deleted_workers = deleted
+                .iter()
+                .map(|w| ds::ProblemWorkerGroupState::make_from_worker_group_state(w.clone()))
+                .collect();
+        } else {
+            let added = c
+                .workers_to_add_map
+                .remove(&stage_problem.name)
+                .unwrap_or_default();
+            let deleted_map = c
+                .workers_to_remove_map
                 .remove(&stage_problem.name)
                 .unwrap_or_default();
             let mut deleted: Vec<rds::Worker> = Vec::with_capacity(deleted_map.len());
@@ -1164,11 +1306,11 @@ pub fn run_fragmentation_autoscaler(
             }
             stage.new_workers = added
                 .iter()
-                .map(|w| ds::ProblemWorkerState::make_from_worker_state(w))
+                .map(|w| ds::ProblemWorkerGroupState::make_from_worker_state(w.clone()))
                 .collect();
             stage.deleted_workers = deleted
                 .iter()
-                .map(|w| ds::ProblemWorkerState::make_from_worker_state(w))
+                .map(|w| ds::ProblemWorkerGroupState::make_from_worker_state(w.clone()))
                 .collect();
         }
     }
@@ -1256,7 +1398,6 @@ impl FragmentationBasedAutoscaler {
                 }
             }
         }
-
         let out = run_fragmentation_autoscaler(
             problem,
             state,
@@ -1264,7 +1405,7 @@ impl FragmentationBasedAutoscaler {
             1.5,
             &mut self.worker_id_factory,
         );
-        debug!("Autoscaler result:\n{:?}", out);
+        debug!("Autoscaler result:\n{}", out);
         out
     }
 }
@@ -1324,7 +1465,7 @@ mod tests {
                 },
             );
         }
-        rds::ClusterResources::new(Some(nodes))
+        rds::ClusterResources { nodes }
     }
 
     fn make_default_state_for_stages(problem: &ds::Problem) -> ds::ProblemState {
@@ -1334,7 +1475,7 @@ mod tests {
                 .iter()
                 .map(|s| ds::ProblemStageState {
                     stage_name: s.name.clone(),
-                    workers: Vec::new(),
+                    worker_groups: Vec::new(),
                     slots_per_worker: 2,
                     is_finished: false,
                 })
@@ -1670,7 +1811,7 @@ mod tests {
                 .iter()
                 .map(|s| ds::ProblemStageState {
                     stage_name: s.name.clone(),
-                    workers: Vec::new(),
+                    worker_groups: Vec::new(),
                     slots_per_worker: 1,
                     is_finished: false,
                 })
@@ -1736,6 +1877,345 @@ mod tests {
         );
         assert_eq!(sol.num_new_workers_per_stage(), vec![120, 8, 240]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
+    }
+
+    // ============================================================================
+    // SPMD Shape Tests
+    // ============================================================================
+
+    #[test]
+    fn test_spmd_node_multiple_basic_allocation() {
+        // Create a cluster with 4 nodes, each with 8 CPUs and 2 GPUs
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(4, 8, 2, false),
+            stages: vec![ds::ProblemStage {
+                name: "spmd_stage".into(),
+                stage_batch_size: 1,
+                worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                    num_gpu_actors_in_group: 4, // Needs 2 nodes (4 GPUs / 2 GPUs per node)
+                    num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                    num_gpus_in_node: 2,
+                }),
+                requested_num_workers: None,
+                over_provision_factor: None,
+            }],
+        };
+        let state = make_default_state_for_stages(&problem);
+        let estimates = estimates_from_speeds(&[Some(1.0)]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
+
+        // The autoscaling algorithm should allocate at least 1 worker group
+        assert!(sol.num_new_workers_per_stage()[0] >= 1);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0]);
+
+        // Verify the worker groups have the correct number of allocations
+        let stage_solution = &sol.stages[0];
+        assert!(stage_solution.new_workers.len() >= 1);
+
+        // Check the first worker group
+        let worker_group = &stage_solution.new_workers[0];
+        assert_eq!(worker_group.resources.len(), 2); // Should span 2 nodes
+
+        // Each allocation should use all GPUs on the node
+        for resource in &worker_group.resources {
+            assert_eq!(resource.gpus.len(), 2); // 2 GPUs per node
+            for gpu_alloc in &resource.gpus {
+                assert_eq!(gpu_alloc.used_fraction, rds::FixedUtil::ONE); // Full GPU usage
+            }
+        }
+    }
+
+    #[test]
+    fn test_spmd_smaller_than_node_basic_allocation() {
+        // Create a cluster with nodes that have 4 GPUs each
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(2, 16, 4, false),
+            stages: vec![ds::ProblemStage {
+                name: "spmd_stage".into(),
+                stage_batch_size: 1,
+                worker_shape: rds::WorkerShape::SpmdSmallerThanNode(
+                    rds::SpmdSmallerThanNodeResources {
+                        num_gpu_actors_in_group: 2, // Less than 4 GPUs per node
+                        num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                        num_gpus_in_node: 4,
+                    },
+                ),
+                requested_num_workers: None,
+                over_provision_factor: None,
+            }],
+        };
+        let state = make_default_state_for_stages(&problem);
+        let estimates = estimates_from_speeds(&[Some(1.0)]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
+
+        // Should allocate multiple workers since each uses only part of a node
+        assert!(sol.num_new_workers_per_stage()[0] > 0);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0]);
+    }
+
+    #[test]
+    fn test_spmd_node_multiple_manual_request() {
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(6, 8, 2, false),
+            stages: vec![ds::ProblemStage {
+                name: "spmd_stage".into(),
+                stage_batch_size: 1,
+                worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                    num_gpu_actors_in_group: 4,
+                    num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                    num_gpus_in_node: 2,
+                }),
+                requested_num_workers: Some(2), // Manually request 2 worker groups
+                over_provision_factor: None,
+            }],
+        };
+        let state = make_default_state_for_stages(&problem);
+        let estimates = estimates_from_speeds(&[Some(1.0)]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
+
+        // Should respect the manual request for 2 worker groups
+        assert_eq!(sol.num_new_workers_per_stage(), vec![2]);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0]);
+
+        // Verify we have 2 worker groups
+        let stage_solution = &sol.stages[0];
+        assert_eq!(stage_solution.new_workers.len(), 2);
+
+        // Each worker group should span 2 nodes (4 GPUs / 2 GPUs per node)
+        for worker_group in &stage_solution.new_workers {
+            assert_eq!(worker_group.resources.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_mixed_spmd_and_regular_pipeline() {
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(4, 16, 4, false),
+            stages: vec![
+                ds::ProblemStage {
+                    name: "cpu_stage".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                        num_cpus: rds::FixedUtil::from_num(2.0),
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                ds::ProblemStage {
+                    name: "spmd_stage".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                        num_gpu_actors_in_group: 8, // Needs 2 nodes
+                        num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                        num_gpus_in_node: 4,
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                ds::ProblemStage {
+                    name: "gpu_stage".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                        num_gpus: 1,
+                        num_cpus: rds::FixedUtil::from_num(2.0),
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+            ],
+        };
+        let state = make_default_state_for_stages(&problem);
+        let estimates = estimates_from_speeds(&[Some(1.0), Some(0.5), Some(2.0)]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
+
+        // All stages should get at least one worker/worker group
+        assert!(sol.num_new_workers_per_stage()[0] > 0); // CPU stage
+        assert!(sol.num_new_workers_per_stage()[1] > 0); // SPMD stage
+        assert!(sol.num_new_workers_per_stage()[2] > 0); // GPU stage
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn test_spmd_insufficient_resources() {
+        // Create a small cluster that cannot fit the SPMD requirement
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(1, 8, 2, false), // Only 1 node with 2 GPUs
+            stages: vec![ds::ProblemStage {
+                name: "spmd_stage".into(),
+                stage_batch_size: 1,
+                worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                    num_gpu_actors_in_group: 8, // Needs 4 nodes (8 GPUs / 2 GPUs per node)
+                    num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                    num_gpus_in_node: 2,
+                }),
+                requested_num_workers: Some(1), // Manual request that cannot be satisfied
+                over_provision_factor: None,
+            }],
+        };
+        let state = make_default_state_for_stages(&problem);
+        let estimates = estimates_from_speeds(&[Some(1.0)]);
+        let _worker_id_factory = WorkerIdFactory::new();
+
+        // This should panic because the manual request cannot be satisfied
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut local_factory = WorkerIdFactory::new();
+            super::run_fragmentation_autoscaler(
+                &problem,
+                &state,
+                &estimates,
+                1.5,
+                &mut local_factory,
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "Should panic when manual SPMD request cannot be satisfied"
+        );
+    }
+
+    #[test]
+    fn test_spmd_worker_removal() {
+        // First create a problem with existing SPMD workers
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(4, 8, 2, false),
+            stages: vec![ds::ProblemStage {
+                name: "spmd_stage".into(),
+                stage_batch_size: 1,
+                worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                    num_gpu_actors_in_group: 4,
+                    num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                    num_gpus_in_node: 2,
+                }),
+                requested_num_workers: Some(1), // Request fewer than what we'll start with
+                over_provision_factor: None,
+            }],
+        };
+
+        // Create state with existing worker groups
+        let existing_worker_group = ds::ProblemWorkerGroupState {
+            id: "existing_worker_0".to_string(),
+            resources: vec![
+                rds::WorkerResources {
+                    node: "node0".to_string(),
+                    cpus: rds::FixedUtil::from_num(4.0),
+                    gpus: vec![
+                        rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                        rds::GpuAllocation {
+                            offset: 1,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                    ],
+                },
+                rds::WorkerResources {
+                    node: "node1".to_string(),
+                    cpus: rds::FixedUtil::from_num(4.0),
+                    gpus: vec![
+                        rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                        rds::GpuAllocation {
+                            offset: 1,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let existing_worker_group_2 = ds::ProblemWorkerGroupState {
+            id: "existing_worker_1".to_string(),
+            resources: vec![
+                rds::WorkerResources {
+                    node: "node2".to_string(),
+                    cpus: rds::FixedUtil::from_num(4.0),
+                    gpus: vec![
+                        rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                        rds::GpuAllocation {
+                            offset: 1,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                    ],
+                },
+                rds::WorkerResources {
+                    node: "node3".to_string(),
+                    cpus: rds::FixedUtil::from_num(4.0),
+                    gpus: vec![
+                        rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                        rds::GpuAllocation {
+                            offset: 1,
+                            used_fraction: rds::FixedUtil::ONE,
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let state = ds::ProblemState {
+            stages: vec![ds::ProblemStageState {
+                stage_name: "spmd_stage".to_string(),
+                worker_groups: vec![existing_worker_group, existing_worker_group_2], // Start with 2 worker groups
+                slots_per_worker: 2,
+                is_finished: false,
+            }],
+        };
+
+        let estimates = estimates_from_speeds(&[Some(1.0)]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
+
+        // Should remove 1 worker group to match the manual request
+        assert_eq!(sol.num_new_workers_per_stage(), vec![0]);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![1]);
     }
 
     // Turned off for normal tests because it takes too long when compiled without optimizations.
@@ -1863,6 +2343,354 @@ mod tests {
         assert_eq!(
             solution2.num_deleted_workers_per_stage(),
             vec![0; problem.stages.len()]
+        );
+    }
+
+    #[test]
+    fn test_mixed_pipeline_throughput_balancing() {
+        // Test a realistic mixed pipeline with different stage speeds to verify
+        // the autoscaler properly balances throughput across SPMD and non-SPMD stages
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(8, 16, 4, false), // 8 nodes, 16 CPUs, 4 GPUs each
+            stages: vec![
+                // Fast preprocessing stage (CPU-only)
+                ds::ProblemStage {
+                    name: "preprocess".into(),
+                    stage_batch_size: 8,
+                    worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                        num_cpus: rds::FixedUtil::from_num(2.0),
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                // Slow inference stage (SPMD across multiple nodes)
+                ds::ProblemStage {
+                    name: "inference".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                        num_gpu_actors_in_group: 8, // Needs 2 nodes (8 GPUs / 4 GPUs per node)
+                        num_cpus_per_actor: rds::FixedUtil::from_num(1.0),
+                        num_gpus_in_node: 4,
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                // Medium-speed postprocessing (fractional GPU)
+                ds::ProblemStage {
+                    name: "postprocess".into(),
+                    stage_batch_size: 4,
+                    worker_shape: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                        gpu_fraction: rds::FixedUtil::from_num(0.25),
+                        num_cpus: rds::FixedUtil::from_num(1.0),
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                // Fast output stage (whole GPU)
+                ds::ProblemStage {
+                    name: "output".into(),
+                    stage_batch_size: 2,
+                    worker_shape: rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                        num_gpus: 1,
+                        num_cpus: rds::FixedUtil::from_num(1.0),
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+            ],
+        };
+
+        let state = make_default_state_for_stages(&problem);
+
+        // Set different speeds to create throughput imbalance
+        // preprocess: fast (5.0 batches/sec), inference: slow (0.1 batches/sec)
+        // postprocess: medium (1.0 batches/sec), output: fast (3.0 batches/sec)
+        let estimates = Estimates {
+            stages: vec![
+                Estimate {
+                    batches_per_second_per_worker: Some(5.0),
+                    num_returns_per_batch: Some(8.0), // 8 outputs per batch
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(0.1),
+                    num_returns_per_batch: Some(1.0), // 1 output per batch
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(1.0),
+                    num_returns_per_batch: Some(4.0), // 4 outputs per batch
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(3.0),
+                    num_returns_per_batch: Some(2.0), // 2 outputs per batch
+                },
+            ],
+        };
+
+        let mut worker_id_factory = WorkerIdFactory::new();
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5, // 50% overallocation target
+            &mut worker_id_factory,
+        );
+
+        // Verify all stages get workers
+        let new_workers = sol.num_new_workers_per_stage();
+        assert!(new_workers[0] > 0, "Preprocess stage should get workers");
+        assert!(new_workers[1] > 0, "Inference stage should get workers");
+        assert!(new_workers[2] > 0, "Postprocess stage should get workers");
+        assert!(new_workers[3] > 0, "Output stage should get workers");
+
+        // The inference stage (slowest) should get the most worker groups relative to its speed
+        // Since it's the bottleneck at 0.1 batches/sec, it should get multiple worker groups
+        assert!(
+            new_workers[1] >= 2,
+            "Inference stage should get multiple worker groups due to being the bottleneck"
+        );
+
+        // Preprocess stage is fast (5.0 batches/sec) but needs to feed the slow inference stage
+        // It should get fewer workers since it's much faster
+        assert!(
+            new_workers[0] <= new_workers[1] * 4,
+            "Preprocess shouldn't be over-allocated given its speed"
+        );
+
+        // Postprocess stage (1.0 batches/sec) should get a reasonable number of workers
+        assert!(
+            new_workers[2] >= 1,
+            "Postprocess should get at least one worker"
+        );
+
+        // Output stage (3.0 batches/sec) should get fewer workers than slower stages
+        assert!(new_workers[3] >= 1, "Output should get at least one worker");
+
+        // Verify no workers are deleted (starting from empty state)
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0, 0]);
+
+        // Check that slots per worker are reasonable (should be >= 2)
+        for stage_sol in &sol.stages {
+            assert!(
+                stage_sol.slots_per_worker >= 2,
+                "Slots per worker should be at least 2"
+            );
+        }
+
+        // Log the results for manual inspection
+        println!("Mixed pipeline throughput balancing test results:");
+        println!("Preprocess (CPU, 5.0 b/s): {} workers", new_workers[0]);
+        println!(
+            "Inference (SPMD, 0.1 b/s): {} worker groups",
+            new_workers[1]
+        );
+        println!(
+            "Postprocess (Frac GPU, 1.0 b/s): {} workers",
+            new_workers[2]
+        );
+        println!("Output (Whole GPU, 3.0 b/s): {} workers", new_workers[3]);
+    }
+
+    #[test]
+    fn test_mixed_pipeline_with_manual_requests_and_scaling() {
+        // Test a complex scenario with manual worker requests mixed with automatic scaling
+        // to verify the algorithm respects constraints while optimizing the rest
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(6, 24, 8, false), // 6 nodes, 24 CPUs, 8 GPUs each
+            stages: vec![
+                // Data loading stage with manual request (CPU-only)
+                ds::ProblemStage {
+                    name: "data_loader".into(),
+                    stage_batch_size: 16,
+                    worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                        num_cpus: rds::FixedUtil::from_num(4.0),
+                    }),
+                    requested_num_workers: Some(3), // Manual request
+                    over_provision_factor: None,
+                },
+                // Model inference (SPMD smaller than node)
+                ds::ProblemStage {
+                    name: "model_inference".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::SpmdSmallerThanNode(
+                        rds::SpmdSmallerThanNodeResources {
+                            num_gpu_actors_in_group: 4, // Uses 4 GPUs within a node
+                            num_cpus_per_actor: rds::FixedUtil::from_num(2.0),
+                            num_gpus_in_node: 8,
+                        },
+                    ),
+                    requested_num_workers: None,      // Auto-scale
+                    over_provision_factor: Some(1.2), // 20% over-provision
+                },
+                // Feature extraction (fractional GPU, auto-scale)
+                ds::ProblemStage {
+                    name: "feature_extraction".into(),
+                    stage_batch_size: 8,
+                    worker_shape: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                        gpu_fraction: rds::FixedUtil::from_num(0.5),
+                        num_cpus: rds::FixedUtil::from_num(2.0),
+                    }),
+                    requested_num_workers: None, // Auto-scale
+                    over_provision_factor: None,
+                },
+                // Result aggregation with manual request (whole GPU)
+                ds::ProblemStage {
+                    name: "aggregation".into(),
+                    stage_batch_size: 4,
+                    worker_shape: rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                        num_gpus: 2,
+                        num_cpus: rds::FixedUtil::from_num(4.0),
+                    }),
+                    requested_num_workers: Some(2), // Manual request
+                    over_provision_factor: None,
+                },
+                // Final output (SPMD across multiple nodes, auto-scale)
+                ds::ProblemStage {
+                    name: "output_processing".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::SpmdNodeMultiple(rds::SpmdNodeMultiple {
+                        num_gpu_actors_in_group: 16, // Needs 2 nodes (16 GPUs / 8 GPUs per node)
+                        num_cpus_per_actor: rds::FixedUtil::from_num(1.0),
+                        num_gpus_in_node: 8,
+                    }),
+                    requested_num_workers: None, // Auto-scale
+                    over_provision_factor: None,
+                },
+            ],
+        };
+
+        let state = make_default_state_for_stages(&problem);
+
+        // Set realistic speeds with some stages being bottlenecks
+        let estimates = Estimates {
+            stages: vec![
+                Estimate {
+                    batches_per_second_per_worker: Some(2.0),
+                    num_returns_per_batch: Some(16.0),
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(0.5), // Slow inference
+                    num_returns_per_batch: Some(1.0),
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(1.5),
+                    num_returns_per_batch: Some(8.0),
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(1.0),
+                    num_returns_per_batch: Some(4.0),
+                },
+                Estimate {
+                    batches_per_second_per_worker: Some(0.8), // Another bottleneck
+                    num_returns_per_batch: Some(1.0),
+                },
+            ],
+        };
+
+        let mut worker_id_factory = WorkerIdFactory::new();
+        let sol = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            2.0, // 100% overallocation target for more aggressive scaling
+            &mut worker_id_factory,
+        );
+
+        let new_workers = sol.num_new_workers_per_stage();
+
+        // Verify manual requests are respected exactly
+        assert_eq!(
+            new_workers[0], 3,
+            "Data loader should get exactly 3 workers as requested"
+        );
+        assert_eq!(
+            new_workers[3], 2,
+            "Aggregation should get exactly 2 workers as requested"
+        );
+
+        // Verify auto-scaled stages get reasonable allocations
+        assert!(
+            new_workers[1] > 0,
+            "Model inference should get at least one worker group"
+        );
+        assert!(
+            new_workers[2] > 0,
+            "Feature extraction should get at least one worker"
+        );
+        assert!(
+            new_workers[4] > 0,
+            "Output processing should get at least one worker group"
+        );
+
+        // The slow stages (model_inference at 0.5 b/s and output_processing at 0.8 b/s)
+        // should get more workers to balance throughput
+        assert!(
+            new_workers[1] >= 1,
+            "Model inference should get multiple workers due to being slow"
+        );
+        assert!(
+            new_workers[4] >= 1,
+            "Output processing should get workers due to being slow"
+        );
+
+        // Feature extraction (1.5 b/s) is faster, so should get fewer workers relative to slower stages
+        assert!(
+            new_workers[2] >= 1,
+            "Feature extraction should get at least one worker"
+        );
+
+        // Verify no deletions (starting from empty)
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0, 0, 0]);
+
+        // Check that over-provisioning factor is applied to model_inference
+        // (it has over_provision_factor: Some(1.2), so its effective speed should be reduced)
+
+        // Verify slots are reasonable
+        for stage_sol in &sol.stages {
+            assert!(
+                stage_sol.slots_per_worker >= 2,
+                "Slots per worker should be at least 2"
+            );
+        }
+
+        // Log detailed results
+        println!("Mixed pipeline with manual requests test results:");
+        println!("Data loader (CPU, manual=3): {} workers", new_workers[0]);
+        println!(
+            "Model inference (SPMD<Node, 0.5 b/s, over_prov=1.2): {} workers",
+            new_workers[1]
+        );
+        println!(
+            "Feature extraction (Frac GPU, 1.5 b/s): {} workers",
+            new_workers[2]
+        );
+        println!("Aggregation (2xGPU, manual=2): {} workers", new_workers[3]);
+        println!(
+            "Output processing (SPMD>Node, 0.8 b/s): {} workers",
+            new_workers[4]
+        );
+
+        // Verify resource utilization is reasonable (not over-allocating beyond cluster capacity)
+        let total_cluster_gpus = 6 * 8; // 48 GPUs total
+        let _total_cluster_cpus = 6 * 24; // 144 CPUs total
+
+        // Rough calculation of GPU usage (this is approximate due to SPMD complexity)
+        let estimated_gpu_usage = (new_workers[1] * 4) as f32 + // Model inference: 4 GPUs per worker
+            new_workers[2] as f32 * 0.5 + // Feature extraction: 0.5 GPU per worker
+            (new_workers[3] * 2) as f32 + // Aggregation: 2 GPUs per worker
+            (new_workers[4] * 16) as f32; // Output processing: 16 GPUs per worker group
+
+        assert!(
+            estimated_gpu_usage <= total_cluster_gpus as f32,
+            "Should not over-allocate GPUs: {} used vs {} available",
+            estimated_gpu_usage,
+            total_cluster_gpus
+        );
+
+        println!(
+            "Estimated GPU utilization: {:.1}/{} ({:.1}%)",
+            estimated_gpu_usage,
+            total_cluster_gpus,
+            (estimated_gpu_usage / total_cluster_gpus as f32) * 100.0
         );
     }
 }

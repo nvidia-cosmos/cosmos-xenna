@@ -25,7 +25,6 @@ from typing import Optional
 
 import attrs
 import ray
-import ray.util.state
 from ray.util.metrics import Gauge
 
 from cosmos_xenna.pipelines.private import (
@@ -45,7 +44,6 @@ V = typing.TypeVar("V")
 
 
 _MAX_MAIN_LOOP_RATE_HZ = 100
-_VERBOSE = False
 
 
 @attrs.define
@@ -168,8 +166,8 @@ class _StreamingLoopMetrics:
 @attrs.define
 class AutoscalerResultForStage:
     slots_per_worker: int
-    new_workers: list[resources.Worker]
-    workers_to_delete: list[resources.Worker]
+    new_workers: list[resources.WorkerGroup]
+    workers_to_delete: list[resources.WorkerGroup]
 
 
 def _make_problem_from_pipeline_spec(
@@ -198,7 +196,7 @@ def _make_problem_from_pipeline_spec(
             data_structures.ProblemStage(
                 stage.name(idx),
                 stage.stage.stage_batch_size,
-                stage.stage.required_resources.to_worker_shape(),
+                stage.stage.required_resources.to_worker_shape(cluster_resources),
                 requested_num_workers=num_workers,
                 over_provision_factor=stage.over_provision_factor,
             )
@@ -216,7 +214,9 @@ def make_task_measurement_from_task_metadata(
     )
 
 
-def make_problem_worker_state_from_worker_state(state: resources.Worker) -> data_structures.ProblemWorkerState:
+def make_problem_worker_state_from_worker_state(
+    state: resources.WorkerGroup,
+) -> data_structures.ProblemWorkerGroupState:
     """Creates a ProblemWorkerState from a Worker instance.
 
     Args:
@@ -225,7 +225,7 @@ def make_problem_worker_state_from_worker_state(state: resources.Worker) -> data
     Returns:
         A new ProblemWorkerState instance.
     """
-    return data_structures.ProblemWorkerState.make(state.id, state.allocation)
+    return data_structures.ProblemWorkerGroupState.make(state.id, state.allocations)
 
 
 class Autoscaler:
@@ -244,7 +244,8 @@ class Autoscaler:
         _algorithm: The autoscaling algorithm to use for calculations.
         _executor: A `ThreadPoolExecutor` for running calculations in the background.
         _autoscale_future: A `Future` object representing the pending result of an
-            autoscaling calculation.
+            autoscaling calculation. When None, no calculation is in progress and
+            any previous results have been applied.
         _autoscale_start_time: The timestamp when the last autoscaling calculation
             was started.
     """
@@ -335,9 +336,9 @@ class Autoscaler:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
         """
-        if self._autoscale_future and not self._autoscale_future.done():
+        if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
-                logger.info("Autoscale calculation already in progress. Skipping.")
+                logger.info("Autoscale calculation already in progress or pending application. Skipping.")
             return
 
         self._autoscale_start_time = time.time()
@@ -354,16 +355,18 @@ class Autoscaler:
         Args:
             pools: The list of actor pools to update with the new scaling results.
         """
-        if self._autoscale_future and self._autoscale_future.done():
-            autoscale_result = self._autoscale_future.result()
+        if self._autoscale_future is not None and self._autoscale_future.done():
+            autoscale_result: data_structures.Solution = self._autoscale_future.result()
 
             for result, pool in zip(autoscale_result.stages, pools):
                 pool.set_num_slots_per_actor(result.slots_per_worker)
                 for w in result.new_workers:
-                    pool.add_actor_to_create(w.to_worker(pool.name))
+                    logger.trace(f"Adding actor to create: {w.to_worker_group(pool.name)}")
+                    pool.add_actor_to_create(w.to_worker_group(pool.name))
 
                 for w in result.deleted_workers:
-                    pool.add_actor_to_delete(w.to_worker(pool.name))
+                    logger.trace(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
+                    pool.add_actor_to_delete(w.to_worker_group(pool.name))
 
             self._autoscale_future = None
             autoscale_end_time = time.time()
@@ -589,6 +592,9 @@ def run_pipeline(
     assert isinstance(pipeline_spec.config.mode_specific, specs.StreamingSpecificSpec)
     # Create a worker allocator to keep track of which workers are allocated across the cluster
     worker_allocator = allocator.WorkerAllocator.make(cluster_resources)
+    # Keeps track of which ports have been used by which worker groups.
+    # This needs to be shared between all actor pools as multiple pools could be utilizing the same node.
+    port_registry = actor_pool.ClusterPortRegistry()
 
     input_queue = Queue()
     input_queue.by_node_id[None].extend(pipeline_spec.input_data)
@@ -601,13 +607,15 @@ def run_pipeline(
     for idx, stage in enumerate(pipeline_spec.stages):
         assert isinstance(stage, specs.StageSpec)
         assert stage.slots_per_actor is not None
-        wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, stage, idx)
+        wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, stage, idx, cluster_resources)
         pool_params = actor_pool.PoolParams(
             enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+            max_tasks_to_poll_per_chunk=pipeline_spec.config.max_tasks_to_poll_per_chunk,
         )
         pools.append(
             actor_pool.ActorPool(
                 worker_allocator,
+                port_registry,
                 wrapped_stage.stage,
                 wrapped_stage.params,
                 stage.name(idx),
@@ -652,7 +660,7 @@ def run_pipeline(
             # to clear room for new actors.
             for pool, is_done in zip(pools, stage_is_dones):
                 if not is_done:
-                    pool.delete_actors()
+                    pool.delete_worker_groups()
 
             # Update all the pools.
             for pool, is_done in zip(pools, stage_is_dones):

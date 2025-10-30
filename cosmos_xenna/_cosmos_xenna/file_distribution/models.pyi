@@ -119,12 +119,14 @@ class NodeStatus:
     node_id: str
     downloading_p2p_chunks: Set[uuid.UUID]
     downloading_s3_chunks: Set[uuid.UUID]
+    writing_chunks: Set[uuid.UUID]
     available_chunks: Set[uuid.UUID]
     completed_or_cached_objects: Set[uuid.UUID]
     unneeded_objects: Set[uuid.UUID]
     num_active_uploads: int
     num_active_assembling_tasks: int
     num_active_unpacking_tasks: int
+    num_active_file_writing_tasks: int
 
 class CacheInfo:
     uri: str
@@ -150,3 +152,9 @@ class ObjectStoreConfigByProfile:
 
 class ObjectStoreByProfile:
     def __init__(self, config_by_profile: ObjectStoreConfigByProfile) -> None: ...
+
+class RetryConfig:
+    num_retries: int
+    base_delay_millis: int
+
+    def __init__(self, num_retries: int, base_delay_millis: int) -> None: ...

@@ -71,6 +71,7 @@ def test_allocating_with_limited_tasks() -> None:
                 autoscale_interval_s=30,
                 autoscaler_verbosity_level=pipelines_v1.VerbosityLevel.DEBUG,
             ),
+            enable_work_stealing=True,
         ),
     )
     pipelines_v1.run_pipeline(pipeline_spec)

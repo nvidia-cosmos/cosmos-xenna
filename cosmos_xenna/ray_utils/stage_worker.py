@@ -64,15 +64,14 @@ Note:
 from __future__ import annotations
 
 import abc
-import contextlib
+import asyncio
 import copy
 import queue
 import threading
 import time
 import typing
 import uuid
-from collections.abc import Iterator
-from typing import Generator, Generic, Optional, Union
+from typing import AsyncGenerator, Generic, Optional, Union
 
 import attrs
 import ray
@@ -299,7 +298,8 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self,
         stage_interface: stage.Interface,
         params: stage.Params,
-        worker: resources.Worker,
+        stage_name: str,
+        metadata: resources.WorkerMetadata,
     ) -> None:
         """Initializes the StageWorker actor.
 
@@ -310,9 +310,10 @@ class StageWorker(abc.ABC, Generic[T, V]):
         """
         self._stage_interface = stage_interface
         self._params = params
+        self._stage_name = stage_name
         self._is_setup = False
         self._node_location: str | None = None
-        self._worker = worker
+        self._metadata = metadata
 
         # Tasks waiting to be downloaded
         self.task_queue: queue.Queue[_TaskDataWithId[T]] = queue.Queue()
@@ -324,6 +325,16 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self._results: dict[str, _Result[V]] = {}
         self.results_lock: threading.Lock = threading.Lock()
         self.stop_flag = threading.Event()
+
+        # Synchronization for setup in processing thread
+        self._setup_requested = threading.Event()
+        self._setup_completed = threading.Event()
+        self._setup_error: Exception | None = None
+
+        # Synchronization for setup_on_node in processing thread
+        self._setup_on_node_requested = threading.Event()
+        self._setup_on_node_completed = threading.Event()
+        self._setup_on_node_error: Exception | None = None
 
         self._downloader_thread = threading.Thread(target=self._downloader_loop)
         self._downloader_thread.start()
@@ -349,19 +360,8 @@ class StageWorker(abc.ABC, Generic[T, V]):
             self._node_location = str(ray.get_runtime_context().get_node_id())
         return self._node_location
 
-    @contextlib.contextmanager
-    def _maybe_with_structured_logging(self) -> Iterator[None]:
-        # TODO: This is bugged and disabled right now. Need to turn it back on.
-        # if self._params.use_structured_logging:
-        #     with vector.maybe_with_structured_logging(stage_name=str(self._params.name)):
-        #         yield
-        # else:  # do nothing
-        #     pass
-
-        yield
-
     @ray.method(retry_exceptions=False)  # type: ignore
-    def setup_on_node(self) -> str:
+    async def setup_on_node(self) -> None:
         """Setup the actor per node.
 
         This is guranteed to be called exactly once by the actor pool for each node.
@@ -372,31 +372,38 @@ class StageWorker(abc.ABC, Generic[T, V]):
         This is useful if you need to do per node setup. For example, you may need to download weights to the node from
         object storage.
         """
-        node_location = self._get_node_location()
-        if self._worker.allocation.gpus and gpu.get_num_gpus() == 0:
+        if (
+            self._metadata.should_set_cuda_visible_devices
+            and self._metadata.allocation.gpus
+            and gpu.get_num_gpus() == 0
+        ):
             raise RuntimeError(
                 "Worker is a GPU worker, but no GPUs are available. This likely means that the ray cluster was not "
                 "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0'. Xenna needs this env variable to be set "
                 "before cluster creation as it works around ray's gpu allocation mechanisms."
             )
-        metadata = resources.WorkerMetadata(self._worker.id, self._worker.allocation)
-        with stage.open_context(self._params.logging_context):
 
-            def func_to_call() -> None:
-                return self._stage_interface.setup_on_node(resources.NodeInfo(node_location), copy.deepcopy(metadata))
+        # Signal the processing thread to perform setup_on_node
+        logger.trace("Requesting setup_on_node in processing thread")
+        self._setup_on_node_requested.set()
 
-            logger.debug(f"Setting up actor for stage={self._params.name} on node={node_location}")
-            retry.do_with_retries(func_to_call, max_attempts=self._params.num_node_setup_retries)
-            logger.debug(f"Finished setting up actor for stage={self._params.name} on node={node_location}")
-            return node_location
+        # Wait for setup_on_node to complete using asyncio
+        logger.trace("Waiting for setup_on_node to complete")
+        while not self._setup_on_node_completed.is_set():
+            await asyncio.sleep(0.01)
+        logger.trace("Setup_on_node completed")
+
+        # Check if setup_on_node failed
+        if self._setup_on_node_error:
+            raise self._setup_on_node_error
 
     @ray.method(retry_exceptions=False)  # type: ignore
-    def setup(self) -> str:
+    async def setup(self) -> str:
         """Sets up the worker by calling the stage's setup method.
 
-        Invokes `self._stage_interface.setup()` with retry logic defined in
-        `self._params.num_setup_retries`. Also determines and caches the
-        Ray node ID where this worker is running.
+        This method delegates the actual setup to the processing thread to ensure
+        that setup and process_data run in the same thread context. This is critical
+        for PyTorch/CUDA contexts and other thread-local state.
 
         Returns:
             The Ray node ID (as a string) where this worker is located.
@@ -404,39 +411,49 @@ class StageWorker(abc.ABC, Generic[T, V]):
         Raises:
             Exception: If setup fails after all retry attempts.
         """
-        if self._worker.allocation.gpus and gpu.get_num_gpus() == 0:
+        if (
+            self._metadata.should_set_cuda_visible_devices
+            and self._metadata.allocation.gpus
+            and gpu.get_num_gpus() == 0
+        ):
             raise RuntimeError(
                 "Worker is a GPU worker, but no GPUs are available. This likely means that the ray cluster was not "
                 "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0'. Xenna needs this env variable to be set "
                 "before cluster creation as it works around ray's gpu allocation mechanisms."
             )
-        metadata = resources.WorkerMetadata(self._worker.id, self._worker.allocation)
-        with stage.open_context(self._params.logging_context):
 
-            def func_to_call() -> None:
-                return self._stage_interface.setup(copy.deepcopy(metadata))
+        # Signal the processing thread to perform setup
+        logger.trace("Requesting setup in processing thread")
+        self._setup_requested.set()
 
-            logger.debug(f"Setting up actor for stage={self._params.name}")
-            retry.do_with_retries(func_to_call, max_attempts=self._params.num_setup_retries)
-            node_location = self._get_node_location()
-            self._is_setup = True
-            logger.debug(f"Finished setting up actor for stage={self._params.name}")
+        # Wait for setup to complete using asyncio
+        logger.trace("Waiting for setup to complete")
+        while not self._setup_completed.is_set():
+            await asyncio.sleep(0.01)
+        logger.trace("Setup completed")
 
-            # metrics
-            for gpu_alloc in self._worker.allocation.gpus:
-                self._metrics_gpu_alloc.set(
-                    gpu_alloc.used_fraction,
-                    tags={
-                        "stage": self._params.name,
-                        "ActorId": self._worker.id,
-                        "GpuIndex": str(gpu_alloc.index),
-                    },
-                )
+        # Check if setup failed
+        if self._setup_error:
+            raise self._setup_error
 
-            return node_location
+        node_location = self._get_node_location()
+        logger.debug(f"Finished setting up actor for stage={self._params.name}")
 
-    @ray.method(num_returns="dynamic", retry_exceptions=False)  # type: ignore
-    def process_data(self, task_data: TaskData[T]) -> Generator[Union[V, TaskResultMetadata], None, None]:
+        # metrics
+        for gpu_alloc in self._metadata.allocation.gpus:
+            self._metrics_gpu_alloc.set(
+                gpu_alloc.used_fraction,
+                tags={
+                    "stage": self._params.name,
+                    "ActorId": self._metadata.worker_id,
+                    "GpuIndex": str(gpu_alloc.index),
+                },
+            )
+
+        return node_location
+
+    @ray.method(retry_exceptions=False)  # type: ignore
+    async def process_data(self, task_data: TaskData[T]) -> AsyncGenerator[Union[V, TaskResultMetadata], None]:
         """Submits a task for asynchronous processing by the worker's internal threads.
 
         This method is the main entry point for tasks. It assigns a unique ID to the
@@ -456,30 +473,30 @@ class StageWorker(abc.ABC, Generic[T, V]):
             Exception: If a processing error occurs for this task within the worker threads,
                        or if a global error (`_global_error`) has stopped the worker.
         """
-        with self._maybe_with_structured_logging():
-            # Generate a unique task ID
-            task_id = str(uuid.uuid4())
+        # Generate a unique task ID
+        task_id = str(uuid.uuid4())
 
-            # Put the task in the queue
-            self.task_queue.put(_TaskDataWithId(task_data.data_refs, task_id, TimingInfo(requested_s=time.time())))
+        # Put the task in the queue
+        self.task_queue.put(_TaskDataWithId(task_data.data_refs, task_id, TimingInfo(requested_s=time.time())))
 
-            result: Optional[_Result[V]] = None
-            # Block until the result is available and propogate any errors.
-            while True:
-                if self._global_error:
-                    raise self._global_error
+        result: Optional[_Result[V]] = None
+        # Block until the result is available and propogate any errors using asyncio.
+        while True:
+            if self._global_error:
+                raise self._global_error
 
-                with self.results_lock:
-                    exception = self._error_map.pop(task_id, None)
-                    if exception is not None:
-                        raise exception
-                    result = self._results.pop(task_id, None)
-                if result is None:
-                    time.sleep(0.01)
-                else:
-                    break
-            yield result.extras
-            yield from result.out_data
+            with self.results_lock:
+                exception = self._error_map.pop(task_id, None)
+                if exception is not None:
+                    raise exception
+                result = self._results.pop(task_id, None)
+            if result is None:
+                await asyncio.sleep(0.01)
+            else:
+                break
+        yield result.extras
+        for item in result.out_data:
+            yield item
 
     @ray.method(retry_exceptions=False)  # type: ignore
     def cancel_task(self, task_data: TaskData[T]) -> bool:
@@ -612,13 +629,12 @@ class StageWorker(abc.ABC, Generic[T, V]):
         Continuously calls `_downloader_step` until the `stop_flag` is set.
         Handles exceptions by calling `_handle_thread_exception`.
         """
-        with self._maybe_with_structured_logging():
-            local_tasks: dict[str, _TaskDataWithId[T]] = {}
-            while not self.stop_flag.is_set():
-                try:
-                    self._downloader_step(local_tasks)
-                except Exception as e:  # noqa: BLE001
-                    self._handle_thread_exception("downloader", None, e)
+        local_tasks: dict[str, _TaskDataWithId[T]] = {}
+        while not self.stop_flag.is_set():
+            try:
+                self._downloader_step(local_tasks)
+            except Exception as e:  # noqa: BLE001
+                self._handle_thread_exception("downloader", None, e)
 
     def _deserializer_step(self) -> None:
         """Performs one iteration of the deserialization loop.
@@ -651,12 +667,11 @@ class StageWorker(abc.ABC, Generic[T, V]):
         Continuously calls `_deserializer_step` until the `stop_flag` is set.
         Handles exceptions by calling `_handle_thread_exception`.
         """
-        with self._maybe_with_structured_logging():
-            while not self.stop_flag.is_set():
-                try:
-                    self._deserializer_step()
-                except Exception as e:  # noqa: BLE001
-                    self._handle_thread_exception("deserializer", None, e)
+        while not self.stop_flag.is_set():
+            try:
+                self._deserializer_step()
+            except Exception as e:  # noqa: BLE001
+                self._handle_thread_exception("deserializer", None, e)
 
     def _process_step(self) -> None:
         """Performs one iteration of the data processing loop.
@@ -693,15 +708,90 @@ class StageWorker(abc.ABC, Generic[T, V]):
     def _process_data_loop(self) -> None:
         """Main loop for the processing thread.
 
-        Continuously calls `_process_step` until the `stop_flag` is set.
-        Handles exceptions by calling `_handle_thread_exception`.
+        First waits for either setup_on_node or setup to be requested, performs the first one called,
+        then continuously processes tasks. Handles exceptions by calling `_handle_thread_exception`.
         """
-        with self._maybe_with_structured_logging():
-            while not self.stop_flag.is_set():
-                try:
-                    self._process_step()
-                except Exception as e:  # noqa: BLE001
-                    self._handle_thread_exception("process_data", None, e)
+        # Wait for either setup_on_node or setup to be requested
+        while not self.stop_flag.is_set():
+            if self._setup_on_node_requested.is_set():
+                logger.trace("Performing setup_on_node in processing thread")
+                self._perform_setup_on_node_in_thread()
+                logger.trace("Finished performing setup_on_node in processing thread")
+                self._setup_on_node_requested.clear()
+                # Don't break out of the loop here as we still need to perform setup.
+            elif self._setup_requested.is_set():
+                logger.trace("Performing setup in processing thread")
+                self._perform_setup_in_thread()
+                logger.trace("Finished performing setup in processing thread")
+                self._setup_requested.clear()
+                break  # Break out of the loop as we are now ready to process data.
+            time.sleep(0.01)
+
+        # Now process tasks continuously
+        while not self.stop_flag.is_set():
+            try:
+                self._process_step()
+            except Exception as e:  # noqa: BLE001
+                self._handle_thread_exception("process_data", None, e)
+
+    def _perform_setup_on_node_in_thread(self) -> None:
+        """Performs the actual setup_on_node in the processing thread.
+
+        This ensures that setup_on_node and process_data run in the same thread context,
+        which is critical for PyTorch/CUDA contexts and other thread-local state.
+        """
+        try:
+            node_location = self._get_node_location()
+            with stage.open_context(self._params.logging_context):
+
+                def func_to_call() -> None:
+                    return self._stage_interface.setup_on_node(
+                        resources.NodeInfo(node_location), copy.deepcopy(self._metadata)
+                    )
+
+                logger.debug(
+                    f"Setting up actor for stage={self._params.name} on node={node_location} in processing thread"
+                )
+                retry.do_with_retries(func_to_call, max_attempts=self._params.num_node_setup_retries)
+                logger.debug(
+                    f"Finished setting up actor for stage={self._params.name} on node={node_location} in processing "
+                    "thread"
+                )
+
+        except Exception as e:  # noqa: BLE001
+            # Store the error for the main thread to pick up
+            self._setup_on_node_error = e
+            logger.error(f"Setup_on_node failed in processing thread for stage={self._params.name}")
+            logger.exception("Setup_on_node failed in processing thread")
+        finally:
+            # Always signal completion, whether success or failure
+            self._setup_on_node_completed.set()
+
+    def _perform_setup_in_thread(self) -> None:
+        """Performs the actual setup in the processing thread.
+
+        This ensures that setup and process_data run in the same thread context,
+        which is critical for PyTorch/CUDA contexts and other thread-local state.
+        """
+        try:
+            with stage.open_context(self._params.logging_context):
+
+                def func_to_call() -> None:
+                    return self._stage_interface.setup(copy.deepcopy(self._metadata))
+
+                logger.debug(f"Setting up actor for stage={self._params.name} in processing thread")
+                retry.do_with_retries(func_to_call, max_attempts=self._params.num_setup_retries)
+                self._is_setup = True
+                logger.debug(f"Finished setting up actor for stage={self._params.name} in processing thread")
+
+        except Exception as e:  # noqa: BLE001
+            # Store the error for the main thread to pick up
+            self._setup_error = e
+            logger.error(f"Setup failed in processing thread for stage={self._params.name}")
+            logger.exception("Setup failed in processing thread")
+        finally:
+            # Always signal completion, whether success or failure
+            self._setup_completed.set()
 
     # TODO: We need to provide each attempt here with a new copy of the input data.
     # As written, the input data can be modified in place, which can cause problems.
@@ -725,7 +815,10 @@ class StageWorker(abc.ABC, Generic[T, V]):
             Exception: If processing fails after retries and `ignore_failures` is False.
         """
         if not self._is_setup:
-            raise RuntimeError("Error, this worker has not been set up. This is likely a pipeline problem.")
+            raise RuntimeError(
+                "Error, this worker has not been set up. The setup() method must be called before process_data(). "
+                "This indicates a bug in the ActorPool or pipeline orchestration."
+            )
 
         def func_to_call() -> list[V]:
             return self._stage_interface.process_data(in_data)
@@ -782,7 +875,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         # This is apparently used by Ray sometimes when the object's __init__ method hasn't been called.
         # Fallback in this case.
-        if hasattr(self, "_worker"):
-            return self._worker.stage_name
+        if hasattr(self, "_stage_name"):
+            return self._stage_name
         else:
             return "StageWorker"

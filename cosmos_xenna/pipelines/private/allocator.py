@@ -27,7 +27,7 @@ class WorkerAllocator:
     def __init__(self, rust_allocator: rust.WorkerAllocator):
         self._rust_allocator = rust_allocator
 
-    def add_worker(self, worker: resources.Worker) -> None:
+    def add_worker(self, worker: resources.WorkerGroup) -> None:
         self._rust_allocator.add_worker(worker.rust)
 
     def remove_worker(self, worker_id: str) -> None:
@@ -39,8 +39,8 @@ class WorkerAllocator:
     # def totals(self) -> resources.ClusterResources:
     #     return resources.ClusterResources.from_rust(self._rust_allocator.totals())
 
-    def get_workers_in_stage(self, stage_name: str) -> list[resources.Worker]:
-        return [resources.Worker(x) for x in self._rust_allocator.get_workers_in_stage(stage_name)]
+    def get_workers_in_stage(self, stage_name: str) -> list[resources.WorkerGroup]:
+        return [resources.WorkerGroup(x) for x in self._rust_allocator.get_workers_in_stage(stage_name)]
 
     def make_detailed_utilization_table(self) -> str:
         return self._rust_allocator.make_detailed_utilization_table()

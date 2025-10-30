@@ -26,24 +26,45 @@
 //!
 //! Typical usage:
 //! ```rust
-//! // Create allocator with cluster resources
-//! let allocator = WorkerAllocator::new(cluster_resources, None)?;
+//! use _cosmos_xenna::pipelines::private::scheduling::allocator::WorkerAllocator;
+//! use _cosmos_xenna::pipelines::private::scheduling::resources::{ClusterResources, Worker, WorkerGroup, WorkerResources, FixedUtil};
+//! use std::collections::HashMap;
 //!
-//! // Add workers for different pipeline stages
-//! allocator.add_worker(Worker::new("worker1".into(), "stage1".into(), resources))?;
-//! allocator.add_worker(Worker::new("worker2".into(), "stage1".into(), resources))?;
+//! fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create cluster resources
+//!     let cluster_resources = ClusterResources {
+//!         nodes: HashMap::new(),
+//!     };
 //!
-//! // Monitor resource usage
-//! println!("{}", allocator.make_detailed_utilization_table());
+//!     // Create allocator with cluster resources
+//!     let mut allocator = WorkerAllocator::new(cluster_resources, None)?;
+//!
+//!     // Create worker resources
+//!     let resources = WorkerResources {
+//!         node: "node1".to_string(),
+//!         cpus: FixedUtil::from_num(1.0),
+//!         gpus: vec![],
+//!     };
+//!
+//!     // Add workers for different pipeline stages
+//!     let worker1 = Worker::new("worker1".into(), "stage1".into(), resources.clone());
+//!     let worker2 = Worker::new("worker2".into(), "stage1".into(), resources);
+//!     allocator.add_worker(WorkerGroup::from_worker(worker1))?;
+//!     allocator.add_worker(WorkerGroup::from_worker(worker2))?;
+//!
+//!     // Monitor resource usage
+//!     println!("{}", allocator.make_detailed_utilization_table());
+//!     Ok(())
+//! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use thiserror::Error;
 
 use crate::utils::module_builders::ImportablePyModuleBuilder;
 
-use super::resources::{AllocationError, ClusterResources, Worker};
+use super::resources::{AllocationError, ClusterResources, WorkerGroup};
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -60,7 +81,7 @@ impl From<WorkerAllocatorError> for PyErr {
 /// * `by_id` - Dictionary mapping worker IDs to Worker instances for this node.
 #[derive(Debug, Default, Clone)]
 pub struct NodeWorkers {
-    pub by_id: HashMap<String, Worker>,
+    pub by_id: HashMap<String, WorkerGroup>,
 }
 
 /// Container for workers assigned to a specific pipeline stage.
@@ -69,7 +90,7 @@ pub struct NodeWorkers {
 /// * `by_id` - Dictionary mapping worker IDs to Worker instances for this stage.
 #[derive(Debug, Default, Clone)]
 pub struct StageWorkers {
-    pub by_id: HashMap<String, Worker>,
+    pub by_id: HashMap<String, WorkerGroup>,
 }
 
 #[derive(Error, Debug)]
@@ -102,7 +123,6 @@ pub enum WorkerAllocatorError {
 #[derive(Debug, Clone)]
 pub struct WorkerAllocator {
     pub cluster_resources: ClusterResources,
-    nodes_state: HashMap<String, NodeWorkers>,
     pub stages_state: HashMap<String, StageWorkers>,
 }
 
@@ -114,16 +134,10 @@ impl WorkerAllocator {
     /// * `workers` - Optional list of pre-existing workers to track.
     pub fn new(
         cluster_resources: ClusterResources,
-        workers: Option<Vec<Worker>>,
+        workers: Option<Vec<WorkerGroup>>,
     ) -> Result<Self, WorkerAllocatorError> {
-        let mut nodes_state: HashMap<String, NodeWorkers> = HashMap::new();
-        for node_id in cluster_resources.nodes.keys() {
-            nodes_state.insert(node_id.clone(), NodeWorkers::default());
-        }
-
         let mut this = Self {
             cluster_resources,
-            nodes_state,
             stages_state: HashMap::new(),
         };
 
@@ -134,14 +148,17 @@ impl WorkerAllocator {
     }
 
     pub fn num_nodes(&self) -> usize {
-        self.nodes_state.len()
+        self.cluster_resources.nodes.len()
     }
 
     fn ensure_worker_id_absent(&self, worker_id: &str) -> Result<(), WorkerAllocatorError> {
-        if self.get_worker_if_exists(worker_id).is_some() {
-            return Err(WorkerAllocatorError::DuplicateWorkerId(
-                worker_id.to_string(),
-            ));
+        // TODO: searrcht throught the states
+        for stage in self.stages_state.values() {
+            if stage.by_id.contains_key(worker_id) {
+                return Err(WorkerAllocatorError::DuplicateWorkerId(
+                    worker_id.to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -157,18 +174,12 @@ impl WorkerAllocator {
     /// # Errors
     /// Returns `WorkerAllocatorError::DuplicateWorkerId` if worker ID already exists.
     /// Returns `WorkerAllocatorError::OverAllocated` if adding worker would exceed available resources.
-    pub fn add_worker(&mut self, worker: Worker) -> Result<(), WorkerAllocatorError> {
+    pub fn add_worker(&mut self, worker: WorkerGroup) -> Result<(), WorkerAllocatorError> {
         self.ensure_worker_id_absent(&worker.id)?;
 
-        // Allocate resources on the node
-        self.cluster_resources.allocate(&worker.allocation)?;
-
-        // Track via node state
-        let node_state = self
-            .nodes_state
-            .get_mut(&worker.allocation.node)
-            .expect("node exists");
-        node_state.by_id.insert(worker.id.clone(), worker.clone());
+        // Allocate resources on the node(s)
+        self.cluster_resources
+            .allocate_multiple(&worker.allocations)?;
 
         // Track in stage index
         self.stages_state
@@ -189,10 +200,10 @@ impl WorkerAllocator {
     /// Returns `WorkerAllocatorError::OverAllocated` if adding workers would exceed available resources.
     pub fn add_workers<I>(&mut self, workers: I) -> Result<(), WorkerAllocatorError>
     where
-        I: IntoIterator<Item = Worker>,
+        I: IntoIterator<Item = WorkerGroup>,
     {
         // Collect workers so we can pre-validate and also roll back if needed
-        let workers_vec: Vec<Worker> = workers.into_iter().collect();
+        let workers_vec: Vec<WorkerGroup> = workers.into_iter().collect();
 
         // Fast duplicate detection within the provided batch
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -230,48 +241,40 @@ impl WorkerAllocator {
     /// * `worker_id` - ID of the worker to retrieve.
     ///
     /// # Returns
-    /// The requested Worker instance.
+    /// The requested WorkerGroup instance.
     ///
     /// # Errors
     /// Returns `WorkerAllocatorError::WorkerNotFound` if no worker exists with the given ID.
-    pub fn get_worker(&self, worker_id: &str) -> Result<Worker, WorkerAllocatorError> {
-        self.get_worker_if_exists(worker_id)
-            .ok_or_else(|| WorkerAllocatorError::WorkerNotFound(worker_id.to_string()))
-    }
-
-    /// Return the worker or None, if it does not exist.
-    pub fn get_worker_if_exists(&self, worker_id: &str) -> Option<Worker> {
-        for node in self.nodes_state.values() {
-            if let Some(found) = node.by_id.get(worker_id) {
-                return Some(found.clone());
+    pub fn get_worker(&self, worker_id: &str) -> Result<&WorkerGroup, WorkerAllocatorError> {
+        for stage in self.stages_state.values() {
+            if let Some(found) = stage.by_id.get(worker_id) {
+                return Ok(found);
             }
         }
-        None
+        Err(WorkerAllocatorError::WorkerNotFound(worker_id.to_string()))
     }
 
-    pub fn remove_worker(&mut self, worker_id: &str) -> Result<Worker, WorkerAllocatorError> {
-        let worker = self.get_worker(worker_id)?;
-        self.cluster_resources
-            .release_allocation(&worker.allocation)?;
+    pub fn remove_worker(&mut self, worker_id: &str) -> Result<WorkerGroup, WorkerAllocatorError> {
+        // Get worker info without borrowing self mutably
+        let (stage_name, allocations) = {
+            let worker: &WorkerGroup = self.get_worker(worker_id)?;
+            (worker.stage_name.clone(), worker.allocations.clone())
+        };
 
-        let node_state = self
-            .nodes_state
-            .get_mut(&worker.allocation.node)
-            .expect("node exists");
-        node_state.by_id.remove(worker_id);
+        // Release allocations
+        self.cluster_resources.release_allocations(&allocations)?;
 
+        // Remove from stage state
         let stage_state = self
             .stages_state
-            .get_mut(&worker.stage_name)
+            .get_mut(&stage_name)
             .expect("stage exists");
-        stage_state.by_id.remove(worker_id);
-
-        Ok(worker)
+        Ok(stage_state.by_id.remove(worker_id).expect("worker exists"))
     }
 
     pub fn delete_workers(&mut self, worker_ids: &[String]) -> Result<(), WorkerAllocatorError> {
         // Delete each worker; if any fail, re-add those already deleted and return the error
-        let mut deleted_workers: Vec<Worker> = Vec::new();
+        let mut deleted_workers: Vec<WorkerGroup> = Vec::new();
         for worker_id in worker_ids {
             match self.remove_worker(worker_id) {
                 Ok(w) => deleted_workers.push(w),
@@ -295,7 +298,7 @@ impl WorkerAllocator {
         &self.cluster_resources
     }
 
-    pub fn get_workers(&self) -> Vec<Worker> {
+    pub fn get_workers(&self) -> Vec<WorkerGroup> {
         let mut out = Vec::new();
         for stage in self.stages_state.values() {
             out.extend(stage.by_id.values().cloned());
@@ -307,36 +310,6 @@ impl WorkerAllocator {
         let mut out: HashMap<String, usize> = HashMap::new();
         for (stage, workers) in &self.stages_state {
             out.insert(stage.clone(), workers.by_id.len());
-        }
-        out
-    }
-
-    /// Returns worker IDs sorted by their node's CPU utilization.
-    ///
-    /// Useful for load balancing and resource optimization decisions.
-    ///
-    /// # Arguments
-    /// * `workers_ids_to_consider` - Optional set of worker IDs to limit consideration to.
-    ///
-    /// # Returns
-    /// List of tuples (cpu_utilization, worker_id) sorted by utilization.
-    pub fn worker_ids_and_node_cpu_utilizations(
-        &self,
-        workers_ids_to_consider: Option<&HashSet<String>>,
-    ) -> Vec<(f32, String)> {
-        let node_utils = self.calculate_node_cpu_utilizations();
-        let mut out: Vec<(f32, String)> = Vec::new();
-
-        for (node_id, node_workers) in &self.nodes_state {
-            let util = node_utils.get(node_id).copied().unwrap_or(0.0);
-            for worker_id in node_workers.by_id.keys() {
-                if workers_ids_to_consider
-                    .map(|s| s.contains(worker_id))
-                    .unwrap_or(true)
-                {
-                    out.push((util, worker_id.clone()));
-                }
-            }
         }
         out
     }
@@ -467,68 +440,22 @@ impl WorkerAllocator {
     ///
     /// # Returns
     /// List of Worker instances assigned to the stage.
-    pub fn get_workers_in_stage(&self, stage_name: &str) -> Vec<Worker> {
+    pub fn get_workers_in_stage(&self, stage_name: &str) -> Vec<WorkerGroup> {
         self.stages_state
             .get(stage_name)
             .map(|s| s.by_id.values().cloned().collect())
             .unwrap_or_default()
     }
 
-    #[pyo3(name = "num_nodes")]
-    pub fn py_num_nodes(&self) -> usize {
-        self.num_nodes()
-    }
-
     #[pyo3(name = "add_worker")]
-    pub fn py_add_worker(&mut self, worker: Worker) -> PyResult<()> {
+    pub fn py_add_worker(&mut self, worker: WorkerGroup) -> PyResult<()> {
         self.add_worker(worker)?;
         Ok(())
     }
 
-    #[pyo3(name = "add_workers")]
-    pub fn py_add_workers(&mut self, workers: Vec<Worker>) -> PyResult<()> {
-        self.add_workers(workers)?;
-        Ok(())
-    }
-
     #[pyo3(name = "remove_worker")]
-    pub fn py_remove_worker(&mut self, worker_id: String) -> PyResult<Worker> {
+    pub fn py_remove_worker(&mut self, worker_id: String) -> PyResult<WorkerGroup> {
         self.remove_worker(&worker_id).map_err(Into::into)
-    }
-
-    #[pyo3(name = "delete_workers")]
-    pub fn py_delete_workers(&mut self, worker_ids: Vec<String>) -> PyResult<()> {
-        self.delete_workers(&worker_ids).map_err(Into::into)
-    }
-
-    #[pyo3(name = "get_worker")]
-    pub fn py_get_worker(&self, worker_id: String) -> Option<Worker> {
-        self.get_worker_if_exists(&worker_id)
-    }
-
-    #[pyo3(name = "get_workers")]
-    pub fn py_get_workers(&self) -> Vec<Worker> {
-        self.get_workers()
-    }
-
-    #[pyo3(name = "get_num_workers_per_stage")]
-    pub fn py_get_num_workers_per_stage(&self) -> HashMap<String, usize> {
-        self.get_num_workers_per_stage()
-    }
-
-    #[pyo3(name = "calculate_lowest_allocated_node_by_cpu")]
-    pub fn py_calculate_lowest_allocated_node_by_cpu(&self) -> Option<String> {
-        self.calculate_lowest_allocated_node_by_cpu()
-    }
-
-    #[pyo3(name = "worker_ids_and_node_cpu_utilizations")]
-    pub fn py_worker_ids_and_node_cpu_utilizations(
-        &self,
-        workers_ids_to_consider: Option<Vec<String>>,
-    ) -> Vec<(f32, String)> {
-        let set_opt = workers_ids_to_consider
-            .map(|v| v.into_iter().collect::<std::collections::HashSet<_>>());
-        self.worker_ids_and_node_cpu_utilizations(set_opt.as_ref())
     }
 
     #[pyo3(name = "make_detailed_utilization_table")]
@@ -587,7 +514,7 @@ mod tests {
         };
         nodes.insert("0".to_string(), node0);
         nodes.insert("1".to_string(), node1);
-        rds::ClusterResources::new(Some(nodes))
+        rds::ClusterResources { nodes: nodes }
     }
 
     fn make_allocator() -> WorkerAllocator {
@@ -595,10 +522,10 @@ mod tests {
     }
 
     fn wr(node: &str, cpus: f32, gpus: Vec<(usize, f32)>) -> rds::WorkerResources {
-        let gpu_allocs: Vec<rds::GPUAllocation> = gpus
+        let gpu_allocs: Vec<rds::GpuAllocation> = gpus
             .into_iter()
-            .map(|(idx, frac)| rds::GPUAllocation {
-                index: idx,
+            .map(|(idx, frac)| rds::GpuAllocation {
+                offset: idx,
                 used_fraction: rds::FixedUtil::from_num(frac),
             })
             .collect();
@@ -619,7 +546,8 @@ mod tests {
     fn test_add_worker() {
         let mut allocator = make_allocator();
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
-        allocator.add_worker(worker.clone()).expect("add");
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+        allocator.add_worker(worker_group.clone()).expect("add");
         let fetched = allocator.get_worker("w1").expect("get");
         assert_eq!(fetched.id, "w1");
         let map = allocator.get_num_workers_per_stage();
@@ -633,7 +561,11 @@ mod tests {
             rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)])),
             rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![])),
         ];
-        allocator.add_workers(workers).expect("add workers");
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        allocator.add_workers(worker_groups).expect("add workers");
         assert!(allocator.get_worker("w1").is_ok());
         assert!(allocator.get_worker("w2").is_ok());
     }
@@ -645,7 +577,11 @@ mod tests {
             rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)])),
             rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![])),
         ];
-        allocator.add_workers(workers).expect("add workers");
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        allocator.add_workers(worker_groups).expect("add workers");
         allocator
             .delete_workers(&vec!["w1".to_string()])
             .expect("delete workers");
@@ -672,7 +608,11 @@ mod tests {
             rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)])),
             rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![])),
         ];
-        allocator.add_workers(workers).expect("add workers");
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        allocator.add_workers(worker_groups).expect("add workers");
         let table = allocator.make_detailed_utilization_table();
         assert!(table.contains("Node 0"));
         assert!(table.contains("Node 1"));
@@ -682,7 +622,8 @@ mod tests {
     fn test_overallocation() {
         let mut allocator = make_allocator();
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 10.0, vec![]));
-        let err = allocator.add_worker(worker).unwrap_err();
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+        let err = allocator.add_worker(worker_group).unwrap_err();
         match err {
             WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
@@ -696,7 +637,11 @@ mod tests {
             rds::Worker::new("w1".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.5)])),
             rds::Worker::new("w2".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.7)])),
         ];
-        let err = allocator.add_workers(workers).unwrap_err();
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        let err = allocator.add_workers(worker_groups).unwrap_err();
         match err {
             WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
@@ -708,8 +653,10 @@ mod tests {
         let mut allocator = make_allocator();
         let w1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.5)]));
         let w2 = rds::Worker::new("w2".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.7)]));
-        allocator.add_worker(w1).expect("add first");
-        let err = allocator.add_worker(w2).unwrap_err();
+        let w1_group = rds::WorkerGroup::from_worker(w1);
+        let w2_group = rds::WorkerGroup::from_worker(w2);
+        allocator.add_worker(w1_group).expect("add first");
+        let err = allocator.add_worker(w2_group).unwrap_err();
         match err {
             WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
@@ -726,7 +673,10 @@ mod tests {
                 rds::WorkerResources {
                     node: "0".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 1.0)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(1.0),
+                    }],
                 },
             ),
             rds::Worker::new(
@@ -735,7 +685,10 @@ mod tests {
                 rds::WorkerResources {
                     node: "1".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 0.7)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(0.7),
+                    }],
                 },
             ),
             rds::Worker::new(
@@ -744,11 +697,18 @@ mod tests {
                 rds::WorkerResources {
                     node: "1".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 0.31)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(0.31),
+                    }],
                 },
             ),
         ];
-        let err = allocator.add_workers(workers).unwrap_err();
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        let err = allocator.add_workers(worker_groups).unwrap_err();
         match err {
             WorkerAllocatorError::DuplicateWorkerId(id) => assert_eq!(id, "2"),
             _ => panic!("unexpected error variant: {err:?}"),
@@ -765,7 +725,10 @@ mod tests {
                 rds::WorkerResources {
                     node: "0".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 1.0)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(1.0),
+                    }],
                 },
             ),
             rds::Worker::new(
@@ -774,7 +737,10 @@ mod tests {
                 rds::WorkerResources {
                     node: "1".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 0.7)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(0.7),
+                    }],
                 },
             ),
             rds::Worker::new(
@@ -783,11 +749,18 @@ mod tests {
                 rds::WorkerResources {
                     node: "1".into(),
                     cpus: rds::FixedUtil::ZERO,
-                    gpus: vec![rds::GPUAllocation::new(0, 0.31)],
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::from_num(0.31),
+                    }],
                 },
             ),
         ];
-        let err = allocator.add_workers(workers).unwrap_err();
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        let err = allocator.add_workers(worker_groups).unwrap_err();
         match err {
             WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
@@ -803,10 +776,14 @@ mod tests {
             rds::WorkerResources {
                 node: "0".into(),
                 cpus: rds::FixedUtil::from_num(1.0),
-                gpus: vec![rds::GPUAllocation::new(0, 1.5)],
+                gpus: vec![rds::GpuAllocation {
+                    offset: 0,
+                    used_fraction: rds::FixedUtil::from_num(1.5),
+                }],
             },
         );
-        let err = allocator.add_worker(worker).unwrap_err();
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+        let err = allocator.add_worker(worker_group).unwrap_err();
         match err {
             WorkerAllocatorError::Allocation(AllocationError::NotEnoughResources { .. }) => {}
             _ => panic!("unexpected error variant: {err:?}"),
@@ -817,7 +794,8 @@ mod tests {
     fn test_get_worker() {
         let mut allocator = make_allocator();
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
-        allocator.add_worker(worker).expect("add");
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+        allocator.add_worker(worker_group).expect("add");
         let retrieved = allocator.get_worker("w1").expect("get");
         assert_eq!(retrieved.id, "w1");
         assert_eq!(retrieved.stage_name, "stage1");
@@ -837,41 +815,10 @@ mod tests {
     fn test_delete_worker() {
         let mut allocator = make_allocator();
         let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
-        allocator.add_worker(worker).expect("add");
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+        allocator.add_worker(worker_group).expect("add");
         allocator.remove_worker("w1").expect("delete");
         assert!(allocator.get_worker("w1").is_err());
-    }
-
-    #[test]
-    fn test_worker_ids_and_node_cpu_utilizations() {
-        let mut allocator = make_allocator();
-        let workers = vec![
-            rds::Worker::new("w1".into(), "stage1".into(), wr("0", 4.0, vec![])),
-            rds::Worker::new("w2".into(), "stage1".into(), wr("0", 2.0, vec![])),
-            rds::Worker::new("w3".into(), "stage2".into(), wr("1", 2.0, vec![])),
-        ];
-        allocator.add_workers(workers).expect("add");
-        let v = allocator.worker_ids_and_node_cpu_utilizations(None);
-        assert_eq!(v.len(), 3);
-        let ids: std::collections::HashSet<_> = v.iter().map(|(_, id)| id.as_str()).collect();
-        assert!(ids.contains("w1") && ids.contains("w2") && ids.contains("w3"));
-    }
-
-    #[test]
-    fn test_worker_ids_and_node_cpu_utilizations_with_subset() {
-        let mut allocator = make_allocator();
-        let workers = vec![
-            rds::Worker::new("w1".into(), "stage1".into(), wr("0", 4.0, vec![])),
-            rds::Worker::new("w2".into(), "stage1".into(), wr("0", 2.0, vec![])),
-            rds::Worker::new("w3".into(), "stage2".into(), wr("1", 2.0, vec![])),
-        ];
-        allocator.add_workers(workers).expect("add");
-        let subset: std::collections::HashSet<String> =
-            ["w1".to_string(), "w3".to_string()].into_iter().collect();
-        let v = allocator.worker_ids_and_node_cpu_utilizations(Some(&subset));
-        assert_eq!(v.len(), 2);
-        let ids: std::collections::HashSet<_> = v.iter().map(|(_, id)| id.as_str()).collect();
-        assert!(ids.contains("w1") && ids.contains("w3"));
     }
 
     #[test]
@@ -881,12 +828,642 @@ mod tests {
             rds::Worker::new("w1".into(), "stage1".into(), wr("0", 4.0, vec![])),
             rds::Worker::new("w2".into(), "stage2".into(), wr("1", 2.0, vec![])),
         ];
-        allocator.add_workers(workers).expect("add");
+        let worker_groups: Vec<rds::WorkerGroup> = workers
+            .into_iter()
+            .map(rds::WorkerGroup::from_worker)
+            .collect();
+        allocator.add_workers(worker_groups).expect("add");
         let utils = allocator.calculate_node_cpu_utilizations();
         assert_eq!(utils.len(), 2);
         let u0 = utils.get("0").copied().unwrap_or_default();
         let u1 = utils.get("1").copied().unwrap_or_default();
         assert!((u0 - 0.5).abs() < 1e-6);
         assert!((u1 - 0.5).abs() < 1e-6);
+    }
+
+    // ============================================================================
+    // WorkerGroup-specific Tests
+    // ============================================================================
+
+    #[test]
+    fn test_workergroup_creation_from_worker() {
+        let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker_group = rds::WorkerGroup::from_worker(worker.clone());
+
+        assert_eq!(worker_group.id, "w1");
+        assert_eq!(worker_group.stage_name, "stage1");
+        assert_eq!(worker_group.allocations.len(), 1);
+        assert_eq!(worker_group.allocations[0].node, worker.allocation.node);
+        assert_eq!(worker_group.allocations[0].cpus, worker.allocation.cpus);
+        assert_eq!(worker_group.allocations[0].gpus, worker.allocation.gpus);
+    }
+
+    #[test]
+    fn test_workergroup_with_multiple_allocations() {
+        let allocation1 = wr("0", 2.0, vec![(0, 0.5)]);
+        let allocation2 = wr("1", 1.0, vec![(0, 0.25)]);
+
+        let worker_group = rds::WorkerGroup {
+            id: "multi_node_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![allocation1.clone(), allocation2.clone()],
+        };
+
+        assert_eq!(worker_group.id, "multi_node_worker");
+        assert_eq!(worker_group.stage_name, "stage1");
+        assert_eq!(worker_group.allocations.len(), 2);
+        assert_eq!(worker_group.allocations[0].node, "0");
+        assert_eq!(worker_group.allocations[1].node, "1");
+    }
+
+    #[test]
+    fn test_workergroup_allocator_add_single() {
+        let mut allocator = make_allocator();
+        let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+
+        // Check initial state - no resources allocated
+        let node0_initial = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+
+        allocator
+            .add_worker(worker_group.clone())
+            .expect("add worker group");
+
+        // Verify worker group was added
+        let retrieved = allocator.get_worker("w1").expect("get worker group");
+        assert_eq!(retrieved.id, "w1");
+        assert_eq!(retrieved.stage_name, "stage1");
+        assert_eq!(retrieved.allocations.len(), 1);
+
+        // Verify resources were actually allocated
+        let node0_after = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0_after.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+    }
+
+    #[test]
+    fn test_workergroup_allocator_add_multiple_allocations() {
+        let mut allocator = make_allocator();
+        let allocation1 = wr("0", 2.0, vec![(0, 0.5)]);
+        let allocation2 = wr("1", 1.0, vec![(0, 0.25)]);
+
+        // Check initial state - no resources allocated
+        let node0_initial = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_initial = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+
+        let worker_group = rds::WorkerGroup {
+            id: "multi_node_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![allocation1, allocation2],
+        };
+
+        allocator
+            .add_worker(worker_group.clone())
+            .expect("add multi-allocation worker group");
+
+        // Verify worker group was added
+        let retrieved = allocator
+            .get_worker("multi_node_worker")
+            .expect("get worker group");
+        assert_eq!(retrieved.id, "multi_node_worker");
+        assert_eq!(retrieved.allocations.len(), 2);
+        assert_eq!(retrieved.allocations[0].node, "0");
+        assert_eq!(retrieved.allocations[1].node, "1");
+
+        // Verify resources were allocated on both nodes
+        let node0_after = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+        assert_eq!(node1_after.used_cpus.to_num::<f32>(), 1.0);
+        assert_eq!(node1_after.gpus[0].used_fraction.to_num::<f32>(), 0.25);
+    }
+
+    #[test]
+    fn test_workergroup_allocator_remove() {
+        let mut allocator = make_allocator();
+        let worker = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker_group = rds::WorkerGroup::from_worker(worker);
+
+        // Add worker and verify resources are allocated
+        allocator
+            .add_worker(worker_group)
+            .expect("add worker group");
+
+        let node0_after_add = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0_after_add.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after_add.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+
+        // Remove worker
+        let removed = allocator.remove_worker("w1").expect("remove worker group");
+        assert_eq!(removed.id, "w1");
+        assert_eq!(removed.allocations.len(), 1);
+
+        // Verify it's actually removed from allocator
+        assert!(allocator.get_worker("w1").is_err());
+
+        // Verify resources were actually deallocated
+        let node0_after_remove = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0_after_remove.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(
+            node0_after_remove.gpus[0].used_fraction.to_num::<f32>(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_workergroup_allocator_remove_multi_allocation() {
+        let mut allocator = make_allocator();
+        let allocation1 = wr("0", 2.0, vec![(0, 0.5)]);
+        let allocation2 = wr("1", 1.0, vec![(0, 0.25)]);
+
+        let worker_group = rds::WorkerGroup {
+            id: "multi_node_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![allocation1, allocation2],
+        };
+
+        // Add worker and verify resources are allocated on both nodes
+        allocator
+            .add_worker(worker_group)
+            .expect("add multi-allocation worker group");
+
+        let node0_after_add = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after_add = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after_add.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after_add.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+        assert_eq!(node1_after_add.used_cpus.to_num::<f32>(), 1.0);
+        assert_eq!(node1_after_add.gpus[0].used_fraction.to_num::<f32>(), 0.25);
+
+        // Remove worker
+        let removed = allocator
+            .remove_worker("multi_node_worker")
+            .expect("remove worker group");
+        assert_eq!(removed.id, "multi_node_worker");
+        assert_eq!(removed.allocations.len(), 2);
+
+        // Verify it's actually removed from allocator
+        assert!(allocator.get_worker("multi_node_worker").is_err());
+
+        // Verify resources were deallocated on both nodes
+        let node0_after_remove = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after_remove = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after_remove.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(
+            node0_after_remove.gpus[0].used_fraction.to_num::<f32>(),
+            0.0
+        );
+        assert_eq!(node1_after_remove.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(
+            node1_after_remove.gpus[0].used_fraction.to_num::<f32>(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_workergroup_allocator_add_multiple_worker_groups() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        // Check initial state
+        let node0_initial = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_initial = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.used_cpus.to_num::<f32>(), 0.0);
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        allocator
+            .add_workers(worker_groups)
+            .expect("add multiple worker groups");
+
+        // Verify workers were added
+        assert!(allocator.get_worker("w1").is_ok());
+        assert!(allocator.get_worker("w2").is_ok());
+
+        let all_workers = allocator.get_workers();
+        assert_eq!(all_workers.len(), 2);
+
+        // Verify resources were allocated on both nodes
+        let node0_after = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+        assert_eq!(node1_after.used_cpus.to_num::<f32>(), 1.0);
+    }
+
+    #[test]
+    fn test_workergroup_allocator_delete_multiple() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        // Add workers and verify resources are allocated
+        allocator
+            .add_workers(worker_groups)
+            .expect("add multiple worker groups");
+
+        let node0_after_add = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after_add = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after_add.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0_after_add.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+        assert_eq!(node1_after_add.used_cpus.to_num::<f32>(), 1.0);
+
+        // Delete one worker
+        allocator
+            .delete_workers(&vec!["w1".to_string()])
+            .expect("delete worker group");
+
+        // Verify w1 is removed but w2 remains
+        assert!(allocator.get_worker("w1").is_err());
+        assert!(allocator.get_worker("w2").is_ok());
+
+        // Verify only w1's resources were deallocated
+        let node0_after_delete = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after_delete = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_after_delete.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(
+            node0_after_delete.gpus[0].used_fraction.to_num::<f32>(),
+            0.0
+        );
+        assert_eq!(node1_after_delete.used_cpus.to_num::<f32>(), 1.0); // w2's resources remain
+    }
+
+    #[test]
+    fn test_workergroup_cross_node_allocation() {
+        let mut allocator = make_allocator();
+
+        // Create a worker group that spans multiple nodes
+        let allocation1 = wr("0", 2.0, vec![(0, 0.5)]);
+        let allocation2 = wr("1", 1.0, vec![(0, 0.25)]);
+
+        let worker_group = rds::WorkerGroup {
+            id: "cross_node_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![allocation1, allocation2],
+        };
+
+        allocator
+            .add_worker(worker_group.clone())
+            .expect("add cross-node worker group");
+
+        let retrieved = allocator
+            .get_worker("cross_node_worker")
+            .expect("get worker group");
+        assert_eq!(retrieved.allocations.len(), 2);
+
+        // Verify resources are allocated on both nodes
+        let node0 = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1 = allocator.cluster_resources.nodes.get("1").unwrap();
+
+        assert_eq!(node0.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+
+        assert_eq!(node1.used_cpus.to_num::<f32>(), 1.0);
+        assert_eq!(node1.gpus[0].used_fraction.to_num::<f32>(), 0.25);
+    }
+
+    #[test]
+    fn test_workergroup_cross_node_allocation_rollback() {
+        let mut allocator = make_allocator();
+
+        // Check initial state
+        let node0_initial = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_initial = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.used_cpus.to_num::<f32>(), 0.0);
+
+        // Create a worker group that spans multiple nodes, but one allocation will fail
+        let allocation1 = wr("0", 2.0, vec![(0, 0.5)]);
+        let allocation2 = wr("1", 10.0, vec![]); // This will fail - not enough CPUs on node1 (only 4 available)
+
+        let worker_group = rds::WorkerGroup {
+            id: "cross_node_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![allocation1, allocation2],
+        };
+
+        let result = allocator.add_worker(worker_group);
+        assert!(result.is_err());
+
+        // Verify that no resources were allocated (rollback worked)
+        let node0_after = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after = allocator.cluster_resources.nodes.get("1").unwrap();
+
+        assert_eq!(node0_after.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_after.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node1_after.used_cpus.to_num::<f32>(), 0.0);
+
+        // Verify the worker group was not added to the allocator
+        assert!(allocator.get_worker("cross_node_worker").is_err());
+    }
+
+    #[test]
+    fn test_workergroup_empty_allocations() {
+        let worker_group = rds::WorkerGroup {
+            id: "empty_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![],
+        };
+
+        assert_eq!(worker_group.id, "empty_worker");
+        assert_eq!(worker_group.allocations.len(), 0);
+    }
+
+    #[test]
+    fn test_workergroup_allocator_with_empty_allocations() {
+        let mut allocator = make_allocator();
+
+        let worker_group = rds::WorkerGroup {
+            id: "empty_worker".to_string(),
+            stage_name: "stage1".to_string(),
+            allocations: vec![],
+        };
+
+        // This should succeed - empty allocations don't require resources
+        allocator
+            .add_worker(worker_group.clone())
+            .expect("add empty worker group");
+
+        let retrieved = allocator
+            .get_worker("empty_worker")
+            .expect("get worker group");
+        assert_eq!(retrieved.allocations.len(), 0);
+    }
+
+    #[test]
+    fn test_workergroup_duplicate_id_detection() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w1".into(), "stage2".into(), wr("1", 1.0, vec![])); // Same ID
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        let result = allocator.add_workers(worker_groups);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            WorkerAllocatorError::DuplicateWorkerId(id) => assert_eq!(id, "w1"),
+            _ => panic!("Expected DuplicateWorkerId error"),
+        }
+    }
+
+    #[test]
+    fn test_workergroup_get_workers() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        allocator
+            .add_workers(worker_groups)
+            .expect("add worker groups");
+
+        let all_workers = allocator.get_workers();
+        assert_eq!(all_workers.len(), 2);
+
+        let ids: Vec<&String> = all_workers.iter().map(|w| &w.id).collect();
+        assert!(ids.contains(&&"w1".to_string()));
+        assert!(ids.contains(&&"w2".to_string()));
+    }
+
+    #[test]
+    fn test_workergroup_get_num_workers_per_stage() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage1".into(), wr("0", 1.0, vec![]));
+        let worker3 = rds::Worker::new("w3".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+            rds::WorkerGroup::from_worker(worker3),
+        ];
+
+        allocator
+            .add_workers(worker_groups)
+            .expect("add worker groups");
+
+        let counts = allocator.get_num_workers_per_stage();
+        assert_eq!(counts.get("stage1").copied().unwrap_or_default(), 2);
+        assert_eq!(counts.get("stage2").copied().unwrap_or_default(), 1);
+    }
+
+    #[test]
+    fn test_workergroup_initialization_with_workers() {
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        let initial_workers = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        let allocator = WorkerAllocator::new(make_simple_cluster(), Some(initial_workers))
+            .expect("create allocator with initial workers");
+
+        // Verify workers were added
+        assert!(allocator.get_worker("w1").is_ok());
+        assert!(allocator.get_worker("w2").is_ok());
+
+        let counts = allocator.get_num_workers_per_stage();
+        assert_eq!(counts.get("stage1").copied().unwrap_or_default(), 1);
+        assert_eq!(counts.get("stage2").copied().unwrap_or_default(), 1);
+
+        // Verify resources were allocated during initialization
+        let node0 = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1 = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0.used_cpus.to_num::<f32>(), 2.0);
+        assert_eq!(node0.gpus[0].used_fraction.to_num::<f32>(), 0.5);
+        assert_eq!(node1.used_cpus.to_num::<f32>(), 1.0);
+    }
+
+    #[test]
+    fn test_workergroup_initialization_with_duplicate_workers() {
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w1".into(), "stage2".into(), wr("1", 1.0, vec![])); // Same ID
+
+        let initial_workers = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        let result = WorkerAllocator::new(make_simple_cluster(), Some(initial_workers));
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            WorkerAllocatorError::DuplicateWorkerId(id) => assert_eq!(id, "w1"),
+            _ => panic!("Expected DuplicateWorkerId error"),
+        }
+    }
+
+    #[test]
+    fn test_workergroup_complex_multi_node_scenario() {
+        let mut allocator = make_allocator();
+
+        // Create a complex scenario with multiple worker groups across different nodes
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.3)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage1".into(), wr("0", 1.0, vec![(1, 0.4)]));
+
+        // Multi-allocation worker group spanning both nodes
+        let allocation1 = wr("0", 1.0, vec![(0, 0.2)]);
+        let allocation2 = wr("1", 1.0, vec![(0, 0.3)]);
+        let multi_node_worker = rds::WorkerGroup {
+            id: "multi_node".to_string(),
+            stage_name: "stage2".to_string(),
+            allocations: vec![allocation1, allocation2],
+        };
+
+        // Check initial state
+        let node0_initial = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_initial = allocator.cluster_resources.nodes.get("1").unwrap();
+        assert_eq!(node0_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node0_initial.gpus[1].used_fraction.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node1_initial.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+
+        // Add all workers
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+            multi_node_worker,
+        ];
+
+        allocator
+            .add_workers(worker_groups)
+            .expect("add complex worker groups");
+
+        // Verify all workers were added
+        assert!(allocator.get_worker("w1").is_ok());
+        assert!(allocator.get_worker("w2").is_ok());
+        assert!(allocator.get_worker("multi_node").is_ok());
+
+        // Verify resource allocation across nodes
+        let node0_after = allocator.cluster_resources.nodes.get("0").unwrap();
+        let node1_after = allocator.cluster_resources.nodes.get("1").unwrap();
+
+        // Node 0: w1 (1.0 CPU, 0.3 GPU0) + w2 (1.0 CPU, 0.4 GPU1) + multi_node (1.0 CPU, 0.2 GPU0)
+        assert_eq!(node0_after.used_cpus.to_num::<f32>(), 3.0);
+        assert!((node0_after.gpus[0].used_fraction.to_num::<f32>() - 0.5).abs() < 1e-4); // 0.3 + 0.2
+        assert!((node0_after.gpus[1].used_fraction.to_num::<f32>() - 0.4).abs() < 1e-4);
+
+        // Node 1: multi_node (1.0 CPU, 0.3 GPU0)
+        assert_eq!(node1_after.used_cpus.to_num::<f32>(), 1.0);
+        assert!((node1_after.gpus[0].used_fraction.to_num::<f32>() - 0.3).abs() < 1e-4);
+
+        // Verify stage counts
+        let counts = allocator.get_num_workers_per_stage();
+        assert_eq!(counts.get("stage1").copied().unwrap_or_default(), 2);
+        assert_eq!(counts.get("stage2").copied().unwrap_or_default(), 1);
+    }
+
+    #[test]
+    fn test_workergroup_gpu_overallocation_detection() {
+        let mut allocator = make_allocator();
+
+        // First worker takes 0.8 of GPU 0
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.8)]));
+
+        // Second worker tries to take 0.5 of the same GPU (total would be 1.3 > 1.0)
+        let worker2 = rds::Worker::new("w2".into(), "stage1".into(), wr("0", 1.0, vec![(0, 0.5)]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        let result = allocator.add_workers(worker_groups);
+        assert!(result.is_err());
+
+        // Verify that no resources were allocated (rollback worked)
+        let node0 = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0.used_cpus.to_num::<f32>(), 0.0);
+        assert_eq!(node0.gpus[0].used_fraction.to_num::<f32>(), 0.0);
+
+        // Verify no workers were added
+        assert!(allocator.get_worker("w1").is_err());
+        assert!(allocator.get_worker("w2").is_err());
+    }
+
+    #[test]
+    fn test_workergroup_cpu_overallocation_detection() {
+        let mut allocator = make_allocator();
+
+        // First worker takes 6.0 CPUs (node0 has 8.0 total)
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 6.0, vec![]));
+
+        // Second worker tries to take 3.0 CPUs (total would be 9.0 > 8.0)
+        let worker2 = rds::Worker::new("w2".into(), "stage1".into(), wr("0", 3.0, vec![]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        let result = allocator.add_workers(worker_groups);
+        assert!(result.is_err());
+
+        // Verify that no resources were allocated (rollback worked)
+        let node0 = allocator.cluster_resources.nodes.get("0").unwrap();
+        assert_eq!(node0.used_cpus.to_num::<f32>(), 0.0);
+
+        // Verify no workers were added
+        assert!(allocator.get_worker("w1").is_err());
+        assert!(allocator.get_worker("w2").is_err());
+    }
+
+    #[test]
+    fn test_workergroup_utilization_table_with_workergroups() {
+        let mut allocator = make_allocator();
+
+        let worker1 = rds::Worker::new("w1".into(), "stage1".into(), wr("0", 2.0, vec![(0, 0.5)]));
+        let worker2 = rds::Worker::new("w2".into(), "stage2".into(), wr("1", 1.0, vec![]));
+
+        let worker_groups = vec![
+            rds::WorkerGroup::from_worker(worker1),
+            rds::WorkerGroup::from_worker(worker2),
+        ];
+
+        allocator
+            .add_workers(worker_groups)
+            .expect("add worker groups");
+
+        let table = allocator.make_detailed_utilization_table();
+        assert!(table.contains("Node 0"));
+        assert!(table.contains("Node 1"));
+
+        // Verify the table shows some utilization (not all zeros)
+        assert!(table.contains("2.00")); // CPU usage
+        assert!(table.contains("0.50")); // GPU usage
     }
 }

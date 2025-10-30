@@ -37,25 +37,25 @@
 //! - **Downloading:** Each worker uses a `reqwest` client to make HTTP GET requests to peer P2P
 //!   servers. The `download_chunk` function handles the specifics of this request.
 //!
-//! - **Temporary Storage:** A key design principle is that this module downloads chunks into a
-//!   temporary directory, as managed by `get_temp_chunk_path`. It does **not** perform file
-//!   assembly. The final assembly of chunks into the target file is the responsibility of a
-//!   separate "assembler" component, which is managed by the control plane. This separation of
-//!   concerns keeps the data plane focused on high-performance data transfer.
+//! - **In-Memory Downloads:** This module downloads chunks into memory and returns them to the
+//!   orchestrator. Disk writing is handled by a separate FileWriterPool to pipeline network I/O
+//!   with disk I/O. This prevents download workers from blocking on disk operations and ensures
+//!   steady P2P upload availability.
 //!
 //! - **Retries:** The system includes a retry mechanism with an exponential backoff strategy to
 //!   handle transient network errors gracefully.
-use crate::file_distribution::common::get_temp_chunk_path;
-use crate::file_distribution::models::{DownloadFromNodeOrder, ObjectAndRange};
+use crate::file_distribution::models::{DownloadFromNodeOrder, ObjectAndRange, RetryConfig};
 use crossbeam_channel::Sender;
-use retry::{OperationResult, delay::Exponential, retry_with_index};
-use std::io::Write;
+use retry::{
+    OperationResult,
+    delay::{Exponential, jitter},
+    retry_with_index,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -63,10 +63,6 @@ use uuid::Uuid;
 pub enum DownloadError {
     #[error("Request failed: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Failed to persist temporary file: {0}")]
-    Persist(#[from] tempfile::PersistError),
     #[error("Request failed with status: {0}")]
     HttpStatus(reqwest::StatusCode),
     #[error("Invalid chunk size. Expected {expected_size} bytes, got {actual_size} bytes.")]
@@ -116,7 +112,7 @@ impl P2pDownloadTask {
 
 #[derive(Debug)]
 pub enum TaskStatus {
-    Completed(P2pDownloadTask),
+    Completed(P2pDownloadTask, Vec<u8>), // Task and downloaded data
     Failed(P2pDownloadTask, DownloadError),
 }
 
@@ -131,9 +127,7 @@ pub struct P2pDownloaderWorkerPool {
 fn download_chunk(
     client: &reqwest::blocking::Client,
     job: &P2pDownloadTask,
-    node_id: &str,
-    is_test: bool,
-) -> Result<(), DownloadError> {
+) -> Result<Vec<u8>, DownloadError> {
     let mut request = client
         .get(format!(
             "http://{}:{}/chunk/{}",
@@ -156,14 +150,9 @@ fn download_chunk(
         return Err(DownloadError::HttpStatus(status));
     }
 
-    let chunk_destination = get_temp_chunk_path(job.chunk_id, node_id, is_test);
+    let bytes = response.bytes()?;
 
-    // Create a temporary file in the same directory as the final destination
-    // This ensures the atomic rename will work (same filesystem)
-    let temp_dir = chunk_destination.parent().unwrap();
-    let mut temp_file = NamedTempFile::new_in(temp_dir)?;
-
-    let bytes = response.bytes().expect("Failed to read response bytes");
+    // Validate chunk size if range is specified
     if let Some(range) = job.object_and_range.range.clone() {
         let expected_size = (range.end - range.start) as usize;
         if bytes.len() != expected_size {
@@ -180,16 +169,7 @@ fn download_chunk(
         }
     }
 
-    std::io::copy(&mut bytes.as_ref(), &mut temp_file)?;
-
-    // Ensure data is written to disk before persist
-    temp_file.flush()?;
-    temp_file.as_file().sync_all()?;
-
-    // Atomically move the temporary file to the final destination
-    temp_file.persist(&chunk_destination)?;
-
-    Ok(())
+    Ok(bytes.to_vec())
 }
 
 fn attempt_download(
@@ -197,14 +177,13 @@ fn attempt_download(
     chunk_id: Uuid,
     client: &reqwest::blocking::Client,
     job: &P2pDownloadTask,
-    node_id: &str,
-    is_test: bool,
-) -> OperationResult<(), DownloadError> {
+    max_retries: u32,
+) -> OperationResult<Vec<u8>, DownloadError> {
     if current_try > 0 {
         log::info!("Retrying job for chunk {}...", chunk_id);
     }
-    match download_chunk(client, job, node_id, is_test) {
-        Ok(()) => OperationResult::Ok(()),
+    match download_chunk(client, job) {
+        Ok(data) => OperationResult::Ok(data),
         Err(e) => {
             if let DownloadError::HttpStatus(status) = e {
                 if status.is_client_error() {
@@ -217,9 +196,11 @@ fn attempt_download(
                 }
             }
             log::warn!(
-                "Download attempt failed for chunk {}: {:?}. It will be retried.",
+                "Download attempt failed for chunk {}: {:?}. Retry {}/{}, retrying...",
                 chunk_id,
-                e
+                e,
+                current_try + 1,
+                max_retries
             );
             OperationResult::Retry(e)
         }
@@ -231,7 +212,12 @@ impl P2pDownloaderWorkerPool {
     ///
     /// # Panics
     /// Panics if `num_workers` is 0.
-    pub fn new(num_workers: usize, node_id: String, is_test: bool) -> Self {
+    pub fn new(
+        num_workers: usize,
+        _node_id: String,
+        _is_test: bool,
+        retry_config: RetryConfig,
+    ) -> Self {
         assert!(
             num_workers > 0,
             "P2pDownloaderWorkerPool must have at least one worker."
@@ -246,10 +232,16 @@ impl P2pDownloaderWorkerPool {
             let rx = task_rx.clone();
             let active_count = Arc::clone(&active_tasks_count);
             let completed_tx_cloned = completed_tx.clone();
-            let node_id_clone = node_id.clone();
+            let retry_config_clone = retry_config.clone();
 
             let handle = thread::spawn(move || {
-                let client = reqwest::blocking::Client::new();
+                let client = reqwest::blocking::Client::builder()
+                    .pool_max_idle_per_host(10) // Reuse connections
+                    .pool_idle_timeout(std::time::Duration::from_secs(30))
+                    .tcp_keepalive(std::time::Duration::from_secs(60))
+                    .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for large chunks
+                    .build()
+                    .expect("Failed to build reqwest client");
                 for job in rx {
                     log::debug!(
                         "[Worker {}] Got a job for chunk {}, starting...",
@@ -259,20 +251,23 @@ impl P2pDownloaderWorkerPool {
                     let _guard = ActiveTaskGuard::new(Arc::clone(&active_count));
                     let chunk_id = job.chunk_id;
 
-                    let result =
-                        retry_with_index(Exponential::from_millis(100).take(3), |current_try| {
+                    let result = retry_with_index(
+                        Exponential::from_millis(retry_config_clone.base_delay_millis)
+                            .map(jitter) // Add randomness to prevent thundering herd
+                            .take(retry_config_clone.num_retries as usize),
+                        |current_try| {
                             attempt_download(
                                 current_try as u32,
                                 chunk_id,
                                 &client,
                                 &job,
-                                &node_id_clone,
-                                is_test,
+                                retry_config_clone.num_retries,
                             )
-                        });
+                        },
+                    );
 
                     let status = match result {
-                        Ok(_) => TaskStatus::Completed(job),
+                        Ok(data) => TaskStatus::Completed(job, data),
                         Err(e) => TaskStatus::Failed(job, e.error),
                     };
 
@@ -327,6 +322,12 @@ impl P2pDownloaderWorkerPool {
         let active_count = self.active_tasks_count.load(Ordering::Relaxed);
 
         queued_count + active_count
+    }
+
+    /// Returns the total number of tasks that are either queued or currently
+    /// being processed by a worker.
+    pub fn get_num_active_tasks(&self) -> usize {
+        self.active_tasks_count.load(Ordering::Relaxed)
     }
 }
 

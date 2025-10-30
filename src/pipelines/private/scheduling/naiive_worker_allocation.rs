@@ -105,7 +105,8 @@ pub enum AllocationError {
 /// # Examples
 ///
 /// ```rust
-/// use crate::pipelines::private::scheduling::{naiive_worker_allocation::*, resources::*};
+/// use _cosmos_xenna::pipelines::private::scheduling::naiive_worker_allocation::AllocationProblemStage;
+/// use _cosmos_xenna::pipelines::private::scheduling::resources::PoolOfResources;
 ///
 /// // Create a stage that processes 2 batches per second per worker
 /// let stage = AllocationProblemStage {
@@ -116,8 +117,6 @@ pub enum AllocationError {
 ///     resources_per_worker: PoolOfResources {
 ///         cpus: 2.0,
 ///         gpus: 1.0,
-///         nvdecs: 1.0,
-///         nvencs: 0.0,
 ///     },
 ///     requested_num_workers: None, // Let optimizer decide
 /// };
@@ -457,32 +456,36 @@ impl AllocationResult {
 /// # Examples
 ///
 /// ```rust
-/// use crate::pipelines::private::scheduling::{naiive_worker_allocation::*, resources::*};
+/// use _cosmos_xenna::pipelines::private::scheduling::naiive_worker_allocation::{AllocationProblem, AllocationProblemStage, solve_allocation};
+/// use _cosmos_xenna::pipelines::private::scheduling::resources::PoolOfResources;
 ///
-/// let problem = AllocationProblem {
-///     stages: vec![
-///         AllocationProblemStage {
-///             name: "decode".to_string(),
-///             batches_per_second_per_worker: 2.0,
-///             num_returns_per_batch: 1.0,
-///             stage_batch_size: 4,
-///             resources_per_worker: PoolOfResources { cpus: 1.0, gpus: 1.0, nvdecs: 1.0, nvencs: 0.0 },
-///             requested_num_workers: None,
-///         },
-///         AllocationProblemStage {
-///             name: "process".to_string(),
-///             batches_per_second_per_worker: 1.0,
-///             num_returns_per_batch: 1.0,
-///             stage_batch_size: 8,
-///             resources_per_worker: PoolOfResources { cpus: 2.0, gpus: 0.0, nvdecs: 0.0, nvencs: 0.0 },
-///             requested_num_workers: Some(3), // Manually specified
-///         },
-///     ],
-///     cluster_resources: PoolOfResources { cpus: 20.0, gpus: 8.0, nvdecs: 4.0, nvencs: 0.0 },
-/// };
+/// fn example() -> Result<(), Box<dyn std::error::Error>> {
+///     let problem = AllocationProblem {
+///         stages: vec![
+///             AllocationProblemStage {
+///                 name: "decode".to_string(),
+///                 batches_per_second_per_worker: 2.0,
+///                 num_returns_per_batch: 1.0,
+///                 stage_batch_size: 4,
+///                 resources_per_worker: PoolOfResources { cpus: 1.0, gpus: 1.0 },
+///                 requested_num_workers: None,
+///             },
+///             AllocationProblemStage {
+///                 name: "process".to_string(),
+///                 batches_per_second_per_worker: 1.0,
+///                 num_returns_per_batch: 1.0,
+///                 stage_batch_size: 8,
+///                 resources_per_worker: PoolOfResources { cpus: 2.0, gpus: 0.0 },
+///                 requested_num_workers: Some(3), // Manually specified
+///             },
+///         ],
+///         cluster_resources: PoolOfResources { cpus: 20.0, gpus: 8.0 },
+///     };
 ///
-/// let result = solve_allocation(problem)?;
-/// println!("Pipeline throughput: {:.2} items/sec", result.throughput);
+///     let result = solve_allocation(problem)?;
+///     println!("Pipeline throughput: {:.2} items/sec", result.throughput);
+///     Ok(())
+/// }
 /// ```
 pub fn solve_allocation(problem: AllocationProblem) -> Result<AllocationResult, AllocationError> {
     // Validate all stage parameters before proceeding with optimization
@@ -801,6 +804,8 @@ fn solve_allocation_with_no_manual_stages(
 /// # Examples
 ///
 /// ```rust
+/// use _cosmos_xenna::pipelines::private::scheduling::naiive_worker_allocation::calculate_input_samples_per_sample;
+///
 /// // Pipeline: decode -> filter -> process
 /// let batch_sizes = vec![8, 4, 2];           // Batch sizes
 /// let returns_per_batch = vec![1.0, 0.5, 1.0]; // Filter removes 50% of samples

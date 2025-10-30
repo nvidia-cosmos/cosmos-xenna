@@ -73,25 +73,20 @@ impl ProblemStage {
     }
 }
 
-/// Represents the state of a worker in the system.
+/// Represents the state of a worker group in the system.
 ///
 /// # Attributes
-/// * `id` - Unique identifier for the worker.
-/// * `resources` - Current resource allocation for this worker.
+/// * `id` - Unique identifier for the worker group.
+/// * `workers` - List of workers in this group.
 #[pyclass(get_all, set_all)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProblemWorkerState {
+pub struct ProblemWorkerGroupState {
     pub id: String,
-    pub resources: resources::WorkerResources,
+    pub resources: Vec<resources::WorkerResources>,
 }
 
 #[pymethods]
-impl ProblemWorkerState {
-    #[new]
-    pub fn new(id: String, resources: resources::WorkerResources) -> Self {
-        Self { id, resources }
-    }
-
+impl ProblemWorkerGroupState {
     /// Creates a ProblemWorkerState from a Worker instance.
     ///
     /// # Arguments
@@ -100,11 +95,24 @@ impl ProblemWorkerState {
     /// # Returns
     /// A new ProblemWorkerState instance.
     #[staticmethod]
-    pub fn make_from_worker_state(state: &resources::Worker) -> Self {
+    pub fn make_from_worker_group_state(state: resources::WorkerGroup) -> Self {
         Self {
-            id: state.id.clone(),
-            resources: state.allocation.clone(),
+            id: state.id,
+            resources: state.allocations,
         }
+    }
+
+    #[staticmethod]
+    pub fn make_from_worker_state(state: resources::Worker) -> Self {
+        Self {
+            id: state.id,
+            resources: vec![state.allocation],
+        }
+    }
+
+    #[new]
+    pub fn py_new(id: String, resources: Vec<resources::WorkerResources>) -> Self {
+        Self { id, resources }
     }
 
     /// Converts this state to a Worker instance.
@@ -114,12 +122,25 @@ impl ProblemWorkerState {
     ///
     /// # Returns
     /// A Worker instance representing this state.
-    pub fn to_worker(&self, stage_name: &str) -> resources::Worker {
-        resources::Worker::new(
-            self.id.clone(),
-            stage_name.to_string(),
-            self.resources.clone(),
-        )
+    pub fn to_worker_group(&self, stage_name: String) -> resources::WorkerGroup {
+        resources::WorkerGroup {
+            id: self.id.clone(),
+            stage_name,
+            allocations: self.resources.clone(),
+        }
+    }
+
+    pub fn to_worker(&self, stage_name: String) -> resources::Worker {
+        if self.resources.len() > 1 {
+            panic!(
+                "Cannot convert ProblemWorkerGroupState to Worker if there are multiple allocations"
+            );
+        }
+        resources::Worker {
+            id: self.id.clone(),
+            stage_name,
+            allocation: self.resources[0].clone(),
+        }
     }
 
     pub fn serialize(&self) -> String {
@@ -143,7 +164,7 @@ impl ProblemWorkerState {
 #[derive(Debug, Clone)]
 pub struct ProblemStageState {
     pub stage_name: String,
-    pub workers: Vec<ProblemWorkerState>,
+    pub worker_groups: Vec<ProblemWorkerGroupState>,
     pub slots_per_worker: usize,
     pub is_finished: bool,
 }
@@ -151,15 +172,15 @@ pub struct ProblemStageState {
 #[pymethods]
 impl ProblemStageState {
     #[new]
-    pub fn new(
+    pub fn py_new(
         stage_name: String,
-        workers: Vec<ProblemWorkerState>,
+        worker_groups: Vec<ProblemWorkerGroupState>,
         slots_per_worker: usize,
         is_finished: bool,
     ) -> Self {
         Self {
             stage_name,
-            workers,
+            worker_groups,
             slots_per_worker,
             is_finished,
         }
@@ -167,7 +188,7 @@ impl ProblemStageState {
 
     /// Returns the current number of workers in this stage.
     pub fn num_workers(&self) -> usize {
-        self.workers.len()
+        self.worker_groups.len()
     }
 }
 
@@ -203,22 +224,30 @@ impl Display for ProblemState {
             .set_header(vec!["Stage", "Worker ID", "Node", "CPUs", "GPUs"]);
 
         for (stage_idx, stage) in self.stages.iter().enumerate() {
-            for w in &stage.workers {
-                let gpu_alloc = w
-                    .resources
-                    .gpus
-                    .iter()
-                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            for w in &stage.worker_groups {
+                // WorkerGroup can have multiple resource allocations
+                for (alloc_idx, resource) in w.resources.iter().enumerate() {
+                    let gpu_alloc = resource
+                        .gpus
+                        .iter()
+                        .map(|g| format!("{}:{:.2}", g.offset, g.used_fraction))
+                        .collect::<Vec<_>>()
+                        .join(", ");
 
-                table.add_row(vec![
-                    stage_idx.to_string(),
-                    w.id.clone(),
-                    w.resources.node.clone(),
-                    format!("{:.2}", w.resources.cpus),
-                    gpu_alloc,
-                ]);
+                    let worker_id = if w.resources.len() > 1 {
+                        format!("{}-{}", w.id, alloc_idx)
+                    } else {
+                        w.id.clone()
+                    };
+
+                    table.add_row(vec![
+                        stage_idx.to_string(),
+                        worker_id,
+                        resource.node.clone(),
+                        format!("{:.2}", resource.cpus.to_num::<f32>()),
+                        gpu_alloc,
+                    ]);
+                }
             }
         }
         write!(f, "{}", table)
@@ -270,8 +299,8 @@ impl Problem {
 #[derive(Debug, Clone)]
 pub struct StageSolution {
     pub slots_per_worker: usize,
-    pub new_workers: Vec<ProblemWorkerState>,
-    pub deleted_workers: Vec<ProblemWorkerState>,
+    pub new_workers: Vec<ProblemWorkerGroupState>,
+    pub deleted_workers: Vec<ProblemWorkerGroupState>,
 }
 
 impl StageSolution {
@@ -325,38 +354,56 @@ impl Display for Solution {
 
         for (stage_idx, stage) in self.stages.iter().enumerate() {
             for w in &stage.new_workers {
-                let gpu_alloc = w
-                    .resources
-                    .gpus
-                    .iter()
-                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                table.add_row(vec![
-                    stage_idx.to_string(),
-                    "New".to_string(),
-                    w.id.clone(),
-                    w.resources.node.clone(),
-                    format!("{:.2}", w.resources.cpus),
-                    gpu_alloc,
-                ]);
+                // WorkerGroup can have multiple resource allocations
+                for (alloc_idx, resource) in w.resources.iter().enumerate() {
+                    let gpu_alloc = resource
+                        .gpus
+                        .iter()
+                        .map(|g| format!("{}:{:.2}", g.offset, g.used_fraction))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let worker_id = if w.resources.len() > 1 {
+                        format!("{}-{}", w.id, alloc_idx)
+                    } else {
+                        w.id.clone()
+                    };
+
+                    table.add_row(vec![
+                        stage_idx.to_string(),
+                        "New".to_string(),
+                        worker_id,
+                        resource.node.clone(),
+                        format!("{:.2}", resource.cpus.to_num::<f32>()),
+                        gpu_alloc,
+                    ]);
+                }
             }
             for w in &stage.deleted_workers {
-                let gpu_alloc = w
-                    .resources
-                    .gpus
-                    .iter()
-                    .map(|g| format!("{}:{:.2}", g.index, g.used_fraction))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                table.add_row(vec![
-                    stage_idx.to_string(),
-                    "Deleted".to_string(),
-                    w.id.clone(),
-                    w.resources.node.clone(),
-                    format!("{:.2}", w.resources.cpus),
-                    gpu_alloc,
-                ]);
+                // WorkerGroup can have multiple resource allocations
+                for (alloc_idx, resource) in w.resources.iter().enumerate() {
+                    let gpu_alloc = resource
+                        .gpus
+                        .iter()
+                        .map(|g| format!("{}:{:.2}", g.offset, g.used_fraction))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let worker_id = if w.resources.len() > 1 {
+                        format!("{}-{}", w.id, alloc_idx)
+                    } else {
+                        w.id.clone()
+                    };
+
+                    table.add_row(vec![
+                        stage_idx.to_string(),
+                        "Deleted".to_string(),
+                        worker_id,
+                        resource.node.clone(),
+                        format!("{:.2}", resource.cpus.to_num::<f32>()),
+                        gpu_alloc,
+                    ]);
+                }
             }
         }
         write!(f, "{}", table)
@@ -481,7 +528,7 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .add_class::<ProblemState>()?
         .add_class::<ProblemStage>()?
         .add_class::<ProblemStageState>()?
-        .add_class::<ProblemWorkerState>()?
+        .add_class::<ProblemWorkerGroupState>()?
         .add_class::<Solution>()?
         .add_class::<StageSolution>()?
         .add_class::<TaskMeasurement>()?

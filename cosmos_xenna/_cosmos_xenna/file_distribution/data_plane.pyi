@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .models import DownloadCatalog, NodeStatus, ObjectStoreByProfile, Orders
+from .models import DownloadCatalog, NodeStatus, ObjectStoreByProfile, Orders, RetryConfig
 
 class DataPlane:
     def __init__(
@@ -27,6 +27,8 @@ class DataPlane:
         node_parallelism: int,
         download_catalog: DownloadCatalog,
         object_store_by_profile: ObjectStoreByProfile,
+        object_store_retry_config: RetryConfig,
+        p2p_retry_config: RetryConfig,
     ) -> None: ...
     def start_p2p_server(self, port: Optional[int] = None) -> int: ...
     def start(self) -> None: ...

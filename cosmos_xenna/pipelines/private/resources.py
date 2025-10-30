@@ -30,6 +30,7 @@ import ray
 import ray.util.scheduling_strategies
 
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import resources as rust  # type: ignore
+from cosmos_xenna.pipelines.private import allocator
 from cosmos_xenna.utils import python_log as logger
 
 try:
@@ -65,6 +66,9 @@ class WorkerShape:
     def rust(self) -> rust.WorkerShape:
         return self._r
 
+    def is_spmd(self) -> bool:
+        return self._r.is_spmd()
+
     def get_num_cpus(self) -> float:
         return self._r.get_num_cpus()
 
@@ -87,12 +91,12 @@ class WorkerShape:
         return cls(rust_worker_shape)
 
 
-class Worker:
+class WorkerGroup:
     @classmethod
-    def make(cls, id: str, stage_name: str, allocation: WorkerResources) -> Worker:
-        return cls(rust.Worker(id, stage_name, allocation.to_rust()))
+    def make(cls, id: str, stage_name: str, allocations: list[WorkerResourcesInternal]) -> WorkerGroup:
+        return cls(rust.WorkerGroup(id, stage_name, [x.to_rust() for x in allocations]))
 
-    def __init__(self, rust_worker: rust.Worker):
+    def __init__(self, rust_worker: rust.WorkerGroup):
         self._r = rust_worker
 
     @property
@@ -104,12 +108,32 @@ class Worker:
         return self._r.stage_name
 
     @property
-    def allocation(self) -> WorkerResources:
-        return WorkerResources.from_rust(self._r.allocation)
+    def allocations(self) -> list[WorkerResourcesInternal]:
+        return [WorkerResourcesInternal.from_rust(x) for x in self._r.allocations]
 
     @property
-    def rust(self) -> rust.Worker:
+    def rust(self) -> rust.WorkerGroup:
         return self._r
+
+    def split_allocation_per_gpu(self) -> list[WorkerResourcesInternal]:
+        """Splits the worker group's allocations into separate WorkerResources for each GPU.
+
+        This method is useful for distributed training/inference scenarios where you need to treat
+        each GPU as a separate worker with its own resource allocation. The CPUs are
+        divided evenly among all GPUs in each allocation.
+
+        Returns:
+            list[WorkerResources]: A list of WorkerResources, one for each GPU in the
+                worker group. Each entry contains:
+                - The same node as the original allocation
+                - A fraction of the CPUs (total CPUs / number of GPUs in that allocation)
+                - A single GPU allocation
+
+        Example:
+            If a worker group has an allocation with 8 CPUs and 4 GPUs, this method will
+            return 4 WorkerResources entries, each with 2 CPUs and 1 GPU.
+        """
+        return [WorkerResourcesInternal.from_rust(x) for x in self._r.split_allocation_per_gpu()]
 
     def __reduce__(self) -> Any:
         """Make the class pickleable by serializing the Rust object to a string."""
@@ -119,12 +143,26 @@ class Worker:
         return (self._reconstruct, (serialized,))
 
     @classmethod
-    def _reconstruct(cls, serialized: str) -> Worker:
+    def _reconstruct(cls, serialized: str) -> WorkerGroup:
         """Reconstruct a Worker from a serialized string."""
         # Deserialize the string back to a Rust Worker
-        rust_worker = rust.Worker.deserialize(serialized)
-        # Create a new Python Worker instance
+        rust_worker = rust.WorkerGroup.deserialize(serialized)
+        # Create a new Python WorkerGroup instance
         return cls(rust_worker)
+
+    def __hash__(self) -> int:
+        return hash(self._r.id)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, WorkerGroup):
+            return False
+        return self._r.id == other._r.id
+
+    def __repr__(self) -> str:
+        return self._r.__repr__()
+
+    def __str__(self) -> str:
+        return self._r.__str__()
 
 
 @attrs.define
@@ -150,36 +188,75 @@ class GpuResources:
 
 
 @attrs.define
-class GpuAllocation:
-    index: int
+class GpuAllocationInternal:
+    """Represents the allocation a worker is taking up for a given GPU.
+
+    This class describes how much of a GPU's resources are allocated to a worker.
+    It's a lightweight reference that points to a GPU in a node's GPU list rather
+    than storing full GPU details.
+
+    Attributes:
+        offset: **Index into the node's NodeResources.gpus list**, not the hardware GPU index.
+                This indirection allows the same allocation to be used with different nodes,
+                and keeps the allocation struct small. To get the actual hardware GPU index
+                or UUID, you must look up node_resources.gpus[offset].
+
+        used_fraction: Fraction of the GPU's compute capacity allocated (0.0 to 1.0).
+                      For whole-GPU allocations, this is 1.0. For fractional allocations,
+                      this can be any value like 0.25, 0.5, etc.
+
+    Important: Offset vs. GPU Index
+        The `offset` field is **not** the hardware GPU index! It's the position in the
+        NodeResources.gpus list. For example:
+        - If a node has 4 GPUs and you want GPU at hardware index 2, you need to find
+          which position in the gpus list corresponds to that GPU.
+        - The actual hardware index is stored in GpuResources.index
+        - The GPU UUID is stored in GpuResources.uuid_
+
+    Example:
+        >>> # Create an allocation for the first GPU in a node's list (offset=0)
+        >>> # using 50% of its capacity
+        >>> alloc = GpuAllocation(offset=0, used_fraction=0.5)
+        >>>
+        >>> # To get the actual hardware GPU index:
+        >>> # hardware_index = node_resources.gpus[alloc.offset].index
+    """
+
+    offset: int
     used_fraction: float
 
     @classmethod
-    def from_rust(cls, rust_gpu_allocation: rust.GPUAllocation) -> GpuAllocation:
-        return GpuAllocation(
-            index=rust_gpu_allocation.index,
+    def from_rust(cls, rust_gpu_allocation: rust.GpuAllocation) -> GpuAllocationInternal:
+        return GpuAllocationInternal(
+            offset=rust_gpu_allocation.offset,
             used_fraction=rust_gpu_allocation.used_fraction,
         )
 
-    def to_rust(self) -> rust.GPUAllocation:
-        return rust.GPUAllocation(
-            index=self.index,
+    def to_rust(self) -> rust.GpuAllocation:
+        return rust.GpuAllocation(
+            offset=self.offset,
             used_fraction=self.used_fraction,
         )
 
 
 @attrs.define
-class WorkerResources:
+class WorkerResourcesInternal:
+    """Like WorkerResources, but track gpu offsets rather than indices.
+
+    This is used internally, becuase it is easier to track gpu offsets (the offset into the node's visible gpus list)
+    rather than indices, but it is confusing to use show it to users, which is what we use WorkerResources for.
+    """
+
     node: str
     cpus: float
-    gpus: list[GpuAllocation]
+    gpus: list[GpuAllocationInternal]
 
     @staticmethod
-    def from_rust(r: rust.WorkerMetadata) -> WorkerResources:
-        return WorkerResources(
+    def from_rust(r: rust.WorkerMetadata) -> WorkerResourcesInternal:
+        return WorkerResourcesInternal(
             r.node,
             r.cpus,
-            [GpuAllocation.from_rust(x) for x in r.gpus],
+            [GpuAllocationInternal.from_rust(x) for x in r.gpus],
         )
 
     def to_rust(self) -> rust.WorkerResources:
@@ -191,22 +268,129 @@ class WorkerResources:
 
 
 @attrs.define
+class GpuAllocation:
+    """Tracks the allocation of a GPU to a worker."""
+
+    # The hardward index of the GPU (e.g. 0, 1, 2, 3)
+    index: int
+    # Fraction of the GPU's compute capacity the worker has been allocated.
+    used_fraction: float
+
+
+@attrs.define
+class WorkerResources:
+    """Tracks the resources a worker is taking up."""
+
+    # Node the worker is running on.
+    node: str
+    # Number of CPUs the worker has been allocated.
+    cpus: float
+    # List of GPUs the worker has been allocated.
+    gpus: list[GpuAllocation]
+
+    @classmethod
+    def from_internal(cls, internal: WorkerResourcesInternal, allocator: allocator.WorkerAllocator) -> WorkerResources:
+        return WorkerResources(
+            node=internal.node,
+            cpus=internal.cpus,
+            gpus=[
+                GpuAllocation(index=allocator.get_gpu_index(internal.node, gpu.offset), used_fraction=gpu.used_fraction)
+                for gpu in internal.gpus
+            ],
+        )
+
+
+@attrs.define
+class NcclRendevousParams:
+    master_addr: str
+    master_port: int
+
+
+@attrs.define
+class DistributedExecutionParams:
+    """
+    Parameters required for distributed training and inference, specifically SPMD/torchrun style training/inference.
+
+    Attributes:
+        rank: Global rank of this process.
+        world_size: Total number of processes.
+        local_rank: Rank within the current node.
+        master_addr: Address of the master node.
+        master_port: Port used for communication.
+    """
+
+    # Global rank of this gpu.
+    rank: int
+    # Total number of gpus
+    world_size: int
+    # Rank within the current node
+    # Usually interpreted as the local gpu id.
+    local_rank: int
+    # Address of the master node.
+    master_addr: str
+    # Port used for communication on the master node.
+    master_port: int
+
+    @classmethod
+    def from_env_vars(cls, env_vars: dict[str, str] | None = None) -> DistributedExecutionParams:
+        if env_vars is None:
+            env_vars = dict(os.environ)  # Use current environment variables.
+        return cls(
+            rank=int(env_vars["RANK"]),
+            world_size=int(env_vars["WORLD_SIZE"]),
+            local_rank=int(env_vars["LOCAL_RANK"]),
+            master_addr=env_vars["MASTER_ADDR"],
+            master_port=int(env_vars["MASTER_PORT"]),
+        )
+
+    def to_env_var_dict(self) -> dict[str, str]:
+        """Create a dict which can be used to set the env vars.
+
+        This follows what torch does.
+        """
+        return {
+            "RANK": str(self.rank),
+            "WORLD_SIZE": str(self.world_size),
+            "LOCAL_RANK": str(self.local_rank),
+            "MASTER_ADDR": self.master_addr,
+            "MASTER_PORT": str(self.master_port),
+        }
+
+
+@attrs.define
 class WorkerMetadata:
     worker_id: str
+    worker_group_id: str
     allocation: WorkerResources
+    should_set_cuda_visible_devices: bool
+    world_size: int | None
+    local_rank: int | None
+    rank: int | None
+    rendevous_params: NcclRendevousParams | None
 
     @staticmethod
     def make_dummy() -> WorkerMetadata:
         return WorkerMetadata(
             worker_id="debug_worker",
-            allocation=rust.WorkerResources(node="debug_node", cpus=1.0, gpus=[]),
+            worker_group_id="debug_worker_group",
+            allocation=WorkerResources(node="debug_node", cpus=1.0, gpus=[]),
+            should_set_cuda_visible_devices=False,
+            world_size=None,
+            local_rank=None,
+            rank=None,
+            rendevous_params=None,
         )
 
-    @staticmethod
-    def from_rust(rust_worker_metadata: rust.WorkerMetadata) -> WorkerMetadata:
-        return WorkerMetadata(
-            worker_id=rust_worker_metadata.worker_id,
-            allocation=rust_worker_metadata.allocation,
+    @property
+    def distributed_execution_params(self) -> DistributedExecutionParams | None:
+        if self.rank is None or self.world_size is None or self.rendevous_params is None or self.local_rank is None:
+            return None
+        return DistributedExecutionParams(
+            rank=self.rank,
+            world_size=self.world_size,
+            local_rank=self.local_rank,
+            master_addr=self.rendevous_params.master_addr,
+            master_port=self.rendevous_params.master_port,
         )
 
 
@@ -226,11 +410,41 @@ class Resources:
     This class provides an intuitive interface for specifying resource requirements
     that get translated into more detailed internal worker shapes.
 
+    Attributes:
+        cpus: Number of CPU cores required (can be fractional)
+        gpus: Number of GPUs required (can be fractional for single-GPU stages,
+              must be integer for SPMD stages)
+        is_spmd: Whether this stage requires SPMD (Single Program, Multiple Data)
+                 execution for distributed inference across multiple GPUs/nodes
+
+    SPMD Mode:
+        When is_spmd=True, the stage runs in distributed inference mode, emulating
+        torchrun behavior. This is required for:
+        - Models/frameworks that only support multi-GPU inference via SPMD coordination (e.g. diffusion models)
+        - Multi-node inference with frameworks like vLLM
+
+        SPMD stages get special treatment:
+        - CUDA_VISIBLE_DEVICES is not modified (follows torchrun behavior)
+        - Environment variables set for distributed coordination (MASTER_ADDR, MASTER_PORT, RANK, etc.)
+        - One actor per GPU, all coordinated as a single worker group
+        - NCCL rendezvous parameters automatically configured
+
+    Examples:
+        >>> # Single GPU stage
+        >>> Resources(cpus=2.0, gpus=1.0)
+
+        >>> # Multi-GPU SPMD stage (for large model inference)
+        >>> Resources(cpus=1.0, gpus=8, is_spmd=True)
+
+        >>> # CPU-only stage
+        >>> Resources(cpus=4.0, gpus=0.0)
+
     See `yotta.ray_utils._specs.Stage.required_resources` for much more info.
     """
 
     cpus: float = 0.0
     gpus: Union[float, int] = 0
+    is_spmd: bool = False
 
     def to_dict(self) -> dict[str, float]:
         return {"cpu": self.cpus, "gpu": self.gpus}
@@ -239,10 +453,11 @@ class Resources:
         return rust.Resources(
             cpus=self.cpus,
             gpus=self.gpus,
+            is_spmd=self.is_spmd,
         )
 
-    def to_worker_shape(self) -> WorkerShape:
-        return WorkerShape(self.to_rust().to_shape())
+    def to_worker_shape(self, cluster_resources: ClusterResources) -> WorkerShape:
+        return WorkerShape(self.to_rust().to_shape(cluster_resources.to_rust()))
 
     def to_pool(self) -> PoolOfResources:
         return PoolOfResources(cpus=self.cpus, gpus=self.gpus)
