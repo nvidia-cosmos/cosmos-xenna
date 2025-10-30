@@ -26,6 +26,7 @@ GITHUB_REPO = "nvidia-cosmos/cosmos-xenna"
 IGNORE_PATTERNS = [
     ".git",
     ".venv",
+    "build_and_publish.py",
     "sync_from_i4.py",
     "sync_to_github.py",
     "INTERNAL_README.md",
