@@ -58,7 +58,7 @@ fn make_cluster(
             },
         );
     }
-    rds::ClusterResources::new(Some(nodes))
+    rds::ClusterResources { nodes }
 }
 
 fn make_default_state_for_stages(problem: &ds::Problem) -> ds::ProblemState {
@@ -68,7 +68,7 @@ fn make_default_state_for_stages(problem: &ds::Problem) -> ds::ProblemState {
             .iter()
             .map(|s| ds::ProblemStageState {
                 stage_name: s.name.clone(),
-                workers: Vec::new(),
+                worker_groups: Vec::new(),
                 slots_per_worker: 2,
                 is_finished: false,
             })
@@ -110,8 +110,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: Some((num_nodes * 4) as usize),
         over_provision_factor: None,
@@ -126,8 +127,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -143,8 +145,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 4.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -159,8 +162,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.25,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -175,8 +179,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 6.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -191,8 +196,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 4.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -207,8 +213,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -223,8 +230,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.25,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -239,8 +247,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 4.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -255,8 +264,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 1.0,
             cpus: 1.0,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: None,
         over_provision_factor: None,
@@ -271,8 +281,9 @@ fn main() {
         worker_shape: rds::Resources {
             gpus: 0.0,
             cpus: 0.25,
+            is_spmd: false,
         }
-        .to_shape()
+        .to_shape(&cluster)
         .unwrap(),
         requested_num_workers: Some((num_nodes * 8) as usize),
         over_provision_factor: None,
@@ -309,7 +320,7 @@ fn main() {
             .zip(solution1.stages.iter())
             .map(|(p, s)| ds::ProblemStageState {
                 stage_name: p.name.clone(),
-                workers: s.new_workers.clone(),
+                worker_groups: s.new_workers.clone(),
                 slots_per_worker: s.slots_per_worker,
                 is_finished: false,
             })

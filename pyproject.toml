@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.1.6"
+version = "0.1.7"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -14,6 +14,7 @@ dependencies = [
     "ray[default]>=2.46.0",
     "tabulate",
     "obstore",
+    "portpicker>=1.6.0",
 ]
 
 # project.optional-dependencies is for public consumption.
@@ -40,6 +41,8 @@ dev = [
     "pyright==1.1.403",
     "pytest>=8.3.5",
     "typer>=0.15.2",
+    "ziglang>=0.15.1",
+    "twine>=6.2.0",
 ]
 
 [tool.uv]

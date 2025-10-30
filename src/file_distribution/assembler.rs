@@ -62,6 +62,31 @@ use uuid::Uuid;
 pub enum AssemblerError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Failed to create directory '{path}': {source}")]
+    CreateDirectoryFailed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to create temporary file in directory '{path}': {source}")]
+    CreateTempFileFailed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to open chunk file '{path}': {source}")]
+    OpenChunkFileFailed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to write cache file '{path}': {source}")]
+    WriteCacheFileFailed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to remove chunk file '{path}': {source}")]
+    RemoveChunkFileFailed {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     #[error("Failed to persist temporary file: {0}")]
     Persist(#[from] tempfile::PersistError),
     #[error("Chunk file not found: {0}")]
@@ -128,10 +153,17 @@ fn assemble_chunks(
     let destination = resolve_path(destination.to_path_buf(), node_id, is_test);
     let parent_dir = destination.parent().ok_or(AssemblerError::NoParentDir)?;
     log::debug!("Ensuring parent directory exists: {:?}", parent_dir);
-    std::fs::create_dir_all(parent_dir)?;
+    std::fs::create_dir_all(parent_dir).map_err(|e| AssemblerError::CreateDirectoryFailed {
+        path: parent_dir.to_path_buf(),
+        source: e,
+    })?;
 
     log::debug!("Creating temporary file in: {:?}", parent_dir);
-    let mut temp_file = NamedTempFile::new_in(parent_dir)?;
+    let mut temp_file =
+        NamedTempFile::new_in(parent_dir).map_err(|e| AssemblerError::CreateTempFileFailed {
+            path: parent_dir.to_path_buf(),
+            source: e,
+        })?;
 
     for chunk_id in chunk_ids {
         log::debug!("Processing chunk ID: {}", chunk_id);
@@ -142,7 +174,11 @@ fn assemble_chunks(
             return Err(AssemblerError::ChunkFileNotFound(*chunk_id));
         }
         log::debug!("Opening chunk file: {:?}", chunk_path);
-        let mut chunk_file = File::open(&chunk_path)?;
+        let mut chunk_file =
+            File::open(&chunk_path).map_err(|e| AssemblerError::OpenChunkFileFailed {
+                path: chunk_path.clone(),
+                source: e,
+            })?;
         log::debug!("Copying chunk {} to temporary file", chunk_id);
         std::io::copy(&mut chunk_file, &mut temp_file)?;
     }
@@ -169,7 +205,10 @@ fn assemble_chunks(
     let cache_path = CacheInfo::get_cache_path_for_file(destination.clone());
     log::debug!("Writing cache info to: {:?}", cache_path);
     let cache_json = cache_info.to_json()?;
-    std::fs::write(&cache_path, cache_json)?;
+    std::fs::write(&cache_path, cache_json).map_err(|e| AssemblerError::WriteCacheFileFailed {
+        path: cache_path.clone(),
+        source: e,
+    })?;
     log::debug!("Successfully wrote cache info to {:?}.", cache_path);
 
     // Clean up temporary chunk files
@@ -178,7 +217,12 @@ fn assemble_chunks(
         let chunk_path = get_temp_chunk_path(*chunk_id, node_id, is_test);
         if chunk_path.exists() {
             log::debug!("Removing temporary chunk file: {:?}", chunk_path);
-            std::fs::remove_file(chunk_path)?;
+            std::fs::remove_file(&chunk_path).map_err(|e| {
+                AssemblerError::RemoveChunkFileFailed {
+                    path: chunk_path,
+                    source: e,
+                }
+            })?;
         }
     }
     log::debug!("Finished cleaning up temporary chunk files.");
@@ -204,7 +248,7 @@ impl AssemblerPool {
         );
         assert!(
             num_workers > 0,
-            "P2pDownloaderWorkerPool must have at least one worker."
+            "AssemblerPool must have at least one worker."
         );
 
         let (task_tx, task_rx) = crossbeam_channel::unbounded::<AssemblerTask>();

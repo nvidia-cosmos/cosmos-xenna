@@ -80,7 +80,7 @@ def _determine_number_of_workers_and_scale_pool(
     )
     assert solution.stages[0].deleted_workers == []
     for worker_to_add in solution.stages[0].new_workers:
-        pool.add_actor_to_create(worker_to_add.to_worker(pool.name))
+        pool.add_actor_to_create(worker_to_add.to_worker_group(pool.name))
 
 
 def run_pipeline(
@@ -91,6 +91,8 @@ def run_pipeline(
     # Create a worker allocator to keep track of which workers are allocated across the cluster
     # We will not use this directly, but it is used by the actor pools
     worker_allocator = allocator.WorkerAllocator.make(cluster_resources)
+    port_registry = actor_pool.ClusterPortRegistry()
+
     worker_id_factory = autoscaling_algorithms.WorkerIdFactory()
     logger.info("Putting all inputs into ray memory store.")
     assert isinstance(pipeline_spec.stages[0], specs.StageSpec)
@@ -108,12 +110,14 @@ def run_pipeline(
     pools: list[actor_pool.ActorPool] = []
     for idx, spec in enumerate(pipeline_spec.stages):
         assert isinstance(spec, specs.StageSpec)
-        wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, spec, idx)
+        wrapped_stage = specs.make_actor_pool_stage_from_stage_spec(pipeline_spec.config, spec, idx, cluster_resources)
         pool_params = actor_pool.PoolParams(
             enable_work_stealing=pipeline_spec.config.enable_work_stealing,
+            max_tasks_to_poll_per_chunk=pipeline_spec.config.max_tasks_to_poll_per_chunk,
         )
         pool = actor_pool.ActorPool(
             worker_allocator,
+            port_registry,
             wrapped_stage.stage,
             wrapped_stage.params,
             spec.name(idx),

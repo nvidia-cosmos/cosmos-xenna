@@ -46,12 +46,12 @@ class Problem:
         return self._r
 
 
-class ProblemWorkerState:
+class ProblemWorkerGroupState:
     @classmethod
-    def make(cls, id: str, resources: resources.WorkerResources) -> ProblemWorkerState:
-        return cls(rust.ProblemWorkerState(id, resources.to_rust()))
+    def make(cls, id: str, resources: list[resources.WorkerResourcesInternal]) -> ProblemWorkerGroupState:
+        return cls(rust.ProblemWorkerGroupState(id, [x.to_rust() for x in resources]))
 
-    def __init__(self, rust_problem_worker_state: rust.ProblemWorkerState) -> None:
+    def __init__(self, rust_problem_worker_state: rust.ProblemWorkerGroupState) -> None:
         self._r = rust_problem_worker_state
 
     @property
@@ -59,20 +59,20 @@ class ProblemWorkerState:
         return self._r.id
 
     @property
-    def resources(self) -> resources.WorkerResources:
-        return resources.WorkerResources.from_rust(self._r.resources)
+    def resources(self) -> list[resources.WorkerResourcesInternal]:
+        return [resources.WorkerResourcesInternal.from_rust(x) for x in self._r.resources]
 
-    def to_worker(self, stage_name: str) -> resources.Worker:
-        return resources.Worker(self._r.to_worker(stage_name))
+    def to_worker_group(self, stage_name: str) -> resources.WorkerGroup:
+        return resources.WorkerGroup(self._r.to_worker_group(stage_name))
 
     @property
-    def rust(self) -> rust.ProblemWorkerState:
+    def rust(self) -> rust.ProblemWorkerGroupState:
         return self._r
 
 
 class ProblemStageState:
     def __init__(
-        self, stage_name: str, workers: list[ProblemWorkerState], slots_per_worker: int, is_finished: bool
+        self, stage_name: str, workers: list[ProblemWorkerGroupState], slots_per_worker: int, is_finished: bool
     ) -> None:
         self._r = rust.ProblemStageState(stage_name, [w.rust for w in workers], slots_per_worker, is_finished)
 
@@ -122,12 +122,12 @@ class StageSolution:
         self._r = rust_stage_solution
 
     @property
-    def deleted_workers(self) -> list[ProblemWorkerState]:
-        return [ProblemWorkerState(w) for w in self._r.deleted_workers]
+    def deleted_workers(self) -> list[ProblemWorkerGroupState]:
+        return [ProblemWorkerGroupState(w) for w in self._r.deleted_workers]
 
     @property
-    def new_workers(self) -> list[ProblemWorkerState]:
-        return [ProblemWorkerState(w) for w in self._r.new_workers]
+    def new_workers(self) -> list[ProblemWorkerGroupState]:
+        return [ProblemWorkerGroupState(w) for w in self._r.new_workers]
 
     @property
     def slots_per_worker(self) -> int:

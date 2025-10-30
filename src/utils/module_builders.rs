@@ -27,12 +27,25 @@ use std::ffi::CString;
 /// - Adding submodules and classes with proper `__module__` attributes
 ///
 /// # Example
-/// ```
-/// let my_module = ImportablePyModuleBuilder::new(py, "my_package.my_module")?
-///     .add_class::<MyClass>()?
-///     .add_submodule(&other_module)?
-///     .add_function(wrap_pyfunction!(my_function, m)?)?
-///     .finish();
+/// ```rust
+/// use _cosmos_xenna::utils::module_builders::ImportablePyModuleBuilder;
+/// use pyo3::prelude::*;
+/// use pyo3::wrap_pyfunction;
+///
+/// fn example_usage() -> PyResult<()> {
+///     Python::with_gil(|py| {
+///         let m = PyModule::new(py, "my_module")?;
+///         let my_module = ImportablePyModuleBuilder::new(py, "my_package.my_module")?
+///             .add_function(wrap_pyfunction!(my_function, m)?)?
+///             .finish();
+///         Ok(())
+///     })
+/// }
+///
+/// #[pyfunction]
+/// fn my_function() -> &'static str {
+///     "Hello, world!"
+/// }
 /// ```
 pub struct ImportablePyModuleBuilder<'py> {
     inner: Bound<'py, PyModule>,
