@@ -96,6 +96,46 @@ impl Drop for ActiveUploadGuard {
     }
 }
 
+// Custom body wrapper that holds the guard during streaming
+// This is used so that we can count the number of active uploads.
+// If we didn't care about this, we could just use axum::body::Body::from(data)
+struct StreamingBodyWithGuard {
+    data: Vec<u8>,
+    _guard: ActiveUploadGuard,
+}
+
+impl StreamingBodyWithGuard {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            _guard: ActiveUploadGuard::new(),
+        }
+    }
+
+    fn into_body(self) -> axum::body::Body {
+        // Create a stream that yields the data in chunks and holds the guard
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks for streaming
+        let data = std::sync::Arc::new(self.data);
+        let _guard = self._guard;
+
+        let stream = futures::stream::unfold(
+            (data, 0, Some(_guard)),
+            |(data, offset, guard)| async move {
+                if offset >= data.len() {
+                    // Guard will be dropped here when stream ends
+                    None
+                } else {
+                    let end = std::cmp::min(offset + CHUNK_SIZE, data.len());
+                    let chunk = data[offset..end].to_vec();
+                    Some((Ok::<_, std::io::Error>(chunk), (data, end, guard)))
+                }
+            },
+        );
+
+        axum::body::Body::from_stream(stream)
+    }
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     node_id: String,
@@ -118,7 +158,6 @@ async fn chunk(
     Query(params): Query<ChunkParams>,
     axum::extract::State(config): axum::extract::State<Arc<ServerConfig>>,
 ) -> Result<Response, (StatusCode, String)> {
-    let _guard = ActiveUploadGuard::new();
     debug!("Request received for chunk {}", chunk_id);
 
     let temp_chunk_path = get_temp_chunk_path(chunk_id, &config.node_id, config.is_test);
@@ -143,9 +182,10 @@ async fn chunk(
             }
         };
         debug!("Successfully read temporary chunk file, sending content");
+        let streaming_body = StreamingBodyWithGuard::new(content);
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(axum::body::Body::from(content))
+            .body(streaming_body.into_body())
             .unwrap());
     }
     debug!("Temporary chunk file not found");
@@ -217,9 +257,10 @@ async fn chunk(
             }
         };
         debug!("Successfully read file, sending content");
+        let streaming_body = StreamingBodyWithGuard::new(content);
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(axum::body::Body::from(content))
+            .body(streaming_body.into_body())
             .unwrap());
     }
     debug!("Chunk not found");
@@ -337,6 +378,9 @@ impl P2pServer {
     #[new]
     #[pyo3(signature = (port, node_id, is_test=false))]
     pub fn new(port: u16, node_id: String, is_test: bool) -> Self {
+        // Reset the counter to prevent accumulation from previous instances
+        ACTIVE_UPLOADS.store(0, Ordering::Relaxed);
+
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let shutdown_tx_clone = shutdown_tx.clone();
 

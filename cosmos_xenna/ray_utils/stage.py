@@ -47,18 +47,16 @@ def open_context(openable: Optional[Openable]) -> Iterator[None]:
             openable.close()
 
 
-def make_cpu_worker_shape(num_cpus: float = 1.0) -> resources.WorkerShape:
-    return resources.Resources(cpus=num_cpus).to_worker_shape()
-
-
 @attrs.define
 class Params:
-    shape: resources.WorkerShape = attrs.field(factory=make_cpu_worker_shape)
+    shape: resources.WorkerShape
     stage_batch_size: int = 1
     slots_per_actor: int = 2
     # Maxmum lifetime in minutes before we internally terminate and restart a worker. 0 means disabled.
+    # Not enabled for SPMD actor pools.
     worker_max_lifetime_m: int = 0
     # Restart interval in minutes between two consecutive over-lifetime restart within each actor pool.
+    # Not enabled for SPMD actor pools.
     worker_restart_interval_m: int = 1
     # The name of the worker stage.
     name: str = "default"

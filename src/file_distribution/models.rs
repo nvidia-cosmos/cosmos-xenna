@@ -316,10 +316,12 @@ pub struct NodeStatus {
     pub node_id: String,
     pub downloading_p2p_chunks: HashSet<Uuid>,
     pub downloading_s3_chunks: HashSet<Uuid>,
+    pub writing_chunks: HashSet<Uuid>,
     pub available_chunks: HashSet<Uuid>,
     pub completed_or_cached_objects: HashSet<Uuid>,
     pub unneeded_objects: HashSet<Uuid>,
     pub num_active_uploads: usize,
+    pub num_active_file_writing_tasks: usize,
     pub num_active_assembling_tasks: usize,
     pub num_active_unpacking_tasks: usize,
 }
@@ -351,7 +353,9 @@ impl CacheInfo {
     }
 
     pub fn get_cache_path_for_file(file_path: PathBuf) -> PathBuf {
-        file_path.with_extension("s3_cache_info")
+        let mut cache_path = file_path.as_os_str().to_owned();
+        cache_path.push(".s3_cache_info");
+        PathBuf::from(cache_path)
     }
 
     pub fn get_cache_path_for_directory(directory_path: PathBuf) -> PathBuf {
@@ -393,6 +397,24 @@ impl NodeMetadata {
     #[getter]
     fn port(&self) -> u16 {
         self.address.port()
+    }
+}
+
+#[pyclass(get_all, set_all)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RetryConfig {
+    pub num_retries: u32,
+    pub base_delay_millis: u64,
+}
+
+#[pymethods]
+impl RetryConfig {
+    #[new]
+    fn new(num_retries: u32, base_delay_millis: u64) -> Self {
+        Self {
+            num_retries,
+            base_delay_millis,
+        }
     }
 }
 
@@ -439,7 +461,19 @@ fn make_object_store(
             object_store::local::LocalFileSystem::new_with_prefix(&PathBuf::from(url.path()))?;
         return Ok(Arc::new(store));
     }
-    let (store, _) = object_store::parse_url_opts(&url, config.config_args)?;
+
+    // Add timeout configurations for better handling of large chunks
+    let mut enhanced_config = config.config_args.clone();
+
+    // Set longer timeouts for large chunk downloads if not already specified
+    enhanced_config
+        .entry("timeout".to_string())
+        .or_insert_with(|| "300s".to_string()); // 5 minutes
+    enhanced_config
+        .entry("connect_timeout".to_string())
+        .or_insert_with(|| "60s".to_string()); // 1 minute
+
+    let (store, _) = object_store::parse_url_opts(&url, enhanced_config)?;
     Ok(Arc::new(store))
 }
 
@@ -493,6 +527,7 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .add_class::<UnpackMethod>()?
         .add_class::<CacheInfo>()?
         .add_class::<NodeMetadata>()?
+        .add_class::<RetryConfig>()?
         .finish();
     Ok(())
 }

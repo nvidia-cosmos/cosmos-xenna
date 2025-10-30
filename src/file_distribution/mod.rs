@@ -16,6 +16,7 @@
 pub mod assembler;
 pub mod common;
 pub mod data_plane;
+pub mod file_writer;
 pub mod models;
 pub mod object_store_download;
 pub mod p2p_download;

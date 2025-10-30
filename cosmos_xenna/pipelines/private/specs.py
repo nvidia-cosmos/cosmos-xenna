@@ -23,6 +23,7 @@ from typing import Any, Generic, Optional, Sequence
 
 import attrs
 
+from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import runtime_envs, stage
 from cosmos_xenna.utils import approx
@@ -93,7 +94,7 @@ class Stage(abc.ABC, Generic[T, V]):
     def required_resources(self) -> resources.Resources:
         """The new way to specify resources required for a stage.
 
-        Return a ray_utils.Resources object which represents the size/hape of each worker in this stage.
+        Return a ray_utils.Resources object which represents the size/shape of each worker in this stage.
         If None, inherit from the model's required resources.
 
         This `Resources` class provides an intuitive interface for specifying resource requirements
@@ -129,6 +130,23 @@ class Stage(abc.ABC, Generic[T, V]):
                 - Each GPU is allocated exclusively (not shared)
                 - System optimizes GPU selection to minimize fragmentation
 
+        4. SPMD Shape (Distributed Inference):
+            - Set gpus to integer ≥ 1
+            - Set is_spmd=True
+            Example: Resources(cpus=1.0, gpus=8, is_spmd=True)
+            Allocation behavior:
+                - Allocated 8 GPUs (prefers to allocate within a single node)
+                - Creates one actor per GPU
+                - Emulates torchrun behavior by setting the proper environment variables
+                - CUDA_VISIBLE_DEVICES is NOT modified (follows torchrun convention)
+                - Required for large models needing tensor parallelism or multi-node inference
+
+        SPMD Use Cases:
+            - Large models requiring tensor parallelism (e.g., 241B parameter models)
+            - vLLM multi-node inference (use distributed_executor_backend="external_launcher")
+            - PyTorch models that only support multi-GPU through distributed coordination
+            - Any inference workload requiring coordination across multiple GPUs/nodes
+
         Resource Allocation Strategy:
         The system uses a fragmentation-aware allocation strategy that:
         - Minimizes resource fragmentation across the cluster
@@ -150,6 +168,68 @@ class Stage(abc.ABC, Generic[T, V]):
         If a model is present, we use that model's conda env name.
         """
         return None
+
+    @property
+    def download_requests(self) -> list[file_distribution.DownloadRequest]:
+        """Returns a list of download requests for this stage.
+
+        This property allows stages to specify artifacts (model weights, conda environments, etc.) that need to be
+        downloaded to all cluster nodes before pipeline execution begins. The distributed P2P download
+        system will efficiently download these files once and share them between nodes.
+
+        Before starting the pipeline, Xenna will use xenna.file_distribution.download_distributed to download
+        all requests from all stages to all nodes. This ensures that required files are available locally
+        on each node, eliminating the need for repeated downloads during pipeline execution.
+
+        Returns:
+            A list of DownloadRequest objects specifying files to download. Each request can be:
+            - ObjectDownloadRequest: Download a single file (with optional unpacking)
+            - PrefixDownloadRequest: Download all files under a prefix/directory
+
+        Example:
+            ```python
+            @property
+            def download_requests(self) -> list[file_distribution.DownloadRequest]:
+                return [
+                    # Download a model file
+                    file_distribution.DownloadRequest(
+                        value=file_distribution.ObjectDownloadRequest(
+                            uri="models/pytorch_model.bin",
+                            destination=pathlib.Path("/tmp/model.bin"),
+                        )
+                    ),
+                    # Download and extract an archive
+                    file_distribution.DownloadRequest(
+                        value=file_distribution.ObjectDownloadRequest(
+                            uri="datasets/data.tar.gz",
+                            destination=pathlib.Path("/tmp/data.tar.gz"),
+                            unpack_options=file_distribution.UnpackOptions(
+                                destination=pathlib.Path("/tmp/extracted/"),
+                            ),
+                        )
+                    ),
+                    # Download all files under a prefix
+                    file_distribution.DownloadRequest(
+                        value=file_distribution.PrefixDownloadRequest(
+                            uri="tokenizer/", destination=pathlib.Path("/tmp/tokenizer/")
+                        )
+                    ),
+                ]
+            ```
+
+        Note:
+            - Files are guaranteed to be available locally when setup_on_node(), setup() and process_data() are called
+            - The system uses the Rust object_store crate for high-performance storage access
+            - URIs in download requests must be RELATIVE to the ObjectStoreConfig base URI
+            - The system uses intelligent caching to avoid re-downloading unchanged files
+            - Large files are automatically chunked and distributed via P2P for efficiency
+            - Authentication is handled via DistributedDownloadConfig passed to run_pipeline()
+
+        See:
+            - cosmos_xenna/file_distribution/README.md for detailed documentation
+            - DistributedDownloadConfig for authentication and performance tuning
+        """
+        return []
 
     def setup_on_node(self, node_info: resources.NodeInfo, worker_metadata: resources.WorkerMetadata) -> None:
         """Sets up a worker in this stage.
@@ -190,8 +270,8 @@ class Stage(abc.ABC, Generic[T, V]):
         pass
 
 
-def validate_stage(stage: Stage[Any, Any]) -> None:
-    stage.required_resources.to_worker_shape()
+def validate_stage(stage: Stage[Any, Any], cluster_resources: resources.ClusterResources) -> None:
+    stage.required_resources.to_worker_shape(cluster_resources)
 
 
 @attrs.define
@@ -232,13 +312,13 @@ class StageSpec(typing.Generic[T, V]):
         else:
             return f"Stage {index:02d} - {type(self.stage).__name__}"
 
-    def validate(self) -> None:
+    def validate(self, cluster_resources: resources.ClusterResources) -> None:
         if self.num_workers is not None and self.num_workers_per_node is not None:
             raise ValueError(
                 "Expected only one of self.num_workers and self.num_workers_per_node to be non-None. "
                 f"However, got {self.num_workers=} and {self.num_workers_per_node=}"
             )
-        validate_stage(self.stage)
+        validate_stage(self.stage, cluster_resources)
 
     def override_with_pipeline_params(self, p: PipelineConfig) -> StageSpec:
         """Maybe override some fields using the global params.
@@ -329,6 +409,8 @@ class PipelineConfig:
     # num_actors * num_slots_per_actor (typically == 2); i.e. when there are very few tasks.
     # Ideally, this would always be turned on. However, right now, work stealing can be slow for large jobs.
     enable_work_stealing: bool = False
+    # When polling for completed tasks, Xenna groups inflight tasks into chunks and call ray.wait once per chunk.
+    max_tasks_to_poll_per_chunk: int = 8
     # Maxmum lifetime in minutes for stage workers before getting terminated and restarted.
     worker_max_lifetime_m: int = 0
     # Interval in minutes between two over-lifetime restart within a stage's actor pool.
@@ -391,7 +473,6 @@ class PipelineSpec:
         stage = stage_spec.stage
         stage_info = f"   class_name: {type(stage).__name__}\n"
         stage_info += f"   required_resources: {stage.required_resources}\n"
-        stage_info += f"   shape: {stage.required_resources.to_worker_shape()}\n"
 
         for field in attrs.fields(StageSpec):
             if field.name != "stage":
@@ -435,7 +516,7 @@ class StageAndParams:
 
 
 def make_actor_pool_stage_from_stage_spec(
-    pipeline_config: PipelineConfig, spec: StageSpec, stage_idx: int
+    pipeline_config: PipelineConfig, spec: StageSpec, stage_idx: int, cluster_resources: resources.ClusterResources
 ) -> StageAndParams:
     assert spec.slots_per_actor is not None
     assert spec.worker_max_lifetime_m is not None
@@ -455,7 +536,7 @@ def make_actor_pool_stage_from_stage_spec(
     return StageAndParams(
         WrappedStage(spec.stage),
         stage.Params(
-            shape=spec.stage.required_resources.to_worker_shape(),
+            shape=spec.stage.required_resources.to_worker_shape(cluster_resources),
             stage_batch_size=spec.stage.stage_batch_size,
             slots_per_actor=spec.slots_per_actor,
             worker_max_lifetime_m=spec.worker_max_lifetime_m,

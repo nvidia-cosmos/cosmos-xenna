@@ -178,27 +178,31 @@ class CacheInfo:
 
 @attrs.define
 class ObjectDownloadRequest:
-    """Request to download a single S3 object with optional post-processing.
+    """Request to download a single object with optional post-processing.
 
-    This class represents a complete download specification for a single S3 object,
+    This class represents a complete download specification for a single object,
     including authentication, destination, caching behavior, and post-download actions
     like archive extraction and symlink creation.
 
     Attributes:
-        profile_name: AWS profile name for S3 authentication and authorization
-        uri: Complete S3 URI (e.g., "s3://bucket/path/file.tar.gz")
+        profile_name: Profile name for object store authentication and authorization.
+            This maps to an ObjectStoreConfig in ObjectStoreConfigByProfile.
+            If None, uses the default profile.
+        uri: Object key/path relative to the object store base URI (e.g., "dataset/file.tar.gz").
+            CRITICAL: This is NOT a full URI but a relative key within the object store
+            configured for the specified profile_name. The object_store crate combines
+            the base URI from ObjectStoreConfig with this relative key.
+
+            Example: If ObjectStoreConfig has uri="s3://my-bucket/", then this uri should
+            be "path/to/file.txt" (NOT "s3://my-bucket/path/to/file.txt"). The full path
+            becomes base_uri + relative_key = "s3://my-bucket/path/to/file.txt".
         destination: Local filesystem path where the object should be saved
-        cache: Whether to enable intelligent caching with metadata validation
-            (default: True). When enabled, creates .s3_cache_info sidecar files
         unpack_options: Optional archive extraction configuration. If provided,
             the downloaded file will be automatically extracted after download
-        symlink_path: Optional path to create a symbolic link pointing to the
-            downloaded file. Useful for creating stable reference paths
 
     Cache Behavior:
-        When cache=True, the system will:
         - Check for existing cached files before downloading
-        - Validate cache using S3 metadata (size, last_modified, URI)
+        - Validate cache using object store metadata (size, last_modified, URI)
         - Skip download if valid cache exists
         - Create .s3_cache_info sidecar files for future validation
 
@@ -208,27 +212,58 @@ class ObjectDownloadRequest:
         - Extracts to the specified destination atomically
         - Supports TAR, TAR.GZ, and ZIP formats with auto-detection
         - Creates cache info for both the archive and extracted directory
+
+    Examples:
+        >>> # Download a single model file
+        >>> request = ObjectDownloadRequest(
+        ...     uri="models/bert-base/pytorch_model.bin",
+        ...     destination=pathlib.Path("/tmp/model.bin"),
+        ... )
+
+        >>> # Download and extract an archive
+        >>> request = ObjectDownloadRequest(
+        ...     uri="datasets/imagenet.tar.gz",
+        ...     destination=pathlib.Path("/tmp/imagenet.tar.gz"),
+        ...     unpack_options=UnpackOptions(
+        ...         destination=pathlib.Path("/tmp/imagenet/"),
+        ...     ),
+        ... )
+
+        >>> # Download with specific authentication profile
+        >>> request = ObjectDownloadRequest(
+        ...     profile_name="internal-models",
+        ...     uri="proprietary/my-model.bin",
+        ...     destination=pathlib.Path("/tmp/my-model.bin"),
+        ... )
     """
 
     uri: str
     destination: pathlib.Path
-    cache: bool = True
     unpack_options: Optional[UnpackOptions] = None
-    symlink_path: Optional[pathlib.Path] = None
     profile_name: str | None = None
 
 
 @attrs.define
 class PrefixDownloadRequest:
-    """Request to download all objects under an S3 prefix (directory-like structure).
+    """Request to download all objects under a prefix (directory-like structure).
 
-    This class enables bulk downloading of entire S3 "directories" by specifying
+    This class enables bulk downloading of entire object store "directories" by specifying
     a prefix. The system will recursively list all objects under the prefix and
-    download them while preserving the directory structure.
+    download them while preserving the directory structure. This is ideal for downloading
+    complete model directories, datasets, or any collection of related files.
 
     Attributes:
-        profile_name: AWS profile name for S3 authentication and authorization
-        uri: S3 prefix URI (e.g., "s3://bucket/dataset/" or "s3://bucket/path/to/data/")
+        profile_name: Profile name for object store authentication and authorization.
+            This maps to an ObjectStoreConfig in ObjectStoreConfigByProfile.
+            If None, uses the default profile.
+        uri: Prefix key/path relative to the object store base URI (e.g., "dataset/" or "path/to/data/").
+            CRITICAL: This is NOT a full URI but a relative prefix within the object store
+            configured for the specified profile_name. The object_store crate combines
+            the base URI from ObjectStoreConfig with this relative prefix.
+
+            Example: If ObjectStoreConfig has uri="s3://my-bucket/", then this uri should
+            be "dataset/" (NOT "s3://my-bucket/dataset/"). Objects under the full prefix
+            "s3://my-bucket/dataset/" will be downloaded.
         destination: Local directory where all objects should be saved,
             preserving the relative path structure from the prefix
         cache: Whether to enable intelligent caching for all downloaded objects
@@ -240,7 +275,21 @@ class PrefixDownloadRequest:
         3. Preserves directory structure relative to the prefix
         4. Downloads objects in parallel across the cluster
 
-    Example:
+    Examples:
+        >>> # Download entire model directory
+        >>> request = PrefixDownloadRequest(uri="models/bert-base/", destination=pathlib.Path("/tmp/models/"))
+
+        >>> # Download dataset with specific profile
+        >>> request = PrefixDownloadRequest(
+        ...     profile_name="datasets", uri="imagenet/train/", destination=pathlib.Path("/data/imagenet/train/")
+        ... )
+
+        >>> # Download all tokenizer files
+        >>> request = PrefixDownloadRequest(
+        ...     uri="tokenizers/gpt2/", destination=pathlib.Path("/tmp/tokenizer/"), cache=True
+        ... )
+
+    Directory Structure Example:
         For prefix "s3://bucket/dataset/" containing:
         - s3://bucket/dataset/train/images/img1.jpg
         - s3://bucket/dataset/train/labels/label1.txt
@@ -250,6 +299,12 @@ class PrefixDownloadRequest:
         - /local/data/train/images/img1.jpg
         - /local/data/train/labels/label1.txt
         - /local/data/test/images/img2.jpg
+
+    Performance Notes:
+        - Each file in the prefix is treated as a separate object for P2P distribution
+        - Large directories benefit from the distributed chunking and sharing system
+        - Consider the total number of files when tuning parallelism settings
+        - For single large archives, ObjectDownloadRequest may be more efficient
     """
 
     uri: str
@@ -260,6 +315,18 @@ class PrefixDownloadRequest:
 
 @attrs.define
 class DownloadRequest:
+    """A request to download either a single object or a prefix of objects.
+
+    This is a wrapper class that can contain either an ObjectDownloadRequest
+    for downloading a single object, or a PrefixDownloadRequest for downloading
+    multiple objects under a prefix.
+
+    The profile_name in the contained request determines which ObjectStoreConfig
+    to use for authentication and base URI configuration. See ObjectDownloadRequest
+    and PrefixDownloadRequest for details on how URIs are interpreted as relative
+    keys within the configured object store.
+    """
+
     value: Union[ObjectDownloadRequest, PrefixDownloadRequest]
 
 
@@ -403,6 +470,7 @@ class NodeStatus:
     node_id: str
     downloading_p2p_chunks: set[uuid.UUID] = attrs.field(factory=set)
     downloading_s3_chunks: set[uuid.UUID] = attrs.field(factory=set)
+    writing_chunks: set[uuid.UUID] = attrs.field(factory=set)
     available_chunks: set[uuid.UUID] = attrs.field(factory=set)
     completed_or_cached_objects: set[uuid.UUID] = attrs.field(factory=set)
     unneeded_objects: set[uuid.UUID] = attrs.field(factory=set)
@@ -414,6 +482,7 @@ class NodeStatus:
     network_bytes_recv: int = 0
     memory_utilization: float = 0.0
     network_capacity_gbps: float | None = None
+    num_active_file_writing_tasks: int = 0
 
     def is_done(self, catalog: _DownloadCatalog) -> bool:
         return (
@@ -431,30 +500,238 @@ class NodeStatus:
     def merge_with_rust(self, rust_status: rust_models.NodeStatus) -> None:
         self.downloading_p2p_chunks = set(rust_status.downloading_p2p_chunks)
         self.downloading_s3_chunks = set(rust_status.downloading_s3_chunks)
+        self.writing_chunks = set(rust_status.writing_chunks)
         self.available_chunks = set(rust_status.available_chunks)
         self.completed_or_cached_objects = set(rust_status.completed_or_cached_objects)
         self.unneeded_objects = set(rust_status.unneeded_objects)
         self.num_active_uploads = rust_status.num_active_uploads
         self.num_active_assembling_tasks = rust_status.num_active_assembling_tasks
         self.num_active_unpacking_tasks = rust_status.num_active_unpacking_tasks
+        self.num_active_file_writing_tasks = rust_status.num_active_file_writing_tasks
 
 
 @attrs.define
 class ObjectStoreConfig:
-    """Configuration for an S3 object store."""
+    """Configuration for an object store using the object_store crate.
+
+    This class provides configuration for connecting to various object storage backends
+    including S3, GCS, Azure Blob Storage, and local filesystems. The object_store crate
+    uses URIs to identify different storage backends and accepts additional configuration
+    parameters via config_args.
+
+    The object_store crate supports these URI schemes:
+    - s3://bucket-name/ - Amazon S3 or S3-compatible storage
+    - gs://bucket-name/ - Google Cloud Storage
+    - azure://container-name/ - Azure Blob Storage
+    - file:///path/to/directory/ - Local filesystem
+
+    Common configuration parameters include:
+    - access_key_id: AWS access key ID for S3
+    - secret_access_key: AWS secret access key for S3
+    - region: AWS region for S3 (e.g., "us-west-2")
+    - endpoint: Custom endpoint URL for S3-compatible services
+    - token: Authentication token for some services
+
+    URI Relationship with Download Requests:
+        The URI in this config serves as the "base URI" for object store operations.
+        Download request URIs are interpreted as **relative keys/paths** within this base:
+
+        - If ObjectStoreConfig has uri="s3://my-bucket/", then download requests
+          specify relative keys like "path/to/file.txt" (not full URIs)
+        - The full object path becomes base_uri + key = "s3://my-bucket/path/to/file.txt"
+        - The profile_name in download requests (ObjectDownloadRequest,
+          PrefixDownloadRequest) determines which ObjectStoreConfig to use
+        - This mapping is handled by ObjectStoreConfigByProfile
+
+    Examples:
+        Basic S3 configuration:
+        >>> config = ObjectStoreConfig.make_for_s3(
+        ...     bucket="my-bucket",
+        ...     endpoint="https://s3.amazonaws.com",
+        ...     access_key_id="AKIAIOSFODNN7EXAMPLE",
+        ...     secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ... )
+
+        S3-compatible service (like MinIO):
+        >>> config = ObjectStoreConfig.make_for_s3(
+        ...     bucket="my-bucket",
+        ...     endpoint="http://localhost:9000",
+        ...     access_key_id="minioadmin",
+        ...     secret_access_key="minioadmin",
+        ... )
+
+        Local filesystem:
+        >>> config = ObjectStoreConfig.make_for_local("/tmp/storage")
+
+    Attributes:
+        uri: The object store URI identifying the backend and bucket/container
+        config_args: Dictionary of additional configuration parameters passed to the object_store crate
+    """
 
     uri: str
     config_args: dict[str, str] = attrs.field(factory=dict)
+
+    # This is taken from obstore.store.ClientConfig
+    # Valid HTTP client configuration fields
+    _VALID_HTTP_CLIENT_FIELDS = {  # noqa: RUF012
+        "allow_http",
+        "allow_invalid_certificates",
+        "connect_timeout",
+        "default_content_type",
+        "default_headers",
+        "http1_only",
+        "http2_keep_alive_interval",
+        "http2_keep_alive_timeout",
+        "http2_keep_alive_while_idle",
+        "http2_only",
+        "pool_idle_timeout",
+        "pool_max_idle_per_host",
+        "proxy_url",
+        "timeout",
+        "user_agent",
+    }
+
+    @staticmethod
+    def is_client_option(config_key: str) -> bool:
+        return config_key in ObjectStoreConfig._VALID_HTTP_CLIENT_FIELDS
+
+    @classmethod
+    def make_for_s3(
+        cls,
+        bucket: str,
+        endpoint: str | None = None,
+        access_key_id: str | None = None,
+        secret_access_key: str | None = None,
+        region: str | None = None,
+        timeout_s: int = 300,
+        connect_timeout_s: int = 60,
+    ) -> ObjectStoreConfig:
+        """Create an ObjectStoreConfig for S3 or S3-compatible storage.
+
+        Args:
+            bucket: S3 bucket name
+            endpoint: S3 endpoint URL (e.g., "https://s3.amazonaws.com" for AWS S3) (optional)
+            access_key_id: AWS access key ID (optional)
+            secret_access_key: AWS secret access key (optional)
+            region: AWS region (optional, e.g., "us-west-2") (optional)
+            timeout_s: Timeout for the S3 operation in seconds (default: 300)
+            connect_timeout_s: Connect timeout for the S3 operation in seconds (default: 60)
+
+        Returns:
+            ObjectStoreConfig configured for S3 access
+
+        Example:
+            >>> config = ObjectStoreConfig.make_for_s3(
+            ...     bucket="my-data-bucket",
+            ...     endpoint="https://s3.us-west-2.amazonaws.com",
+            ...     access_key_id="some_access_key_id",
+            ...     secret_access_key="some_secret_access_key",
+            ...     region="us-west-2",
+            ... )
+        """
+        config_args: dict[str, str] = {}
+        if access_key_id is not None:
+            config_args["access_key_id"] = access_key_id
+        if secret_access_key is not None:
+            config_args["secret_access_key"] = secret_access_key
+        if endpoint is not None:
+            config_args["endpoint"] = endpoint
+        if region is not None:
+            config_args["region"] = region
+
+        config_args["timeout"] = f"{timeout_s}s"
+        config_args["connect_timeout"] = f"{connect_timeout_s}s"
+
+        return cls(uri=f"s3://{bucket}/", config_args=config_args)
+
+    @classmethod
+    def make_for_local(cls, directory_path: str) -> ObjectStoreConfig:
+        """Create an ObjectStoreConfig for local filesystem storage.
+
+        Args:
+            directory_path: Local directory path to use as storage root
+
+        Returns:
+            ObjectStoreConfig configured for local filesystem access
+
+        Example:
+            >>> config = ObjectStoreConfig.make_for_local("/tmp/object_storage")
+        """
+        return cls(uri=f"file://{directory_path}", config_args={})
+
+    @classmethod
+    def make_for_gcs(cls, bucket: str, service_account_key: str | None = None) -> ObjectStoreConfig:
+        """Create an ObjectStoreConfig for Google Cloud Storage.
+
+        Args:
+            bucket: GCS bucket name
+            service_account_key: Optional path to service account key JSON file
+
+        Returns:
+            ObjectStoreConfig configured for GCS access
+
+        Example:
+            >>> config = ObjectStoreConfig.make_for_gcs(
+            ...     bucket="my-gcs-bucket", service_account_key="/path/to/service-account.json"
+            ... )
+        """
+        config_args = {}
+        if service_account_key is not None:
+            config_args["service_account_key"] = service_account_key
+
+        return cls(uri=f"gs://{bucket}/", config_args=config_args)
 
     def to_rust(self) -> rust_models.ObjectStoreConfig:
         return rust_models.ObjectStoreConfig(uri=self.uri, config_args=self.config_args)
 
 
+# @attrs.define
+# class RetryConfig:
+#     num_retries: int = 5
+#     base_delay_s: float = 1.0
+#     delay_factor: float = 2.0
+#     max_delay_s: float = 16
+
+#     def to_rust(self) -> rust_models.RetryConfig:
+#         return rust_models.RetryConfig(
+#             num_retries=self.num_retries,
+#             base_delay_s=self.base_delay_s,
+#             delay_factor=self.delay_factor,
+#             max_delay_s=self.max_delay_s,
+#         )
+
+
 @attrs.define
 class ObjectStoreConfigByProfile:
-    """Configuration for an S3 object store by profile."""
+    """A mapping of ObjectStoreConfig by profile name.
+
+    This class enables using multiple object store configurations within a single
+    download session. Each profile maps to a different ObjectStoreConfig, allowing
+    downloads from different buckets, storage services, or authentication contexts.
+
+    When processing download requests, the profile_name in ObjectDownloadRequest or
+    PrefixDownloadRequest determines which ObjectStoreConfig to use:
+    - If profile_name is None, uses the config mapped to None (default profile)
+    - If profile_name is "prod", uses the config mapped to "prod"
+    - The download request URI is interpreted as a relative key within the selected config
+
+    Example:
+        configs = ObjectStoreConfigByProfile(profiles={
+            None: ObjectStoreConfig.make_for_s3(bucket="default-bucket", ...),
+            "prod": ObjectStoreConfig.make_for_s3(bucket="prod-bucket", ...),
+            "dev": ObjectStoreConfig.make_for_s3(bucket="dev-bucket", ...),
+        })
+
+        # This request would use the "prod" profile's ObjectStoreConfig
+        request = ObjectDownloadRequest(
+            profile_name="prod",
+            uri="data/file.txt",  # Relative key, becomes s3://prod-bucket/data/file.txt
+            destination=Path("/local/file.txt")
+        )
+    """
 
     profiles: dict[str | None, ObjectStoreConfig]
+    # retry_config: RetryConfig
 
     def to_rust(self) -> rust_models.ObjectStoreConfigByProfile:
         return rust_models.ObjectStoreConfigByProfile(
@@ -472,7 +749,13 @@ class ObjectStoreByProfile:
     def make_from_config_by_profile(cls, config_by_profile: ObjectStoreConfigByProfile) -> ObjectStoreByProfile:
         return cls(
             profiles={
-                profile: obs.store.from_url(config.uri, config=config.config_args)  # type: ignore
+                profile: obs.store.from_url(
+                    config.uri,
+                    config={k: v for k, v in config.config_args.items() if not ObjectStoreConfig.is_client_option(k)},  # pyright: ignore[reportArgumentType]
+                    client_options={  # pyright: ignore[reportArgumentType]
+                        k: v for k, v in config.config_args.items() if ObjectStoreConfig.is_client_option(k)
+                    },
+                )  # type: ignore
                 for profile, config in config_by_profile.profiles.items()
             }
         )

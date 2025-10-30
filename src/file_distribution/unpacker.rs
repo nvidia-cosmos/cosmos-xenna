@@ -129,13 +129,18 @@ fn unpack_method_from_path(path: &Path) -> Result<UnpackMethod, UnpackerError> {
         match ext {
             Some(e) => {
                 log::warn!("Unsupported file extension: {}", e);
-                Err(UnpackerError::UnsupportedUnpackMethod(e.to_string()))
+                Err(UnpackerError::UnsupportedUnpackMethod(format!(
+                    "Unsupported file extension '{}' for file: {}",
+                    e,
+                    path.display()
+                )))
             }
             None => {
                 log::warn!("No file extension found for: {:?}", path);
-                Err(UnpackerError::UnsupportedUnpackMethod(
-                    "No extension found".to_string(),
-                ))
+                Err(UnpackerError::UnsupportedUnpackMethod(format!(
+                    "No extension found for file: {}",
+                    path.display()
+                )))
             }
         }
     };
