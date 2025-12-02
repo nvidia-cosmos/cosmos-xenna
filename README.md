@@ -25,11 +25,13 @@ Xenna is a distributed pipeline orchestrator that manages multi-stage data proce
 - **Backpressure**: Managing memory by controlling how much data queues between stages
 - **Monitoring**: Providing real-time visibility into pipeline performance
 
-**Execution Modes**: Xenna supports two execution modes:
+**Execution Modes**: Xenna supports three execution modes:
 
 1. **Streaming Mode** (recommended): All stages run concurrently. Data flows through the pipeline continuously, with Xenna automatically balancing worker counts to maximize throughput. This mode minimizes memory usage and is ideal for processing large datasets.
 
 2. **Batch Mode**: Each stage completes fully before the next stage begins. Simpler but requires materializing all intermediate data in memory.
+
+3. **Serving Mode**: This is for online serving scenario, where input data arrives in real time. It behaves very similar to *streaming mode* except that it takes a pair of input (source) & output (sink) queues to poll input & push processed data, instead of taking a pre-populated list of input data and optionally returns output data in the end.
 
 **Architecture**: Xenna is built on top of Ray and is heavily inspired by Ray Data. It creates Ray Actors for each stage worker and runs a main orchestrator loop that constantly polls actors and moves data between stages. The streaming autoscaler tries to ensure that the throughput of all stages is equal and maximized, using complex bin-packing algorithms to optimize GPU utilization.
 
