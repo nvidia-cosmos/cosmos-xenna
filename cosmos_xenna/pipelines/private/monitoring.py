@@ -514,8 +514,11 @@ class PipelineMonitor:
                 )
 
         # overall pipeline progress
-        pipeline_progress = total_completed_task_stages / (self._initital_input_length * len(stats.actor_pools))
-        self._metrics_pipeline_progress.set(pipeline_progress)
+        if self._initital_input_length > 0:
+            pipeline_progress = total_completed_task_stages / (self._initital_input_length * len(stats.actor_pools))
+            self._metrics_pipeline_progress.set(pipeline_progress)
+        else:
+            self._metrics_pipeline_progress.set(0.0)
         # resource usage per stage
         for stage_name, usage_stats in stats.resource_usage_per_stage.items():
             self._metrics_actor_resource_usage.set(

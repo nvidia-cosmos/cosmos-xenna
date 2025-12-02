@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.1.7"
+version = "0.1.8"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }

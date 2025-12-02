@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 import copy
 import enum
+import multiprocessing
 import typing
 from typing import Any, Generic, Optional, Sequence
 
@@ -52,6 +53,10 @@ class ExecutionMode(enum.Enum):
     # materialize intermediate data products. Additionally, for many pipelines, streaming mode can be
     # more efficient at processing.
     BATCH = 1
+    # Online serving mode where stages run continuously. Similar to STREAMING but designed for online
+    # serving scenarios where requests arrive dynamically via an input source queue and results are
+    # pushed to output a sink queue. Workers remain active indefinitely waiting for new requests.
+    SERVING = 2
 
 
 class Stage(abc.ABC, Generic[T, V]):
@@ -454,6 +459,16 @@ class JobInfo:
 
 
 @attrs.define
+class ServingQueues:
+    source: multiprocessing.Queue
+    sink: multiprocessing.Queue
+
+    def __deepcopy__(self, memo: dict) -> "ServingQueues":
+        # do a shallow copy
+        return ServingQueues(self.source, self.sink)
+
+
+@attrs.define
 class PipelineSpec:
     """Specification for a simplified ray pipeline.
 
@@ -463,11 +478,15 @@ class PipelineSpec:
     See ray_utils/README.md for more info.
     """
 
+    # offline processing with pre-populated input data
     # TODO: Can we support a generator here?
     input_data: Sequence[Any]
     stages: Sequence[StageSpec | Stage]
     config: PipelineConfig = attrs.field(factory=PipelineConfig)
     job_info: Optional[JobInfo] = None
+
+    # online serving with input queue to poll for new requests and output queue to push results
+    serving_queues: ServingQueues | None = None
 
     def _format_stage_spec(self, stage_spec: StageSpec) -> str:
         stage = stage_spec.stage

@@ -27,7 +27,7 @@ class _ProcessStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
+        return pipelines_v1.Resources(cpus=0.5, gpus=0.0)
 
     @property
     def stage_batch_size(self) -> int:

@@ -532,6 +532,13 @@ class ResourceInfoFromNode:
     gpus: list[GpuInfo]
 
 
+@attrs.define
+class ResourceInfoFromRay:
+    node_id: str
+    cpus: float | None
+    gpus: float | None
+
+
 def parse_visible_cuda_devices(cuda_visible_devices: Optional[str]) -> list[int | uuid.UUID | str] | None:
     """Parse a CUDA_VISIBLE_DEVICES string into typed tokens.
 
@@ -725,6 +732,7 @@ def make_cluster_resources_for_ray_cluster(
 
     out_dict = {}
     alive_nodes: list[str] = []
+    reported_resources: dict[str, ResourceInfoFromRay] = {}
     for node in nodes:
         node_id = node["NodeID"]
         node_name = node.get("NodeManagerHostname", "unknown")
@@ -733,6 +741,11 @@ def make_cluster_resources_for_ray_cluster(
             logger.warning(f"Node {node_id} on {node_name} is not alive?? Skipping it.")
             continue
         alive_nodes.append(node_id)
+        reported_resources[node_id] = ResourceInfoFromRay(
+            node_id=node_id,
+            cpus=node.get("Resources", {}).get("CPU", None),
+            gpus=node.get("Resources", {}).get("GPU", None),
+        )
 
     futures = [
         _get_node_info_from_current_node.options(
@@ -750,7 +763,7 @@ def make_cluster_resources_for_ray_cluster(
     for node_id, info in zip(alive_nodes, infos):
         out_dict[str(node_id)] = NodeResources(
             used_cpus=0.0,
-            total_cpus=int(info.cpus * cpu_allocation_percentage),
+            total_cpus=int(_get_cpu_count(reported_resources[node_id], info) * cpu_allocation_percentage),
             gpus=[
                 GpuResources(
                     index=x.index,
@@ -764,3 +777,10 @@ def make_cluster_resources_for_ray_cluster(
 
     out = ClusterResources(out_dict)
     return out
+
+
+def _get_cpu_count(info_from_ray: ResourceInfoFromRay, info_from_node: ResourceInfoFromNode) -> int:
+    # use the Ray-reported CPU count if available, otherwise use the number of CPUs from the node info
+    if info_from_ray.cpus is not None and isinstance(info_from_ray.cpus, float) and info_from_ray.cpus > 0:
+        return int(info_from_ray.cpus)
+    return info_from_node.cpus

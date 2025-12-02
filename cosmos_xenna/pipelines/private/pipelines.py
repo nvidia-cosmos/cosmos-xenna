@@ -459,7 +459,7 @@ def run_pipeline(
     # Override stage level params with global params if needed
     for idx in range(len(pipeline_spec.stages)):
         pipeline_spec.stages[idx] = pipeline_spec.stages[idx].override_with_pipeline_params(pipeline_spec.config)
-    if not pipeline_spec.input_data:
+    if not pipeline_spec.input_data and pipeline_spec.config.execution_mode != specs.ExecutionMode.SERVING:
         logger.warning(
             "No input data specified for the pipeline. Skipping running the pipeline and return an empty list."
         )
@@ -487,7 +487,10 @@ def run_pipeline(
     if distibuted_download_config is not None:
         download_artifacts(pipeline_spec.stages, distibuted_download_config)  # pyright: ignore[reportArgumentType]
 
-    if pipeline_spec.config.execution_mode == specs.ExecutionMode.STREAMING:
+    if (
+        pipeline_spec.config.execution_mode == specs.ExecutionMode.STREAMING
+        or pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING
+    ):
         if pipeline_spec.config.mode_specific is None:
             pipeline_spec.config.mode_specific = specs.StreamingSpecificSpec()
         return streaming.run_pipeline(pipeline_spec, cluster_resources)
