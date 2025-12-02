@@ -2,6 +2,20 @@
 
 ## Latest
 
+## [0.1.8]
+
+### Released
+
+- 2025-12-01
+
+### Added
+
+- Added a SERVING mode that extends STREAMING mode for online-serving use case.
+
+### Fixed
+
+- Updated Xenna to use Ray-reported CPU resources.
+
 ## [0.1.7]
 
 ### Released

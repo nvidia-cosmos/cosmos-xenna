@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import math
+import queue as python_queue
 import random
 import time
 import typing
@@ -688,6 +689,20 @@ def run_pipeline(
 
             autoscaler.add_measurements(pool_extra_metadatas)
 
+            # In SERVING mode, poll the source queue for new-arriving requests.
+            if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+                assert pipeline_spec.serving_queues is not None
+                try:
+                    new_task = pipeline_spec.serving_queues.source.get(block=False)
+                    if new_task is None:
+                        # consider a None task as a termination signal
+                        logger.info("Received None task which is the termination signal of serving mode")
+                        break
+                except python_queue.Empty:
+                    pass
+                else:
+                    input_queue.by_node_id[None].append(new_task)
+
             # Add tasks if needed and able.
             # Start from the back and
             # NOTE: This is reversed.
@@ -699,10 +714,20 @@ def run_pipeline(
 
                 is_last_stage = idx == len(pools) - 1
                 is_first_stage = idx == 0
-                if is_last_stage and not pipeline_spec.config.return_last_stage_outputs:
-                    # If the last stage and the user did not ask for the results, we don't need to queue them.
-                    pass
+                if is_last_stage:
+                    if pipeline_spec.serving_queues is not None:
+                        # fetch the actual data and push to the sink; block until the sink can accept the results.
+                        for task in completed_tasks:
+                            for data_ref in task.task_data:
+                                pipeline_spec.serving_queues.sink.put(ray.get(data_ref), block=True, timeout=None)
+                    elif pipeline_spec.config.return_last_stage_outputs:
+                        # Add to the output_queue for final return.
+                        [output_queue.add_task(x) for x in completed_tasks]
+                    else:
+                        # If the last stage and the user did not ask for the results, we don't need to queue them.
+                        pass
                 else:
+                    # pass to the next stage
                     [output_queue.add_task(x) for x in completed_tasks]
 
                 while True:
@@ -766,6 +791,9 @@ def run_pipeline(
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
             # NOTE: This is iterating forward
             for idx, pool in enumerate(pools):
+                # In SERVING mode, we never mark stages as done.
+                if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+                    break
                 # A pool can never become "undone". Skip past anything which is already done.
                 if stage_is_dones[idx]:
                     continue
