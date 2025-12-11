@@ -564,7 +564,7 @@ pub fn find_best_allocation_using_fragmentation_gradient_descent(
 ///
 /// # Arguments
 /// * `cluster` - Cluster resource helper
-/// * `workload` - Workload object describing expected task distribution  
+/// * `workload` - Workload object describing expected task distribution
 /// * `potential_workers` - List of workers that could be removed
 ///
 /// # Returns

@@ -236,4 +236,3 @@ impl Drop for FileWriterPool {
         log::debug!("--- [Drop] All file writer workers have shut down. ---");
     }
 }
-

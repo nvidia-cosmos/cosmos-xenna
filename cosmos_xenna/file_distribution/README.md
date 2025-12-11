@@ -106,11 +106,11 @@ class MyModelStage(pipelines_v1.Stage):
                     cache=True  # Enable caching
                 )
             ),
-            
+
             # Download and extract an archive
             file_distribution.DownloadRequest(
                 value=file_distribution.ObjectDownloadRequest(
-                    uri="datasets/my-dataset.tar.gz", 
+                    uri="datasets/my-dataset.tar.gz",
                     destination=pathlib.Path("/tmp/datasets/my-dataset.tar.gz"),
                     unpack_options=file_distribution.UnpackOptions(
                         destination=pathlib.Path("/tmp/datasets/extracted/"),
@@ -118,7 +118,7 @@ class MyModelStage(pipelines_v1.Stage):
                     )
                 )
             ),
-            
+
             # Download all files under a prefix
             file_distribution.DownloadRequest(
                 value=file_distribution.PrefixDownloadRequest(
@@ -127,7 +127,7 @@ class MyModelStage(pipelines_v1.Stage):
                 )
             )
         ]
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Files are guaranteed to be available locally at this point
         self.model = torch.load("/tmp/models/pytorch_model.bin")
@@ -178,8 +178,8 @@ Support different credentials for different object stores:
 config_by_profile = file_distribution.ObjectStoreConfigByProfile(
     profiles={
         "models": file_distribution.ObjectStoreConfig.make_for_s3(
-            bucket="company-models", 
-            access_key_id="...", 
+            bucket="company-models",
+            access_key_id="...",
             secret_access_key="..."
         ),
         "datasets": file_distribution.ObjectStoreConfig.make_for_s3(
@@ -238,7 +238,7 @@ file_distribution.DownloadRequest(
 
 # Supported formats:
 # - TAR (.tar)
-# - TAR.GZ (.tar.gz, .tgz) 
+# - TAR.GZ (.tar.gz, .tgz)
 # - ZIP (.zip)
 # - Auto-detection based on file extension
 ```

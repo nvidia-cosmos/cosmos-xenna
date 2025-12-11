@@ -410,7 +410,7 @@ pub struct PoolOfResources {
     /// Number of CPUs (can be fractional)
     #[pyo3(get, set)]
     pub cpus: f32,
-    /// Number of GPUs (can be fractional)  
+    /// Number of GPUs (can be fractional)
     #[pyo3(get, set)]
     pub gpus: f32,
 }

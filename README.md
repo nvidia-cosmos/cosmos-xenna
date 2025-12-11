@@ -49,15 +49,15 @@ class DownloadStage(pipelines_v1.Stage):
     @property
     def stage_batch_size(self) -> int:
         return 10  # Process 10 videos at a time
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         return pipelines_v1.Resources(gpus=0, cpus=1.0)
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Initialize S3 client (runs once per worker)
         self._s3_client = make_s3_client()
-    
+
     def process_data(self, samples: list[Sample]) -> list[Sample]:
         # Download video bytes from S3 (runs for each batch)
         for sample in samples:
@@ -69,15 +69,15 @@ class CaptionStage(pipelines_v1.Stage):
     @property
     def stage_batch_size(self) -> int:
         return 5  # Larger batches would OOM the GPU
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         return pipelines_v1.Resources(gpus=1.0, cpus=1.0)
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Load model weights (runs once per worker)
         self._model = load_vlm_model()
-    
+
     def process_data(self, samples: list[Sample]) -> list[Sample]:
         # Run inference (runs for each batch)
         for sample in samples:
@@ -89,15 +89,15 @@ class WriterStage(pipelines_v1.Stage):
     @property
     def stage_batch_size(self) -> int:
         return 10
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         return pipelines_v1.Resources(gpus=0, cpus=1.0)
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         self._s3_client = make_s3_client()
         self._db = make_postgres_connection()
-    
+
     def process_data(self, samples: list[Sample]) -> list[Sample]:
         # Upload captions and write database records
         for sample in samples:
@@ -277,7 +277,7 @@ class LargeModelStage(pipelines_v1.Stage):
     def __init__(self, model_name: str, tensor_parallel_size: int):
         self._model_name = model_name
         self._tp_size = tensor_parallel_size
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         # Enable SPMD mode for multi-GPU inference
@@ -286,13 +286,13 @@ class LargeModelStage(pipelines_v1.Stage):
             cpus=1.0,
             is_spmd=True  # This enables SPMD coordination
         )
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         """Setup runs on each actor in the worker group."""
         # Get distributed execution parameters
         dist_params = worker_metadata.distributed_execution_params
         print(f"Setting up rank {dist_params.rank}/{dist_params.world_size}")
-        
+
         # Initialize vLLM with tensor parallelism
         self._llm = vllm.LLM(
             model=self._model_name,
@@ -305,13 +305,13 @@ class LargeModelStage(pipelines_v1.Stage):
             self._model_name,
             trust_remote_code=True
         )
-    
+
     def process_data(self, prompts: list[str]) -> list[str]:
         """Process data - only rank 0 returns results."""
         # All ranks participate in inference, but vLLM handles coordination
         sampling_params = vllm.SamplingParams(max_tokens=512)
         outputs = self._llm.generate(prompts, sampling_params)
-        
+
         # vLLM only returns results from rank 0
         return [output.outputs[0].text for output in outputs]
 
@@ -387,7 +387,7 @@ class MyModelStage(pipelines_v1.Stage):
                     cache=True  # Enable caching for future runs
                 )
             ),
-            
+
             # Download and extract an archive
             file_distribution.DownloadRequest(
                 value=file_distribution.ObjectDownloadRequest(
@@ -400,7 +400,7 @@ class MyModelStage(pipelines_v1.Stage):
                     )
                 )
             ),
-            
+
             # Download all files under a prefix (directory)
             file_distribution.DownloadRequest(
                 value=file_distribution.PrefixDownloadRequest(
@@ -410,16 +410,16 @@ class MyModelStage(pipelines_v1.Stage):
                 )
             )
         ]
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         return pipelines_v1.Resources(gpus=1.0, cpus=1.0)
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Files are guaranteed to be available at this point
         import torch
         self.model = torch.load("/tmp/models/pytorch_model.bin")
-    
+
     def process_data(self, inputs: list[str]) -> list[str]:
         # Your inference code here
         return inputs
@@ -593,7 +593,7 @@ of the dependencies from core, dev, GPU, and examples.
 Use UV to run all commands. For example, to run the example pipeline, use:
 
 ```bash
-uv run examples/simple_vlm_inference.py 
+uv run examples/simple_vlm_inference.py
 ```
 
 This will auto-sync dependencies if needed and execute the command in the UV-managed virtualenv.
