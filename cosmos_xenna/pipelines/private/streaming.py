@@ -361,12 +361,16 @@ class Autoscaler:
 
             for result, pool in zip(autoscale_result.stages, pools):
                 pool.set_num_slots_per_actor(result.slots_per_worker)
+                logger.debug(
+                    f"Autoscale result for pool {pool.name}: {len(result.new_workers)} new workers, "
+                    f"{len(result.deleted_workers)} deleted workers"
+                )
                 for w in result.new_workers:
-                    logger.trace(f"Adding actor to create: {w.to_worker_group(pool.name)}")
+                    logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_create(w.to_worker_group(pool.name))
 
                 for w in result.deleted_workers:
-                    logger.trace(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
+                    logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_delete(w.to_worker_group(pool.name))
 
             self._autoscale_future = None
@@ -816,10 +820,10 @@ def run_pipeline(
             rate_limiter.sleep()
             new_stats.sleep_end = time.time()
             last_stats = StreamingExecutorStats(new_stats)
-            logger.debug(f"Input queue: {len(input_queue)}")
+            logger.trace(f"Input queue: {len(input_queue)}")
             for idx, queue in enumerate(queues):
-                logger.debug(f"Queue {idx}: {len(queue)}")
-            logger.debug(last_stats.to_log_string())
+                logger.trace(f"Queue {idx}: {len(queue)}")
+            logger.trace(last_stats.to_log_string())
 
     if pipeline_spec.config.return_last_stage_outputs:
         return ray.get(queues[-1].get_all_samples())

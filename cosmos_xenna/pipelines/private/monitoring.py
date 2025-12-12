@@ -332,7 +332,10 @@ class PipelineMonitor:
         # Maybe log the current state.
         if self._log_rate_limiter.can_call():
             if self._verbosity_level >= VerbosityLevel.INFO:
-                self._print_state(stats.pipeline)
+                # Setting PYTHON_LOG seems to be a global setting for any loguru logger.
+                # So this additional verbosity setting is for xenna users to control logging level for specific info.
+                display = stats.pipeline.display()
+                logger.info(f"Pipeline stats:\n{display}")
             return True
         else:
             return False
@@ -384,10 +387,6 @@ class PipelineMonitor:
             extra_data_per_stage=extra_outputs,
         )
         return contents
-
-    def _print_state(self, stats: PipelineStats) -> None:
-        display = stats.display()
-        print(display)
 
     def close(self) -> None:
         assert self._opened
