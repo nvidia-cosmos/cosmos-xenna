@@ -761,6 +761,7 @@ def make_cluster_resources_for_ray_cluster(
     logger.debug(f"Node info futures completed. Results: {infos}")
 
     for node_id, info in zip(alive_nodes, infos):
+        node_gpus = _get_gpus(reported_resources[node_id], info)
         out_dict[str(node_id)] = NodeResources(
             used_cpus=0.0,
             total_cpus=int(_get_cpu_count(reported_resources[node_id], info) * cpu_allocation_percentage),
@@ -770,13 +771,34 @@ def make_cluster_resources_for_ray_cluster(
                     uuid_=x.uuid_,
                     used_fraction=0.0,
                 )
-                for x in info.gpus
+                for x in node_gpus
             ],
             name=str(node_id),
         )
 
     out = ClusterResources(out_dict)
     return out
+
+
+def _get_gpus(info_from_ray: ResourceInfoFromRay, info_from_node: ResourceInfoFromNode) -> list[GpuInfo]:
+    """Return the GPU list for a node, capped by Ray's reported GPU count.
+
+    pynvml discovers all physical GPUs on the node (filtered by CUDA_VISIBLE_DEVICES if set),
+    but Ray may have been started with fewer GPUs (e.g. ``ray start --num-gpus=1`` on a 2-GPU
+    node). We respect the Ray allocation by keeping at most ``ray_gpu_count`` GPUs, sorted by
+    hardware index, which is consistent with Ray's 0-based resource-ID-to-physical-GPU mapping.
+    """
+    detected_gpus = sorted(info_from_node.gpus, key=lambda g: g.index)
+    ray_gpu_count = info_from_ray.gpus
+    if ray_gpu_count is not None and ray_gpu_count >= 0:
+        ray_gpu_count_int = int(ray_gpu_count)
+        if len(detected_gpus) > ray_gpu_count_int:
+            logger.info(
+                f"Node {info_from_ray.node_id}: pynvml detected {len(detected_gpus)} GPUs but Ray "
+                f"reports {ray_gpu_count_int}. Capping to {ray_gpu_count_int} GPUs to respect Ray allocation."
+            )
+            detected_gpus = detected_gpus[:ray_gpu_count_int]
+    return detected_gpus
 
 
 def _get_cpu_count(info_from_ray: ResourceInfoFromRay, info_from_node: ResourceInfoFromNode) -> int:
