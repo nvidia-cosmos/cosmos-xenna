@@ -87,7 +87,7 @@ class MyModelStage(pipelines_v1.Stage):
                 )
             )
         ]
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # File is guaranteed to be available locally
         self.model = torch.load("/tmp/model.bin")
@@ -137,20 +137,20 @@ class LargeModelInferenceStage(pipelines_v1.Stage):
     def __init__(self, model_name: str, tensor_parallel_size: int):
         self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
-    
+
     @property
     def required_resources(self) -> pipelines_v1.Resources:
         # Request SPMD execution across multiple GPUs
         return pipelines_v1.Resources(
-            cpus=1.0, 
+            cpus=1.0,
             gpus=self.tensor_parallel_size,  # e.g., 8 GPUs total
             is_spmd=True  # Enable SPMD coordination
         )
-    
+
     def setup(self, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         # Environment variables are automatically set by Xenna:
         # MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE, LOCAL_RANK
-        
+
         import vllm
         self.llm = vllm.LLM(
             model=f"/tmp/{self.model_name}/",
@@ -159,7 +159,7 @@ class LargeModelInferenceStage(pipelines_v1.Stage):
             trust_remote_code=True,
             gpu_memory_utilization=0.95
         )
-    
+
     def process_data(self, prompts: list[str]) -> list[str]:
         # All actors run the same code, vLLM handles tensor parallelism internally
         outputs = self.llm.generate(prompts)

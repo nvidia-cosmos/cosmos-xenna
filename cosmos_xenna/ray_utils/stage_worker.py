@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Code used to run the pipeline workers in a streaming Ray pipeline.
 
@@ -361,7 +362,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         return self._node_location
 
     @ray.method(retry_exceptions=False)  # type: ignore
-    async def setup_on_node(self) -> None:
+    async def setup_on_node(self, **_kwargs: object) -> None:
         """Setup the actor per node.
 
         This is guranteed to be called exactly once by the actor pool for each node.
@@ -371,6 +372,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         This is useful if you need to do per node setup. For example, you may need to download weights to the node from
         object storage.
+
+        Note:
+            **_kwargs absorbs internal Ray tracing kwargs injected at runtime.
         """
         if (
             self._metadata.should_set_cuda_visible_devices
@@ -379,7 +383,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         ):
             raise RuntimeError(
                 "Worker is a GPU worker, but no GPUs are available. This likely means that the ray cluster was not "
-                "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0'. Xenna needs this env variable to be set "
+                "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1'. Xenna needs this env variable to be set "
                 "before cluster creation as it works around ray's gpu allocation mechanisms."
             )
 
@@ -398,7 +402,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
             raise self._setup_on_node_error
 
     @ray.method(retry_exceptions=False)  # type: ignore
-    async def setup(self) -> str:
+    async def setup(self, **_kwargs: object) -> str:
         """Sets up the worker by calling the stage's setup method.
 
         This method delegates the actual setup to the processing thread to ensure
@@ -410,6 +414,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         Raises:
             Exception: If setup fails after all retry attempts.
+
+        Note:
+            **_kwargs absorbs internal Ray tracing kwargs injected at runtime.
         """
         if (
             self._metadata.should_set_cuda_visible_devices
@@ -418,7 +425,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         ):
             raise RuntimeError(
                 "Worker is a GPU worker, but no GPUs are available. This likely means that the ray cluster was not "
-                "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0'. Xenna needs this env variable to be set "
+                "started with 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1'. Xenna needs this env variable to be set "
                 "before cluster creation as it works around ray's gpu allocation mechanisms."
             )
 
@@ -453,7 +460,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
         return node_location
 
     @ray.method(retry_exceptions=False)  # type: ignore
-    async def process_data(self, task_data: TaskData[T]) -> AsyncGenerator[Union[V, TaskResultMetadata], None]:
+    async def process_data(
+        self, task_data: TaskData[T], **_kwargs: object
+    ) -> AsyncGenerator[Union[V, TaskResultMetadata], None]:
         """Submits a task for asynchronous processing by the worker's internal threads.
 
         This method is the main entry point for tasks. It assigns a unique ID to the
@@ -472,6 +481,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
         Raises:
             Exception: If a processing error occurs for this task within the worker threads,
                        or if a global error (`_global_error`) has stopped the worker.
+
+        Note:
+            **_kwargs absorbs internal Ray tracing kwargs injected at runtime.
         """
         # Generate a unique task ID
         task_id = str(uuid.uuid4())
@@ -499,13 +511,16 @@ class StageWorker(abc.ABC, Generic[T, V]):
             yield item
 
     @ray.method(retry_exceptions=False)  # type: ignore
-    def cancel_task(self, task_data: TaskData[T]) -> bool:
+    def cancel_task(self, task_data: TaskData[T], **_kwargs: object) -> bool:
         """Attempts to cancel a task that has been submitted but not yet started.
 
         Best-effort removal from internal queues; returns True if the task was found and removed
         from either the submission queue or the downloaded-but-not-deserialized queue.
         If the task has already begun deserialization or processing, cancellation will likely fail
         and this returns False.
+
+        Note:
+            **_kwargs absorbs internal Ray tracing kwargs injected at runtime.
         """
 
         # Helper to remove a matching task from a Queue by draining and reconstructing it.
