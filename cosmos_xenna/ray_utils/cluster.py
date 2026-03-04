@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import os
 
@@ -71,7 +72,7 @@ def init_or_connect_to_cluster(
     # We set these manually in Xenna because we allocate the gpus manually instead of relying on ray's mechanisms.
     # This will *only* get picked up from here if the cluster is started from this script. In the case of previously
     # existing clusters, this needs to be set in the processes that set up the cluster.
-    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     # These need to be set to allow listing debug info about more than 10k actors.
     os.environ["RAY_MAX_LIMIT_FROM_API_SERVER"] = str(API_LIMIT)
     os.environ["RAY_MAX_LIMIT_FROM_DATA_SOURCE"] = str(API_LIMIT)
@@ -83,11 +84,13 @@ def init_or_connect_to_cluster(
         logger.__class__, serializer=logger_custom_serializer, deserializer=logger_custom_deserializer
     )
 
+    tracing_hook = os.environ.get("XENNA_RAY_TRACING_HOOK")
     context = ray.init(
         include_dashboard=True,
         ignore_reinit_error=True,
         log_to_driver=log_to_driver,
         _metrics_export_port=ray_metrics_port,
+        **({"_tracing_startup_hook": tracing_hook} if tracing_hook else {}),
     )
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context

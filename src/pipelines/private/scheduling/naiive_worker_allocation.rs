@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 
 //! Resource allocation optimizer for multi-stage streaming pipelines using linear programming.
 //!
@@ -90,7 +91,7 @@ pub enum AllocationError {
     ///
     /// This occurs when stage parameters violate basic requirements:
     /// - `batches_per_second_per_worker` must be positive
-    /// - `num_returns_per_batch` must be positive  
+    /// - `num_returns_per_batch` must be positive
     /// - `stage_batch_size` must be positive
     #[error("Invalid stage configuration for stage '{stage}': {reason}")]
     InvalidStage { stage: String, reason: String },
@@ -139,7 +140,7 @@ pub struct AllocationProblemStage {
     /// This accounts for stages that may generate more or fewer outputs than inputs.
     /// For example:
     /// - A 1:1 transformation has `num_returns_per_batch = 1.0`
-    /// - A stage that duplicates inputs has `num_returns_per_batch = 2.0`  
+    /// - A stage that duplicates inputs has `num_returns_per_batch = 2.0`
     /// - A filtering stage might have `num_returns_per_batch = 0.5`
     /// Must be positive.
     pub num_returns_per_batch: f64,
@@ -221,7 +222,7 @@ impl AllocationProblemStage {
 ///
 /// Contains all information needed to solve the worker allocation problem:
 /// - Stage definitions with resource requirements
-/// - Available cluster resources  
+/// - Available cluster resources
 /// - Processing speed characteristics
 /// - Manual worker count specifications
 ///
@@ -428,7 +429,7 @@ impl AllocationResult {
 /// This function serves as the main entry point for resource allocation. It implements
 /// a comprehensive optimization strategy that:
 /// 1. Validates input parameters for all stages
-/// 2. Separates manually specified stages from auto-scaling stages  
+/// 2. Separates manually specified stages from auto-scaling stages
 /// 3. Reserves resources for manual stages
 /// 4. Optimizes remaining resources for auto-scaling stages using linear programming
 /// 5. Combines results into a complete allocation
@@ -630,7 +631,7 @@ pub fn solve_allocation(problem: AllocationProblem) -> Result<AllocationResult, 
 ///
 /// **Subject to:**
 /// - t_i ≥ z                                    (minimum throughput constraint)
-/// - t_i = x_i * samples_per_sample_i * bps_i * batch_size_i  (throughput definition)  
+/// - t_i = x_i * samples_per_sample_i * bps_i * batch_size_i  (throughput definition)
 /// - t_i = z + s_i                              (slack definition)
 /// - Σ(x_i * resources_i) ≤ cluster_resources   (resource constraints for each type)
 /// - x_i ≥ 1, x_i ∈ ℤ                          (integer worker counts, minimum 1)
@@ -667,7 +668,7 @@ fn solve_allocation_with_no_manual_stages(
 
     // Create decision variables for each stage
     let mut x_vars: Vec<Variable> = Vec::with_capacity(problem.stages.len()); // Worker counts
-    let mut t_vars: Vec<Variable> = Vec::with_capacity(problem.stages.len()); // Throughputs  
+    let mut t_vars: Vec<Variable> = Vec::with_capacity(problem.stages.len()); // Throughputs
     let mut s_vars: Vec<Variable> = Vec::with_capacity(problem.stages.len()); // Slack variables
 
     for i in 0..problem.stages.len() {
@@ -812,7 +813,7 @@ fn solve_allocation_with_no_manual_stages(
 ///
 /// let factors = calculate_input_samples_per_sample(&batch_sizes, &returns_per_batch);
 /// // factors = [1.0, 8.0, 32.0]
-/// // - Stage 0: 1 first-stage sample per stage-0 sample  
+/// // - Stage 0: 1 first-stage sample per stage-0 sample
 /// // - Stage 1: 8 first-stage samples per stage-1 sample (due to batching)
 /// // - Stage 2: 32 first-stage samples per stage-2 sample (batching + filtering)
 /// ```

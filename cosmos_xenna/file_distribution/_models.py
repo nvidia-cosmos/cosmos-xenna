@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
 import enum
 import pathlib
 import uuid
-from typing import Optional, Union
+from datetime import timedelta
+from typing import TYPE_CHECKING, Optional, Union
 
 import attrs
 import obstore as obs
+
+if TYPE_CHECKING:
+    from obstore.store import RetryConfig
 
 from cosmos_xenna._cosmos_xenna.file_distribution import models as rust_models
 
@@ -570,6 +575,7 @@ class ObjectStoreConfig:
 
     uri: str
     config_args: dict[str, str] = attrs.field(factory=dict)
+    retry_config: RetryConfig | None = None
 
     # This is taken from obstore.store.ClientConfig
     # Valid HTTP client configuration fields
@@ -605,6 +611,10 @@ class ObjectStoreConfig:
         region: str | None = None,
         timeout_s: int = 300,
         connect_timeout_s: int = 60,
+        max_retries: int = 15,
+        retry_timeout: timedelta = timedelta(minutes=5),
+        init_backoff: timedelta = timedelta(milliseconds=200),
+        max_backoff: timedelta = timedelta(seconds=30),
     ) -> ObjectStoreConfig:
         """Create an ObjectStoreConfig for S3 or S3-compatible storage.
 
@@ -616,6 +626,10 @@ class ObjectStoreConfig:
             region: AWS region (optional, e.g., "us-west-2") (optional)
             timeout_s: Timeout for the S3 operation in seconds (default: 300)
             connect_timeout_s: Connect timeout for the S3 operation in seconds (default: 60)
+            max_retries: Max number of retries for transient errors (default: 15)
+            retry_timeout: Max total time for retries (default: 5 min)
+            init_backoff: Initial backoff duration (default: 200ms)
+            max_backoff: Maximum backoff duration (default: 30s)
 
         Returns:
             ObjectStoreConfig configured for S3 access
@@ -642,7 +656,17 @@ class ObjectStoreConfig:
         config_args["timeout"] = f"{timeout_s}s"
         config_args["connect_timeout"] = f"{connect_timeout_s}s"
 
-        return cls(uri=f"s3://{bucket}/", config_args=config_args)
+        retry_cfg: RetryConfig = {
+            "max_retries": max_retries,
+            "retry_timeout": retry_timeout,
+            "backoff": {
+                "init_backoff": init_backoff,
+                "max_backoff": max_backoff,
+                "base": 2,
+            },
+        }
+
+        return cls(uri=f"s3://{bucket}/", config_args=config_args, retry_config=retry_cfg)
 
     @classmethod
     def make_for_local(cls, directory_path: str) -> ObjectStoreConfig:
@@ -755,6 +779,7 @@ class ObjectStoreByProfile:
                     client_options={  # pyright: ignore[reportArgumentType]
                         k: v for k, v in config.config_args.items() if ObjectStoreConfig.is_client_option(k)
                     },
+                    retry_config=config.retry_config,
                 )  # type: ignore
                 for profile, config in config_by_profile.profiles.items()
             }
