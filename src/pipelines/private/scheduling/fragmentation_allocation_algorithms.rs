@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +12,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 
 //! Allocation algorithms which rely on an expected distribution of jobs and the concept of "fragmentation".
 //!
@@ -564,7 +565,7 @@ pub fn find_best_allocation_using_fragmentation_gradient_descent(
 ///
 /// # Arguments
 /// * `cluster` - Cluster resource helper
-/// * `workload` - Workload object describing expected task distribution  
+/// * `workload` - Workload object describing expected task distribution
 /// * `potential_workers` - List of workers that could be removed
 ///
 /// # Returns

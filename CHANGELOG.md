@@ -2,6 +2,23 @@
 
 ## Latest
 
+## [0.2.0]
+
+### Released
+
+- 2026-03-03
+
+### Added
+
+- Added support for OpenTelemetry distributed tracing via optional `XENNA_RAY_TRACING_HOOK` during Ray initialization.
+- Added configurable S3/object-store retry settings in `ObjectStoreConfig.make_for_s3` (`max_retries`, `retry_timeout`, `init_backoff`, `max_backoff`).
+- Added autoscaling smoke tests for fragmentation and large-model allocation scenarios.
+
+### Fixed
+
+- Updated Xenna to use `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` for compatibility with upstream Ray behavior.
+- Fixed GPU allocation source-of-truth by capping detected GPUs to Ray-reported GPU count per node.
+
 ## [0.1.8]
 
 ### Released
