@@ -67,6 +67,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import copy
+import os
 import queue
 import threading
 import time
@@ -75,6 +76,7 @@ import uuid
 from typing import AsyncGenerator, Generic, Optional, Union
 
 import attrs
+import psutil
 import ray
 import ray.experimental
 from ray.util.metrics import Gauge
@@ -874,6 +876,28 @@ class StageWorker(abc.ABC, Generic[T, V]):
         logger.exception(f"Error in {thread_name}. Killing worker.")
         self._global_error = e
         self.stop_flag.set()  # Stop all threads
+
+    def get_pid_tree(self) -> list[tuple[int, float]]:
+        """Return this process's PID and all descendant PIDs, each paired with its create_time.
+
+        Called by the actor pool before ray.kill() to snapshot the full process tree.
+        The create_time is used by the reaper to guard against PID reuse: if the OS recycles
+        a PID before the reap task runs, the create_time mismatch will prevent killing an
+        innocent process. Survivors are reaped after the kill to handle processes that outlive
+        their actor shutdown.
+        """
+        try:
+            p = psutil.Process(os.getpid())
+            procs = [p, *p.children(recursive=True)]
+            result = []
+            for proc in procs:
+                try:
+                    result.append((proc.pid, proc.create_time()))
+                except psutil.NoSuchProcess:
+                    pass  # child exited between children() and create_time(); skip it
+            return result if result else [(p.pid, p.create_time())]
+        except psutil.NoSuchProcess:
+            return [(os.getpid(), 0.0)]
 
     def shutdown(self) -> None:
         """Signals the worker threads to stop and waits for them to exit."""

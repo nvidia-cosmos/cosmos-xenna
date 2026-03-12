@@ -443,32 +443,44 @@ class ProcessTree:
 
         # Create a mapping of pid to ProcessInfo
         process_dict: dict[int, ProcessInfo] = {}
+        pid_to_ppid: dict[int, int] = {}
+        skipped_invalid_pid = 0
 
         for proc in processes:
             try:
-                pid = proc.info["pid"]  # type: ignore
+                info = proc.info  # type: ignore[attr-defined]
+                pid = info.get("pid") if isinstance(info, dict) else None
+                if not isinstance(pid, int):
+                    skipped_invalid_pid += 1
+                    continue
+                memory_info = info.get("memory_info") if isinstance(info, dict) else None
+                ppid = info.get("ppid") if isinstance(info, dict) else 0
+
+                pid_to_ppid[pid] = ppid if isinstance(ppid, int) else 0
                 process_dict[pid] = ProcessInfo(
                     pid=pid,
-                    name=proc.info["name"],  # type: ignore
-                    memory_usage_rss=proc.info["memory_info"].rss,  # type: ignore
-                    memory_usage_shared=proc.info["memory_info"].shared,  # type: ignore
-                    cpu_utilization=proc.info["cpu_percent"],  # type: ignore
+                    name=str(info.get("name", "")) if isinstance(info, dict) else "",
+                    memory_usage_rss=getattr(memory_info, "rss", 0),
+                    memory_usage_shared=getattr(memory_info, "shared", 0),
+                    cpu_utilization=float(info.get("cpu_percent", 0.0)) if isinstance(info, dict) else 0.0,
                 )
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
                 continue
+
+        if skipped_invalid_pid > 0:
+            logger.warning(
+                "ProcessTree.make: skipped "
+                f"{skipped_invalid_pid} process entry(ies) with missing/invalid pid out of {len(processes)}"
+            )
 
         # Build the process tree
         root = ProcessInfo(pid=0, name="ROOT", memory_usage_rss=0, memory_usage_shared=0, cpu_utilization=0)
         for pid, proc_info in process_dict.items():
-            try:
-                ppid = next(p for p in processes if p.info["pid"] == pid).info["ppid"]  # type: ignore
-                if ppid == 0 or ppid == 1 or ppid not in process_dict:
-                    root.children.append(proc_info)
-                else:
-                    process_dict[ppid].children.append(proc_info)
-            except StopIteration:
-                # If we can't find the process, add it to root
+            ppid = pid_to_ppid.get(pid, 0)
+            if ppid == 0 or ppid == 1 or ppid not in process_dict:
                 root.children.append(proc_info)
+            else:
+                process_dict[ppid].children.append(proc_info)
 
         # TODO: Add GPU utilization if available
         return ProcessTree(root=root)
