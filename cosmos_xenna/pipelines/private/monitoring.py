@@ -46,9 +46,18 @@ from typing import Any, List
 
 import attrs
 import ray
+import ray.exceptions
 import ray.util.scheduling_strategies
 import ray.util.state
 from ray.util.metrics import Gauge
+
+try:
+    import pynvml
+
+    HAS_NVML = True
+except ImportError:
+    pynvml = None
+    HAS_NVML = False
 
 from cosmos_xenna.pipelines.private.monitoring_types import (
     ActorInfo,
@@ -63,6 +72,34 @@ from cosmos_xenna.ray_utils import actor_pool, resource_monitor, stage_worker
 from cosmos_xenna.utils import python_log as logger
 from cosmos_xenna.utils import timing
 from cosmos_xenna.utils.verbosity import VerbosityLevel
+
+_GPU_ORPHAN_SCAN_INTERVAL_S = 30
+
+
+def _get_live_ray_pids_on_node(node_id: str) -> set[int]:
+    """Return all PIDs and descendants belonging to live Ray actors on this node."""
+    import psutil
+
+    pids: set[int] = set()
+    try:
+        for actor in get_ray_actors():
+            if actor.node_id != node_id:
+                continue
+            pid = actor.pid
+            if pid:
+                pid = int(pid)
+                pids.add(pid)
+                try:
+                    pids.update(c.pid for c in psutil.Process(pid).children(recursive=True))
+                except psutil.NoSuchProcess:
+                    pass
+                except (psutil.AccessDenied, psutil.ZombieProcess) as e:
+                    logger.warning(f"Failed to inspect child processes for pid={pid}: {e}")
+    except (ray.exceptions.RayError, AttributeError, TypeError, ValueError) as e:
+        logger.warning(f"Failed to collect live Ray pids on node {node_id}: {e}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Unexpected error collecting live Ray pids on node {node_id}: {e}")
+    return pids
 
 
 @attrs.define
@@ -85,11 +122,18 @@ class NodeResourceMonitor:
 
     def __init__(self) -> None:
         self._node_id = ray.get_runtime_context().get_node_id()
+        self._node_ip = ray.util.get_node_ip_address()
         self._latest_metrics: SystemDataAndProcessTree | None = None
         self._exception = None
         self._stop_event = threading.Event()
+        self._pynvml: Any | None = None
+        self._nvml_handles: list[Any] | None = None
         self._thread = threading.Thread(target=self._metrics_loop)
         self._thread.start()
+        self._orphan_thread: threading.Thread | None = None
+        if HAS_NVML:
+            self._orphan_thread = threading.Thread(target=self._orphan_scan_loop, daemon=True)
+            self._orphan_thread.start()
 
     def _metrics_loop(self) -> None:
         monitor = resource_monitor.ResourceMonitor()
@@ -103,6 +147,64 @@ class NodeResourceMonitor:
                 self._exception = str(e)
                 break
             sleeper.sleep()
+
+    def _orphan_scan_loop(self) -> None:
+        sleeper = timing.RateLimiter(1.0 / _GPU_ORPHAN_SCAN_INTERVAL_S)
+        while not self._stop_event.is_set():
+            sleeper.sleep()
+            try:
+                self._scan_gpu_orphans()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"GpuOrphanMonitor({self._node_ip}): orphan loop iteration failed: {e}")
+
+    def _maybe_init_nvml(self) -> bool:
+        if self._pynvml is not None and self._nvml_handles is not None:
+            return True
+
+        if not HAS_NVML or pynvml is None:
+            return False
+
+        pynvml.nvmlInit()
+        self._pynvml = pynvml
+        self._nvml_handles = [pynvml.nvmlDeviceGetHandleByIndex(idx) for idx in range(pynvml.nvmlDeviceGetCount())]
+        return True
+
+    def _scan_gpu_orphans(self) -> None:
+        try:
+            if not self._maybe_init_nvml():
+                return
+            nvml = self._pynvml
+            handles = self._nvml_handles
+            assert nvml is not None
+            assert handles is not None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"GpuOrphanMonitor({self._node_ip}): failed to initialize NVML: {e}")
+            return
+
+        prefix = f"GpuOrphanMonitor({self._node_ip})"
+        live_pids = _get_live_ray_pids_on_node(self._node_id)
+        try:
+            import psutil
+
+            found_orphan = False
+            for idx, handle in enumerate(handles):
+                for proc in nvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                    if proc.pid in live_pids:
+                        continue
+                    mem_gb = proc.usedGpuMemory / (1024**3)
+                    try:
+                        proc_name = psutil.Process(proc.pid).name()
+                    except psutil.NoSuchProcess:
+                        proc_name = "gone"
+                    logger.debug(
+                        f"{prefix}: GPU-{idx} orphan pid={proc.pid} mem={mem_gb:.2f}GB"
+                        f" process={proc_name!r} - not owned by any live Ray actor"
+                    )
+                    found_orphan = True
+            if not found_orphan:
+                logger.debug(f"{prefix}: scan complete, no orphans found")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{prefix}: scan failed: {e}")
 
     def get_latest_metrics(self) -> SystemDataAndProcessTree | None:
         if self._exception:
@@ -477,7 +579,7 @@ class PipelineMonitor:
         # calculate a normalization factor for the next stage when calculating progress
         normalization_factor = 1.0
         # total completed task stages
-        total_completed_task_stages = 0
+        total_completed_task_stages = 0.0
 
         # loop through all stages
         for pool_stats in stats.actor_pools:

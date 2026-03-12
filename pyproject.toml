@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.2.0"
+version = "0.2.1"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -13,7 +13,7 @@ dependencies = [
     "pulp",
     "ray[default]>=2.46.0",
     "tabulate",
-    "obstore",
+    "obstore<0.9.0",  # 0.9.0 regression: delete() ignores store prefix from from_url()
     "portpicker>=1.6.0",
 ]
 

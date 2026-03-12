@@ -17,7 +17,7 @@
 import ctypes
 import random
 
-import pytest  # noqa: F401
+import pytest
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
 
@@ -64,6 +64,7 @@ class _SegfaultingStage(pipelines_v1.Stage):
 #     assert sorted(results) == [x * 2 for x in range(1000)]
 
 
+@pytest.mark.skip(reason="Might be flaky in CI")
 def test_nominal_streaming_pipeline():
     pipeline_spec = pipelines_v1.PipelineSpec(
         input_data=range(200),

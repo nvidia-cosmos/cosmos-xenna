@@ -21,6 +21,7 @@ from __future__ import annotations
 import collections
 import copy
 import enum
+import os
 import statistics
 import time
 import typing
@@ -28,6 +29,7 @@ from typing import Generic, Optional
 
 import attrs
 import portpicker
+import psutil
 import ray
 import ray.exceptions
 import ray.util.scheduling_strategies
@@ -42,6 +44,123 @@ from cosmos_xenna.utils import python_log as logger
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
+
+
+_KILL_ACTOR_SURVIVORS: bool = os.getenv("XENNA_KILL_ACTOR_SURVIVORS", "0") == "1"
+
+
+def _get_actor_os_pid(actor_ref: ActorHandle) -> str:
+    """Look up the OS PID of a Ray actor via Ray's state API.
+
+    Returns the PID as a string, or 'unknown' if the lookup fails.
+    This is the same PID visible in Ray's log prefixes like '(StageName pid=XXXXX)'.
+    """
+    actor_id_obj = getattr(actor_ref, "_actor_id", None)
+    if actor_id_obj is None:
+        return "unknown"
+
+    try:
+        actor_id = actor_id_obj.hex()
+    except (AttributeError, TypeError):
+        return "unknown"
+
+    try:
+        info = ray.state.actors(actor_id=actor_id)
+    except ray.exceptions.RayError:
+        return "unknown"
+
+    if not isinstance(info, dict):
+        return "unknown"
+
+    pid = info.get("Pid")
+    return str(pid) if pid else "unknown"
+
+
+def _get_actor_pid_tree(actor_ref: ActorHandle) -> list[tuple[int, float | None]]:
+    """Return the PID tree of a live actor before killing it.
+
+    Calls get_pid_tree() on the actor with a short timeout. Falls back to just
+    the actor's main PID (from Ray state) if the call fails or times out.
+
+    Returns a list of (pid, create_time) pairs. create_time is None in the fallback
+    path where we can't reach the actor to read it - the reaper will still kill that
+    PID but without PID-reuse protection.
+    """
+    try:
+        return ray.get(actor_ref.get_pid_tree.remote(), timeout=5)  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        pid_str = _get_actor_os_pid(actor_ref)
+        logger.warning(f"get_pid_tree() timed out or failed ({e}), falling back to actor pid={pid_str} only")
+        try:
+            return [(int(pid_str), None)]
+        except ValueError:
+            return []
+
+
+_REAP_GRACE_PERIOD_S = 15
+
+
+@ray.remote(num_cpus=0)
+def _reap_pids(pid_entries: list[tuple[int, float | None]]) -> None:
+    """Kill any surviving processes from a specific list of PIDs on this node.
+
+    Dispatched as a fire-and-forget task pinned to the actor's node after ray.kill().
+    Waits _REAP_GRACE_PERIOD_S before checking, giving ray.kill() time to propagate
+    through GCS -> raylet -> SIGKILL before we intervene.
+
+    Each entry is (pid, create_time). If create_time is not None, the process is only
+    killed if its current create_time matches the snapshot - protecting against PID reuse
+    where the OS recycles a PID to an innocent process between snapshot and reap.
+    """
+    deadline = time.monotonic() + _REAP_GRACE_PERIOD_S
+    while time.monotonic() < deadline:
+        if all(not psutil.pid_exists(pid) for pid, _ in pid_entries):
+            logger.debug(f"_reap_pids: all {len(pid_entries)} pid(s) gone within grace period")
+            return
+        time.sleep(0.5)
+
+    survived = []
+    for pid, expected_create_time in pid_entries:
+        try:
+            p = psutil.Process(pid)
+            if expected_create_time is not None:
+                actual_create_time = p.create_time()
+                if actual_create_time != expected_create_time:
+                    logger.info(
+                        f"_reap_pids: skipping pid={pid} - create_time mismatch "
+                        f"(expected={expected_create_time:.3f}, actual={actual_create_time:.3f}): "
+                        f"PID was reused by another process"
+                    )
+                    continue
+            name = p.name()
+            p.kill()
+            survived.append((pid, name))
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"_reap_pids: failed to kill pid={pid}: {e}")
+
+    if survived:
+        for pid, name in survived:
+            logger.warning(f"actor survivor killed: pid={pid} name={name!r} survived ray.kill() - sent SIGKILL")
+    else:
+        logger.debug(f"_reap_pids: all {len(pid_entries)} pid(s) gone within grace period or already dead")
+
+
+def _kill_actor_and_reap(actor_ref: ActorHandle, node_id: str, label: str) -> None:
+    """Snapshot the actor's PID tree, ray.kill() it, then dispatch a cleanup task to the node."""
+    pid_entries = _get_actor_pid_tree(actor_ref)
+    pids = [p for p, _ in pid_entries]
+    logger.info(f"Killing {label} (pids={pids})")
+    ray.kill(actor_ref)
+    logger.info(f"ray.kill() dispatched for {label} (pids={pids})")
+    if pid_entries and _KILL_ACTOR_SURVIVORS:
+        _reap_pids.options(  # type: ignore[attr-defined]
+            num_cpus=0,
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False
+            ),
+        ).remote(pid_entries)
 
 
 _RATE_ESTIMATE_LOOKBACK_S = 60 * 10
@@ -125,7 +244,7 @@ class _ReadyActor(Generic[V]):
         return [x for x in self.slots if not x.has_task]
 
     def kill(self) -> None:
-        ray.kill(self.actor_ref)
+        _kill_actor_and_reap(self.actor_ref, self.metadata.allocation.node, f"ready actor {self.metadata.worker_id}")
 
     def maybe_resize_num_slots_per_actor(self, new_slots_per_actor: int) -> None:
         if len(self.slots) == new_slots_per_actor:
@@ -164,7 +283,9 @@ class _PendingNodeActor:
     node_setup_call_ref: ObjectRef[str]
 
     def kill(self) -> None:
-        ray.kill(self.actor_ref)
+        _kill_actor_and_reap(
+            self.actor_ref, self.metadata.allocation.node, f"node-setup actor {self.metadata.worker_id}"
+        )
 
 
 @attrs.define
@@ -181,7 +302,7 @@ class _ActorWaitingForNodeSetup:
     actor_ref: ActorHandle
 
     def kill(self) -> None:
-        ray.kill(self.actor_ref)
+        _kill_actor_and_reap(self.actor_ref, self.metadata.allocation.node, f"waiting actor {self.metadata.worker_id}")
 
 
 @attrs.define
@@ -200,7 +321,7 @@ class _PendingActor:
     setup_call_ref: ObjectRef[str]
 
     def kill(self) -> None:
-        ray.kill(self.actor_ref)
+        _kill_actor_and_reap(self.actor_ref, self.metadata.allocation.node, f"pending actor {self.metadata.worker_id}")
 
     def to_stats(self) -> monitoring.PendingActorStats:
         return monitoring.PendingActorStats(self.metadata.worker_id, self.metadata.allocation)
