@@ -2,6 +2,17 @@
 
 ## Latest
 
+## [0.2.1]
+
+### Released
+
+- 2026-03-11
+
+### Fixed
+
+- Fixed leaking child processes from stage actors by snapshotting the PID tree before `ray.kill()` and reaping survivors via a pinned follow-up task (opt-in via `XENNA_KILL_ACTOR_SURVIVORS=1`).
+- Fixed O(n²) process tree construction in `ProcessTree.make` and hardened it against missing/invalid psutil fields.
+
 ## [0.2.0]
 
 ### Released
