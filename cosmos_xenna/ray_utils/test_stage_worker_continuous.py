@@ -507,30 +507,32 @@ class TestContinuousInputQueueSize:
 class TestSlotsAutoIncrease:
     """Verify that slots_per_actor auto-increases for continuous stages.
 
-    The formula: effective_slots = max(configured_slots, continuous_input_queue_size + 2)
-    ensures the download/deserialize pipeline stays ahead of the input queue.
+    The formula: effective_slots = max(configured_slots, 4)
+    ensures the download/deserialize pipeline stays ahead of the input
+    queue.  The minimum of 4 allows 2 tasks downloading + 2 tasks
+    buffered in input_q, keeping the GPU fed across task transitions
+    while spreading load across GPUs.
     """
 
-    def test_default_queue_bumps_slots_from_2_to_6(self) -> None:
-        """With default queue size (4), slots should auto-increase from 2 to 6."""
-        configured_slots = 2
-        continuous_q_size = 4  # default
-        effective = max(configured_slots, continuous_q_size + 2)
-        assert effective == 6
+    _CONTINUOUS_MIN_SLOTS = 4
 
-    def test_custom_queue_8_bumps_slots_to_10(self) -> None:
-        """With queue size 8 (vllm async override), slots should be 10."""
+    def test_default_slots_bumped_to_min(self) -> None:
+        """With default slots (2), should auto-increase to 4."""
         configured_slots = 2
-        continuous_q_size = 8
-        effective = max(configured_slots, continuous_q_size + 2)
-        assert effective == 10
+        effective = max(configured_slots, self._CONTINUOUS_MIN_SLOTS)
+        assert effective == 4
 
     def test_explicit_high_slots_not_reduced(self) -> None:
-        """If user configures slots > queue + 2, their value wins."""
-        configured_slots = 12
-        continuous_q_size = 4
-        effective = max(configured_slots, continuous_q_size + 2)
-        assert effective == 12
+        """If user configures slots > min, their value wins."""
+        configured_slots = 8
+        effective = max(configured_slots, self._CONTINUOUS_MIN_SLOTS)
+        assert effective == 8
+
+    def test_exact_min_unchanged(self) -> None:
+        """Slots exactly at the minimum should remain unchanged."""
+        configured_slots = 4
+        effective = max(configured_slots, self._CONTINUOUS_MIN_SLOTS)
+        assert effective == 4
 
     def test_non_continuous_stage_keeps_original_slots(self) -> None:
         """Non-continuous stages should not have slots modified."""

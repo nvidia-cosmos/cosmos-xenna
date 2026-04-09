@@ -124,9 +124,9 @@ class ContinuousInterface(abc.ABC):
         reduce engine starvation gaps at the cost of holding more deserialized
         task data in memory.
 
-        The framework auto-adjusts ``slots_per_actor`` to ``max(configured,
-        continuous_input_queue_size + 2)`` so the download/deserialize
-        pipeline stays ahead of the input queue.
+        The framework auto-adjusts ``slots_per_actor`` to at least 4 for
+        continuous stages so the download/deserialize pipeline stays ahead
+        of the input queue.
         """
         return 4
 

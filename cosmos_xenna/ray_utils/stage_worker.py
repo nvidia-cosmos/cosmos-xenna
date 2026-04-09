@@ -917,9 +917,11 @@ class StageWorker(abc.ABC, Generic[T, V]):
         """
         from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface as _ContinuousInterface
 
-        maxsize = 4
-        if isinstance(self._stage_interface, _ContinuousInterface):
-            maxsize = self._stage_interface.continuous_input_queue_size
+        assert isinstance(self._stage_interface, _ContinuousInterface)
+        maxsize = self._stage_interface.continuous_input_queue_size
+        if maxsize < 1:
+            msg = f"continuous_input_queue_size must be >= 1, got {maxsize}"
+            raise ValueError(msg)
         input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=maxsize)
         output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
         stop_event = asyncio.Event()
@@ -962,6 +964,13 @@ class StageWorker(abc.ABC, Generic[T, V]):
             except queue.Empty:
                 continue
             task.timing.process_start_time_s = time.time()
+            logger.debug(
+                "continuous feeder: task %s -> input_q (qsize=%d/%d, deserialized_q=%d)",
+                task.uuid,
+                input_q.qsize(),
+                input_q.maxsize,
+                self.deserialized_queue.qsize(),
+            )
             await input_q.put(
                 _ContinuousTaskInput(
                     task_id=task.uuid,

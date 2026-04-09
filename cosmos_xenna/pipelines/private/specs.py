@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import copy
 import enum
+import logging
 import multiprocessing
 import typing
 from typing import Any, Generic, Optional, Sequence
@@ -531,6 +532,9 @@ class WrappedStage(stage.Interface):
         return self._stage.process_data(data)
 
 
+_logger = logging.getLogger(__name__)
+
+
 @attrs.define
 class StageAndParams:
     stage: stage.Interface
@@ -557,14 +561,23 @@ def make_actor_pool_stage_from_stage_spec(
         modify_cuda_visible_devices_env_var = pipeline_config.clear_cuda_visible_devices_on_cpu_actors
 
     # Use ContinuousWrappedStage when the user's stage opts into continuous mode.
-    # Auto-increase slots_per_actor so the download/deserialize pipeline stays
-    # ahead of the stage's input queue, reducing engine starvation gaps.
+    # Auto-increase slots_per_actor to 4 so the download/deserialize pipeline
+    # stays ahead of the stage's input queue, reducing engine starvation gaps.
+    # 4 slots allow 2 tasks downloading + 2 tasks buffered in input_q, keeping
+    # the GPU fed across task transitions while spreading load across GPUs.
+    _CONTINUOUS_MIN_SLOTS = 4
     wrapped: stage.Interface
     effective_slots = spec.slots_per_actor
     if isinstance(spec.stage, ContinuousInterface):
         wrapped = ContinuousWrappedStage(spec.stage)
-        continuous_q_size = spec.stage.continuous_input_queue_size
-        effective_slots = max(spec.slots_per_actor, continuous_q_size + 2)
+        effective_slots = max(spec.slots_per_actor, _CONTINUOUS_MIN_SLOTS)
+        if effective_slots > spec.slots_per_actor:
+            _logger.info(
+                "Auto-increased slots_per_actor for continuous stage %s: %d -> %d",
+                type(spec.stage).__name__,
+                spec.slots_per_actor,
+                effective_slots,
+            )
     else:
         wrapped = WrappedStage(spec.stage)
 
