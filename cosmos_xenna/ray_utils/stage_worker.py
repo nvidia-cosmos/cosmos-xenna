@@ -897,7 +897,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
         except Exception as e:  # noqa: BLE001
             self._handle_thread_exception("run_continuous", None, e)
         finally:
-            loop.shutdown_asyncgens()
+            loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
     async def _run_continuous_async(self) -> None:

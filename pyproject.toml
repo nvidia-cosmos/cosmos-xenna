@@ -4,7 +4,7 @@ version = "0.2.1"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "attrs",
     "cattrs",
@@ -212,7 +212,7 @@ mypy-init-return = true # Let RUFF infer the return type for most __init__ metho
 
 [tool.pyright]
 typeCheckingMode = "basic"
-pythonVersion = "3.9"
+pythonVersion = "3.12"
 include = ["cosmos_xenna"]
 
 reportOptionalCall = false
