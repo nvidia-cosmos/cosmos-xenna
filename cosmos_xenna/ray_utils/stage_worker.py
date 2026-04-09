@@ -247,12 +247,21 @@ class TaskResultMetadata:
 
     Contains timing details, failure information, and input data size.
     This is the second return value of the public `process_data` method.
+
+    Attributes:
+        rate_duration_s: Optional override duration (seconds) for the autoscaler
+            rate estimator.  When set (continuous mode), the ``ActorPool`` uses
+            this instead of ``timing.process_dur`` so that the rate estimator
+            receives inter-completion intervals while ``timing`` retains actual
+            per-task wall-clock time.  ``None`` (batch mode default) means the
+            rate estimator falls back to ``timing.process_dur``.
     """
 
     timing: TimingInfo
     failure_info: FailureInfo
     task_data_info: TaskDataInfo
     num_returns: int
+    rate_duration_s: float | None = None
 
 
 def _get_object_size(ref: ray.ObjectRef) -> int:
@@ -906,7 +915,12 @@ class StageWorker(abc.ABC, Generic[T, V]):
         Uses ``asyncio.TaskGroup`` for structured concurrency -- if any task
         raises, all siblings are cancelled automatically.
         """
-        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=4)
+        from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface as _ContinuousInterface
+
+        maxsize = 4
+        if isinstance(self._stage_interface, _ContinuousInterface):
+            maxsize = self._stage_interface.continuous_input_queue_size
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=maxsize)
         output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
         stop_event = asyncio.Event()
 
@@ -931,9 +945,14 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
         Runs ``deserialized_queue.get()`` in a thread to avoid blocking the
         event loop.  Backpressure propagates naturally: when ``input_q`` is
-        full (``maxsize=4``), ``await input_q.put()`` blocks the feeder,
-        which stops draining ``deserialized_queue``, which backs up into
-        the downloader/deserializer pipeline.
+        full (``maxsize`` from ``continuous_input_queue_size``, default 4),
+        ``await input_q.put()`` blocks the feeder, which stops draining
+        ``deserialized_queue``, which backs up into the downloader/deserializer
+        pipeline.
+
+        Sets ``timing.process_start_time_s`` to mark when the task enters
+        continuous processing, analogous to ``_process_step`` which sets it
+        just before calling ``_process_data`` in batch mode.
         """
         from cosmos_xenna.ray_utils.continuous_stage import ContinuousTaskInput as _ContinuousTaskInput
 
@@ -942,6 +961,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 task = await asyncio.to_thread(self.deserialized_queue.get, timeout=0.1)
             except queue.Empty:
                 continue
+            task.timing.process_start_time_s = time.time()
             await input_q.put(
                 _ContinuousTaskInput(
                     task_id=task.uuid,
@@ -956,11 +976,22 @@ class StageWorker(abc.ABC, Generic[T, V]):
     ) -> None:
         """Collect completed tasks from the stage and store in ``_results``.
 
-        Uses inter-completion-interval timing: ``process_start_time_s`` is set
-        to the previous task's completion time so that ``(end - start)`` reflects
-        actual per-slot throughput rather than wall-clock overlap duration.
-        This gives the autoscaler accurate rate estimates when multiple tasks
-        overlap inside ``run_continuous()``.
+        Dual-track timing:
+
+        * **Observability** (``timing.process_dur``): actual wall-clock time
+          each task spent inside the continuous stage, from feeder handoff
+          (``process_start_time_s``, set by ``_feed_continuous_async``) to
+          completion (``process_end_time_s``, set here).  This feeds the
+          ``pipeline_actor_process_time`` gauge and the
+          ``pipeline_stage_process_time_total`` counter.
+
+        * **Autoscaler** (``rate_duration_s``): inter-completion interval
+          between consecutive task completions on this actor.  When tasks
+          overlap inside ``run_continuous()``, the interval reflects actual
+          per-slot throughput rather than per-task wall-clock time.  Passed
+          to ``ActorPool`` via ``TaskResultMetadata.rate_duration_s`` so the
+          rate estimator drives correct autoscaling without distorting the
+          observability metrics.
         """
         last_completion_time: float | None = None
         while not stop_event.is_set():
@@ -971,11 +1002,14 @@ class StageWorker(abc.ABC, Generic[T, V]):
 
             now = time.time()
             timing = result.timing
-            # Inter-completion-interval timing for autoscaler accuracy.
-            # First task uses its original timing (no correction needed).
-            if last_completion_time is not None:
-                timing.process_start_time_s = last_completion_time
             timing.process_end_time_s = now
+
+            # Inter-completion interval for the autoscaler rate estimator.
+            # First task has no predecessor, so rate_dur stays None and the
+            # rate estimator falls back to timing.process_dur.
+            rate_dur: float | None = None
+            if last_completion_time is not None:
+                rate_dur = now - last_completion_time
             last_completion_time = now
 
             with self.results_lock:
@@ -990,6 +1024,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
                         ),
                         TaskDataInfo(sum(result.object_sizes)),
                         len(result.out_data),
+                        rate_duration_s=rate_dur,
                     ),
                 )
 

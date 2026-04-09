@@ -258,7 +258,7 @@ wheels = [
 
 [[package]]
 name = "cosmos-xenna"
-version = "0.3.1+dev7d17590"
+version = "0.3.2+devdf1cc4d"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },

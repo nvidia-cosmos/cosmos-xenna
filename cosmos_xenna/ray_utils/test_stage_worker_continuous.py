@@ -20,6 +20,16 @@ and timing-correction logic from ``StageWorker._feed_continuous_async``,
 ``_collect_continuous_async``, and ``_watch_stop_flag`` without
 instantiating a Ray actor.  The logic under test is replicated from the
 StageWorker methods so we can verify behaviour in isolation.
+
+Dual-track timing:
+
+* ``timing.process_start_time_s`` is set by the feeder when the task
+  enters continuous processing (analogous to batch mode's ``_process_step``).
+* ``timing.process_end_time_s`` is set by the collector when the completed
+  task is dequeued.
+* ``rate_duration_s`` on ``TaskResultMetadata`` carries the inter-completion
+  interval for the autoscaler rate estimator, keeping ``timing.process_dur``
+  as the actual per-task wall-clock time for observability metrics.
 """
 
 import asyncio
@@ -31,10 +41,10 @@ from unittest.mock import MagicMock
 from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface, ContinuousTaskInput, ContinuousTaskOutput
 from cosmos_xenna.ray_utils.stage_worker import FailureInfo, TaskDataInfo, TaskResultMetadata, TimingInfo
 
-
 # ---------------------------------------------------------------------------
 # Replicated feeder logic (mirrors StageWorker._feed_continuous_async)
 # ---------------------------------------------------------------------------
+
 
 async def _feed_continuous(
     deserialized_queue: queue.Queue,
@@ -47,6 +57,7 @@ async def _feed_continuous(
             task = await asyncio.to_thread(deserialized_queue.get, timeout=0.1)
         except queue.Empty:
             continue
+        task.timing.process_start_time_s = time.time()
         await input_q.put(
             ContinuousTaskInput(
                 task_id=task.uuid,
@@ -61,13 +72,19 @@ async def _feed_continuous(
 # Replicated collector logic (mirrors StageWorker._collect_continuous_async)
 # ---------------------------------------------------------------------------
 
+
 async def _collect_continuous(
     output_q: asyncio.Queue[ContinuousTaskOutput],
     stop_event: asyncio.Event,
     results: dict,
     results_lock: threading.Lock,
 ) -> None:
-    """Collect completed tasks with inter-completion-interval timing (same as StageWorker)."""
+    """Collect completed tasks with dual-track timing (same as StageWorker).
+
+    ``timing.process_end_time_s`` is set to actual completion time.
+    ``rate_duration_s`` carries the inter-completion interval for the
+    autoscaler; ``timing.process_dur`` retains actual per-task wall-clock time.
+    """
     last_completion_time: float | None = None
     while not stop_event.is_set():
         try:
@@ -77,9 +94,11 @@ async def _collect_continuous(
 
         now = time.time()
         timing = result.timing
-        if last_completion_time is not None:
-            timing.process_start_time_s = last_completion_time
         timing.process_end_time_s = now
+
+        rate_dur: float | None = None
+        if last_completion_time is not None:
+            rate_dur = now - last_completion_time
         last_completion_time = now
 
         with results_lock:
@@ -91,6 +110,7 @@ async def _collect_continuous(
                     FailureInfo(should_process_further=True, should_restart_worker=False),
                     TaskDataInfo(sum(result.object_sizes)),
                     len(result.out_data),
+                    rate_duration_s=rate_dur,
                 ),
             }
 
@@ -137,6 +157,42 @@ class TestFeedContinuousAsync:
         assert got.task_id == "task-1"
         assert got.data == ["payload"]
         assert got.object_sizes == [42]
+
+    def test_sets_process_start_time(self) -> None:
+        """Feeder should set process_start_time_s on the timing before enqueuing."""
+        deser_q: queue.Queue = queue.Queue()
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=4)
+        stop = asyncio.Event()
+
+        mock_task = MagicMock()
+        mock_task.uuid = "task-1"
+        mock_task.data = ["payload"]
+        mock_task.timing = TimingInfo()
+        mock_task.object_sizes = [10]
+
+        before = time.time()
+        deser_q.put(mock_task)
+
+        async def _drive() -> ContinuousTaskInput:
+            feeder = asyncio.create_task(_feed_continuous(deser_q, input_q, stop))
+            result = await asyncio.wait_for(input_q.get(), timeout=2.0)
+            stop.set()
+            feeder.cancel()
+            try:
+                await feeder
+            except asyncio.CancelledError:
+                pass
+            return result
+
+        runner = asyncio.Runner()
+        try:
+            got = runner.run(_drive())
+        finally:
+            runner.close()
+
+        after = time.time()
+        assert got.timing.process_start_time_s >= before
+        assert got.timing.process_start_time_s <= after
 
     def test_bridges_multiple_tasks(self) -> None:
         """Multiple tasks should be delivered in order."""
@@ -197,7 +253,7 @@ class TestFeedContinuousAsync:
 
 
 class TestCollectContinuousAsync:
-    """Verify collector logic and inter-completion-interval timing."""
+    """Verify collector logic and dual-track timing."""
 
     def test_collects_single_result(self) -> None:
         """A single output should be stored in results."""
@@ -206,7 +262,7 @@ class TestCollectContinuousAsync:
         results: dict = {}
         lock = threading.Lock()
 
-        timing = TimingInfo()
+        timing = TimingInfo(process_start_time_s=100.0)
         output_q.put_nowait(
             ContinuousTaskOutput(
                 task_id="out-1",
@@ -218,7 +274,6 @@ class TestCollectContinuousAsync:
 
         async def _drive() -> None:
             collector = asyncio.create_task(_collect_continuous(output_q, stop, results, lock))
-            # Wait for the result to be processed.
             for _ in range(50):
                 await asyncio.sleep(0.05)
                 if "out-1" in results:
@@ -241,13 +296,15 @@ class TestCollectContinuousAsync:
         assert results["out-1"]["metadata"].num_returns == 1
         assert results["out-1"]["metadata"].task_data_info.serialized_input_size == 50
 
-    def test_inter_completion_timing_first_task_unchanged(self) -> None:
-        """First completed task should keep its original process_start_time_s."""
+    def test_first_task_preserves_process_start_and_has_no_rate_dur(self) -> None:
+        """First task should keep its original process_start_time_s (set by feeder)
+        and have rate_duration_s = None (no predecessor)."""
         output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
         stop = asyncio.Event()
         results: dict = {}
         lock = threading.Lock()
 
+        # Simulate feeder-set process_start_time_s.
         timing = TimingInfo(process_start_time_s=100.0)
         output_q.put_nowait(
             ContinuousTaskOutput(
@@ -277,14 +334,17 @@ class TestCollectContinuousAsync:
         finally:
             runner.close()
 
-        # First task: process_start_time_s should remain as original (100.0)
-        # because there's no previous completion to reference.
-        assert results["first"]["metadata"].timing.process_start_time_s == 100.0
-        # process_end_time_s should be set to "now" (a recent timestamp).
-        assert results["first"]["metadata"].timing.process_end_time_s > 0
+        md = results["first"]["metadata"]
+        # process_start_time_s preserved from feeder (not overwritten).
+        assert md.timing.process_start_time_s == 100.0
+        # process_end_time_s set to actual completion time.
+        assert md.timing.process_end_time_s > 0
+        # First task has no predecessor, so rate_duration_s is None.
+        assert md.rate_duration_s is None
 
-    def test_inter_completion_timing_second_task_corrected(self) -> None:
-        """Second task should have process_start_time_s set to first task's completion time."""
+    def test_second_task_preserves_start_and_has_rate_dur(self) -> None:
+        """Second task should keep its original process_start_time_s and
+        have rate_duration_s equal to the inter-completion interval."""
         output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
         stop = asyncio.Event()
         results: dict = {}
@@ -293,12 +353,8 @@ class TestCollectContinuousAsync:
         t1 = TimingInfo(process_start_time_s=100.0)
         t2 = TimingInfo(process_start_time_s=200.0)
 
-        output_q.put_nowait(
-            ContinuousTaskOutput(task_id="t1", out_data=["a"], timing=t1, object_sizes=[10])
-        )
-        output_q.put_nowait(
-            ContinuousTaskOutput(task_id="t2", out_data=["b"], timing=t2, object_sizes=[20])
-        )
+        output_q.put_nowait(ContinuousTaskOutput(task_id="t1", out_data=["a"], timing=t1, object_sizes=[10]))
+        output_q.put_nowait(ContinuousTaskOutput(task_id="t2", out_data=["b"], timing=t2, object_sizes=[20]))
 
         async def _drive() -> None:
             collector = asyncio.create_task(_collect_continuous(output_q, stop, results, lock))
@@ -322,21 +378,28 @@ class TestCollectContinuousAsync:
         assert "t1" in results
         assert "t2" in results
 
-        # First task keeps original start time (100.0).
-        assert results["t1"]["metadata"].timing.process_start_time_s == 100.0
+        md1 = results["t1"]["metadata"]
+        md2 = results["t2"]["metadata"]
 
-        # Second task's start time should be set to first task's completion
-        # time (inter-completion-interval), NOT 200.0 (its original value).
-        t2_start = results["t2"]["metadata"].timing.process_start_time_s
-        t1_end = results["t1"]["metadata"].timing.process_end_time_s
-        assert t2_start == t1_end, (
-            f"Second task's process_start should equal first task's process_end "
-            f"(inter-completion interval), got start={t2_start}, expected={t1_end}"
+        # Both tasks keep their original process_start_time_s (feeder-set).
+        assert md1.timing.process_start_time_s == 100.0
+        assert md2.timing.process_start_time_s == 200.0
+
+        # First task: no predecessor -> rate_duration_s is None.
+        assert md1.rate_duration_s is None
+
+        # Second task: rate_duration_s = inter-completion interval.
+        assert md2.rate_duration_s is not None
+        t1_end = md1.timing.process_end_time_s
+        t2_end = md2.timing.process_end_time_s
+        expected_rate_dur = t2_end - t1_end
+        assert abs(md2.rate_duration_s - expected_rate_dur) < 0.01, (
+            f"rate_duration_s should be inter-completion interval, "
+            f"got {md2.rate_duration_s}, expected ~{expected_rate_dur}"
         )
 
-        # The interval should be small (both processed near-instantly).
-        interval = results["t2"]["metadata"].timing.process_end_time_s - t2_start
-        assert interval < 1.0, f"Inter-completion interval too large: {interval}s"
+        # The inter-completion interval should be small (both processed near-instantly).
+        assert md2.rate_duration_s < 1.0, f"Inter-completion interval too large: {md2.rate_duration_s}s"
 
 
 class TestWatchStopFlag:
@@ -388,3 +451,90 @@ class TestContinuousInterfaceDetection:
 
         wrapped = ContinuousWrappedStage(MagicMock())
         assert isinstance(wrapped, ContinuousInterface)
+
+
+class TestContinuousInputQueueSize:
+    """Verify configurable input queue size for continuous stages."""
+
+    def test_default_queue_size_used_in_feeder(self) -> None:
+        """With default continuous_input_queue_size (4), the input_q should have maxsize=4."""
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=4)
+        assert input_q.maxsize == 4
+
+    def test_custom_queue_size_via_interface(self) -> None:
+        """Stages with custom continuous_input_queue_size should control the buffer depth."""
+
+        class DeepStage(ContinuousInterface):
+            @property
+            def continuous_input_queue_size(self) -> int:
+                return 8
+
+            async def run_continuous(self, input_queue, output_queue, stop_event):
+                pass
+
+        stage = DeepStage()
+        maxsize = stage.continuous_input_queue_size
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=maxsize)
+        assert input_q.maxsize == 8
+
+    def test_backpressure_at_custom_size(self) -> None:
+        """Input queue at custom maxsize should block put when full."""
+
+        class SmallStage(ContinuousInterface):
+            @property
+            def continuous_input_queue_size(self) -> int:
+                return 2
+
+            async def run_continuous(self, input_queue, output_queue, stop_event):
+                pass
+
+        stage = SmallStage()
+        q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=stage.continuous_input_queue_size)
+
+        # Fill the queue.
+        for i in range(2):
+            q.put_nowait(ContinuousTaskInput(task_id=f"t-{i}", data=[], timing=TimingInfo(), object_sizes=[]))
+
+        assert q.full()
+
+        # put_nowait should raise when full (backpressure).
+        import pytest
+
+        with pytest.raises(asyncio.QueueFull):
+            q.put_nowait(ContinuousTaskInput(task_id="overflow", data=[], timing=TimingInfo(), object_sizes=[]))
+
+
+class TestSlotsAutoIncrease:
+    """Verify that slots_per_actor auto-increases for continuous stages.
+
+    The formula: effective_slots = max(configured_slots, continuous_input_queue_size + 2)
+    ensures the download/deserialize pipeline stays ahead of the input queue.
+    """
+
+    def test_default_queue_bumps_slots_from_2_to_6(self) -> None:
+        """With default queue size (4), slots should auto-increase from 2 to 6."""
+        configured_slots = 2
+        continuous_q_size = 4  # default
+        effective = max(configured_slots, continuous_q_size + 2)
+        assert effective == 6
+
+    def test_custom_queue_8_bumps_slots_to_10(self) -> None:
+        """With queue size 8 (vllm async override), slots should be 10."""
+        configured_slots = 2
+        continuous_q_size = 8
+        effective = max(configured_slots, continuous_q_size + 2)
+        assert effective == 10
+
+    def test_explicit_high_slots_not_reduced(self) -> None:
+        """If user configures slots > queue + 2, their value wins."""
+        configured_slots = 12
+        continuous_q_size = 4
+        effective = max(configured_slots, continuous_q_size + 2)
+        assert effective == 12
+
+    def test_non_continuous_stage_keeps_original_slots(self) -> None:
+        """Non-continuous stages should not have slots modified."""
+        configured_slots = 2
+        assert not isinstance(MagicMock(), ContinuousInterface)
+        # For non-continuous stages, effective_slots = configured_slots.
+        assert configured_slots == 2

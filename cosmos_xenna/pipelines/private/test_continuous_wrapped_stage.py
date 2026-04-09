@@ -87,3 +87,17 @@ class TestContinuousWrappedStage:
             runner.close()
 
         inner.run_continuous.assert_awaited_once_with(input_q, output_q, stop)
+
+    def test_continuous_input_queue_size_delegates(self) -> None:
+        """continuous_input_queue_size should delegate to wrapped stage."""
+        inner = self._make_mock_stage()
+        inner.continuous_input_queue_size = 12
+        wrapped = ContinuousWrappedStage(inner)
+        assert wrapped.continuous_input_queue_size == 12
+
+    def test_continuous_input_queue_size_default(self) -> None:
+        """When wrapped stage uses default (4), wrapper should return 4."""
+        inner = self._make_mock_stage()
+        inner.continuous_input_queue_size = 4
+        wrapped = ContinuousWrappedStage(inner)
+        assert wrapped.continuous_input_queue_size == 4

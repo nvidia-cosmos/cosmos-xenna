@@ -65,6 +65,11 @@ class ContinuousWrappedStage(stage.Interface, ContinuousInterface):
         """Not used -- continuous mode bypasses ``process_data``."""
         raise NotImplementedError("ContinuousWrappedStage uses run_continuous(), not process_data()")
 
+    @property
+    def continuous_input_queue_size(self) -> int:
+        """Delegate to the wrapped stage's ``continuous_input_queue_size``."""
+        return self._stage.continuous_input_queue_size
+
     async def run_continuous(
         self,
         input_queue: asyncio.Queue[ContinuousTaskInput],

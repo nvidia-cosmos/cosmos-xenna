@@ -111,3 +111,25 @@ class TestContinuousInterface:
 
         # A plain object should not match.
         assert not isinstance(MagicMock(), ContinuousInterface)
+
+    def test_default_continuous_input_queue_size(self) -> None:
+        """Default continuous_input_queue_size should be 4 for backward compat."""
+
+        class MyStage(ContinuousInterface):
+            async def run_continuous(self, input_queue, output_queue, stop_event):
+                pass
+
+        assert MyStage().continuous_input_queue_size == 4
+
+    def test_custom_continuous_input_queue_size(self) -> None:
+        """Subclasses can override continuous_input_queue_size."""
+
+        class DeepBufferStage(ContinuousInterface):
+            @property
+            def continuous_input_queue_size(self) -> int:
+                return 12
+
+            async def run_continuous(self, input_queue, output_queue, stop_event):
+                pass
+
+        assert DeepBufferStage().continuous_input_queue_size == 12

@@ -111,6 +111,25 @@ class ContinuousInterface(abc.ABC):
             async def run_continuous(self, input_q, output_q, stop): ...
     """
 
+    @property
+    def continuous_input_queue_size(self) -> int:
+        """Maximum number of deserialized tasks buffered for the stage.
+
+        The StageWorker's feeder bridges ``deserialized_queue`` to an async
+        ``input_queue`` of this size.  Backpressure propagates when the queue
+        is full: feeder blocks, deserialized_queue backs up, downloads stall.
+
+        Override to increase the buffer for GPU-bound stages where the
+        download/deserialize pipeline is slower than inference.  Larger values
+        reduce engine starvation gaps at the cost of holding more deserialized
+        task data in memory.
+
+        The framework auto-adjusts ``slots_per_actor`` to ``max(configured,
+        continuous_input_queue_size + 2)`` so the download/deserialize
+        pipeline stays ahead of the input queue.
+        """
+        return 4
+
     @abc.abstractmethod
     async def run_continuous(
         self,

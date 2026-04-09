@@ -557,9 +557,14 @@ def make_actor_pool_stage_from_stage_spec(
         modify_cuda_visible_devices_env_var = pipeline_config.clear_cuda_visible_devices_on_cpu_actors
 
     # Use ContinuousWrappedStage when the user's stage opts into continuous mode.
+    # Auto-increase slots_per_actor so the download/deserialize pipeline stays
+    # ahead of the stage's input queue, reducing engine starvation gaps.
     wrapped: stage.Interface
+    effective_slots = spec.slots_per_actor
     if isinstance(spec.stage, ContinuousInterface):
         wrapped = ContinuousWrappedStage(spec.stage)
+        continuous_q_size = spec.stage.continuous_input_queue_size
+        effective_slots = max(spec.slots_per_actor, continuous_q_size + 2)
     else:
         wrapped = WrappedStage(spec.stage)
 
@@ -568,7 +573,7 @@ def make_actor_pool_stage_from_stage_spec(
         stage.Params(
             shape=spec.stage.required_resources.to_worker_shape(cluster_resources),
             stage_batch_size=spec.stage.stage_batch_size,
-            slots_per_actor=spec.slots_per_actor,
+            slots_per_actor=effective_slots,
             worker_max_lifetime_m=spec.worker_max_lifetime_m,
             worker_restart_interval_m=spec.worker_restart_interval_m,
             name=spec.name(stage_idx),

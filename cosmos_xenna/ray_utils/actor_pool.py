@@ -1563,7 +1563,15 @@ class ActorPool(Generic[T, V]):
         # Only update metrics for the primary actor. This is rank=0 for spmd.
         if is_primary:
             self._task_result_metadatas.append(metadata)
-            actor.rate_estimator.update(metadata.timing.process_end_time_s - metadata.timing.process_start_time_s)
+            # Continuous-mode stages provide rate_duration_s (inter-completion
+            # interval) for the autoscaler while keeping timing.process_dur as
+            # actual per-task wall-clock time for observability metrics.
+            rate_dur = (
+                metadata.rate_duration_s
+                if metadata.rate_duration_s is not None
+                else metadata.timing.process_end_time_s - metadata.timing.process_start_time_s
+            )
+            actor.rate_estimator.update(rate_dur)
             # Unless told not to, ignore the data and continue on.
             if not metadata.failure_info.should_process_further:
                 self._num_null_tasks += 1
