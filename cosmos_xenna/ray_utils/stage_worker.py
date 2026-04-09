@@ -965,7 +965,7 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 continue
             task.timing.process_start_time_s = time.time()
             logger.debug(
-                "continuous feeder: task %s -> input_q (qsize=%d/%d, deserialized_q=%d)",
+                "continuous feeder: task {} -> input_q (qsize={}/{}, deserialized_q={})",
                 task.uuid,
                 input_q.qsize(),
                 input_q.maxsize,
