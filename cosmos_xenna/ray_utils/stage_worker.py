@@ -73,9 +73,12 @@ import threading
 import time
 import typing
 import uuid
-from typing import AsyncGenerator, Generic, Optional, Union
+from typing import TYPE_CHECKING, AsyncGenerator, Generic, Optional, Union
 
 import attrs
+
+if TYPE_CHECKING:
+    from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface, ContinuousTaskInput, ContinuousTaskOutput
 import psutil
 import ray
 import ray.experimental
@@ -744,7 +747,15 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 break  # Break out of the loop as we are now ready to process data.
             time.sleep(0.01)
 
-        # Now process tasks continuously
+        # Continuous mode: stage implements ContinuousInterface mixin.
+        # Late import to avoid circular dependency (continuous_stage imports TimingInfo from this module).
+        from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface as _ContinuousInterface
+
+        if isinstance(self._stage_interface, _ContinuousInterface):
+            self._run_continuous_mode()
+            return
+
+        # Batch mode: standard process_data() loop
         while not self.stop_flag.is_set():
             try:
                 self._process_step()
@@ -861,6 +872,126 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 logger.error("Got an exception in process_data")
                 logger.exception("Got an exception in process_data")
                 raise e
+
+    # -- Continuous-mode methods ------------------------------------------------
+    #
+    # These methods implement the async orchestration when the stage opts into
+    # ContinuousInterface.  The event loop is created on the processor thread
+    # (preserving CUDA/NCCL affinity).  Feeder and collector are asyncio tasks
+    # that bridge the existing sync queues to the stage's async queues.
+    #
+    # ::
+    #
+    #   deserialized_queue --[feeder]--> input_q --> stage.run_continuous
+    #                                                     |
+    #                                               output_q --[collector]--> _results
+    #
+    #   stop_flag (threading) --[watcher]--> stop_event (asyncio)
+
+    def _run_continuous_mode(self) -> None:
+        """Create an event loop on the processor thread and run async orchestration."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run_continuous_async())
+        except Exception as e:  # noqa: BLE001
+            self._handle_thread_exception("run_continuous", None, e)
+        finally:
+            loop.shutdown_asyncgens()
+            loop.close()
+
+    async def _run_continuous_async(self) -> None:
+        """Async orchestration: feeder + collector + stage + stop watcher.
+
+        Uses ``asyncio.TaskGroup`` for structured concurrency -- if any task
+        raises, all siblings are cancelled automatically.
+        """
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=4)
+        output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
+        stop_event = asyncio.Event()
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._watch_stop_flag(stop_event))
+            tg.create_task(self._feed_continuous_async(input_q, stop_event))
+            tg.create_task(self._collect_continuous_async(output_q, stop_event))
+            tg.create_task(
+                self._stage_interface.run_continuous(input_q, output_q, stop_event)  # type: ignore[union-attr]
+            )
+
+    async def _watch_stop_flag(self, stop_event: asyncio.Event) -> None:
+        """Bridge ``threading.Event`` (stop_flag) to ``asyncio.Event`` (stop_event)."""
+        while not self.stop_flag.is_set():
+            await asyncio.sleep(0.1)
+        stop_event.set()
+
+    async def _feed_continuous_async(
+        self, input_q: asyncio.Queue[ContinuousTaskInput], stop_event: asyncio.Event
+    ) -> None:
+        """Bridge the sync ``deserialized_queue`` to the async ``input_queue``.
+
+        Runs ``deserialized_queue.get()`` in a thread to avoid blocking the
+        event loop.  Backpressure propagates naturally: when ``input_q`` is
+        full (``maxsize=4``), ``await input_q.put()`` blocks the feeder,
+        which stops draining ``deserialized_queue``, which backs up into
+        the downloader/deserializer pipeline.
+        """
+        from cosmos_xenna.ray_utils.continuous_stage import ContinuousTaskInput as _ContinuousTaskInput
+
+        while not stop_event.is_set():
+            try:
+                task = await asyncio.to_thread(self.deserialized_queue.get, timeout=0.1)
+            except queue.Empty:
+                continue
+            await input_q.put(
+                _ContinuousTaskInput(
+                    task_id=task.uuid,
+                    data=task.data,
+                    timing=task.timing,
+                    object_sizes=task.object_sizes,
+                )
+            )
+
+    async def _collect_continuous_async(
+        self, output_q: asyncio.Queue[ContinuousTaskOutput], stop_event: asyncio.Event
+    ) -> None:
+        """Collect completed tasks from the stage and store in ``_results``.
+
+        Uses inter-completion-interval timing: ``process_start_time_s`` is set
+        to the previous task's completion time so that ``(end - start)`` reflects
+        actual per-slot throughput rather than wall-clock overlap duration.
+        This gives the autoscaler accurate rate estimates when multiple tasks
+        overlap inside ``run_continuous()``.
+        """
+        last_completion_time: float | None = None
+        while not stop_event.is_set():
+            try:
+                result = await asyncio.wait_for(output_q.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            now = time.time()
+            timing = result.timing
+            # Inter-completion-interval timing for autoscaler accuracy.
+            # First task uses its original timing (no correction needed).
+            if last_completion_time is not None:
+                timing.process_start_time_s = last_completion_time
+            timing.process_end_time_s = now
+            last_completion_time = now
+
+            with self.results_lock:
+                self._results[result.task_id] = _Result(
+                    result.task_id,
+                    result.out_data,
+                    TaskResultMetadata(
+                        timing,
+                        FailureInfo(
+                            should_process_further=True,
+                            should_restart_worker=False,
+                        ),
+                        TaskDataInfo(sum(result.object_sizes)),
+                        len(result.out_data),
+                    ),
+                )
 
     def _handle_thread_exception(self, thread_name: str, task_id: str | None, e: Exception) -> None:
         """Handles exceptions occurring within the worker threads.

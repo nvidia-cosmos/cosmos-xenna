@@ -27,7 +27,9 @@ import attrs
 
 from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.pipelines.private.continuous_wrapped_stage import ContinuousWrappedStage
 from cosmos_xenna.ray_utils import runtime_envs, stage
+from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface
 from cosmos_xenna.utils import approx
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
@@ -531,7 +533,7 @@ class WrappedStage(stage.Interface):
 
 @attrs.define
 class StageAndParams:
-    stage: WrappedStage
+    stage: stage.Interface
     params: stage.Params
 
 
@@ -553,8 +555,16 @@ def make_actor_pool_stage_from_stage_spec(
         # This means that (assuming the node has gpus) the stage will have the same CUDA_VISIBLE_DEVICES as the rest of
         # the node.
         modify_cuda_visible_devices_env_var = pipeline_config.clear_cuda_visible_devices_on_cpu_actors
+
+    # Use ContinuousWrappedStage when the user's stage opts into continuous mode.
+    wrapped: stage.Interface
+    if isinstance(spec.stage, ContinuousInterface):
+        wrapped = ContinuousWrappedStage(spec.stage)
+    else:
+        wrapped = WrappedStage(spec.stage)
+
     return StageAndParams(
-        WrappedStage(spec.stage),
+        wrapped,
         stage.Params(
             shape=spec.stage.required_resources.to_worker_shape(cluster_resources),
             stage_batch_size=spec.stage.stage_batch_size,
