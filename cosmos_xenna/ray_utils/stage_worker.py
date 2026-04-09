@@ -78,7 +78,7 @@ from typing import TYPE_CHECKING, AsyncGenerator, Generic, Optional, Union
 import attrs
 
 if TYPE_CHECKING:
-    from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface, ContinuousTaskInput, ContinuousTaskOutput
+    from cosmos_xenna.ray_utils.continuous_stage import ContinuousTaskInput, ContinuousTaskOutput
 import psutil
 import ray
 import ray.experimental
