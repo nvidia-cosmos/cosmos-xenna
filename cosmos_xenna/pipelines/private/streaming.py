@@ -375,7 +375,7 @@ class Autoscaler:
         if self._autoscale_future is not None and self._autoscale_future.done():
             autoscale_result: data_structures.Solution = self._autoscale_future.result()
 
-            for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools, strict=False)):
+            for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools, strict=True)):
                 pool.set_num_slots_per_actor(result.slots_per_worker)
 
                 # Snapshot the property-generated lists so we can filter them locally.
@@ -407,7 +407,12 @@ class Autoscaler:
                 # preventing aggressive cliffs (e.g. 20->2 in one cycle).
                 if workers_to_delete and self._max_scale_down_fraction < 1.0:
                     current = pool.num_ready_actors
-                    max_delete = max(1, int(current * self._max_scale_down_fraction))
+                    if current == 0:
+                        # No ready actors to delete -- skip clamping, let deletions
+                        # target pending/setup actors if the Rust layer requested them.
+                        max_delete = len(workers_to_delete)
+                    else:
+                        max_delete = max(1, int(current * self._max_scale_down_fraction))
                     if len(workers_to_delete) > max_delete:
                         logger.info(
                             f"Rate-limit guard: clamping {pool.name} deletions from "
