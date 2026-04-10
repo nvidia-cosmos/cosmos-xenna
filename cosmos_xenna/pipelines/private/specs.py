@@ -383,10 +383,7 @@ class StreamingSpecificSpec:
 
     def __attrs_post_init__(self) -> None:
         if not (0 < self.autoscale_max_scale_down_fraction <= 1.0):
-            msg = (
-                f"autoscale_max_scale_down_fraction must be in (0, 1.0], "
-                f"got {self.autoscale_max_scale_down_fraction}"
-            )
+            msg = f"autoscale_max_scale_down_fraction must be in (0, 1.0], got {self.autoscale_max_scale_down_fraction}"
             raise ValueError(msg)
 
 

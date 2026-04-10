@@ -1349,7 +1349,16 @@ class ActorPool(Generic[T, V]):
 
         while self._worker_groups_to_create:
             worker_group = self._worker_groups_to_create.pop()
-            self._add_worker_group(worker_group)
+            try:
+                self._add_worker_group(worker_group)
+            except ValueError as e:
+                if "Allocation error" not in str(e):
+                    raise
+                logger.warning(
+                    f"Skipping worker creation for {self.name}: "
+                    f"worker {worker_group.id} "
+                    f"(will retry on next autoscale cycle): {e}",
+                )
 
     def _schedule_task_on_worker_group(self, worker_group: _WorkerGroup) -> None:
         # Pop task from the front of the queue (FIFO)
