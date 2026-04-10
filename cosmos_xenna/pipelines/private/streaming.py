@@ -277,6 +277,7 @@ class Autoscaler:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
+        self._max_scale_down_fraction: float = pipeline_spec.config.mode_specific.autoscale_max_scale_down_fraction
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -347,30 +348,79 @@ class Autoscaler:
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
-    def apply_autoscale_result_if_ready(self, pools: list[actor_pool.ActorPool]) -> None:
+    def apply_autoscale_result_if_ready(
+        self,
+        pools: list[actor_pool.ActorPool],
+        queues: list[Queue],
+        input_queue: Queue,
+    ) -> None:
         """Applies the result of a completed autoscaling calculation.
 
         If the calculation is not yet finished, this method does nothing. Once the
         result is applied, it updates the actor pools with new worker
-        configurations.
+        configurations. Two guards filter the Rust autoscaler's deletions:
+
+        Guard 1 (queue-aware): blocks deletions for a stage that still has
+        input backlog (upstream inter-stage queue + pool internal queue).
+
+        Guard 2 (rate-limited): caps the number of deletions per stage to
+        ``max_scale_down_fraction`` of the current actor count, preventing
+        aggressive scale-down cliffs.
 
         Args:
             pools: The list of actor pools to update with the new scaling results.
+            queues: The inter-stage queues (one per stage).
+            input_queue: The pipeline input queue (upstream of stage 0).
         """
         if self._autoscale_future is not None and self._autoscale_future.done():
             autoscale_result: data_structures.Solution = self._autoscale_future.result()
 
-            for result, pool in zip(autoscale_result.stages, pools):
+            for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools, strict=False)):
                 pool.set_num_slots_per_actor(result.slots_per_worker)
+
+                # Snapshot the property-generated lists so we can filter them locally.
+                # StageSolution.deleted_workers/new_workers are read-only properties that
+                # reconstruct from the Rust object on every access.
+                workers_to_delete = result.deleted_workers
+                workers_to_create = result.new_workers
+
                 logger.debug(
-                    f"Autoscale result for pool {pool.name}: {len(result.new_workers)} new workers, "
-                    f"{len(result.deleted_workers)} deleted workers"
+                    f"Autoscale result for pool {pool.name}: {len(workers_to_create)} new workers, "
+                    f"{len(workers_to_delete)} deleted workers"
                 )
-                for w in result.new_workers:
+
+                # -- Guard 1: Queue-aware scale-down protection --
+                # Block deletions for any stage that still has input work queued
+                if workers_to_delete:
+                    upstream_q = len(input_queue) if idx == 0 else len(queues[idx - 1])
+                    pool_q = len(pool._task_queue)
+                    effective_backlog = upstream_q + pool_q
+                    if effective_backlog > 0:
+                        logger.info(
+                            f"Queue-aware guard: blocking {len(workers_to_delete)} deletion(s) for {pool.name} "
+                            f"(backlog={effective_backlog}, upstream_q={upstream_q}, pool_q={pool_q})"
+                        )
+                        workers_to_delete = []
+
+                # -- Guard 2: Rate-limited scale-down --
+                # Cap deletions to at most max_scale_down_fraction of current actors,
+                # preventing aggressive cliffs (e.g. 20->2 in one cycle).
+                if workers_to_delete and self._max_scale_down_fraction < 1.0:
+                    current = pool.num_ready_actors
+                    max_delete = max(1, int(current * self._max_scale_down_fraction))
+                    if len(workers_to_delete) > max_delete:
+                        logger.info(
+                            f"Rate-limit guard: clamping {pool.name} deletions from "
+                            f"{len(workers_to_delete)} to {max_delete} "
+                            f"(current_actors={current}, fraction={self._max_scale_down_fraction})"
+                        )
+                        workers_to_delete = workers_to_delete[:max_delete]
+
+                for w in workers_to_create:
                     logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_create(w.to_worker_group(pool.name))
 
-                for w in result.deleted_workers:
+                for w in workers_to_delete:
                     logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_delete(w.to_worker_group(pool.name))
 
@@ -659,7 +709,7 @@ def run_pipeline(
             new_stats = StreamingExecutorTiming(time.time())
 
             # Apply autoscale results if they are ready.
-            autoscaler.apply_autoscale_result_if_ready(pools)
+            autoscaler.apply_autoscale_result_if_ready(pools, queues, input_queue)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need

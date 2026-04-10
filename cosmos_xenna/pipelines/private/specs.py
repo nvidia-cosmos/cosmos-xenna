@@ -372,9 +372,22 @@ class StreamingSpecificSpec:
     #   unstable that performance fluctuation can cause downstream stages to get starved.
     #   So this parameter sets a lower bound on max_queued to prevent that.
     max_queued_lower_bound: int = 8
+    # Maximum fraction of current actors that can be deleted per autoscale cycle.
+    # 0.5 means at most 50% of actors can be deleted in one cycle, enforcing gradual
+    # scale-down (e.g. 20->10->5->3->2->1 over multiple cycles instead of 20->2).
+    # Set to 1.0 to disable the rate limiter.
+    autoscale_max_scale_down_fraction: float = 0.5
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
+
+    def __attrs_post_init__(self) -> None:
+        if not (0 < self.autoscale_max_scale_down_fraction <= 1.0):
+            msg = (
+                f"autoscale_max_scale_down_fraction must be in (0, 1.0], "
+                f"got {self.autoscale_max_scale_down_fraction}"
+            )
+            raise ValueError(msg)
 
 
 @attrs.define
