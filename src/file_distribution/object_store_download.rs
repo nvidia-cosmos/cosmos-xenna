@@ -137,7 +137,7 @@ async fn download_chunk_internal(
         task.chunk_id
     );
 
-    Ok(bytes.to_vec())
+    Ok(bytes.into())
 }
 
 /// Check if this looks like a timeout disguised as a decode error

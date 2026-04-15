@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Allocation algorithms which rely on an expected distribution of jobs and the concept of "fragmentation".
 //!
 //! This is just one component of our pipeline scheduling algorithm. It's basically just solving the bin packing problem.
@@ -38,9 +37,9 @@ use super::resources as rds;
 ///
 /// # Attributes
 /// * `frequency` - A float between 0 and 1 representing how often this stage occurs in workload.
-///     The sum of all stage frequencies in a workload should equal 1.
+///   The sum of all stage frequencies in a workload should equal 1.
 /// * `shape` - A WorkerShape object defining the resource requirements (CPU, GPU, etc.)
-///     for this stage of the workload.
+///   for this stage of the workload.
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub frequency: f32,
@@ -55,7 +54,7 @@ pub struct Stage {
 ///
 /// # Attributes
 /// * `stages` - A list of Stage objects representing the different task types
-///     and their frequencies in this workload.
+///   and their frequencies in this workload.
 #[derive(Debug, Clone)]
 pub struct Workload {
     pub stages: Vec<Stage>,
@@ -430,7 +429,7 @@ pub fn estimate_fragmentation_on_cluster(
 /// * `workload` - Workload object describing expected task distribution
 /// * `shape` - WorkerShape to be allocated
 /// * `reusable_workers` - Workers we could potentially re-use. This is helpful to avoid thrashing in our auto-scaling
-///     algorithm. We assume these are the same shape as "shape", but do not check this.
+///   algorithm. We assume these are the same shape as "shape", but do not check this.
 /// * `worker_reuse_fragmentation_equivalent` - A reward for re-using workers.
 ///
 /// # Returns
@@ -660,7 +659,7 @@ pub fn find_best_allocation_for_spmd_node_multiple(
 
     // Sort by node names and take the first num_nodes_needed
     potential_nodes.sort_by(|a, b| a.name.cmp(&b.name));
-    let selected_nodes = &potential_nodes[..num_nodes_needed as usize];
+    let selected_nodes = &potential_nodes[..num_nodes_needed];
 
     // Allocate the first num_nodes_needed nodes
     let mut worker_allocations = Vec::new();
@@ -695,12 +694,12 @@ pub fn find_worker_group_to_delete_for_spmd_node_multiple(
     potential_worker_groups: &std::collections::HashMap<String, rds::WorkerGroup>,
 ) -> String {
     // Select a random worker group to delete
-    let worker_group_id = potential_worker_groups
+
+    potential_worker_groups
         .keys()
         .next()
         .expect("non-empty")
-        .clone();
-    worker_group_id
+        .clone()
 }
 
 // --------------------

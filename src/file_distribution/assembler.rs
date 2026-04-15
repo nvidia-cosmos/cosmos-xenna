@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # P2P Data Plane
 //!
 //! This module defines the core data plane logic for the Xenna P2P file distribution system.
@@ -166,20 +165,29 @@ fn assemble_chunks(
             source: e,
         })?;
 
-    for chunk_id in chunk_ids {
+    let chunk_paths: Vec<std::path::PathBuf> = chunk_ids
+        .iter()
+        .map(|id| get_temp_chunk_path(*id, node_id, is_test))
+        .collect();
+
+    for (chunk_id, chunk_path) in chunk_ids.iter().zip(&chunk_paths) {
         log::debug!("Processing chunk ID: {}", chunk_id);
-        let chunk_path = get_temp_chunk_path(*chunk_id, node_id, is_test);
-        log::debug!("Chunk file size: {:?}", chunk_path.metadata()?.len());
-        if !chunk_path.exists() {
-            log::error!("Chunk file not found at path: {:?}", chunk_path);
-            return Err(AssemblerError::ChunkFileNotFound(*chunk_id));
-        }
         log::debug!("Opening chunk file: {:?}", chunk_path);
-        let mut chunk_file =
-            File::open(&chunk_path).map_err(|e| AssemblerError::OpenChunkFileFailed {
-                path: chunk_path.clone(),
-                source: e,
-            })?;
+        let mut chunk_file = File::open(chunk_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                log::error!("Chunk file not found at path: {:?}", chunk_path);
+                AssemblerError::ChunkFileNotFound(*chunk_id)
+            } else {
+                AssemblerError::OpenChunkFileFailed {
+                    path: chunk_path.clone(),
+                    source: e,
+                }
+            }
+        })?;
+        log::debug!(
+            "Chunk file size: {:?}",
+            chunk_path.metadata().map(|m| m.len())
+        );
         log::debug!("Copying chunk {} to temporary file", chunk_id);
         std::io::copy(&mut chunk_file, &mut temp_file)?;
     }
@@ -214,16 +222,16 @@ fn assemble_chunks(
 
     // Clean up temporary chunk files
     log::debug!("Cleaning up temporary chunk files.");
-    for chunk_id in chunk_ids {
-        let chunk_path = get_temp_chunk_path(*chunk_id, node_id, is_test);
-        if chunk_path.exists() {
-            log::debug!("Removing temporary chunk file: {:?}", chunk_path);
-            std::fs::remove_file(&chunk_path).map_err(|e| {
-                AssemblerError::RemoveChunkFileFailed {
-                    path: chunk_path,
+    for chunk_path in &chunk_paths {
+        match std::fs::remove_file(chunk_path) {
+            Ok(()) => log::debug!("Removed temporary chunk file: {:?}", chunk_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(AssemblerError::RemoveChunkFileFailed {
+                    path: chunk_path.clone(),
                     source: e,
-                }
-            })?;
+                });
+            }
         }
     }
     log::debug!("Finished cleaning up temporary chunk files.");

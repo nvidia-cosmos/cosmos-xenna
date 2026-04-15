@@ -38,12 +38,12 @@ fn _cosmos_xenna(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let name = m.name()?.extract::<String>()?;
     // Create submodules
     let pipelines_module = ImportablePyModuleBuilder::new(py, &format!("{name}.pipelines"))?;
-    pipelines::register_module(py, &pipelines_module.as_module())?;
+    pipelines::register_module(py, pipelines_module.as_module())?;
     let pipelines = pipelines_module.finish();
 
     let file_distribution_module =
         ImportablePyModuleBuilder::new(py, &format!("{name}.file_distribution"))?;
-    file_distribution::register_module(py, &file_distribution_module.as_module())?;
+    file_distribution::register_module(py, file_distribution_module.as_module())?;
     let file_distribution = file_distribution_module.finish();
 
     // Add submodules to main module

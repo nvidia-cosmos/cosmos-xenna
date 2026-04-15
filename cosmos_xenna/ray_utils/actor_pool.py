@@ -126,7 +126,7 @@ def _reap_pids(pid_entries: list[tuple[int, float | None]]) -> None:
             if expected_create_time is not None:
                 actual_create_time = p.create_time()
                 if actual_create_time != expected_create_time:
-                    logger.info(
+                    logger.debug(
                         f"_reap_pids: skipping pid={pid} - create_time mismatch "
                         f"(expected={expected_create_time:.3f}, actual={actual_create_time:.3f}): "
                         f"PID was reused by another process"
@@ -151,9 +151,9 @@ def _kill_actor_and_reap(actor_ref: ActorHandle, node_id: str, label: str) -> No
     """Snapshot the actor's PID tree, ray.kill() it, then dispatch a cleanup task to the node."""
     pid_entries = _get_actor_pid_tree(actor_ref)
     pids = [p for p, _ in pid_entries]
-    logger.info(f"Killing {label} (pids={pids})")
+    logger.debug(f"Killing {label} (pids={pids})")
     ray.kill(actor_ref)
-    logger.info(f"ray.kill() dispatched for {label} (pids={pids})")
+    logger.debug(f"ray.kill() dispatched for {label} (pids={pids})")
     if pid_entries and _KILL_ACTOR_SURVIVORS:
         _reap_pids.options(  # type: ignore[attr-defined]
             num_cpus=0,

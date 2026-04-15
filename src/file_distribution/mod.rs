@@ -59,17 +59,17 @@ use crate::utils::module_builders::ImportablePyModuleBuilder;
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let common_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.common", m.name().unwrap()))?;
-    common::register_module(py, &common_module.as_module())?;
+    common::register_module(py, common_module.as_module())?;
     let common = common_module.finish();
 
     let data_plane_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.data_plane", m.name().unwrap()))?;
-    data_plane::register_module(py, &data_plane_module.as_module())?;
+    data_plane::register_module(py, data_plane_module.as_module())?;
     let data_plane = data_plane_module.finish();
 
     let models_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.models", m.name().unwrap()))?;
-    models::register_module(py, &models_module.as_module())?;
+    models::register_module(py, models_module.as_module())?;
     let models = models_module.finish();
 
     // Add submodules to main module

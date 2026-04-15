@@ -35,7 +35,7 @@ pub fn setup_logging() {
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let private_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.private", m.name().unwrap()))?;
-    private::register_module(py, &private_module.as_module())?;
+    private::register_module(py, private_module.as_module())?;
     let private = private_module.finish();
 
     // Add submodules to main module

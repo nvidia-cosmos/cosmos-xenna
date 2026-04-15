@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::{
     thread::sleep,
     time::{Duration, Instant},
@@ -56,8 +55,9 @@ impl RateLimitedDoer {
 
     pub fn maybe_do<F: FnOnce()>(&mut self, action: F) {
         let now = Instant::now();
-        if self.last_triggered.is_none()
-            || now.duration_since(self.last_triggered.unwrap()) >= self.duration
+        if self
+            .last_triggered
+            .is_none_or(|last| now.duration_since(last) >= self.duration)
         {
             action();
             self.last_triggered = Some(now);

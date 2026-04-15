@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Resource allocation manager for distributed pipeline workers.
 //!
 //! This module provides resource allocation and tracking capabilities for a distributed
@@ -65,7 +64,7 @@ use thiserror::Error;
 
 use crate::utils::module_builders::ImportablePyModuleBuilder;
 
-use super::resources::{AllocationError, ClusterResources, WorkerGroup};
+use super::resources::{AllocationError, ClusterResources, WorkerGroup, create_bar_chart};
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -379,28 +378,6 @@ impl WorkerAllocator {
     }
 }
 
-/// Creates an ASCII bar chart showing resource utilization.
-///
-/// # Arguments
-/// * `used` - Amount of resource currently in use.
-/// * `total` - Total amount of resource available.
-/// * `width` - Width of the bar chart in characters.
-///
-/// # Returns
-/// String representation of a bar chart showing utilization.
-fn create_bar_chart(used: f32, total: f32, width: usize) -> String {
-    if total <= 0.0 {
-        return format!("[{}] {used:.2}/{total:.2}", "-".repeat(width));
-    }
-    let filled = ((used / total).clamp(0.0, 1.0) * width as f32) as usize;
-    let bar = format!(
-        "[{}{}] {used:.2}/{total:.2}",
-        "#".repeat(filled),
-        "-".repeat(width - filled)
-    );
-    bar
-}
-
 // --------------------
 // PyO3 methods on WorkerAllocator
 // --------------------
@@ -515,7 +492,7 @@ mod tests {
         };
         nodes.insert("0".to_string(), node0);
         nodes.insert("1".to_string(), node1);
-        rds::ClusterResources { nodes: nodes }
+        rds::ClusterResources { nodes }
     }
 
     fn make_allocator() -> WorkerAllocator {
@@ -584,7 +561,7 @@ mod tests {
             .collect();
         allocator.add_workers(worker_groups).expect("add workers");
         allocator
-            .delete_workers(&vec!["w1".to_string()])
+            .delete_workers(&["w1".to_string()])
             .expect("delete workers");
         assert!(allocator.get_worker("w1").is_err());
         assert!(allocator.get_worker("w2").is_ok());
@@ -594,7 +571,7 @@ mod tests {
     fn test_delete_non_existent_worker() {
         let mut allocator = make_allocator();
         let err = allocator
-            .delete_workers(&vec!["non_existent".to_string()])
+            .delete_workers(&["non_existent".to_string()])
             .unwrap_err();
         match err {
             WorkerAllocatorError::WorkerNotFound(id) => assert_eq!(id, "non_existent"),
@@ -1090,7 +1067,7 @@ mod tests {
 
         // Delete one worker
         allocator
-            .delete_workers(&vec!["w1".to_string()])
+            .delete_workers(&["w1".to_string()])
             .expect("delete worker group");
 
         // Verify w1 is removed but w2 remains
