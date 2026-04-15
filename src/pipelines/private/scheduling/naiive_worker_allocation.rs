@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Resource allocation optimizer for multi-stage streaming pipelines using linear programming.
 //!
 //! This module implements an optimization-based resource allocation system that determines
@@ -142,7 +141,7 @@ pub struct AllocationProblemStage {
     /// - A 1:1 transformation has `num_returns_per_batch = 1.0`
     /// - A stage that duplicates inputs has `num_returns_per_batch = 2.0`
     /// - A filtering stage might have `num_returns_per_batch = 0.5`
-    /// Must be positive.
+    ///   Must be positive.
     pub num_returns_per_batch: f64,
 
     /// Number of input items processed together in a single batch.
@@ -697,9 +696,9 @@ fn solve_allocation_with_no_manual_stages(
     let slack_penalty_coeff = 0.001; // Small coefficient ensures throughput remains primary objective
     let mut slack_sum: Expression = 0.0.into();
     for si in &s_vars {
-        slack_sum = slack_sum + *si;
+        slack_sum += *si;
     }
-    objective = objective - slack_penalty_coeff * slack_sum;
+    objective -= slack_penalty_coeff * slack_sum;
 
     // Create the optimization model with our objective
     let mut model = vars.maximise(objective).using(default_solver);
@@ -737,8 +736,8 @@ fn solve_allocation_with_no_manual_stages(
 
     for (i, stage) in problem.stages.iter().enumerate() {
         // For each stage, add: (number of workers) * (resources per worker)
-        sum_cpus = sum_cpus + x_vars[i] * stage.resources_per_worker.cpus as f64;
-        sum_gpus = sum_gpus + x_vars[i] * stage.resources_per_worker.gpus as f64;
+        sum_cpus += x_vars[i] * stage.resources_per_worker.cpus as f64;
+        sum_gpus += x_vars[i] * stage.resources_per_worker.gpus as f64;
     }
 
     // Add resource capacity constraints for each resource type
@@ -1069,7 +1068,7 @@ mod tests {
                 stage("A", 1.0, 1.0, 1, pool(1e6, 0.0), None),
                 stage("B", 1.0, 1.0, 1, pool(1e6, 0.0), None),
             ],
-            cluster_resources: pool(3e6 as f32, 0.0),
+            cluster_resources: pool(3e6_f32, 0.0),
         };
         let result = solve_allocation(problem).expect("alloc");
         assert_allocation_result(&result, &[1, 1], Some(1.0), 1e-1);

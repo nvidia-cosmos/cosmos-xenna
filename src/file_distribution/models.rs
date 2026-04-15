@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use object_store::ObjectStore;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -127,14 +126,10 @@ impl DownloadCatalog {
         chunks: Vec<ChunkToDownload>,
         chunks_by_object: HashMap<Uuid, Vec<Uuid>>,
     ) -> Self {
-        let mut objects_map = HashMap::new();
-        for object in objects {
-            objects_map.insert(object.object_id, object);
-        }
-        let mut chunks_map = HashMap::new();
-        for chunk in chunks {
-            chunks_map.insert(chunk.chunk_id, chunk);
-        }
+        let objects_map: HashMap<Uuid, ObjectToDownload> =
+            objects.into_iter().map(|o| (o.object_id, o)).collect();
+        let chunks_map: HashMap<Uuid, ChunkToDownload> =
+            chunks.into_iter().map(|c| (c.chunk_id, c)).collect();
         Self {
             objects: objects_map,
             chunks: chunks_map,
@@ -250,7 +245,7 @@ impl DownloadFromNodeOrder {
             SocketAddr::new(
                 source_node_ip
                     .parse()
-                    .expect(&format!("Invalid IP address {}", source_node_ip)),
+                    .unwrap_or_else(|_| panic!("Invalid IP address {}", source_node_ip)),
                 source_node_port,
             ),
         )
@@ -371,7 +366,7 @@ impl CacheInfo {
         Self {
             uri,
             size,
-            last_modified_unix_micros: last_modified_unix_micros,
+            last_modified_unix_micros,
         }
     }
 }
@@ -459,14 +454,13 @@ fn make_object_store(
     let url = Url::parse(&config.uri).expect("Failed to parse url");
     if url.scheme() == "file" {
         let store =
-            object_store::local::LocalFileSystem::new_with_prefix(&PathBuf::from(url.path()))?;
+            object_store::local::LocalFileSystem::new_with_prefix(PathBuf::from(url.path()))?;
         return Ok(Arc::new(store));
     }
 
     // Add timeout configurations for better handling of large chunks
-    let mut enhanced_config = config.config_args.clone();
-
     // Set longer timeouts for large chunk downloads if not already specified
+    let mut enhanced_config = config.config_args;
     enhanced_config
         .entry("timeout".to_string())
         .or_insert_with(|| "300s".to_string()); // 5 minutes
@@ -484,7 +478,7 @@ impl ObjectStoreByProfile {
     fn new(config_by_profile: ObjectStoreConfigByProfile) -> Result<Self, XennaError> {
         let mut profiles: HashMap<Option<String>, Arc<dyn ObjectStore>> = HashMap::new();
         for (profile_name, config) in config_by_profile.profiles {
-            profiles.insert(profile_name.clone(), make_object_store(config)?);
+            profiles.insert(profile_name, make_object_store(config)?);
         }
         Ok(Self { profiles })
     }
@@ -492,7 +486,6 @@ impl ObjectStoreByProfile {
 
 impl ObjectStoreByProfile {
     pub fn get_client(&self, profile_name: Option<&str>) -> Arc<dyn ObjectStore> {
-        // Convert Option<&str> to Option<String> for lookup
         let key: Option<String> = profile_name.map(|s| s.to_string());
         self.profiles
             .get(&key)

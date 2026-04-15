@@ -24,7 +24,7 @@ use crate::utils::module_builders::ImportablePyModuleBuilder;
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let scheduling_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.scheduling", m.name().unwrap()))?;
-    scheduling::register_module(py, &scheduling_module.as_module())?;
+    scheduling::register_module(py, scheduling_module.as_module())?;
     let scheduling = scheduling_module.finish();
 
     // Add submodules to main module

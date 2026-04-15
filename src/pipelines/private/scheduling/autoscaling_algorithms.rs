@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Algorithms for auto-scaling streaming pipeline workers with smart resource packing.
 //!
 //! This module implements an adaptive worker allocation system for streaming pipelines that optimizes
@@ -480,7 +479,7 @@ fn make_workload_from_state(state: &ds::ProblemState, problem: &ds::Problem) -> 
                 .iter()
                 .map(|s| frag::Stage {
                     frequency: freq,
-                    shape: s.worker_shape.clone().into(),
+                    shape: s.worker_shape.clone(),
                 })
                 .collect(),
         };
@@ -490,10 +489,10 @@ fn make_workload_from_state(state: &ds::ProblemState, problem: &ds::Problem) -> 
         stages: problem
             .stages
             .iter()
-            .zip(per_stage_requested.into_iter())
+            .zip(per_stage_requested)
             .map(|(s, req)| frag::Stage {
                 frequency: (req as f32) / (total_requested as f32),
-                shape: s.worker_shape.clone().into(),
+                shape: s.worker_shape.clone(),
             })
             .collect(),
     }
@@ -648,7 +647,7 @@ fn add_worker_fn(
         rds::WorkerShape::SpmdNodeMultiple(shape) => {
             // TODO: Pipe in worker_groups_to_remove_map so that we can reuse workers.
             let result = frag::find_best_allocation_for_spmd_node_multiple(&c.cluster, &shape);
-            if result.worker_allocations.len() > 0 {
+            if !result.worker_allocations.is_empty() {
                 ok = true;
                 // Create the worker group
                 let worker_group = rds::WorkerGroup {
@@ -742,7 +741,7 @@ fn remove_best_worker_fn(
             let chosen_worker_id = frag::find_worker_group_to_delete_for_spmd_node_multiple(
                 &mut c.cluster,
                 &shape,
-                &worker_groups,
+                worker_groups,
             );
             let worker_group = c
                 .current_worker_groups_per_stage
@@ -771,7 +770,7 @@ fn remove_best_worker_fn(
             // Choose deletion using the fragmentation heuristic
             let chosen_worker_id = frag::find_worker_to_delete_using_fragmentation_gradient_descent(
                 &mut c.cluster,
-                &workload_estimate,
+                workload_estimate,
                 worker_map,
             );
             let worker = worker_map
@@ -922,12 +921,10 @@ pub fn run_fragmentation_autoscaler(
         HashMap::new();
     // Ensure all stages have entries in both maps for consistency
     for s in &problem.stages {
-        current_workers_per_stage
-            .entry(s.name.clone())
-            .or_insert_with(HashMap::new);
+        current_workers_per_stage.entry(s.name.clone()).or_default();
         current_worker_groups_per_stage
             .entry(s.name.clone())
-            .or_insert_with(HashMap::new);
+            .or_default();
     }
     // Seed with existing workers
     for w in make_workers_from_problem_state(problem, state) {
@@ -965,7 +962,7 @@ pub fn run_fragmentation_autoscaler(
             stage_batch_size: stage_problem.stage_batch_size,
             num_returns_per_batch: stage_estimate.num_returns_per_batch,
             num_input_samples_per_sample: None,
-            shape: stage_problem.worker_shape.clone().into(),
+            shape: stage_problem.worker_shape.clone(),
             requested_num_workers: stage_problem.requested_num_workers,
             is_finished: stage_state.is_finished,
         });
@@ -1096,28 +1093,28 @@ pub fn run_fragmentation_autoscaler(
         if stage.is_finished || stage.requested_num_workers.is_some() {
             continue;
         }
-        if stage.current_workers < 1 {
-            if !add_worker_fn(
+        if stage.current_workers < 1
+            && !add_worker_fn(
                 stage,
                 &workload_estimate,
                 worker_reuse_fragmentation_equivalent,
                 &mut metrics,
                 &mut c,
-            ) {
-                panic!(
-                    concat!(
-                        "Unable to allocate minimum worker for stage {}: requested={} current={}; ",
-                        "cluster resources: cpu={}/{} gpu={}/{}"
-                    ),
-                    stage.name,
-                    stage.requested_num_workers.unwrap_or(0),
-                    stage.current_workers,
-                    c.cluster.num_used_cpus(),
-                    c.cluster.num_total_cpus(),
-                    c.cluster.num_used_gpus(),
-                    c.cluster.num_total_gpus()
-                );
-            }
+            )
+        {
+            panic!(
+                concat!(
+                    "Unable to allocate minimum worker for stage {}: requested={} current={}; ",
+                    "cluster resources: cpu={}/{} gpu={}/{}"
+                ),
+                stage.name,
+                stage.requested_num_workers.unwrap_or(0),
+                stage.current_workers,
+                c.cluster.num_used_cpus(),
+                c.cluster.num_total_cpus(),
+                c.cluster.num_used_gpus(),
+                c.cluster.num_total_gpus()
+            );
         }
     }
     let phase2_duration_s = phase2_start.elapsed().as_secs_f64();
@@ -1267,11 +1264,12 @@ pub fn run_fragmentation_autoscaler(
 
     // Build the final Solution: slots are set first; adds/deletes are populated
     // per stage from the allocator-local bookkeeping accumulated above.
-    let mut out = ds::Solution::default();
-    out.stages = num_slots_per_stage
-        .into_iter()
-        .map(|slots| ds::StageSolution::new(slots))
-        .collect();
+    let mut out = ds::Solution {
+        stages: num_slots_per_stage
+            .into_iter()
+            .map(ds::StageSolution::new)
+            .collect(),
+    };
 
     for (idx, stage_problem) in problem.stages.iter().enumerate() {
         let stage = &mut out.stages[idx];
@@ -1351,7 +1349,10 @@ impl Default for FragmentationBasedAutoscaler {
 impl FragmentationBasedAutoscaler {
     #[new]
     #[pyo3(signature = (speed_estimation_window_duration_s = 180.0, speed_estimation_min_data_points = 5))]
-    fn new(speed_estimation_window_duration_s: f64, speed_estimation_min_data_points: usize) -> Self {
+    fn new(
+        speed_estimation_window_duration_s: f64,
+        speed_estimation_min_data_points: usize,
+    ) -> Self {
         Self {
             worker_id_factory: WorkerIdFactory::new(),
             speed_estimation_window_duration_s,
@@ -1393,10 +1394,10 @@ impl FragmentationBasedAutoscaler {
 
         // Apply over_provision_factor adjustments if it is set and we have a speed estimate
         for (stage_est, stage_problem) in estimates.stages.iter_mut().zip(problem.stages.iter()) {
-            if let Some(f) = stage_problem.over_provision_factor {
-                if let Some(bps) = stage_est.batches_per_second_per_worker.as_mut() {
-                    *bps /= f as f64;
-                }
+            if let Some(f) = stage_problem.over_provision_factor
+                && let Some(bps) = stage_est.batches_per_second_per_worker.as_mut()
+            {
+                *bps /= f as f64;
             }
         }
         let out = run_fragmentation_autoscaler(
@@ -1919,7 +1920,7 @@ mod tests {
 
         // Verify the worker groups have the correct number of allocations
         let stage_solution = &sol.stages[0];
-        assert!(stage_solution.new_workers.len() >= 1);
+        assert!(!stage_solution.new_workers.is_empty());
 
         // Check the first worker group
         let worker_group = &stage_solution.new_workers[0];

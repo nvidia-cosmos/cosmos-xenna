@@ -30,24 +30,24 @@ use crate::utils::module_builders::ImportablePyModuleBuilder;
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let resources_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.resources", m.name().unwrap()))?;
-    resources::register_module(py, &resources_module.as_module())?;
+    resources::register_module(py, resources_module.as_module())?;
     let resources = resources_module.finish();
 
     let allocator_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.allocator", m.name().unwrap()))?;
-    allocator::register_module(py, &allocator_module.as_module())?;
+    allocator::register_module(py, allocator_module.as_module())?;
     let allocator = allocator_module.finish();
 
     let autoscaling_algorithms_module = ImportablePyModuleBuilder::new(
         py,
         &format!("{}.autoscaling_algorithms", m.name().unwrap()),
     )?;
-    autoscaling_algorithms::register_module(py, &autoscaling_algorithms_module.as_module())?;
+    autoscaling_algorithms::register_module(py, autoscaling_algorithms_module.as_module())?;
     let autoscaling_algorithms = autoscaling_algorithms_module.finish();
 
     let data_structures_module =
         ImportablePyModuleBuilder::new(py, &format!("{}.data_structures", m.name().unwrap()))?;
-    data_structures::register_module(py, &data_structures_module.as_module())?;
+    data_structures::register_module(py, data_structures_module.as_module())?;
     let data_structures = data_structures_module.finish();
 
     // Add submodules to main module

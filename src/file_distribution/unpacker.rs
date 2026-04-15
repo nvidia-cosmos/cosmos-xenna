@@ -170,7 +170,7 @@ fn unpack_file(
     let method_to_use = match method {
         UnpackMethod::Auto => {
             log::debug!("Auto-detecting unpack method for: {:?}", archive_path);
-            unpack_method_from_path(&archive_path)
+            unpack_method_from_path(archive_path)
         }
         _ => {
             log::debug!("Using specified unpack method: {:?}", method);

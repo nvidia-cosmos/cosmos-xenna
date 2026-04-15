@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! A copy of pipelines::private::scheduling::autoscaling_algorithms::tests::test_large_number_of_nodes
 //! This was copied because I couldn't figure out how to get this command working:
 //! CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph --release --unit-test cosmos-xenna -- pipelines::private::scheduling::autoscaling_algorithms::tests::test_large_number_of_nodes
@@ -115,7 +114,7 @@ fn main() {
         }
         .to_shape(&cluster)
         .unwrap(),
-        requested_num_workers: Some((num_nodes * 4) as usize),
+        requested_num_workers: Some(num_nodes * 4),
         over_provision_factor: None,
     });
     speeds.push(Some(1.0));
@@ -286,7 +285,7 @@ fn main() {
         }
         .to_shape(&cluster)
         .unwrap(),
-        requested_num_workers: Some((num_nodes * 8) as usize),
+        requested_num_workers: Some(num_nodes * 8),
         over_provision_factor: None,
     });
     speeds.push(Some(1.0));

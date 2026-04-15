@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Data structures used to represent allocated/available resources on a cluster/node/gpu.
 //!
 //! Many of the classes in this module are "shapes". A shape is a fully specified resource requirement for something.
@@ -353,14 +352,14 @@ impl Resources {
                 return Ok(WorkerShape::SpmdSmallerThanNode(
                     SpmdSmallerThanNodeResources {
                         num_gpu_actors_in_group: gpus_per_group as u16,
-                        num_cpus_per_actor: num_cpus_per_actor,
+                        num_cpus_per_actor,
                         num_gpus_in_node: most_common_num_gpus_per_node as u8,
                     },
                 ));
-            } else if gpus_per_group % most_common_num_gpus_per_node == 0 {
+            } else if gpus_per_group.is_multiple_of(most_common_num_gpus_per_node) {
                 return Ok(WorkerShape::SpmdNodeMultiple(SpmdNodeMultiple {
                     num_gpu_actors_in_group: gpus_per_group as u16,
-                    num_cpus_per_actor: num_cpus_per_actor,
+                    num_cpus_per_actor,
                     num_gpus_in_node: most_common_num_gpus_per_node as u8,
                 }));
             } else {
@@ -388,12 +387,12 @@ impl Resources {
 
         // Fractional GPU
         if !(self.gpus > 0.0 && self.gpus < 1.0) {
-            return Err(ShapeError::FractionalGpuNotValid(*self));
+            Err(ShapeError::FractionalGpuNotValid(*self))
         } else {
-            return Ok(WorkerShape::FractionalGpu(FractionalGpu {
+            Ok(WorkerShape::FractionalGpu(FractionalGpu {
                 gpu_fraction: to_fixed_floor_f32(self.gpus),
                 num_cpus: to_fixed_floor_f32(self.cpus),
-            }));
+            }))
         }
     }
 }
@@ -627,7 +626,7 @@ impl GpuAllocation {
 ///
 /// # Returns
 /// String representation of a bar chart showing utilization.
-fn create_bar_chart(used: f32, total: f32, width: usize) -> String {
+pub(crate) fn create_bar_chart(used: f32, total: f32, width: usize) -> String {
     if total <= 0.0 {
         return format!("[{}] {used:.2}/{total:.2}", "-".repeat(width));
     }
@@ -728,7 +727,7 @@ impl NodeResources {
         Self {
             used_cpus: FixedUtil::from_num(used_cpus),
             total_cpus: FixedUtil::from_num(total_cpus),
-            gpus: gpus,
+            gpus,
             name,
         }
     }
@@ -753,26 +752,19 @@ impl NodeResources {
     }
 
     pub fn used_pool(&self) -> PoolOfResources {
-        let mut out = PoolOfResources {
+        let gpu_used: f32 = self.gpus.iter().map(|g| g.used_fraction.to_num::<f32>()).sum();
+        PoolOfResources {
             cpus: self.used_cpus.to_num::<f32>(),
-            gpus: 0.0,
-        };
-        for gpu in &self.gpus {
-            out = out.add(&gpu.used_pool());
+            gpus: gpu_used,
         }
-        out
     }
 
     pub fn free_pool(&self) -> PoolOfResources {
-        let mut out = PoolOfResources {
+        let gpu_free: f32 = self.gpus.iter().map(|g| 1.0 - g.used_fraction.to_num::<f32>()).sum();
+        PoolOfResources {
             cpus: self.total_cpus.to_num::<f32>() - self.used_cpus.to_num::<f32>(),
-            gpus: 0.0,
-        };
-
-        for gpu in &self.gpus {
-            out = out.add(&gpu.free_pool());
+            gpus: gpu_free,
         }
-        out
     }
 
     pub fn num_gpus(&self) -> usize {
@@ -981,7 +973,7 @@ impl ClusterResources {
     pub fn calc_most_common_num_gpus_per_node(&self) -> usize {
         let mut num_gpus_per_node: std::collections::HashMap<usize, usize> = Default::default();
         for node in self.nodes.values() {
-            if node.gpus.len() > 0 {
+            if !node.gpus.is_empty() {
                 *num_gpus_per_node.entry(node.gpus.len()).or_insert(0) += 1;
             }
         }
@@ -1000,11 +992,7 @@ impl ClusterResources {
     }
 
     pub fn num_used_gpus(&self) -> usize {
-        let mut out: usize = 0;
-        for node in self.nodes.values() {
-            out += node.gpus.len();
-        }
-        out
+        self.nodes.values().map(|n| n.gpus.len()).sum()
     }
 
     pub fn num_used_cpus(&self) -> f32 {
@@ -1026,27 +1014,15 @@ impl ClusterResources {
     }
 
     pub fn used_pool(&self) -> PoolOfResources {
-        let mut out = PoolOfResources::default();
-        for node in self.nodes.values() {
-            out = out.add(&node.used_pool());
-        }
-        out
+        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.used_pool()))
     }
 
     pub fn free_pool(&self) -> PoolOfResources {
-        let mut out = PoolOfResources::default();
-        for node in self.nodes.values() {
-            out = out.add(&node.free_pool());
-        }
-        out
+        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.free_pool()))
     }
 
     pub fn total_pool(&self) -> PoolOfResources {
-        let mut out = PoolOfResources::default();
-        for node in self.nodes.values() {
-            out = out.add(&node.total_pool());
-        }
-        out
+        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.total_pool()))
     }
 
     pub fn make_detailed_utilization_table(&self) -> String {
@@ -1236,7 +1212,7 @@ impl WorkerGroup {
                 metadata.push(WorkerResources {
                     node: allocation.node.clone(),
                     cpus: allocation.cpus / FixedUtil::from_num(allocation.gpus.len()),
-                    gpus: vec![gpu.clone()],
+                    gpus: vec![*gpu],
                 });
             }
         }
@@ -1305,7 +1281,6 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .add_class::<CpuOnly>()?
         .add_class::<FractionalGpu>()?
         .add_class::<WholeNumberedGpu>()?
-        .add_class::<NodeInfo>()?
         .add_class::<WorkerShape>()?
         .finish();
     Ok(())
@@ -2042,7 +2017,7 @@ mod tests {
         cluster.allocate(&worker).unwrap();
 
         // Then release
-        let result = cluster.release_allocations(&[worker.clone()]);
+        let result = cluster.release_allocations(std::slice::from_ref(&worker));
         assert!(result.is_ok());
 
         // Check that resources are freed

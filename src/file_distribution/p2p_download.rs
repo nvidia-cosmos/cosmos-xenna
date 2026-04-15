@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # P2P Data Plane
 //!
 //! This module defines the core data plane logic for the Xenna P2P file distribution system.
@@ -154,7 +153,7 @@ fn download_chunk(
     let bytes = response.bytes()?;
 
     // Validate chunk size if range is specified
-    if let Some(range) = job.object_and_range.range.clone() {
+    if let Some(ref range) = job.object_and_range.range {
         let expected_size = (range.end - range.start) as usize;
         if bytes.len() != expected_size {
             log::error!(
@@ -170,7 +169,7 @@ fn download_chunk(
         }
     }
 
-    Ok(bytes.to_vec())
+    Ok(bytes.into())
 }
 
 fn attempt_download(
@@ -186,15 +185,15 @@ fn attempt_download(
     match download_chunk(client, job) {
         Ok(data) => OperationResult::Ok(data),
         Err(e) => {
-            if let DownloadError::HttpStatus(status) = e {
-                if status.is_client_error() {
-                    log::debug!(
-                        "A client error occurred for chunk {}: {}. This is not retryable.",
-                        chunk_id,
-                        status
-                    );
-                    return OperationResult::Err(e);
-                }
+            if let DownloadError::HttpStatus(status) = e
+                && status.is_client_error()
+            {
+                log::debug!(
+                    "A client error occurred for chunk {}: {}. This is not retryable.",
+                    chunk_id,
+                    status
+                );
+                return OperationResult::Err(e);
             }
             log::warn!(
                 "Download attempt failed for chunk {}: {:?}. Retry {}/{}, retrying...",

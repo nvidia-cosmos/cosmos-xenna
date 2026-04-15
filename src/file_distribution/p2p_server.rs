@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # P2P Server
 //!
 //! This module implements the peer-to-peer (P2P) server component of the Xenna data plane.
@@ -41,6 +40,7 @@
 use super::common::{get_temp_chunk_path, resolve_path};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, Query},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -116,18 +116,18 @@ impl StreamingBodyWithGuard {
     fn into_body(self) -> axum::body::Body {
         // Create a stream that yields the data in chunks and holds the guard
         const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks for streaming
-        let data = std::sync::Arc::new(self.data);
+        let data: Bytes = self.data.into();
         let _guard = self._guard;
 
         let stream = futures::stream::unfold(
-            (data, 0, Some(_guard)),
+            (data, 0usize, Some(_guard)),
             |(data, offset, guard)| async move {
                 if offset >= data.len() {
                     // Guard will be dropped here when stream ends
                     None
                 } else {
                     let end = std::cmp::min(offset + CHUNK_SIZE, data.len());
-                    let chunk = data[offset..end].to_vec();
+                    let chunk = data.slice(offset..end);
                     Some((Ok::<_, std::io::Error>(chunk), (data, end, guard)))
                 }
             },
@@ -284,14 +284,14 @@ async fn write_chunk(
         temp_chunk_path.display()
     );
 
-    if let Some(parent) = temp_chunk_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            debug!("Failed to create directory {:?}: {}", parent, e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create directory {:?}: {}", parent, e),
-            ));
-        }
+    if let Some(parent) = temp_chunk_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        debug!("Failed to create directory {:?}: {}", parent, e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create directory {:?}: {}", parent, e),
+        ));
     }
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -365,10 +365,10 @@ impl P2pServer {
         }
 
         self.shutdown_tx.send(())?;
-        if let Some(handle) = self.server_handle.take() {
-            if handle.join().is_err() {
-                return Err(P2pServerError::ThreadPanic);
-            }
+        if let Some(handle) = self.server_handle.take()
+            && handle.join().is_err()
+        {
+            return Err(P2pServerError::ThreadPanic);
         }
         Ok(())
     }

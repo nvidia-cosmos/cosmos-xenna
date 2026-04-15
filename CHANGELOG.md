@@ -2,6 +2,18 @@
 
 ## Latest
 
+## [0.2.2]
+
+### Released
+
+- 2026-04-13
+
+### Fixed
+
+- Implemented zero-copy Bytes streaming, removed some allocations and several buffer copies
+- Lower verbosity on Ray orphan reap messages
+- Fixed lint and cargo-audit warnings, remove unused crates
+
 ## [0.2.1]
 
 ### Released

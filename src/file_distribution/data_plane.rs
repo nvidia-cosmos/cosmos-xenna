@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # P2P Data Plane
 //!
 //! This module defines the core data plane logic for the Xenna P2P file distribution system.
@@ -247,12 +246,10 @@ fn find_cached_things_and_remove_invalid(
         }
     }
 
-    let objects_no_unpacking = cached_objects
-        .difference(&objects_already_unpacked)
-        .cloned()
-        .collect::<HashSet<_>>()
-        .difference(&objects_needed_to_be_unpacked)
-        .cloned()
+    let objects_no_unpacking: HashSet<Uuid> = cached_objects
+        .iter()
+        .filter(|id| !objects_already_unpacked.contains(id) && !objects_needed_to_be_unpacked.contains(id))
+        .copied()
         .collect();
 
     Ok(CachedThings {
@@ -303,10 +300,10 @@ impl AssemblyTracker {
                 if let Some(remaining_chunks) = self
                     .remaining_chunks_for_assembly
                     .get_mut(&chunk.parent_object_id)
+                    && remaining_chunks.remove(chunk_id)
+                    && remaining_chunks.is_empty()
                 {
-                    if remaining_chunks.remove(chunk_id) && remaining_chunks.is_empty() {
-                        objects_ready_for_assembly.insert(chunk.parent_object_id);
-                    }
+                    objects_ready_for_assembly.insert(chunk.parent_object_id);
                 }
             } else {
                 warn!(
@@ -374,6 +371,7 @@ pub struct Orchestrator {
     completed_or_cached_objects: HashSet<Uuid>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl Orchestrator {
     /// Start the orchestrator and initialize all worker pools.
     pub fn new(
@@ -488,7 +486,7 @@ impl Orchestrator {
             .map(ObjectStoreDownloadTask::from_chunk_to_download)
             .collect();
         self.os_download_active_uuids
-            .extend(tasks.iter().map(|t| t.chunk_id.clone()));
+            .extend(tasks.iter().map(|t| t.chunk_id));
         self.object_downloader.add_tasks(tasks);
 
         let p2p_tasks: Vec<P2pDownloadTask> = orders
@@ -497,7 +495,7 @@ impl Orchestrator {
             .map(P2pDownloadTask::from_p2p_download_order)
             .collect();
         self.p2p_download_active_uuids
-            .extend(p2p_tasks.iter().map(|t| t.chunk_id.clone()));
+            .extend(p2p_tasks.iter().map(|t| t.chunk_id));
         self.p2p_downloader.add_tasks(p2p_tasks);
 
         let mut newly_written_chunks = HashSet::new();
