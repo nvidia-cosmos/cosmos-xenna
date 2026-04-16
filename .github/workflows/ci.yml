@@ -41,9 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          cache-workspaces: ". -> target"
+          workspaces: ". -> target"
 
       - uses: astral-sh/setup-uv@v4
         with:
@@ -72,9 +75,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          cache-workspaces: ". -> target"
+          workspaces: ". -> target"
 
       - uses: astral-sh/setup-uv@v4
         with:
@@ -99,9 +105,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          components: clippy, rustfmt
+          workspaces: ". -> target"
 
       - name: cargo fmt
         run: cargo fmt --check
@@ -125,7 +136,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
 
       - name: cargo test
         run: cargo test
