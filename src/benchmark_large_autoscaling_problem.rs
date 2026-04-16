@@ -301,7 +301,8 @@ fn main() {
     log::info!("Running autoscaler with 1.5x over-provision factor");
     let mut worker_id_factory = WorkerIdFactory::new();
     let solution1 =
-        run_fragmentation_autoscaler(&problem, &state, &estimates, 1.5, &mut worker_id_factory);
+        run_fragmentation_autoscaler(&problem, &state, &estimates, 1.5, &mut worker_id_factory)
+            .unwrap();
     log::info!("Finished first run");
 
     // Multiply the speeds by some random (repeatable) factor.
@@ -333,7 +334,8 @@ fn main() {
         &estimates,
         1.5,
         &mut worker_id_factory,
-    );
+    )
+    .unwrap();
 
     // Print a small confirmation so we know it ran
     log::info!(

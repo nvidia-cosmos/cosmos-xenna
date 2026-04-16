@@ -2,6 +2,16 @@
 
 ## Latest
 
+## [0.2.3]
+
+### Released
+
+- 2026-04-14
+
+### Fixed
+
+- Fixed the Xenna autoscaler which will return a raised Python exception on allocation failure instead of a `panic!()`.
+
 ## [0.2.2]
 
 ### Released
