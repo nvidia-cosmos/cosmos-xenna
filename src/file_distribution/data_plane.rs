@@ -248,7 +248,9 @@ fn find_cached_things_and_remove_invalid(
 
     let objects_no_unpacking: HashSet<Uuid> = cached_objects
         .iter()
-        .filter(|id| !objects_already_unpacked.contains(id) && !objects_needed_to_be_unpacked.contains(id))
+        .filter(|id| {
+            !objects_already_unpacked.contains(id) && !objects_needed_to_be_unpacked.contains(id)
+        })
         .copied()
         .collect();
 
