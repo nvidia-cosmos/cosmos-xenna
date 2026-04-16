@@ -804,7 +804,7 @@ fn remove_best_worker_fn(
 ///   allocations/deallocations that improve pipeline throughput while respecting resource
 ///   fragmentation on heterogeneous nodes/GPUs.
 /// - Stages with manually requested worker counts are satisfied first and treated as fixed.
-/// - Ensures every non-manual stage has at least one worker (if resources allow).
+/// - Ensures every non-manual stage has at least one worker; returns an error if resources are insufficient.
 /// - Balances throughput by repeatedly helping the slowest active stage, borrowing workers
 ///   from faster stages when it does not violate their own throughput constraints.
 /// - Optionally over-allocates slower stages up to a multiplicative target relative to the
@@ -824,9 +824,9 @@ fn remove_best_worker_fn(
 ///
 /// Algorithm phases
 /// 1) Satisfy manual requests: For stages with `requested_num_workers`, add/delete until the
-///    requested count is met. This can panic if resources cannot satisfy a hard manual request.
+///    requested count is met. Returns `Err` if resources cannot satisfy a hard manual request.
 /// 2) Ensure minimum one worker: For non-manual stages, allocate a worker if none exists.
-///    This can panic if the cluster cannot fit even a single required worker shape.
+///    Returns `Err` if the cluster cannot fit even a single required worker shape.
 /// 3) Balance minimum throughput: Among active stages (non-manual with valid speeds), repeatedly
 ///    pick the slowest stage and try to allocate one worker. If allocation fails due to
 ///    fragmentation, attempt to remove one worker from a donor stage that can afford it (keeps
@@ -847,13 +847,17 @@ fn remove_best_worker_fn(
 ///   speeds via `calculate_num_slots_per_worker_for_all_stages`.
 /// - Side-effect free: Only the returned `ds::Solution` communicates the desired changes.
 ///
-/// Panics
-/// - If a stage has `requested_num_workers` and the allocator cannot place the required number
+/// Errors
+/// Returns `PyErr` (`RuntimeError` on the Python side) when:
+/// - A stage has `requested_num_workers` and the allocator cannot place the required number
 ///   of workers.
-/// - If a non-manual stage has zero workers and the allocator cannot place at least one.
+/// - A non-manual stage has zero workers and the allocator cannot place at least one.
+///
+/// The error message includes the stage name, requested/current counts, and cluster
+/// CPU/GPU usage to aid diagnosis.
 ///
 /// Returns
-/// - `ds::Solution` where for each stage:
+/// - `PyResult<ds::Solution>` — `Ok(solution)` where for each stage:
 ///   - `new_workers`: proposed workers (with concrete resource assignments) to create.
 ///   - `deleted_workers`: existing workers to remove.
 ///   - `slots_per_worker`: desired concurrency per worker as computed from current state.
@@ -892,7 +896,7 @@ fn remove_best_worker_fn(
 ///     &estimates,
 ///     1.5, // allow 50% headroom for slower stages
 ///     &mut worker_id_factory,
-/// );
+/// ).unwrap();
 /// // Apply `solution` in the scheduler layer.
 /// ```
 ///
@@ -900,6 +904,7 @@ fn remove_best_worker_fn(
 /// # Python (via PyO3 export)
 /// from cosmos_xenna import run_fragmentation_autoscaler
 /// sol = run_fragmentation_autoscaler(problem, state, estimates, 1.5, worker_id_factory)
+/// # Raises RuntimeError if resources are insufficient.
 /// # `sol.stages[i].new_workers` and `.deleted_workers` describe desired changes.
 /// ```
 #[pyfunction]
@@ -909,7 +914,7 @@ pub fn run_fragmentation_autoscaler(
     estimates: &Estimates,
     overallocation_target: f64,
     worker_id_factory: &mut WorkerIdFactory,
-) -> ds::Solution {
+) -> PyResult<ds::Solution> {
     // Overall timer
     let overall_start = std::time::Instant::now();
     // Build a cluster snapshot and seed with current workers so subsequent add/remove
@@ -1044,7 +1049,7 @@ pub fn run_fragmentation_autoscaler(
     let workload_estimate = make_workload_from_state(state, problem);
 
     // Phase 1: Honor hard manual requests. These are treated as fixed constraints;
-    // if they cannot be satisfied we intentionally panic to surface misconfiguration
+    // if they cannot be satisfied we return an error to surface misconfiguration
     // or insufficient cluster capacity for the requested shape/count.
     log::debug!("Phase 1: satisfy manually requested counts");
     let phase1_start = std::time::Instant::now();
@@ -1066,10 +1071,18 @@ pub fn run_fragmentation_autoscaler(
                     &mut metrics,
                     &mut c,
                 ) {
-                    panic!(
-                        "Unable to allocate requested workers for stage {}. Requested={}, Current={}",
-                        stage.name, req, stage.current_workers
-                    );
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Unable to allocate requested workers for stage {}. \
+                         Requested={}, Current={}; \
+                         cluster resources: cpu={}/{} gpu={}/{}",
+                        stage.name,
+                        req,
+                        stage.current_workers,
+                        c.cluster.num_used_cpus(),
+                        c.cluster.num_total_cpus(),
+                        c.cluster.num_used_gpus(),
+                        c.cluster.num_total_gpus(),
+                    )));
                 }
             }
             while stage.current_workers > req {
@@ -1086,7 +1099,7 @@ pub fn run_fragmentation_autoscaler(
     );
 
     // Phase 2: Ensure forward progress by guaranteeing at least one worker on
-    // every non-manual stage. This may also panic if a single worker cannot fit.
+    // every non-manual stage. Returns an error if a single worker cannot fit.
     let phase2_start = std::time::Instant::now();
     for stage in &mut stages {
         // Skip finished stages and manually-requested stages
@@ -1102,19 +1115,18 @@ pub fn run_fragmentation_autoscaler(
                 &mut c,
             )
         {
-            panic!(
-                concat!(
-                    "Unable to allocate minimum worker for stage {}: requested={} current={}; ",
-                    "cluster resources: cpu={}/{} gpu={}/{}"
-                ),
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Unable to allocate minimum worker for stage {}: \
+                 requested={} current={}; \
+                 cluster resources: cpu={}/{} gpu={}/{}",
                 stage.name,
                 stage.requested_num_workers.unwrap_or(0),
                 stage.current_workers,
                 c.cluster.num_used_cpus(),
                 c.cluster.num_total_cpus(),
                 c.cluster.num_used_gpus(),
-                c.cluster.num_total_gpus()
-            );
+                c.cluster.num_total_gpus(),
+            )));
         }
     }
     let phase2_duration_s = phase2_start.elapsed().as_secs_f64();
@@ -1317,7 +1329,7 @@ pub fn run_fragmentation_autoscaler(
     // Overall duration
     let overall_duration_s = overall_start.elapsed().as_secs_f64();
     log::debug!("Autoscaler total duration_s={:.6}", overall_duration_s);
-    out
+    Ok(out)
 }
 
 // --------------------
@@ -1381,7 +1393,7 @@ impl FragmentationBasedAutoscaler {
         }
     }
 
-    fn autoscale(&mut self, current_time: f64, state: &ds::ProblemState) -> ds::Solution {
+    fn autoscale(&mut self, current_time: f64, state: &ds::ProblemState) -> PyResult<ds::Solution> {
         let problem = self
             .problem
             .as_ref()
@@ -1406,9 +1418,9 @@ impl FragmentationBasedAutoscaler {
             &estimates,
             1.5,
             &mut self.worker_id_factory,
-        );
+        )?;
         debug!("Autoscaler result:\n{}", out);
-        out
+        Ok(out)
     }
 }
 
@@ -1640,7 +1652,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![4]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0]);
     }
@@ -1689,7 +1702,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![10, 8, 5]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
     }
@@ -1717,7 +1731,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![10]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0]);
     }
@@ -1766,7 +1781,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![2, 2, 4]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
     }
@@ -1827,7 +1843,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![2, 1, 1]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
     }
@@ -1876,7 +1893,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
         assert_eq!(sol.num_new_workers_per_stage(), vec![120, 8, 240]);
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0, 0]);
     }
@@ -1912,7 +1930,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // The autoscaling algorithm should allocate at least 1 worker group
         assert!(sol.num_new_workers_per_stage()[0] >= 1);
@@ -1964,7 +1983,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // Should allocate multiple workers since each uses only part of a node
         assert!(sol.num_new_workers_per_stage()[0] > 0);
@@ -1997,7 +2017,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // Should respect the manual request for 2 worker groups
         assert_eq!(sol.num_new_workers_per_stage(), vec![2]);
@@ -2060,7 +2081,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // All stages should get at least one worker/worker group
         assert!(sol.num_new_workers_per_stage()[0] > 0); // CPU stage
@@ -2088,23 +2110,19 @@ mod tests {
         };
         let state = make_default_state_for_stages(&problem);
         let estimates = estimates_from_speeds(&[Some(1.0)]);
-        let _worker_id_factory = WorkerIdFactory::new();
+        let mut worker_id_factory = WorkerIdFactory::new();
 
-        // This should panic because the manual request cannot be satisfied
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut local_factory = WorkerIdFactory::new();
-            super::run_fragmentation_autoscaler(
-                &problem,
-                &state,
-                &estimates,
-                1.5,
-                &mut local_factory,
-            )
-        }));
+        let result = super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        );
 
         assert!(
             result.is_err(),
-            "Should panic when manual SPMD request cannot be satisfied"
+            "Should return Err when manual SPMD request cannot be satisfied"
         );
     }
 
@@ -2213,7 +2231,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // Should remove 1 worker group to match the manual request
         assert_eq!(sol.num_new_workers_per_stage(), vec![0]);
@@ -2314,7 +2333,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         let new_state = ds::ProblemState {
             stages: problem
@@ -2336,7 +2356,8 @@ mod tests {
             &estimates,
             1.5,
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             solution2.num_new_workers_per_stage(),
@@ -2435,7 +2456,8 @@ mod tests {
             &estimates,
             1.5, // 50% overallocation target
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         // Verify all stages get workers
         let new_workers = sol.num_new_workers_per_stage();
@@ -2595,7 +2617,8 @@ mod tests {
             &estimates,
             2.0, // 100% overallocation target for more aggressive scaling
             &mut worker_id_factory,
-        );
+        )
+        .unwrap();
 
         let new_workers = sol.num_new_workers_per_stage();
 
