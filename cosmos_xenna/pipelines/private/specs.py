@@ -372,6 +372,14 @@ class StreamingSpecificSpec:
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
+    # Maximum fraction of current ready actors that can be deleted per
+    # autoscale cycle. For example, 0.5 means at most 50% deleted per cycle,
+    # enforcing gradual scale-down (20->10->5->3->2->1 over multiple cycles).
+    # Default 1.0 = disabled (all deletions pass through).
+    autoscale_max_scale_down_fraction: float = attrs.field(
+        default=1.0,
+        validator=[attrs.validators.gt(0), attrs.validators.le(1.0)],
+    )
 
 
 @attrs.define
