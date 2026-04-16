@@ -69,9 +69,24 @@ use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+// Python exception types exposed to the Python side so callers can catch
+// specific error variants by type instead of string-matching on ValueError.
+// All three inherit from ValueError for backward compatibility.
+pyo3::create_exception!(allocator, PyAllocationError, PyValueError);
+pyo3::create_exception!(allocator, DuplicateWorkerIdError, PyValueError);
+pyo3::create_exception!(allocator, WorkerNotFoundError, PyValueError);
+
 impl From<WorkerAllocatorError> for PyErr {
     fn from(err: WorkerAllocatorError) -> PyErr {
-        PyValueError::new_err(err.to_string())
+        match err {
+            WorkerAllocatorError::DuplicateWorkerId(_) => {
+                DuplicateWorkerIdError::new_err(err.to_string())
+            }
+            WorkerAllocatorError::WorkerNotFound(_) => {
+                WorkerNotFoundError::new_err(err.to_string())
+            }
+            WorkerAllocatorError::Allocation(_) => PyAllocationError::new_err(err.to_string()),
+        }
     }
 }
 
@@ -443,11 +458,17 @@ impl WorkerAllocator {
 }
 
 /// Module initialization
-pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add submodules to main module
     ImportablePyModuleBuilder::from(m.clone())?
         .add_class::<WorkerAllocator>()?
         .finish();
+    m.add("AllocationError", py.get_type::<PyAllocationError>())?;
+    m.add(
+        "DuplicateWorkerIdError",
+        py.get_type::<DuplicateWorkerIdError>(),
+    )?;
+    m.add("WorkerNotFoundError", py.get_type::<WorkerNotFoundError>())?;
     Ok(())
 }
 

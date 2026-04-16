@@ -38,6 +38,7 @@ from ray.actor import ActorHandle
 from ray.util.metrics import Counter
 
 from cosmos_xenna.pipelines.private import allocator, resources
+from cosmos_xenna.pipelines.private.allocator import AllocationError
 from cosmos_xenna.ray_utils import monitoring, stage, stage_worker
 from cosmos_xenna.utils import grouping, stats, timing
 from cosmos_xenna.utils import python_log as logger
@@ -897,7 +898,17 @@ class ActorPool(Generic[T, V]):
         self._cluster_port_registry.register_port(node_id, worker.id, rendevous_params.master_port)
         return rendevous_params
 
-    def _add_worker_group(self, worker: resources.WorkerGroup) -> None:
+    def _add_worker_group(self, worker: resources.WorkerGroup) -> bool:
+        """Add a worker group, allocating resources and creating actors.
+
+        ``AllocationError`` from the Rust ``WorkerAllocator`` (TOCTOU race
+        with stale resource snapshot) is caught and logged at WARNING level;
+        the next autoscale cycle will retry with a fresh snapshot.
+
+        Returns:
+            True if the worker group was created successfully, False if the
+            allocation was skipped due to a stale-snapshot race.
+        """
         if self._is_spmd:
             rendevous_params = self._find_rendevous_params_for_worker_group(worker)
         else:
@@ -905,7 +916,15 @@ class ActorPool(Generic[T, V]):
 
         logger.trace(f"Adding worker group: {worker.id}")
         worker_group = _WorkerGroup(worker, set(), _WorkerGroupState.WAITING_FOR_SETUP, rendevous_params)
-        self._allocator.add_worker(worker)
+        try:
+            self._allocator.add_worker(worker)
+        except AllocationError as e:
+            logger.warning(
+                f"Skipping worker creation for {self.name}: "
+                f"worker {worker.id} "
+                f"(will retry on next autoscale cycle): {e}",
+            )
+            return False
         if self._is_spmd:
             logger.trace(f"Creating SPMD actors for worker group: {worker_group.worker_group.id}")
             splits = worker.split_allocation_per_gpu()
@@ -924,6 +943,7 @@ class ActorPool(Generic[T, V]):
             assert len(worker.allocations) == 1, "Non-SPMD actors should only have one allocation"
             self._create_actor_for_worker_group(worker_group, worker.allocations[0], None, None)
         self._worker_groups[worker_group.worker_group.id] = worker_group
+        return True
 
     def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, metadata: resources.WorkerMetadata) -> None:
         """Adds an actor to the list waiting for node setup on its target node."""
