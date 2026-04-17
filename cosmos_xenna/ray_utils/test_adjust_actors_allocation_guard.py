@@ -174,3 +174,37 @@ class TestAllocationGuard:
             assert "MyTestStage" in log_msg
             assert "wg-abc" in log_msg
             assert "Allocation error" in log_msg
+
+    def test_fragmentation_message_is_forwarded_in_warning(self) -> None:
+        """Fragmentation diagnostics from the Rust layer propagate verbatim into the WARNING log.
+
+        The enriched ``AllocationError::NotEnoughResources`` Display format
+        includes the per-GPU free-fraction vector and the
+        ``fragmentation_suspected`` classifier. The Python guard forwards
+        ``str(e)`` unchanged into the ``logger.warning`` call, so operators
+        can distinguish the "4 half-used GPUs" fragmentation pattern from
+        plain CPU/GPU under-provisioning without any extra Python plumbing.
+        This test asserts that forwarding behaviour with a mock side-effect
+        that mirrors the real Rust ``Display`` string; it does not require
+        the compiled Rust extension to be loaded.
+        """
+        wg = _make_mock_worker_group("wg-frag")
+        pool = _make_pool_with_queue([wg])
+        pool.name = "FragStage"
+        pool._allocator.add_worker.side_effect = _AllocationError(
+            "Allocation error: Not enough resources on node node-42. "
+            "Requested: PoolOfResources { cpus: 1.0, gpus: 1.0 }, "
+            "available: PoolOfResources { cpus: 1.0, gpus: 2.0 }, "
+            "per_gpu_free: [0.5, 0.5, 0.5, 0.5], "
+            "fragmentation_suspected: true"
+        )
+
+        with patch("cosmos_xenna.ray_utils.actor_pool.logger") as mock_logger:
+            pool._adjust_actors()
+
+            mock_logger.warning.assert_called_once()
+            log_msg = mock_logger.warning.call_args[0][0]
+            assert "per_gpu_free: [0.5, 0.5, 0.5, 0.5]" in log_msg
+            assert "fragmentation_suspected: true" in log_msg
+            assert "FragStage" in log_msg
+            assert "wg-frag" in log_msg
