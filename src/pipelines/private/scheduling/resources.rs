@@ -268,13 +268,32 @@ impl From<ShapeError> for PyErr {
 pub enum AllocationError {
     #[error("GPU index {gpu_index} out of range for node resources")]
     GpuIndexOutOfRange { gpu_index: usize },
+    // NotEnoughResources carries both aggregate (`available: PoolOfResources`)
+    // and per-GPU (`per_gpu_free`) free-capacity views so operators can
+    // distinguish "node is genuinely under-provisioned" from
+    // "aggregate free looks sufficient but no single GPU slot has a
+    // contiguous block large enough".
+    //
+    //   fragmentation_suspected == true
+    //       => aggregate CPU + aggregate GPU free >= requested,
+    //          yet at least one requested GPU slot cannot fit in a
+    //          single physical GPU at its current utilisation.
+    //
+    //   fragmentation_suspected == false
+    //       => request failed due to plain under-provisioning
+    //          (aggregate CPU or aggregate GPU free < requested).
     #[error(
-        "Not enough resources on node {node}. Requested: {resources:?}, available: {available:?}"
+        "Not enough resources on node {node}. \
+         Requested: {resources:?}, available: {available:?}, \
+         per_gpu_free: {per_gpu_free:?}, \
+         fragmentation_suspected: {fragmentation_suspected}"
     )]
     NotEnoughResources {
         node: String,
         resources: PoolOfResources,
         available: PoolOfResources,
+        per_gpu_free: Vec<f32>,
+        fragmentation_suspected: bool,
     },
     #[error("Node '{0}' not found in cluster resources")]
     NodeNotFound(String),
@@ -818,6 +837,51 @@ impl NodeResources {
         true
     }
 
+    /// Snapshot of per-GPU free fractions for diagnostic error payloads.
+    ///
+    /// The vector index matches the `offset` field of `GpuAllocation`, NOT
+    /// the hardware GPU index. Each entry is in the closed interval `[0.0, 1.0]`,
+    /// where `1.0` means the GPU is entirely free and `0.0` means fully used.
+    fn per_gpu_free_fractions(&self) -> Vec<f32> {
+        self.gpus
+            .iter()
+            .map(|g| 1.0f32 - g.used_fraction.to_num::<f32>())
+            .collect()
+    }
+
+    /// Classifies an allocation failure as a fragmentation event.
+    ///
+    /// Returns `true` when aggregate CPU and aggregate GPU free capacity on
+    /// this node would each cover the request, yet at least one requested
+    /// GPU slot cannot fit in a single physical GPU at its current
+    /// utilisation. This is the TOCTOU-safe signature of "4 half-used GPUs
+    /// look like 2.0 free GPUs but no single GPU has 1.0 contiguous free".
+    ///
+    /// Returns `false` when the failure is due to plain under-provisioning
+    /// (aggregate CPU or aggregate GPU free < requested).
+    fn is_fragmentation_suspected(&self, requested: &WorkerResources) -> bool {
+        let free = self.free_pool();
+        let requested_pool = requested.to_pool();
+
+        // Aggregate free must be sufficient for fragmentation to apply;
+        // otherwise the failure is under-provisioning, not fragmentation.
+        if free.cpus < requested_pool.cpus || free.gpus < requested_pool.gpus {
+            return false;
+        }
+
+        // At least one requested GPU slot must fail to fit in a single GPU
+        // for this to count as fragmentation.
+        for gpu in &requested.gpus {
+            if let Some(node_gpu) = self.gpus.get(gpu.offset) {
+                if node_gpu.used_fraction + gpu.used_fraction > FixedUtil::ONE {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn allocate(&mut self, resources: &WorkerResources) -> Result<(), AllocationError> {
         // Check CPUs
         if self.used_cpus + resources.cpus > self.total_cpus {
@@ -825,6 +889,8 @@ impl NodeResources {
                 node: self.name.clone().unwrap_or_default(),
                 resources: resources.to_pool(),
                 available: self.free_pool(),
+                per_gpu_free: self.per_gpu_free_fractions(),
+                fragmentation_suspected: self.is_fragmentation_suspected(resources),
             });
         }
 
@@ -836,6 +902,8 @@ impl NodeResources {
                     node: self.name.clone().unwrap_or_default(),
                     resources: resources.to_pool(),
                     available: self.free_pool(),
+                    per_gpu_free: self.per_gpu_free_fractions(),
+                    fragmentation_suspected: self.is_fragmentation_suspected(resources),
                 });
             }
         }
