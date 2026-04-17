@@ -230,6 +230,56 @@ def make_problem_worker_state_from_worker_state(
     return data_structures.ProblemWorkerGroupState.make(state.id, state.allocations)
 
 
+def _required_workers_for_stage(
+    slots_per_actor: int,
+    stage_batch_size: int,
+    inflight_slots: int,
+    backlog_samples: int,
+) -> int:
+    """Compute the minimum workers a stage must retain to preserve progress.
+
+    Returns the max of three lower bounds:
+
+      * ``Autoscaler.MIN_WORKERS_PER_STAGE`` - keeps the stage alive so the
+        autoscaler can scale it back up once upstream data resumes (avoids
+        cold-start latency during temporary upstream lulls).
+      * ``ceil(inflight_slots / slots_per_actor)`` - enough actors to hold
+        every task already dispatched to a slot; deleting below this would
+        forcefully return tasks to the queue and starve downstream stages.
+      * ``ceil(backlog_samples / (slots_per_actor * stage_batch_size))`` -
+        enough actors to drain the queued backlog at full per-actor
+        utilisation within one autoscale cycle.
+
+    Args:
+        slots_per_actor: Concurrent task slots per actor. Must be ``> 0``.
+        stage_batch_size: Batch size declared by the stage. Must be ``> 0``.
+        inflight_slots: Actor slots currently executing tasks. Must be
+            ``>= 0``.
+        backlog_samples: Tasks waiting for an actor slot (upstream queue
+            + pool's internal task queue). Must be ``>= 0``.
+
+    Returns:
+        The minimum worker count a proposed scale-down must leave alive.
+
+    Raises:
+        ValueError: If any argument violates the bounds above.
+
+    """
+    if slots_per_actor <= 0:
+        raise ValueError(f"slots_per_actor must be > 0, got {slots_per_actor}")
+    if stage_batch_size <= 0:
+        raise ValueError(f"stage_batch_size must be > 0, got {stage_batch_size}")
+    if inflight_slots < 0:
+        raise ValueError(f"inflight_slots must be >= 0, got {inflight_slots}")
+    if backlog_samples < 0:
+        raise ValueError(f"backlog_samples must be >= 0, got {backlog_samples}")
+
+    workers_for_inflight = math.ceil(inflight_slots / slots_per_actor)
+    capacity_per_actor = slots_per_actor * stage_batch_size
+    workers_for_backlog = math.ceil(backlog_samples / capacity_per_actor)
+    return max(Autoscaler.MIN_WORKERS_PER_STAGE, workers_for_inflight, workers_for_backlog)
+
+
 class Autoscaler:
     """Manages the autoscaling of pipeline stages in a streaming execution mode.
 
@@ -251,6 +301,15 @@ class Autoscaler:
         _autoscale_start_time: The timestamp when the last autoscaling calculation
             was started.
     """
+
+    # Floor for the backlog-aware scale-down guard (see
+    # ``_required_workers_for_stage``). Keeps one actor alive on every
+    # *active* stage so work arriving after a temporary upstream lull
+    # is processed immediately instead of paying a cold-start cycle.
+    # Finished-stage teardown bypasses the guard via ``is_done`` in
+    # ``run_pipeline``, and end-of-pipeline teardown happens via the
+    # ``Autoscaler`` context exit, so this floor never strands actors.
+    MIN_WORKERS_PER_STAGE: typing.ClassVar[int] = 1
 
     def __init__(
         self,
@@ -347,39 +406,125 @@ class Autoscaler:
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
-    def apply_autoscale_result_if_ready(self, pools: list[actor_pool.ActorPool]) -> None:
-        """Applies the result of a completed autoscaling calculation.
+    def apply_autoscale_result_if_ready(
+        self,
+        pools: list[actor_pool.ActorPool],
+        upstream_queue_lens: list[int],
+        stage_batch_sizes: list[int],
+    ) -> None:
+        """Apply a completed autoscaling result, clamping unsafe deletions.
 
-        If the calculation is not yet finished, this method does nothing. Once the
-        result is applied, it updates the actor pools with new worker
-        configurations.
+        No-op if no result is pending. Otherwise, for each stage, the Rust
+        autoscaler's proposed worker deletions are capped so the surviving
+        workers can still (a) hold every task already dispatched to an actor
+        slot and (b) drain the queued backlog at full per-actor utilisation.
+        Deletions are only reduced, never grown.
+
+        This guard exists because the Rust ``FragmentationBasedAutoscaler``
+        optimises throughput fairness and is blind to queue depth and
+        in-flight work: when the upstream source finishes, measured throughput
+        falls to zero and Rust can propose deleting most of a stage's actors
+        in a single cycle (e.g. ``20 -> 2``), stranding tasks already in the
+        queue and starving downstream GPU stages.
+
+        ::
+
+            Drain-tail cliff (upstream stops at t0; queue still = Q > 0 tasks):
+
+              workers
+                 ^
+              W0 +=*.
+                 |   `*-.     Rust: throughput=0 -> cuts workers hard
+                 |       `*-.____________________   (queue stranded, GPU idle)
+                 |
+                 |    *-.     guard: w >= ceil(queue / per-actor-capacity)
+                 |       `*-.__   (shrinks only as the queue actually drains)
+               1 +-------------*-.-.-.===========>
+                 +-------t0---------------------------> time
 
         Args:
-            pools: The list of actor pools to update with the new scaling results.
+            pools: Actor pools to update with the new scaling results.
+            upstream_queue_lens: Per-stage upstream queue lengths. Entry
+                ``[i]`` is the number of tasks waiting to be pulled into
+                ``pools[i]`` (the pipeline's input queue for stage ``0``, or
+                ``queues[i - 1]`` for downstream stages). Must have the same
+                length as ``pools``.
+            stage_batch_sizes: Per-stage declared ``stage_batch_size`` values
+                (each must be ``>= 1``). Must have the same length as
+                ``pools``.
+
+        Raises:
+            ValueError: If ``upstream_queue_lens`` or ``stage_batch_sizes``
+                has a length different from ``pools``. This is a caller-side
+                contract violation, not a runtime condition.
+
         """
-        if self._autoscale_future is not None and self._autoscale_future.done():
-            autoscale_result: data_structures.Solution = self._autoscale_future.result()
+        if self._autoscale_future is None or not self._autoscale_future.done():
+            return
 
-            for result, pool in zip(autoscale_result.stages, pools):
-                pool.set_num_slots_per_actor(result.slots_per_worker)
-                logger.debug(
-                    f"Autoscale result for pool {pool.name}: {len(result.new_workers)} new workers, "
-                    f"{len(result.deleted_workers)} deleted workers"
+        if len(upstream_queue_lens) != len(pools) or len(stage_batch_sizes) != len(pools):
+            raise ValueError(
+                f"Guard inputs have mismatched lengths: pools={len(pools)}, "
+                f"upstream_queue_lens={len(upstream_queue_lens)}, "
+                f"stage_batch_sizes={len(stage_batch_sizes)}"
+            )
+
+        autoscale_result: data_structures.Solution = self._autoscale_future.result()
+
+        for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools)):
+            # Snapshot pre-mutation state: the guard must reason about the
+            # ``slots_per_actor`` value under which the current in-flight work
+            # was committed. ``set_num_slots_per_actor`` below only *increases*
+            # slots, so reading after it would underestimate the number of
+            # workers needed to hold the in-flight tasks.
+            pre_slots_per_actor = pool.slots_per_actor
+            pre_inflight_slots = pool.num_used_slots
+            pre_ready_actors = pool.num_ready_actors
+            pre_pool_queued = pool.num_queued_tasks
+
+            pool.set_num_slots_per_actor(result.slots_per_worker)
+            logger.debug(
+                f"Autoscale result for pool {pool.name}: {len(result.new_workers)} new workers, "
+                f"{len(result.deleted_workers)} deleted workers"
+            )
+
+            # Clamp Rust's proposed deletions to the backlog-aware floor
+            # computed from the pre-mutation snapshot
+            deletions = list(result.deleted_workers)
+            proposed_delete_count = len(deletions)
+            if proposed_delete_count > 0:
+                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued
+                required_workers = _required_workers_for_stage(
+                    slots_per_actor=pre_slots_per_actor,
+                    stage_batch_size=stage_batch_sizes[idx],
+                    inflight_slots=pre_inflight_slots,
+                    backlog_samples=backlog_samples,
                 )
-                for w in result.new_workers:
-                    logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
-                    pool.add_actor_to_create(w.to_worker_group(pool.name))
+                max_safe_deletions = max(0, pre_ready_actors - required_workers)
+                allowed_delete_count = min(proposed_delete_count, max_safe_deletions)
+                if allowed_delete_count < proposed_delete_count:
+                    logger.info(
+                        f"Clamped scale-down for stage {pool.name}: "
+                        f"current={pre_ready_actors}, required={required_workers}, "
+                        f"proposed_delete={proposed_delete_count}, allowed_delete={allowed_delete_count}, "
+                        f"upstream_q={upstream_queue_lens[idx]}, pool_q={pre_pool_queued}, "
+                        f"inflight_slots={pre_inflight_slots}, slots_per_actor={pre_slots_per_actor}, "
+                        f"stage_batch_size={stage_batch_sizes[idx]}"
+                    )
+                deletions = deletions[:allowed_delete_count]
 
-                for w in result.deleted_workers:
-                    logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
-                    pool.add_actor_to_delete(w.to_worker_group(pool.name))
+            for w in result.new_workers:
+                logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
+                pool.add_actor_to_create(w.to_worker_group(pool.name))
 
-            self._autoscale_future = None
-            autoscale_end_time = time.time()
-            if autoscale_end_time - self._autoscale_start_time > 1.0:
-                logger.warning(
-                    f"Applying autoscale results took {autoscale_end_time - self._autoscale_start_time} seconds"
-                )
+            for w in deletions:
+                logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
+                pool.add_actor_to_delete(w.to_worker_group(pool.name))
+
+        self._autoscale_future = None
+        autoscale_end_time = time.time()
+        if autoscale_end_time - self._autoscale_start_time > 1.0:
+            logger.warning(f"Applying autoscale results took {autoscale_end_time - self._autoscale_start_time} seconds")
 
 
 def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resources: resources.ClusterResources) -> None:
@@ -632,6 +777,13 @@ def run_pipeline(
     # Create a vector used to track whether a stages are finished or not.
     stage_is_dones = [False for _ in pools]
 
+    # Static per-stage ``stage_batch_size`` values used by the backlog-aware
+    # scale-down guard. Stage batch sizes do not change over the
+    # pipeline's lifetime, so build once outside the main loop.
+    stage_batch_sizes: list[int] = [
+        typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
+    ]
+
     autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
@@ -658,8 +810,14 @@ def run_pipeline(
         while True:
             new_stats = StreamingExecutorTiming(time.time())
 
-            # Apply autoscale results if they are ready.
-            autoscaler.apply_autoscale_result_if_ready(pools)
+            # Apply autoscale results if they are ready. Compute the
+            # per-stage upstream queue lengths used by the backlog-aware
+            # scale-down guard: stage 0 draws from the pipeline
+            # input queue; every other stage draws from ``queues[idx - 1]``.
+            upstream_queue_lens: list[int] = [
+                len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(len(pools))
+            ]
+            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_batch_sizes)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
