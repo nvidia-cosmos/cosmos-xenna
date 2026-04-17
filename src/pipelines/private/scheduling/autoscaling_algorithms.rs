@@ -2250,7 +2250,7 @@ mod tests {
         // run of the autoscaler produces no changes.
 
         // Create a cluster with plenty of resources
-        let cluster = make_cluster(100, 24, 8, 4, 4, false);
+        let cluster = make_cluster(100, 24, 8, false);
 
         let mut stages = Vec::new();
         let mut speeds = Vec::new();
@@ -2259,9 +2259,9 @@ mod tests {
         stages.push(ds::ProblemStage {
             name: format!("stage_{}", cur_stage_idx),
             stage_batch_size: 1,
-            worker_shape: rds::WorkerShapeWrapper {
-                inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 1.0 }),
-            },
+            worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::from_num(1.0),
+            }),
             requested_num_workers: None,
             over_provision_factor: None,
         });
@@ -2272,14 +2272,10 @@ mod tests {
             stages.push(ds::ProblemStage {
                 name: format!("stage_{}", cur_stage_idx),
                 stage_batch_size: 1,
-                worker_shape: rds::WorkerShapeWrapper {
-                    inner: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
-                        num_gpus: 0.1,
-                        num_cpus: 1.0,
-                        num_nvdecs: 0,
-                        num_nvencs: 0,
-                    }),
-                },
+                worker_shape: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                    gpu_fraction: rds::FixedUtil::from_num(0.1),
+                    num_cpus: rds::FixedUtil::from_num(1.0),
+                }),
                 requested_num_workers: None,
                 over_provision_factor: None,
             });
@@ -2291,14 +2287,10 @@ mod tests {
             stages.push(ds::ProblemStage {
                 name: format!("stage_{}", cur_stage_idx),
                 stage_batch_size: 1,
-                worker_shape: rds::WorkerShapeWrapper {
-                    inner: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
-                        num_gpus: 0.1,
-                        num_cpus: 1.0,
-                        num_nvdecs: 1,
-                        num_nvencs: 2,
-                    }),
-                },
+                worker_shape: rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                    gpu_fraction: rds::FixedUtil::from_num(0.1),
+                    num_cpus: rds::FixedUtil::from_num(1.0),
+                }),
                 requested_num_workers: None,
                 over_provision_factor: None,
             });
@@ -2309,9 +2301,9 @@ mod tests {
         stages.push(ds::ProblemStage {
             name: format!("stage_{}", cur_stage_idx),
             stage_batch_size: 1,
-            worker_shape: rds::WorkerShapeWrapper {
-                inner: rds::WorkerShape::CpuOnly(rds::CpuOnly { num_cpus: 1.0 }),
-            },
+            worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::from_num(1.0),
+            }),
             requested_num_workers: None,
             over_provision_factor: None,
         });
@@ -2343,7 +2335,7 @@ mod tests {
                 .zip(solution1.stages.iter())
                 .map(|(p, s)| ds::ProblemStageState {
                     stage_name: p.name.clone(),
-                    workers: s.new_workers.clone(),
+                    worker_groups: s.new_workers.clone(),
                     slots_per_worker: s.slots_per_worker,
                     is_finished: false,
                 })

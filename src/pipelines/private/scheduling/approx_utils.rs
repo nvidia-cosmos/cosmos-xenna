@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 pub const EPSILON: f64 = 1e-6;
 
 /// Compare two floats with epsilon tolerance.
