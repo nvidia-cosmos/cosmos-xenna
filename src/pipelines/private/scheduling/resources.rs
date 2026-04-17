@@ -752,7 +752,11 @@ impl NodeResources {
     }
 
     pub fn used_pool(&self) -> PoolOfResources {
-        let gpu_used: f32 = self.gpus.iter().map(|g| g.used_fraction.to_num::<f32>()).sum();
+        let gpu_used: f32 = self
+            .gpus
+            .iter()
+            .map(|g| g.used_fraction.to_num::<f32>())
+            .sum();
         PoolOfResources {
             cpus: self.used_cpus.to_num::<f32>(),
             gpus: gpu_used,
@@ -760,7 +764,11 @@ impl NodeResources {
     }
 
     pub fn free_pool(&self) -> PoolOfResources {
-        let gpu_free: f32 = self.gpus.iter().map(|g| 1.0 - g.used_fraction.to_num::<f32>()).sum();
+        let gpu_free: f32 = self
+            .gpus
+            .iter()
+            .map(|g| 1.0 - g.used_fraction.to_num::<f32>())
+            .sum();
         PoolOfResources {
             cpus: self.total_cpus.to_num::<f32>() - self.used_cpus.to_num::<f32>(),
             gpus: gpu_free,
@@ -1014,15 +1022,23 @@ impl ClusterResources {
     }
 
     pub fn used_pool(&self) -> PoolOfResources {
-        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.used_pool()))
+        self.nodes
+            .values()
+            .fold(PoolOfResources::default(), |acc, n| acc.add(&n.used_pool()))
     }
 
     pub fn free_pool(&self) -> PoolOfResources {
-        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.free_pool()))
+        self.nodes
+            .values()
+            .fold(PoolOfResources::default(), |acc, n| acc.add(&n.free_pool()))
     }
 
     pub fn total_pool(&self) -> PoolOfResources {
-        self.nodes.values().fold(PoolOfResources::default(), |acc, n| acc.add(&n.total_pool()))
+        self.nodes
+            .values()
+            .fold(PoolOfResources::default(), |acc, n| {
+                acc.add(&n.total_pool())
+            })
     }
 
     pub fn make_detailed_utilization_table(&self) -> String {
