@@ -81,13 +81,26 @@ def _make_deleted_worker(worker_id: str = "w") -> MagicMock:
     return w
 
 
-def _make_autoscaler_with_solution(solution: MagicMock) -> Autoscaler:
-    """Construct an ``Autoscaler`` bypassing ``__init__`` and pre-loaded solution."""
+def _make_autoscaler_with_solution(solution: MagicMock, enable_backlog_guard: bool = True) -> Autoscaler:
+    """Construct an ``Autoscaler`` bypassing ``__init__`` with a pre-loaded solution.
+
+    Args:
+        solution: Mock ``Solution`` returned by ``self._autoscale_future.result()``.
+        enable_backlog_guard: Value for ``Autoscaler._enable_backlog_guard``.
+            Defaults to ``True`` so existing tests continue to exercise the
+            active-guard path. Set to ``False`` to verify the disabled path.
+
+    Returns:
+        An ``Autoscaler`` instance with the minimal attributes required by
+        ``apply_autoscale_result_if_ready``.
+
+    """
     autoscaler = object.__new__(Autoscaler)
     future: concurrent.futures.Future[MagicMock] = concurrent.futures.Future()
     future.set_result(solution)
     autoscaler._autoscale_future = future
     autoscaler._autoscale_start_time = 0.0
+    autoscaler._enable_backlog_guard = enable_backlog_guard
     return autoscaler
 
 
@@ -414,6 +427,112 @@ def test_logs_clamping_at_info_level(loguru_caplog: pytest.LogCaptureFixture) ->
     assert "proposed_delete=11" in message
     assert "allowed_delete=0" in message
     assert "pool_q=20" in message
+
+
+@pytest.mark.parametrize(
+    (
+        "ready_actors",
+        "slots_per_actor",
+        "stage_batch_size",
+        "inflight_slots",
+        "queued_tasks",
+        "upstream_q",
+        "proposed_deletions",
+        "enable_guard",
+        "expected_deletions",
+        "expect_clamp_log",
+    ),
+    [
+        # ----- Scenario 1: heavy upstream backlog -----
+        # backlog=20, slots=2, batch=1 -> required = ceil(20/2) = 10 workers
+        # ready=10 -> max_safe = 0; guard refuses all 5 deletions
+        # disabled bypasses entirely -> all 5 pass through
+        pytest.param(10, 2, 1, 0, 0, 20, 5, True, 0, True, id="heavy_upstream_backlog_guard_on"),
+        pytest.param(10, 2, 1, 0, 0, 20, 5, False, 5, False, id="heavy_upstream_backlog_guard_off"),
+        # ----- Scenario 2: pool's own queue backlog (same arithmetic) -----
+        # Confirms the guard sums upstream_q AND pool's num_queued_tasks
+        pytest.param(10, 2, 1, 0, 20, 0, 5, True, 0, True, id="pool_queue_backlog_guard_on"),
+        pytest.param(10, 2, 1, 0, 20, 0, 5, False, 5, False, id="pool_queue_backlog_guard_off"),
+        # ----- Scenario 3: in-flight dominates the floor -----
+        # inflight=8, slots=2 -> required = ceil(8/2) = 4
+        # ready=10, max_safe = 6; proposed=9 -> allowed=min(9,6)=6
+        # disabled passes all 9 through (does NOT preserve in-flight slots)
+        pytest.param(10, 2, 1, 8, 0, 0, 9, True, 6, True, id="inflight_dominates_guard_on"),
+        pytest.param(10, 2, 1, 8, 0, 0, 9, False, 9, False, id="inflight_dominates_guard_off"),
+        # ----- Scenario 4: drain-tail with no work -----
+        # required = max(MIN_WORKERS_PER_STAGE=1, 0, 0) = 1
+        # ready=5, max_safe=4; proposed=5 -> guard keeps 1 alive (allows 4)
+        # disabled allows all 5 (no floor protection at all)
+        pytest.param(5, 1, 1, 0, 0, 0, 5, True, 4, True, id="drain_tail_guard_on"),
+        pytest.param(5, 1, 1, 0, 0, 0, 5, False, 5, False, id="drain_tail_guard_off"),
+        # ----- Scenario 5: mixed in-flight + backlog -----
+        # inflight=4 -> w_inflight = 2; backlog=10, slots=2, batch=1 -> w_backlog = 5
+        # required = max(1, 2, 5) = 5; ready=8, max_safe=3; proposed=6 -> allowed=3
+        pytest.param(8, 2, 1, 4, 10, 0, 6, True, 3, True, id="inflight_plus_backlog_guard_on"),
+        pytest.param(8, 2, 1, 4, 10, 0, 6, False, 6, False, id="inflight_plus_backlog_guard_off"),
+        # ----- Scenario 6: partial clamping (Rust proposal exceeds safe budget) -----
+        # backlog=6, slots=2, batch=1 -> required = ceil(6/2) = 3
+        # ready=10, max_safe=7; proposed=8 -> allowed=7 (one held back)
+        # disabled passes all 8 through -- single-deletion difference still
+        # produces the clamp log under guard=True.
+        pytest.param(10, 2, 1, 0, 0, 6, 8, True, 7, True, id="partial_clamp_guard_on"),
+        pytest.param(10, 2, 1, 0, 0, 6, 8, False, 8, False, id="partial_clamp_guard_off"),
+        # ----- Scenario 7: no work AND no clamping needed -----
+        # required = MIN_WORKERS_PER_STAGE = 1; ready=20, proposed=3
+        # max_safe=19, allowed=min(3,19)=3 -- guard still permits all 3.
+        # No clamping happens, so no log line under guard=True either.
+        pytest.param(20, 2, 1, 0, 0, 0, 3, True, 3, False, id="no_clamp_needed_guard_on"),
+        pytest.param(20, 2, 1, 0, 0, 0, 3, False, 3, False, id="no_clamp_needed_guard_off"),
+    ],
+)
+def test_guard_flag_governs_deletion_clamping(
+    loguru_caplog: pytest.LogCaptureFixture,
+    ready_actors: int,
+    slots_per_actor: int,
+    stage_batch_size: int,
+    inflight_slots: int,
+    queued_tasks: int,
+    upstream_q: int,
+    proposed_deletions: int,
+    enable_guard: bool,
+    expected_deletions: int,
+    expect_clamp_log: bool,
+) -> None:
+    """Verify ``apply_autoscale_result_if_ready`` honours ``_enable_backlog_guard``.
+
+    Each parameter row captures one (pool state, Rust proposal, guard flag)
+    combination, alongside the expected number of accepted deletions and
+    whether a ``Clamped scale-down`` INFO log must be emitted. Pairs with
+    matching ``..._on`` / ``..._off`` ids prove the flag flips behavior
+    while holding all other inputs constant.
+    """
+    pool = _make_mock_pool(
+        num_ready_actors=ready_actors,
+        num_used_slots=inflight_slots,
+        slots_per_actor=slots_per_actor,
+        num_queued_tasks=queued_tasks,
+    )
+    solution = _make_solution(
+        [_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(proposed_deletions)])]
+    )
+    autoscaler = _make_autoscaler_with_solution(solution, enable_backlog_guard=enable_guard)
+
+    autoscaler.apply_autoscale_result_if_ready(
+        pools=[pool],
+        upstream_queue_lens=[upstream_q],
+        stage_batch_sizes=[stage_batch_size],
+    )
+
+    assert pool.add_actor_to_delete.call_count == expected_deletions, (
+        f"deletion count mismatch: expected {expected_deletions}, got {pool.add_actor_to_delete.call_count}"
+    )
+    clamp_messages = [rec.getMessage() for rec in loguru_caplog.records if "Clamped scale-down" in rec.getMessage()]
+    if expect_clamp_log:
+        assert len(clamp_messages) == 1, f"expected exactly one clamp log, got {clamp_messages!r}"
+        assert f"proposed_delete={proposed_deletions}" in clamp_messages[0]
+        assert f"allowed_delete={expected_deletions}" in clamp_messages[0]
+    else:
+        assert clamp_messages == [], f"unexpected clamp log emitted: {clamp_messages!r}"
 
 
 def test_no_future_does_nothing() -> None:

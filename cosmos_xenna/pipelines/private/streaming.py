@@ -290,6 +290,47 @@ class Autoscaler:
     The `Autoscaler` is implemented as a context manager to ensure that the
     background thread executor is properly shut down upon exit.
 
+    Multi-stage allocation policy
+    -----------------------------
+    The Rust ``run_fragmentation_autoscaler`` (driven by
+    ``FragmentationBasedAutoscaler``) decides per-stage worker counts in
+    four phases on every cycle, using a single shared ``ClusterResources``
+    snapshot:
+
+      * Phase 1 - honour ``requested_num_workers`` for manual stages.
+      * Phase 2 (FLOOR) - every non-manual, non-finished stage gets at
+        least one worker. Prevents downstream starvation when an
+        upstream stage would otherwise consume the whole cluster.
+      * Phase 3 (PREEMPTION) - max-min loop: while the slowest stage
+        can be grown (directly via free CPU, or by stealing one worker
+        from a "donor" stage that stays above the current minimum
+        throughput after losing it), keep doing so. This is the
+        mechanism that re-balances workers from over-provisioned
+        upstream stages toward a slower downstream bottleneck.
+      * Phase 4 (HEADROOM) - controlled over-allocation up to
+        ``base_min * overallocation_target`` (default 1.5).
+
+    Apply-side invariants (this class + ``ActorPool``):
+
+      * The streaming main loop runs a two-pass apply each cycle:
+        first ``pool.delete_worker_groups()`` on every active pool to
+        return resources to the cluster, then ``pool.update()`` on
+        every active pool to run creations. This guarantees that
+        CPU/GPU freed by a delete in stage N is visible to a create
+        in stage M of the same cycle.
+      * ``ActorPool._adjust_actors`` preserves the same
+        delete-before-create ordering within a single pool. In the
+        streaming path the ``delete_worker_groups()`` two-pass has
+        already drained pending deletions before ``_adjust_actors``
+        runs, so this in-pool ordering is primarily a safety net
+        (and the canonical ordering in batch mode).
+      * Even with that ordering, the planner's per-node placement is
+        a snapshot from up to ``autoscale_interval_s`` ago. If actual
+        per-node CPU has drifted (a worker died, or another stage
+        consumed CPU outside the planner's view), an individual
+        ``_add_worker_group`` can still surface ``AllocationError``
+        and is retried on the next cycle.
+
     Attributes:
         _verbosity_level: The level of logging verbosity.
         _allocator: An instance of `WorkerAllocator` to manage worker resources.
@@ -300,6 +341,11 @@ class Autoscaler:
             any previous results have been applied.
         _autoscale_start_time: The timestamp when the last autoscaling calculation
             was started.
+        _enable_backlog_guard: When True, ``apply_autoscale_result_if_ready``
+            clamps Rust-proposed deletions so surviving workers can still
+            drain the queued backlog. When False, all deletions pass through
+            unchanged (original main-branch behavior). Sourced from
+            ``StreamingSpecificSpec.enable_backlog_aware_scaledown``.
     """
 
     # Floor for the backlog-aware scale-down guard (see
@@ -336,6 +382,7 @@ class Autoscaler:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
+        self._enable_backlog_guard: bool = pipeline_spec.config.mode_specific.enable_backlog_aware_scaledown
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -492,7 +539,7 @@ class Autoscaler:
             # computed from the pre-mutation snapshot
             deletions = list(result.deleted_workers)
             proposed_delete_count = len(deletions)
-            if proposed_delete_count > 0:
+            if self._enable_backlog_guard and proposed_delete_count > 0:
                 backlog_samples = upstream_queue_lens[idx] + pre_pool_queued
                 required_workers = _required_workers_for_stage(
                     slots_per_actor=pre_slots_per_actor,

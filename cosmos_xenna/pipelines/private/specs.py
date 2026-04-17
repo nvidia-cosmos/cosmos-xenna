@@ -372,6 +372,13 @@ class StreamingSpecificSpec:
     # Add verbosity level for the autoscaler
     autoscaler_verbosity_level: VerbosityLevel = VerbosityLevel.NONE
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
+    # Backlog-aware scale-down guard.
+    #
+    # When True (default), the autoscaler clamps Rust-proposed worker
+    # deletions so that the surviving workers can still drain the queued
+    # backlog (upstream queue + this pool's own queue) at the pre-scaling
+    # ``slots_per_actor``.
+    enable_backlog_aware_scaledown: bool = True
 
 
 @attrs.define
