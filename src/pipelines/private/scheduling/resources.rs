@@ -1968,6 +1968,140 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Fragmentation-classifier tests for AllocationError enrichment.
+    //
+    //   per_gpu_free             -- parallel vector of 1.0 - used_fraction,
+    //                               indexed by GpuAllocation.offset.
+    //   fragmentation_suspected  -- true iff aggregate CPU + aggregate GPU
+    //                               free cover the request yet at least one
+    //                               requested GPU slot cannot fit in a single
+    //                               physical GPU at its current utilisation.
+    //
+    // These tests pin the classifier behaviour on the three operational
+    // scenarios:
+    //   (A) CPU path fails        -> fragmentation_suspected = false
+    //   (B) GPU path fails with
+    //       enough aggregate free  -> fragmentation_suspected = true
+    //   (C) GPU path fails with
+    //       GPUs fully saturated   -> fragmentation_suspected = false
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_fragmentation_suspected_false_when_cpu_under_provisioned() {
+        let mut node = NodeResources::make_uniform(8, 2);
+        node.used_cpus = FixedUtil::from_num(7.0);
+
+        let worker = WorkerResources {
+            node: "n".to_string(),
+            cpus: FixedUtil::from_num(4.0),
+            gpus: vec![],
+        };
+
+        let err = node.allocate(&worker).unwrap_err();
+        match err {
+            AllocationError::NotEnoughResources {
+                fragmentation_suspected,
+                per_gpu_free,
+                ..
+            } => {
+                assert!(
+                    !fragmentation_suspected,
+                    "CPU under-provisioning must not be classified as fragmentation",
+                );
+                assert_eq!(
+                    per_gpu_free.len(),
+                    2,
+                    "per_gpu_free must snapshot every GPU on the node even for CPU-only failures",
+                );
+            }
+            other => panic!("Expected NotEnoughResources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fragmentation_suspected_true_when_gpus_half_used() {
+        let mut node = NodeResources::make_uniform(8, 4);
+        for gpu in &mut node.gpus {
+            gpu.used_fraction = FixedUtil::from_num(0.5);
+        }
+
+        let worker = WorkerResources {
+            node: "n".to_string(),
+            cpus: FixedUtil::from_num(1.0),
+            gpus: vec![GpuAllocation {
+                offset: 0,
+                used_fraction: FixedUtil::from_num(1.0),
+            }],
+        };
+
+        let err = node.allocate(&worker).unwrap_err();
+        match err {
+            AllocationError::NotEnoughResources {
+                fragmentation_suspected,
+                per_gpu_free,
+                available,
+                ..
+            } => {
+                assert!(
+                    fragmentation_suspected,
+                    "4 half-used GPUs must be classified as fragmentation when a single 1.0 slot is requested",
+                );
+                assert_eq!(per_gpu_free.len(), 4);
+                for free in &per_gpu_free {
+                    assert!(
+                        (free - 0.5).abs() < 1e-4,
+                        "per_gpu_free entry {free} should be ~0.5",
+                    );
+                }
+                assert!(
+                    available.gpus > 1.0,
+                    "aggregate GPU free {} must cover request 1.0 for this to be fragmentation",
+                    available.gpus,
+                );
+            }
+            other => panic!("Expected NotEnoughResources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fragmentation_suspected_false_when_gpus_genuinely_exhausted() {
+        let mut node = NodeResources::make_uniform(8, 2);
+        for gpu in &mut node.gpus {
+            gpu.used_fraction = FixedUtil::ONE;
+        }
+
+        let worker = WorkerResources {
+            node: "n".to_string(),
+            cpus: FixedUtil::from_num(1.0),
+            gpus: vec![GpuAllocation {
+                offset: 0,
+                used_fraction: FixedUtil::from_num(1.0),
+            }],
+        };
+
+        let err = node.allocate(&worker).unwrap_err();
+        match err {
+            AllocationError::NotEnoughResources {
+                fragmentation_suspected,
+                per_gpu_free,
+                ..
+            } => {
+                assert!(
+                    !fragmentation_suspected,
+                    "fully saturated GPUs must not be classified as fragmentation",
+                );
+                for free in &per_gpu_free {
+                    assert!(
+                        *free < 1e-4,
+                        "per_gpu_free entry {free} should be ~0.0 for saturated GPUs",
+                    );
+                }
+            }
+            other => panic!("Expected NotEnoughResources, got {other:?}"),
+        }
+    }
+
     // ============================================================================
     // ClusterResources Tests
     // ============================================================================
