@@ -38,7 +38,7 @@ from ray.actor import ActorHandle
 from ray.util.metrics import Counter
 
 from cosmos_xenna.pipelines.private import allocator, resources
-from cosmos_xenna.pipelines.private.allocator import AllocationError
+from cosmos_xenna.pipelines.private.allocator import AllocationError  # type: ignore[attr-defined]
 from cosmos_xenna.ray_utils import monitoring, stage, stage_worker
 from cosmos_xenna.utils import grouping, stats, timing
 from cosmos_xenna.utils import python_log as logger
