@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # Object Store Downloader
 //!
 //! This module defines the core data plane logic for downloading files from an object store

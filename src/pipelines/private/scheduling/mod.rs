@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 pub mod allocator;
 pub mod approx_utils;
 pub mod autoscaling_algorithms;
