@@ -19,6 +19,7 @@ import time
 import pytest
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
+from cosmos_xenna.utils.ci import is_running_in_cicd
 
 
 class _ProcessStage(pipelines_v1.Stage):
@@ -28,7 +29,10 @@ class _ProcessStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=0.5, gpus=0.0)
+        # Scale per-stage CPU requirements for CI jobs
+        # (1 + 10 workers per node => 0.25 + 2.5 = 2.75 total).
+        cpus = 0.25 if is_running_in_cicd() else 0.5
+        return pipelines_v1.Resources(cpus=cpus, gpus=0.0)
 
     @property
     def stage_batch_size(self) -> int:

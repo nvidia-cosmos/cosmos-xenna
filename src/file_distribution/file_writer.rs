@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # File Writer Pool
 //!
 //! This module implements a thread pool for asynchronous file writing operations.
