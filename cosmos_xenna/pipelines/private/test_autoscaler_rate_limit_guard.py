@@ -27,6 +27,7 @@ import pytest
 
 from cosmos_xenna.pipelines.private.specs import StreamingSpecificSpec
 from cosmos_xenna.pipelines.private.streaming import Autoscaler
+from cosmos_xenna.utils import verbosity
 
 
 def _make_mock_worker(worker_id: str = "w1") -> MagicMock:
@@ -74,7 +75,7 @@ def _make_autoscaler(max_scale_down_fraction: float = 0.5) -> Autoscaler:
     autoscaler = object.__new__(Autoscaler)
     autoscaler._autoscale_future = None
     autoscaler._autoscale_start_time = 0.0
-    autoscaler._verbosity_level = 0
+    autoscaler._verbosity_level = verbosity.VerbosityLevel.NONE
     autoscaler._max_scale_down_fraction = max_scale_down_fraction
     return autoscaler
 
