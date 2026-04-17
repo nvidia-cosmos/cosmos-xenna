@@ -1,0 +1,173 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  IS_RUNNING_IN_CICD: "1"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Python lint — platform-independent, so only runs on x86_64.
+  # Runs on PRs only.
+  # -------------------------------------------------------------------
+  python-lint:
+    name: Python Lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies and build extension
+        run: |
+          uv sync
+          uv run maturin develop --release
+
+      - name: Lint (ruff, pyright, license headers)
+        run: uv run run_presubmit.py lint --no-fix
+
+  # -------------------------------------------------------------------
+  # Python tests — on both x86_64 and arm64.
+  # -------------------------------------------------------------------
+  python-test:
+    name: Python Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies and build extension
+        run: |
+          uv sync
+          uv run maturin develop --release
+
+      - name: Unit tests
+        run: uv run run_presubmit.py unit-test
+
+  # -------------------------------------------------------------------
+  # Rust lint — platform-independent, so only runs on x86_64.
+  # Runs on PRs only.
+  # -------------------------------------------------------------------
+  rust-lint:
+    name: Rust Lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # -------------------------------------------------------------------
+  # Rust tests — on both x86_64 and arm64.
+  # -------------------------------------------------------------------
+  rust-test:
+    name: Rust Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: ". -> target"
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo test (release)
+        run: cargo test --release --features release-tests
+
+  # -------------------------------------------------------------------
+  # Gate job: single required status check for branch protection rules.
+  #
+  # On PRs: all four jobs must succeed.
+  # On push to main: lint jobs are skipped; only tests must succeed.
+  # -------------------------------------------------------------------
+  ci-pass:
+    name: CI Pass
+    if: always()
+    needs: [python-lint, python-test, rust-lint, rust-test]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          results=("${{ needs.python-lint.result }}" \
+                   "${{ needs.python-test.result }}" \
+                   "${{ needs.rust-lint.result }}" \
+                   "${{ needs.rust-test.result }}")
+          for r in "${results[@]}"; do
+            # "skipped" is acceptable — lint jobs are intentionally skipped on push to main.
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
+              echo "::error::One or more CI jobs did not succeed (got: $r)"
+              exit 1
+            fi
+          done

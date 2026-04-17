@@ -72,6 +72,16 @@ pub enum P2pServerError {
 
     #[error("Health check failed: {0}")]
     HealthCheck(#[from] reqwest::Error),
+
+    #[error("Failed to bind to {addr}: {source}")]
+    Bind {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Server thread exited before signaling readiness")]
+    StartupAborted,
 }
 
 impl From<P2pServerError> for PyErr {
@@ -378,7 +388,7 @@ impl P2pServer {
 impl P2pServer {
     #[new]
     #[pyo3(signature = (port, node_id, is_test=false))]
-    pub fn new(port: u16, node_id: String, is_test: bool) -> Self {
+    pub fn new(port: u16, node_id: String, is_test: bool) -> Result<Self, P2pServerError> {
         // Reset the counter to prevent accumulation from previous instances
         ACTIVE_UPLOADS.store(0, Ordering::Relaxed);
 
@@ -392,6 +402,11 @@ impl P2pServer {
         };
         let server_config = Arc::new(ServerConfig { node_id, is_test });
 
+        // Signal readiness back to the caller once the TCP listener is bound.
+        // This prevents a race where the server isn't yet accepting connections
+        // when the first health check arrives.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), std::io::Error>>();
+
         let server_handle = thread::spawn(move || {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
@@ -399,18 +414,27 @@ impl P2pServer {
                     Ok(listener) => listener,
                     Err(e) => {
                         eprintln!("Failed to bind to {}: {}", addr, e);
+                        let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
                 println!("P2P server listening on {}", addr);
+                if ready_tx.send(Ok(())).is_err() {
+                    // Caller already gave up; don't bother serving.
+                    return;
+                }
                 server_main(shutdown_rx, listener, server_config).await;
             });
         });
 
-        P2pServer {
-            shutdown_tx: shutdown_tx_clone,
-            server_handle: Some(server_handle),
-            addr,
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(P2pServer {
+                shutdown_tx: shutdown_tx_clone,
+                server_handle: Some(server_handle),
+                addr,
+            }),
+            Ok(Err(source)) => Err(P2pServerError::Bind { addr, source }),
+            Err(_) => Err(P2pServerError::StartupAborted),
         }
     }
 

@@ -248,7 +248,9 @@ fn find_cached_things_and_remove_invalid(
 
     let objects_no_unpacking: HashSet<Uuid> = cached_objects
         .iter()
-        .filter(|id| !objects_already_unpacked.contains(id) && !objects_needed_to_be_unpacked.contains(id))
+        .filter(|id| {
+            !objects_already_unpacked.contains(id) && !objects_needed_to_be_unpacked.contains(id)
+        })
         .copied()
         .collect();
 
@@ -699,12 +701,12 @@ impl DataPlane {
         }
     }
 
-    pub fn start_p2p_server(&mut self, port: Option<u16>) -> u16 {
+    pub fn start_p2p_server(&mut self, port: Option<u16>) -> Result<u16, P2pServerError> {
         let port = port
             .or_else(|| Some(portpicker::pick_unused_port().unwrap()))
             .unwrap();
-        self.p2p_server = Some(P2pServer::new(port, self.node_id.clone(), self.is_test));
-        port
+        self.p2p_server = Some(P2pServer::new(port, self.node_id.clone(), self.is_test)?);
+        Ok(port)
     }
 
     pub fn start(&mut self) -> Result<(), OrchestratorError> {

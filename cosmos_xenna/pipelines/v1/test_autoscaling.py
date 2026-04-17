@@ -26,6 +26,7 @@ import pytest
 
 import cosmos_xenna.pipelines.v1 as pipelines_v1
 from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.utils.ci import is_running_in_cicd
 
 
 class _ProcessStage(pipelines_v1.Stage):
@@ -39,7 +40,9 @@ class _ProcessStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=1.0, gpus=0.0)
+        # Scale per-stage CPU requirements for CI jobs (5 stages => 2.5 total).
+        cpus = 0.5 if is_running_in_cicd() else 1.0
+        return pipelines_v1.Resources(cpus=cpus, gpus=0.0)
 
     def setup(self, worker_metadata: resources.WorkerMetadata) -> None:
         time.sleep(self._setup_dur)

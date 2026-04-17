@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! # Unpacker Worker Pool
 //!
 //! This module is responsible for unpacking archived files.

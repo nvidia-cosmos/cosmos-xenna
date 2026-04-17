@@ -21,6 +21,7 @@ import pytest  # noqa: F401
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
 from cosmos_xenna.utils import python_log as logger
+from cosmos_xenna.utils.ci import is_running_in_cicd
 
 
 @attrs.define
@@ -67,7 +68,9 @@ class SimpleStage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=5.0, gpus=0.0)
+        # Scale per-stage CPU requirements for CI jobs.
+        cpus = 1.0 if is_running_in_cicd() else 5.0
+        return pipelines_v1.Resources(cpus=cpus, gpus=0.0)
 
     def process_data(self, samples: list[_Sample]) -> list[_Sample]:
         return samples

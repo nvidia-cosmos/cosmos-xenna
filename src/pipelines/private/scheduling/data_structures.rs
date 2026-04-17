@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Data structures used by autoscaling algorithms and simulations.
 //!
 //! This module presents an interface for autoscaling algorithms. This interface formulates the autoscaling information as
