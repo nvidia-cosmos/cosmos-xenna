@@ -26,6 +26,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  IS_RUNNING_IN_CICD: "1"
 
 jobs:
   # -------------------------------------------------------------------
@@ -36,8 +37,6 @@ jobs:
     name: Python Lint
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
-    env:
-      IS_RUNNING_IN_CICD: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -70,8 +69,6 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-22.04, ubuntu-22.04-arm]
-    env:
-      IS_RUNNING_IN_CICD: "1"
     steps:
       - uses: actions/checkout@v4
 

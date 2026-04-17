@@ -19,6 +19,7 @@ import time
 import pytest  # noqa: F401
 
 from cosmos_xenna.pipelines import v1 as pipelines_v1
+from cosmos_xenna.utils.ci import is_running_in_cicd
 
 
 class Stage(pipelines_v1.Stage):
@@ -31,7 +32,9 @@ class Stage(pipelines_v1.Stage):
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
-        return pipelines_v1.Resources(cpus=2.0, gpus=0.0)
+        # Scale per-stage CPU requirements for CI jobs.
+        cpus = 1.0 if is_running_in_cicd() else 2.0
+        return pipelines_v1.Resources(cpus=cpus, gpus=0.0)
 
     def setup_on_node(self, node_info: pipelines_v1.NodeInfo, worker_metadata: pipelines_v1.WorkerMetadata) -> None:
         self._setup_on_node_result = True
