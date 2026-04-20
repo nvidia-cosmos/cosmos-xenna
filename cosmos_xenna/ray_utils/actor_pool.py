@@ -901,6 +901,17 @@ class ActorPool(Generic[T, V]):
     def _add_worker_group(self, worker: resources.WorkerGroup) -> bool:
         """Add a worker group, allocating resources and creating actors.
 
+        Ordering invariant (do NOT change without considering port leaks):
+        the Rust allocator gate runs FIRST, before any SPMD-only side
+        effects - specifically the rendezvous-port registration in
+        ``self._cluster_port_registry`` and its ``ray.get`` RPC. The
+        ``_cluster_port_registry`` is only cleaned up in
+        ``_delete_worker_group``, which is unreachable for a worker
+        group that was never inserted into ``self._worker_groups``.
+        Registering the port before the allocator gate would therefore
+        permanently leak a port entry on every ``AllocationError``
+        (and waste a synchronous RPC on the hot failure path).
+
         ``AllocationError`` from the Rust ``WorkerAllocator`` (TOCTOU race
         with stale resource snapshot) is caught and logged at WARNING level;
         the next autoscale cycle will retry with a fresh snapshot.
@@ -909,13 +920,7 @@ class ActorPool(Generic[T, V]):
             True if the worker group was created successfully, False if the
             allocation was skipped due to a stale-snapshot race.
         """
-        if self._is_spmd:
-            rendevous_params = self._find_rendevous_params_for_worker_group(worker)
-        else:
-            rendevous_params = None
-
-        logger.trace(f"Adding worker group: {worker.id}")
-        worker_group = _WorkerGroup(worker, set(), _WorkerGroupState.WAITING_FOR_SETUP, rendevous_params)
+        # Allocator gate first - short-circuit before any SPMD side effects.
         try:
             self._allocator.add_worker(worker)
         except AllocationError as e:
@@ -925,6 +930,16 @@ class ActorPool(Generic[T, V]):
                 f"(will retry on next autoscale cycle): {e}",
             )
             return False
+
+        # Only after the allocator has accepted the worker do we acquire
+        # the SPMD rendezvous params (which registers a port on the node).
+        if self._is_spmd:
+            rendevous_params = self._find_rendevous_params_for_worker_group(worker)
+        else:
+            rendevous_params = None
+
+        logger.trace(f"Adding worker group: {worker.id}")
+        worker_group = _WorkerGroup(worker, set(), _WorkerGroupState.WAITING_FOR_SETUP, rendevous_params)
         if self._is_spmd:
             logger.trace(f"Creating SPMD actors for worker group: {worker_group.worker_group.id}")
             splits = worker.split_allocation_per_gpu()

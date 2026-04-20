@@ -78,6 +78,57 @@ def _make_pool_with_queue(worker_groups: list[MagicMock]) -> MagicMock:
     return pool
 
 
+def _make_spmd_pool(worker_groups: list[MagicMock]) -> MagicMock:
+    """Build an ``ActorPool`` mock configured for the SPMD code path.
+
+    Same pattern as ``_make_pool_with_queue`` but flips ``_is_spmd`` and
+    wires a mock ``_cluster_port_registry`` so SPMD-specific side effects
+    (port registration, rendezvous lookup) are observable in assertions.
+
+    ``_find_rendevous_params_for_worker_group`` and
+    ``_create_actor_for_worker_group`` stay as auto-spec MagicMocks so the
+    test exercises only the ordering logic in ``_add_worker_group``,
+    not the rendezvous RPC or actor-spawn machinery.
+    """
+    import cosmos_xenna.ray_utils.actor_pool as ap_module
+
+    ap_module.AllocationError = _AllocationError  # type: ignore[misc]
+
+    pool = MagicMock(spec=ap_module.ActorPool)
+    pool.name = "SpmdStage"
+    pool._is_spmd = True
+    pool._allocator = MagicMock()
+    pool._cluster_port_registry = MagicMock()
+    pool._worker_groups = {}
+    pool._worker_groups_to_delete = collections.deque()
+    pool._worker_groups_to_create = collections.deque(worker_groups)
+    pool._find_rendevous_params_for_worker_group = MagicMock(return_value=MagicMock(master_port=29500))
+    pool._adjust_actors = ap_module.ActorPool._adjust_actors.__get__(pool)
+    pool._add_worker_group = ap_module.ActorPool._add_worker_group.__get__(pool)
+    return pool
+
+
+def _make_spmd_worker_group(worker_id: str = "wg-spmd-1", num_gpus: int = 2) -> MagicMock:
+    """Create a minimal SPMD ``WorkerGroup`` mock.
+
+    ``split_allocation_per_gpu`` returns a list of ``num_gpus`` mock
+    allocations so the SPMD per-GPU actor-creation loop runs that many
+    iterations.
+    """
+    wg = MagicMock()
+    wg.id = worker_id
+    allocation = MagicMock()
+    allocation.node = "node-A"
+    wg.allocations = [allocation]
+    splits = []
+    for _ in range(num_gpus):
+        split = MagicMock()
+        split.node = "node-A"
+        splits.append(split)
+    wg.split_allocation_per_gpu = MagicMock(return_value=splits)
+    return wg
+
+
 class TestAllocationGuard:
     """Tests for the AllocationError guard in _add_worker_group."""
 
@@ -174,3 +225,53 @@ class TestAllocationGuard:
             assert "MyTestStage" in log_msg
             assert "wg-abc" in log_msg
             assert "Allocation error" in log_msg
+
+
+class TestSpmdAllocationOrdering:
+    """Ordering invariant for SPMD ``_add_worker_group``.
+
+    The Rust allocator gate must run before the rendezvous-port lookup
+    so that an ``AllocationError`` cannot leak a port entry into the
+    ``ClusterPortRegistry`` (only cleared in ``_delete_worker_group``,
+    which is unreachable for a worker that was never added).
+    """
+
+    def test_spmd_allocation_failure_does_not_register_port(self) -> None:
+        """SPMD ``AllocationError`` must skip the rendezvous-port lookup entirely."""
+        wg = _make_spmd_worker_group("wg-spmd-fail")
+        pool = _make_spmd_pool([wg])
+        pool._allocator.add_worker.side_effect = _AllocationError("Allocation error: Not enough GPUs on node-A")
+
+        result = pool._add_worker_group(wg)
+
+        assert result is False
+        pool._find_rendevous_params_for_worker_group.assert_not_called()
+        pool._cluster_port_registry.register_port.assert_not_called()
+        assert pool._worker_groups == {}
+        pool._create_actor_for_worker_group.assert_not_called()
+
+    def test_spmd_allocation_success_invokes_rendezvous_and_creates_actors(self) -> None:
+        """On allocator success, rendezvous lookup runs and SPMD per-GPU actors are created."""
+        wg = _make_spmd_worker_group("wg-spmd-ok", num_gpus=2)
+        pool = _make_spmd_pool([wg])
+
+        result = pool._add_worker_group(wg)
+
+        assert result is True
+        pool._find_rendevous_params_for_worker_group.assert_called_once_with(wg)
+        assert pool._create_actor_for_worker_group.call_count == 2
+        assert "wg-spmd-ok" in pool._worker_groups
+
+    def test_allocator_is_called_before_rendezvous_lookup(self) -> None:
+        """Defensive ordering check: allocator gate runs strictly before rendezvous lookup."""
+        wg = _make_spmd_worker_group("wg-spmd-order")
+        pool = _make_spmd_pool([wg])
+
+        parent = MagicMock()
+        parent.attach_mock(pool._allocator.add_worker, "add_worker")
+        parent.attach_mock(pool._find_rendevous_params_for_worker_group, "find_rendezvous")
+
+        pool._add_worker_group(wg)
+
+        method_call_order = [call[0] for call in parent.mock_calls]
+        assert method_call_order.index("add_worker") < method_call_order.index("find_rendezvous")
