@@ -75,7 +75,6 @@ def test_autoscaling() -> None:
             mode_specific=pipelines_v1.StreamingSpecificSpec(
                 autoscale_interval_s=1,
                 autoscaler_verbosity_level=pipelines_v1.VerbosityLevel.DEBUG,
-                enable_backlog_aware_scaledown=False,
             ),
         ),
     )
@@ -287,14 +286,6 @@ def test_autoscaler_preempts_upstream_for_slow_downstream(monkeypatch: pytest.Mo
                     mode_specific=pipelines_v1.StreamingSpecificSpec(
                         autoscale_interval_s=1,
                         autoscaler_verbosity_level=pipelines_v1.VerbosityLevel.DEBUG,
-                        # Disable the backlog-aware scale-down guard for this
-                        # test: it intentionally clamps upstream deletions when
-                        # the upstream input queue is large, which is exactly
-                        # the situation we want Phase 3 preemption to resolve.
-                        # Leaving it ON would hide the preemption behavior we
-                        # are pinning here and surface as an AllocationError
-                        # (upstream keeps CPUs, downstream cannot be placed).
-                        enable_backlog_aware_scaledown=False,
                     ),
                 ),
             )

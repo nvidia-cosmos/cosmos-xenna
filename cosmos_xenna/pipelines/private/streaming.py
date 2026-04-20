@@ -341,11 +341,13 @@ class Autoscaler:
             any previous results have been applied.
         _autoscale_start_time: The timestamp when the last autoscaling calculation
             was started.
-        _enable_backlog_guard: When True, ``apply_autoscale_result_if_ready``
-            clamps Rust-proposed deletions so surviving workers can still
-            drain the queued backlog. When False, all deletions pass through
-            unchanged (original main-branch behavior). Sourced from
+        _enable_backlog_guard: Sourced from
             ``StreamingSpecificSpec.enable_backlog_aware_scaledown``.
+            Default False - all Rust-proposed deletions
+            pass through unchanged. When True (opt-in),
+            ``apply_autoscale_result_if_ready`` clamps deletions so
+            surviving workers can still drain the queued backlog at the
+            pre-scaling ``slots_per_actor``.
     """
 
     # Floor for the backlog-aware scale-down guard (see

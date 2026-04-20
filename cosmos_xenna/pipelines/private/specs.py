@@ -374,11 +374,14 @@ class StreamingSpecificSpec:
     executor_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
     # Backlog-aware scale-down guard.
     #
-    # When True (default), the autoscaler clamps Rust-proposed worker
-    # deletions so that the surviving workers can still drain the queued
-    # backlog (upstream queue + this pool's own queue) at the pre-scaling
-    # ``slots_per_actor``.
-    enable_backlog_aware_scaledown: bool = True
+    # Default ``False`` - Rust-proposed worker deletions pass through unchanged.
+    #
+    # Set ``True`` to have the autoscaler clamp deletions so that the surviving workers
+    # on each pool can still drain the queued backlog (upstream queue + this pool's own queue)
+    # at the pre-scaling ``slots_per_actor``. This protects downstream stages from the drain-tail
+    # starvation pattern where source completion triggers aggressive CPU-stage scale-down before
+    # queued work has drained.
+    enable_backlog_aware_scaledown: bool = False
 
 
 @attrs.define
