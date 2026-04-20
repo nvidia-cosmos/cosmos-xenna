@@ -16,12 +16,12 @@
 """Unit tests for the ``ActorPool.num_queued_tasks`` public property."""
 
 import collections
-from typing import Optional
+from typing import Any
 
 from cosmos_xenna.ray_utils.actor_pool import ActorPool, Task
 
 
-def _make_task(node_id: Optional[str] = None) -> Task:
+def _make_task(node_id: str | None = None) -> Task[Any]:
     """Build a minimal ``Task`` instance with empty data for queue-length tests."""
     return Task(task_data=[], origin_node_id=node_id)
 

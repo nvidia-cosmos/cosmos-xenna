@@ -352,9 +352,10 @@ class Autoscaler:
     # ``_required_workers_for_stage``). Keeps one actor alive on every
     # *active* stage so work arriving after a temporary upstream lull
     # is processed immediately instead of paying a cold-start cycle.
-    # Finished-stage teardown bypasses the guard via ``is_done`` in
-    # ``run_pipeline``, and end-of-pipeline teardown happens via the
-    # ``Autoscaler`` context exit, so this floor never strands actors.
+    # ``apply_autoscale_result_if_ready`` bypasses this floor for stages
+    # whose ``stages_is_dones[idx]`` flag is True, and end-of-pipeline
+    # teardown happens via the ``Autoscaler`` context exit + ``pool.stop()``,
+    # so this floor never strands actors.
     MIN_WORKERS_PER_STAGE: typing.ClassVar[int] = 1
 
     def __init__(
@@ -372,17 +373,19 @@ class Autoscaler:
             cluster_resources: The available resources in the cluster.
             verbosity_level: The verbosity level for logging.
         """
+        mode_specific = pipeline_spec.config.mode_specific
+        assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
         self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
-            pipeline_spec.config.mode_specific.autoscale_speed_estimation_window_duration_s,
-            pipeline_spec.config.mode_specific.autoscale_speed_estimation_min_data_points,
+            mode_specific.autoscale_speed_estimation_window_duration_s,
+            mode_specific.autoscale_speed_estimation_min_data_points,
         )
         self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
-        self._enable_backlog_guard: bool = pipeline_spec.config.mode_specific.enable_backlog_aware_scaledown
+        self._enable_backlog_guard: bool = mode_specific.enable_backlog_aware_scaledown
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -458,21 +461,28 @@ class Autoscaler:
         pools: list[actor_pool.ActorPool],
         upstream_queue_lens: list[int],
         stage_batch_sizes: list[int],
+        stages_is_dones: list[bool],
     ) -> None:
         """Apply a completed autoscaling result, clamping unsafe deletions.
 
-        No-op if no result is pending. Otherwise, for each stage, the Rust
-        autoscaler's proposed worker deletions are capped so the surviving
+        No-op if no result is pending. Otherwise, for each *active* stage, the
+        Rust autoscaler's proposed worker deletions are capped so the surviving
         workers can still (a) hold every task already dispatched to an actor
         slot and (b) drain the queued backlog at full per-actor utilisation.
         Deletions are only reduced, never grown.
 
-        This guard exists because the Rust ``FragmentationBasedAutoscaler``
-        optimises throughput fairness and is blind to queue depth and
-        in-flight work: when the upstream source finishes, measured throughput
+        Stages whose ``stages_is_dones[idx]`` flag is ``True`` bypass the guard
+        entirely: their proposed deletions pass through unchanged so the
+        ``MIN_WORKERS_PER_STAGE`` floor never strands actors after the work
+        upstream of them has finished. This complements ``run_pipeline``,
+        which calls ``pool.stop()`` once a stage transitions to done; the
+        bypass guarantees the autoscaler queue does not first try to leave
+        an actor alive on a stage the main loop is about to tear down.
+
+        When the upstream source finishes, measured throughput
         falls to zero and Rust can propose deleting most of a stage's actors
         in a single cycle (e.g. ``20 -> 2``), stranding tasks already in the
-        queue and starving downstream GPU stages.
+        queue and starving downstream stages.
 
         ::
 
@@ -499,24 +509,43 @@ class Autoscaler:
             stage_batch_sizes: Per-stage declared ``stage_batch_size`` values
                 (each must be ``>= 1``). Must have the same length as
                 ``pools``.
+            stages_is_dones: Per-stage completion flags. ``True`` means the
+                stage has finished consuming all upstream work and is being
+                torn down by the main loop; the guard skips clamping for
+                those stages so the floor never strands a worker. Must have
+                the same length as ``pools``.
 
         Raises:
-            ValueError: If ``upstream_queue_lens`` or ``stage_batch_sizes``
-                has a length different from ``pools``. This is a caller-side
-                contract violation, not a runtime condition.
+            ValueError: If ``upstream_queue_lens``, ``stage_batch_sizes``,
+                ``stages_is_dones``, or ``autoscale_result.stages`` has a
+                length different from ``pools``. These are caller-side or
+                planner-side contract violations, not runtime conditions.
 
         """
         if self._autoscale_future is None or not self._autoscale_future.done():
             return
 
-        if len(upstream_queue_lens) != len(pools) or len(stage_batch_sizes) != len(pools):
+        if (
+            len(upstream_queue_lens) != len(pools)
+            or len(stage_batch_sizes) != len(pools)
+            or len(stages_is_dones) != len(pools)
+        ):
             raise ValueError(
                 f"Guard inputs have mismatched lengths: pools={len(pools)}, "
                 f"upstream_queue_lens={len(upstream_queue_lens)}, "
-                f"stage_batch_sizes={len(stage_batch_sizes)}"
+                f"stage_batch_sizes={len(stage_batch_sizes)}, "
+                f"stages_is_dones={len(stages_is_dones)}"
             )
 
         autoscale_result: data_structures.Solution = self._autoscale_future.result()
+        if len(autoscale_result.stages) != len(pools):
+            # Mismatched lengths would silently truncate the shorter side via
+            # ``zip``, leaving stages with stale worker counts. This is a
+            # planner-side invariant violation, surface it explicitly.
+            raise ValueError(
+                f"Autoscale result stage count {len(autoscale_result.stages)} "
+                f"does not match pool count {len(pools)}; planner contract violated."
+            )
 
         for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools)):
             # Snapshot pre-mutation state: the guard must reason about the
@@ -536,10 +565,12 @@ class Autoscaler:
             )
 
             # Clamp Rust's proposed deletions to the backlog-aware floor
-            # computed from the pre-mutation snapshot
+            # computed from the pre-mutation snapshot. Skip the clamp for
+            # finished stages so end-of-stage teardown can release resources
+            # without the floor stranding actors.
             deletions = list(result.deleted_workers)
             proposed_delete_count = len(deletions)
-            if self._enable_backlog_guard and proposed_delete_count > 0:
+            if self._enable_backlog_guard and proposed_delete_count > 0 and not stages_is_dones[idx]:
                 backlog_samples = upstream_queue_lens[idx] + pre_pool_queued
                 required_workers = _required_workers_for_stage(
                     slots_per_actor=pre_slots_per_actor,
@@ -864,7 +895,7 @@ def run_pipeline(
             upstream_queue_lens: list[int] = [
                 len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(len(pools))
             ]
-            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_batch_sizes)
+            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_batch_sizes, stage_is_dones)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need

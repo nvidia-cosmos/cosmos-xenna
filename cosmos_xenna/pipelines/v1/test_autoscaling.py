@@ -23,7 +23,6 @@ See the "Running a multinode Ray job" of pipelines/examples/README.md for more i
 import os
 import time
 import uuid
-from typing import Optional
 
 import pytest
 import ray
@@ -100,7 +99,7 @@ class _FixedCpuStage(pipelines_v1.Stage):
         gpus: float = 0.0,
         setup_dur: float = 0.0,
         process_dur: float = 0.0,
-        tracker_name: Optional[str] = None,
+        tracker_name: str | None = None,
     ) -> None:
         self._name = name
         self._cpus = cpus
@@ -128,21 +127,19 @@ class _FixedCpuStage(pipelines_v1.Stage):
         return [x * 2 for x in task]
 
 
-# ---------------------------------------------------------------------------
-# Worker tracker -- a test-local Ray actor that records which stages
-# actually instantiated workers during a pipeline run. We use distinct PIDs
-# as the identity because each Ray worker actor runs in its own process; a
-# starved stage would only ever materialize the Phase 2 floor worker, so a
-# count > 1 for a given stage proves Phase 3 preemption (or Phase 4 headroom)
-# grew that stage beyond the floor.
-#
-# ``num_cpus=0`` is critical: the tracker must NOT consume any CPU from the
-# autoscaler's budget, otherwise tests that claim a 100-CPU cluster would
-# actually see 99 CPUs available to stage workers.
-# ---------------------------------------------------------------------------
 @ray.remote(num_cpus=0)
 class _WorkerTracker:
-    """Tracks unique (stage_name, pid) pairs registered by stage setups."""
+    """Track unique ``(stage_name, pid)`` pairs registered by stage setups.
+
+    Each Ray worker actor runs in its own process, so distinct PIDs identify
+    distinct workers. A starved stage materialises only the Phase 2 floor
+    worker; a count > 1 for a given stage therefore proves Phase 3
+    preemption (or Phase 4 headroom) grew that stage beyond the floor.
+
+    ``num_cpus=0`` keeps the tracker out of the autoscaler's budget so a
+    test that claims a 100-CPU cluster sees all 100 CPUs available to
+    stage workers.
+    """
 
     def __init__(self) -> None:
         self._pids: dict[str, set[int]] = {}
@@ -154,7 +151,7 @@ class _WorkerTracker:
         return {k: len(v) for k, v in self._pids.items()}
 
 
-def _init_ray_for_autoscale_test(num_cpus: int, num_gpus: int) -> None:
+def _init_ray_for_autoscale_test(monkeypatch: pytest.MonkeyPatch, num_cpus: int, num_gpus: int) -> None:
     """Pre-initialize Ray with the same options the pipeline uses.
 
     ``run_pipeline`` eventually calls
@@ -162,7 +159,7 @@ def _init_ray_for_autoscale_test(num_cpus: int, num_gpus: int) -> None:
     ``RAY_MAX_LIMIT_FROM_API_SERVER`` / ``RAY_MAX_LIMIT_FROM_DATA_SOURCE``
     to 40000 and then calls
     ``ray.init(include_dashboard=True, ignore_reinit_error=True, ...)``.
-    When we need to override ``num_cpus``/``num_gpus`` for a contention
+    When we need to override ``num_cpus`` / ``num_gpus`` for a contention
     scenario we must call ``ray.init`` first with those counts, but we
     must also set the same env vars **before** ``ray.init`` -- the
     dashboard agent reads them at startup. If set after, the agent is
@@ -172,14 +169,17 @@ def _init_ray_for_autoscale_test(num_cpus: int, num_gpus: int) -> None:
     mirrors the pipeline's init so the dashboard agent is started
     (otherwise the later pipeline init is a no-op under
     ``ignore_reinit_error=True``).
+
+    ``monkeypatch.setenv`` is used so the env vars are reverted at the
+    end of the test instead of leaking into sibling tests run in the
+    same pytest process.
     """
-    # Direct assignment (not setdefault): a smaller inherited value for
-    # RAY_MAX_LIMIT_FROM_API_SERVER silently reproduces the exact HTTP
-    # 500 / RayStateApiException this helper exists to prevent, so the
-    # test must authoritatively set it.
-    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-    os.environ["RAY_MAX_LIMIT_FROM_API_SERVER"] = "40000"
-    os.environ["RAY_MAX_LIMIT_FROM_DATA_SOURCE"] = "40000"
+    # Authoritative assignment via monkeypatch: a smaller inherited value
+    # for RAY_MAX_LIMIT_FROM_API_SERVER silently reproduces the exact HTTP
+    # 500 / RayStateApiException this helper exists to prevent.
+    monkeypatch.setenv("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("RAY_MAX_LIMIT_FROM_API_SERVER", "40000")
+    monkeypatch.setenv("RAY_MAX_LIMIT_FROM_DATA_SOURCE", "40000")
     ray.init(
         num_cpus=num_cpus,
         num_gpus=num_gpus,
@@ -189,7 +189,7 @@ def _init_ray_for_autoscale_test(num_cpus: int, num_gpus: int) -> None:
 
 
 @pytest.mark.slow
-def test_autoscaler_does_not_starve_downstream_under_cpu_pressure() -> None:
+def test_autoscaler_does_not_starve_downstream_under_cpu_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin Phase 2 floor: downstream keeps >= 1 worker under upstream load.
 
     Scenario:
@@ -211,7 +211,7 @@ def test_autoscaler_does_not_starve_downstream_under_cpu_pressure() -> None:
     2. A generous wall-clock backstop (``elapsed < 90s``) so that an
        actual deadlock terminates the test instead of hanging.
     """
-    _init_ray_for_autoscale_test(num_cpus=100, num_gpus=0)
+    _init_ray_for_autoscale_test(monkeypatch, num_cpus=100, num_gpus=0)
     try:
         tracker = _WorkerTracker.options(name="floor_tracker").remote()  # type: ignore[attr-defined]
         try:
@@ -244,7 +244,7 @@ def test_autoscaler_does_not_starve_downstream_under_cpu_pressure() -> None:
 
 
 @pytest.mark.slow
-def test_autoscaler_preempts_upstream_for_slow_downstream() -> None:
+def test_autoscaler_preempts_upstream_for_slow_downstream(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin Phase 3 preemption: donors give up workers for a slower downstream.
 
     Preemption contract: when the downstream stage is the cluster
@@ -271,7 +271,7 @@ def test_autoscaler_preempts_upstream_for_slow_downstream() -> None:
     downstream, which is the same contract from the user's POV -
     downstream did not stay stuck at the Phase 2 floor).
     """
-    _init_ray_for_autoscale_test(num_cpus=100, num_gpus=0)
+    _init_ray_for_autoscale_test(monkeypatch, num_cpus=100, num_gpus=0)
     try:
         tracker = _WorkerTracker.options(name="autoscale_tracker").remote()  # type: ignore[attr-defined]
         try:
@@ -321,18 +321,27 @@ def _install_fake_gpus(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
     ``cpu=1, gpu=1`` tail stage that reproduces the production
     ``AllocationError`` cascade.
 
-    Cross-process caveat: on a *single-node* local Ray cluster, the
+    Cross-process caveat: on a *single-node* local Ray cluster the
     remote ``_get_node_info_from_current_node`` task is scheduled on
-    the same node that started Ray (the driver host). Empirically,
-    Ray picks up the patched module attribute when the worker
-    imports ``resources``, so the cluster snapshot comes back with
-    the synthetic ``GpuInfo`` entries (visible in the
-    ``ClusterResources`` log line). On a multi-node cluster this
-    trick would not propagate, but multi-node clusters by
-    construction have real GPUs, so the patch is unnecessary there.
+    the same node that started Ray (the driver host) and Ray re-imports
+    ``resources`` in the worker process, picking up the patched module
+    attribute. We verify the patch actually took effect by calling
+    ``get_local_gpu_info()`` back through the patched module reference.
+    On a multi-node cluster this trick would not propagate, but
+    multi-node clusters by construction have real GPUs, so the patch is
+    unnecessary there.
     """
     fake_gpus = [resources.GpuInfo(index=i, name=f"FakeGPU-{i}", uuid_=uuid.uuid4()) for i in range(count)]
     monkeypatch.setattr(resources, "get_local_gpu_info", lambda: list(fake_gpus))
+    # Sanity-check the patch reaches the symbol consumed by Ray's worker
+    # import path. A regression here (e.g. the producer moves modules)
+    # would otherwise surface as a hard-to-diagnose "GPU stage starved"
+    # failure inside the test body.
+    observed = resources.get_local_gpu_info()
+    assert len(observed) == count, (
+        f"_install_fake_gpus: expected {count} fake GPUs, got {len(observed)}; "
+        "patch likely missed the symbol consumed by ``_get_node_info_from_current_node``."
+    )
 
 
 @pytest.mark.slow
@@ -358,7 +367,7 @@ def test_autoscaler_chain_with_gpu_tail(monkeypatch: pytest.MonkeyPatch) -> None
        placed, GPU stage never created, GPU idle".
     """
     _install_fake_gpus(monkeypatch, count=4)
-    _init_ray_for_autoscale_test(num_cpus=100, num_gpus=4)
+    _init_ray_for_autoscale_test(monkeypatch, num_cpus=100, num_gpus=4)
     try:
         tracker = _WorkerTracker.options(name="chain_tracker").remote()  # type: ignore[attr-defined]
         try:
