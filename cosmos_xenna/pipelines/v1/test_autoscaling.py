@@ -23,7 +23,7 @@ See the "Running a multinode Ray job" of pipelines/examples/README.md for more i
 import os
 import time
 import uuid
-from typing import Optional
+from typing import Iterator, Optional
 
 import pytest
 import ray
@@ -31,6 +31,21 @@ import ray
 import cosmos_xenna.pipelines.v1 as pipelines_v1
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.utils.ci import is_running_in_cicd
+
+
+@pytest.fixture(autouse=True)
+def _ensure_clean_ray() -> Iterator[None]:
+    """Guarantee a fresh Ray cluster per test in this module.
+
+    Shutting down before AND after each test makes the order of
+    tests irrelevant and contains the blast radius of any future
+    test that forgets its own cleanup.
+    """
+    if ray.is_initialized():
+        ray.shutdown()
+    yield
+    if ray.is_initialized():
+        ray.shutdown()
 
 
 class _ProcessStage(pipelines_v1.Stage):
@@ -78,9 +93,10 @@ def test_autoscaling() -> None:
             ),
         ),
     )
-    # Start the pipeline. If we run this locally, it will start a local ray cluster and submit our job. If we run it
-    # with "uv run yotta launch --mode=ngc-ray", it will connect to the existing cluster and submit our job.
-    pipelines_v1.run_pipeline(pipeline_spec)
+    try:
+        pipelines_v1.run_pipeline(pipeline_spec)
+    finally:
+        ray.shutdown()
 
 
 class _FixedCpuStage(pipelines_v1.Stage):
