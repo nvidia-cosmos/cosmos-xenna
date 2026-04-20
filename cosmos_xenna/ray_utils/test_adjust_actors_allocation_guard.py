@@ -237,10 +237,23 @@ class TestSpmdAllocationOrdering:
     """
 
     def test_spmd_allocation_failure_does_not_register_port(self) -> None:
-        """SPMD ``AllocationError`` must skip the rendezvous-port lookup entirely."""
+        """SPMD ``AllocationError`` must skip rendezvous-port registration entirely.
+
+        The mocked rendezvous helper mirrors production by calling
+        ``_cluster_port_registry.register_port`` so the assertion that
+        ``register_port`` is never called is a real regression check
+        (not a tautology that passes only because the rendezvous helper
+        itself was mocked out).
+        """
         wg = _make_spmd_worker_group("wg-spmd-fail")
         pool = _make_spmd_pool([wg])
         pool._allocator.add_worker.side_effect = _AllocationError("Allocation error: Not enough GPUs on node-A")
+
+        def _rendezvous_with_port_registration(w: MagicMock) -> MagicMock:
+            pool._cluster_port_registry.register_port(w.allocations[0].node, w.id, 29500)
+            return MagicMock(master_port=29500)
+
+        pool._find_rendevous_params_for_worker_group = MagicMock(side_effect=_rendezvous_with_port_registration)
 
         result = pool._add_worker_group(wg)
 
@@ -251,7 +264,11 @@ class TestSpmdAllocationOrdering:
         pool._create_actor_for_worker_group.assert_not_called()
 
     def test_spmd_allocation_success_invokes_rendezvous_and_creates_actors(self) -> None:
-        """On allocator success, rendezvous lookup runs and SPMD per-GPU actors are created."""
+        """On allocator success, rendezvous lookup runs and SPMD per-GPU actors are created.
+
+        Also verifies the rollback path is NOT triggered on the happy path
+        (no spurious allocator removal or port-registry cleanup).
+        """
         wg = _make_spmd_worker_group("wg-spmd-ok", num_gpus=2)
         pool = _make_spmd_pool([wg])
 
@@ -261,6 +278,8 @@ class TestSpmdAllocationOrdering:
         pool._find_rendevous_params_for_worker_group.assert_called_once_with(wg)
         assert pool._create_actor_for_worker_group.call_count == 2
         assert "wg-spmd-ok" in pool._worker_groups
+        pool._allocator.remove_worker.assert_not_called()
+        pool._cluster_port_registry.clear_port.assert_not_called()
 
     def test_allocator_is_called_before_rendezvous_lookup(self) -> None:
         """Defensive ordering check: allocator gate runs strictly before rendezvous lookup."""
@@ -275,3 +294,21 @@ class TestSpmdAllocationOrdering:
 
         method_call_order = [call[0] for call in parent.mock_calls]
         assert method_call_order.index("add_worker") < method_call_order.index("find_rendezvous")
+
+    def test_post_allocator_failure_rolls_back_allocator_and_port(self) -> None:
+        """If a post-allocator step raises, both allocator and registry are rolled back."""
+        wg = _make_spmd_worker_group("wg-spmd-rollback")
+        pool = _make_spmd_pool([wg])
+
+        def _rendezvous_then_fail(w: MagicMock) -> MagicMock:
+            pool._cluster_port_registry.register_port(w.allocations[0].node, w.id, 29500)
+            raise RuntimeError("simulated ray.get RPC failure")
+
+        pool._find_rendevous_params_for_worker_group = MagicMock(side_effect=_rendezvous_then_fail)
+
+        with pytest.raises(RuntimeError, match="simulated ray.get RPC failure"):
+            pool._add_worker_group(wg)
+
+        pool._allocator.remove_worker.assert_called_once_with("wg-spmd-rollback")
+        pool._cluster_port_registry.clear_port.assert_called_once_with("node-A", "wg-spmd-rollback")
+        assert pool._worker_groups == {}

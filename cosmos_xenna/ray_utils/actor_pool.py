@@ -901,7 +901,7 @@ class ActorPool(Generic[T, V]):
     def _add_worker_group(self, worker: resources.WorkerGroup) -> bool:
         """Add a worker group, allocating resources and creating actors.
 
-        Ordering invariant (do NOT change without considering port leaks):
+        Ordering invariant (do NOT change without considering state leaks):
         the Rust allocator gate runs FIRST, before any SPMD-only side
         effects - specifically the rendezvous-port registration in
         ``self._cluster_port_registry`` and its ``ray.get`` RPC. The
@@ -911,6 +911,14 @@ class ActorPool(Generic[T, V]):
         Registering the port before the allocator gate would therefore
         permanently leak a port entry on every ``AllocationError``
         (and waste a synchronous RPC on the hot failure path).
+
+        Symmetric guarantee: any code path between successful allocation
+        and the final ``self._worker_groups[...] = worker_group`` insertion
+        that raises an exception will roll back both the allocator
+        admission and any partial port registration via the ``finally``
+        block below. New post-allocator side effects must therefore be
+        either (a) infallible or (b) cleaned up inside this same
+        ``finally`` block.
 
         ``AllocationError`` from the Rust ``WorkerAllocator`` (TOCTOU race
         with stale resource snapshot) is caught and logged at WARNING level;
@@ -931,34 +939,66 @@ class ActorPool(Generic[T, V]):
             )
             return False
 
-        # Only after the allocator has accepted the worker do we acquire
-        # the SPMD rendezvous params (which registers a port on the node).
-        if self._is_spmd:
-            rendevous_params = self._find_rendevous_params_for_worker_group(worker)
-        else:
-            rendevous_params = None
+        # The allocator has accepted the worker; from here, any failure
+        # before insertion into ``self._worker_groups`` must roll back
+        # both the allocator admission and any partial port registration.
+        # ``_delete_worker_group`` is unreachable for a worker group that
+        # was never inserted, so cleanup happens in the ``finally`` below.
+        inserted = False
+        try:
+            # Only after the allocator has accepted the worker do we acquire
+            # the SPMD rendezvous params (which registers a port on the node).
+            if self._is_spmd:
+                rendevous_params = self._find_rendevous_params_for_worker_group(worker)
+            else:
+                rendevous_params = None
 
-        logger.trace(f"Adding worker group: {worker.id}")
-        worker_group = _WorkerGroup(worker, set(), _WorkerGroupState.WAITING_FOR_SETUP, rendevous_params)
-        if self._is_spmd:
-            logger.trace(f"Creating SPMD actors for worker group: {worker_group.worker_group.id}")
-            splits = worker.split_allocation_per_gpu()
-            # SPMD requires one actor per GPU across the cluster
-            # The autoscaler splits worker groups by node, but we need to create actors for each GPU,
-            # so we split the worker group by GPU here.
-            old_node = None
-            for idx, allocation in enumerate(splits):
-                # Every time the node name changes, we need to reset local rank
-                if allocation is not None and allocation.node != old_node:
-                    old_node = allocation.node
-                # Create actor with SPMD coordination (idx=rank, len(splits)=world_size)
-                self._create_actor_for_worker_group(worker_group, allocation, idx, len(splits))
-        else:
-            # Regular (non-SPMD) actors - single allocation per worker group
-            assert len(worker.allocations) == 1, "Non-SPMD actors should only have one allocation"
-            self._create_actor_for_worker_group(worker_group, worker.allocations[0], None, None)
-        self._worker_groups[worker_group.worker_group.id] = worker_group
-        return True
+            logger.trace(f"Adding worker group: {worker.id}")
+            worker_group = _WorkerGroup(worker, set(), _WorkerGroupState.WAITING_FOR_SETUP, rendevous_params)
+            if self._is_spmd:
+                logger.trace(f"Creating SPMD actors for worker group: {worker_group.worker_group.id}")
+                splits = worker.split_allocation_per_gpu()
+                # SPMD requires one actor per GPU across the cluster
+                # The autoscaler splits worker groups by node, but we need to create actors for each GPU,
+                # so we split the worker group by GPU here.
+                old_node = None
+                for idx, allocation in enumerate(splits):
+                    # Every time the node name changes, we need to reset local rank
+                    if allocation is not None and allocation.node != old_node:
+                        old_node = allocation.node
+                    # Create actor with SPMD coordination (idx=rank, len(splits)=world_size)
+                    self._create_actor_for_worker_group(worker_group, allocation, idx, len(splits))
+            else:
+                # Regular (non-SPMD) actors - single allocation per worker group
+                assert len(worker.allocations) == 1, "Non-SPMD actors should only have one allocation"
+                self._create_actor_for_worker_group(worker_group, worker.allocations[0], None, None)
+            self._worker_groups[worker_group.worker_group.id] = worker_group
+            inserted = True
+            return True
+        finally:
+            if not inserted:
+                # Roll back allocator admission and any partial port
+                # registration so cluster-side state matches reality.
+                # ``clear_port`` is a no-op if no port was registered,
+                # so unconditional cleanup on the SPMD path is safe.
+                logger.warning(
+                    f"Rolling back partial worker creation for {self.name}: worker {worker.id}",
+                )
+                try:
+                    self._allocator.remove_worker(worker.id)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        f"Allocator rollback failed for {self.name} worker {worker.id}: {e}",
+                        exc_info=True,
+                    )
+                if self._is_spmd:
+                    try:
+                        self._cluster_port_registry.clear_port(worker.allocations[0].node, worker.id)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(
+                            f"Port registry rollback failed for {self.name} worker {worker.id}: {e}",
+                            exc_info=True,
+                        )
 
     def _add_actor_to_waiting_list(self, actor_handle: ActorHandle, metadata: resources.WorkerMetadata) -> None:
         """Adds an actor to the list waiting for node setup on its target node."""
@@ -1175,6 +1215,10 @@ class ActorPool(Generic[T, V]):
         if actor_id_to_delete is not None and worker_allocation_to_restart is not None:
             logger.info(f"Restarting {actor_id_to_delete} from {self._name} after {max_running_time_m:.0f} minutes")
             deleted_worker_group = self._delete_worker_group(worker_allocation_to_restart.worker_group_id)
+            # _add_worker_group cannot fail here: the shared allocator is single-writer
+            # (this main thread), and the worker.id and its resources were freed by the
+            # preceding _delete_worker_group call, so neither DuplicateWorkerId nor
+            # OverAllocated can be raised. The bool return is intentionally ignored.
             self._add_worker_group(deleted_worker_group)
             self._last_actor_restart_time = time.time()
 
