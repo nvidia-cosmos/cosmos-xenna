@@ -203,15 +203,15 @@ class TestConfigValidation:
 
     def test_rejects_zero(self) -> None:
         """fraction=0 violates gt(0) validator."""
-        with pytest.raises(ValueError, match="greater than 0"):
+        with pytest.raises(ValueError, match=r"must be > 0"):
             StreamingSpecificSpec(autoscale_max_scale_down_fraction=0)
 
     def test_rejects_negative(self) -> None:
         """fraction=-0.5 violates gt(0) validator."""
-        with pytest.raises(ValueError, match="greater than 0"):
+        with pytest.raises(ValueError, match=r"must be > 0"):
             StreamingSpecificSpec(autoscale_max_scale_down_fraction=-0.5)
 
     def test_rejects_above_one(self) -> None:
         """fraction=1.5 violates le(1.0) validator."""
-        with pytest.raises(ValueError, match=r"less than or equal to 1\.0"):
+        with pytest.raises(ValueError, match=r"must be <= 1\.0"):
             StreamingSpecificSpec(autoscale_max_scale_down_fraction=1.5)
