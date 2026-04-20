@@ -23,6 +23,7 @@ See the "Running a multinode Ray job" of pipelines/examples/README.md for more i
 import os
 import time
 import uuid
+from typing import Optional
 
 import pytest
 import ray
@@ -99,7 +100,7 @@ class _FixedCpuStage(pipelines_v1.Stage):
         gpus: float = 0.0,
         setup_dur: float = 0.0,
         process_dur: float = 0.0,
-        tracker_name: str | None = None,
+        tracker_name: Optional[str] = None,
     ) -> None:
         self._name = name
         self._cpus = cpus
@@ -232,7 +233,7 @@ def test_autoscaler_does_not_starve_downstream_under_cpu_pressure(monkeypatch: p
             start = time.monotonic()
             pipelines_v1.run_pipeline(spec)
             elapsed = time.monotonic() - start
-            counts = ray.get(tracker.counts.remote())
+            counts: dict[str, int] = ray.get(tracker.counts.remote())  # type: ignore[attr-defined]
             assert counts.get("downstream", 0) >= 1, (
                 f"Phase 2 floor failed: downstream never instantiated a worker; counts={counts}"
             )
@@ -298,7 +299,7 @@ def test_autoscaler_preempts_upstream_for_slow_downstream(monkeypatch: pytest.Mo
                 ),
             )
             pipelines_v1.run_pipeline(spec)
-            counts = ray.get(tracker.counts.remote())
+            counts: dict[str, int] = ray.get(tracker.counts.remote())  # type: ignore[attr-defined]
             assert counts.get("downstream", 0) > 1, (
                 f"Phase 3 preemption failed: downstream stuck at "
                 f"{counts.get('downstream', 0)} unique worker(s); counts={counts}"
@@ -396,7 +397,7 @@ def test_autoscaler_chain_with_gpu_tail(monkeypatch: pytest.MonkeyPatch) -> None
             start = time.monotonic()
             pipelines_v1.run_pipeline(spec)
             elapsed = time.monotonic() - start
-            counts = ray.get(tracker.counts.remote())
+            counts: dict[str, int] = ray.get(tracker.counts.remote())  # type: ignore[attr-defined]
             assert elapsed < 180.0, f"Chain pipeline took {elapsed:.1f}s; possible deadlock; counts={counts}"
             assert counts.get("gpu_tail", 0) >= 1, f"GPU tail starved (production cascade reproduced): counts={counts}"
         finally:

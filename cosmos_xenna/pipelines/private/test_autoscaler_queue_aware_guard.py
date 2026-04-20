@@ -24,7 +24,7 @@ import logging
 import math
 import time
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,8 +56,8 @@ def _make_mock_pool(
 
 def _make_solution_stage(
     *,
-    new_workers: list[Any] | None = None,
-    deleted_workers: list[Any] | None = None,
+    new_workers: Optional[list[Any]] = None,
+    deleted_workers: Optional[list[Any]] = None,
     slots_per_worker: int = 1,
 ) -> MagicMock:
     """Build a mock ``StageSolution`` matching what Rust would return."""
