@@ -678,6 +678,11 @@ class ActorPool(Generic[T, V]):
         return bool(self._task_queue) or self.num_used_slots > 0 or bool(self._completed_tasks)
 
     @property
+    def num_queued_tasks(self) -> int:
+        """Return the number of tasks queued in the pool waiting for an actor slot."""
+        return len(self._task_queue)
+
+    @property
     def num_ready_actors(self) -> int:
         return len(self._ready_actors)
 
@@ -728,7 +733,7 @@ class ActorPool(Generic[T, V]):
                 self._num_completed_tasks,
                 self._num_null_tasks,
                 self._num_dynamically_spawned_tasks,
-                len(self._task_queue),
+                self.num_queued_tasks,
                 len(self._completed_tasks) + ext_output_queue_size,
             ),
             monitoring.SlotStats(self.num_used_slots, self.num_empty_slots),
