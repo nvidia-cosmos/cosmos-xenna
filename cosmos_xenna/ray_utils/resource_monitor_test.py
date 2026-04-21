@@ -64,10 +64,23 @@ class _FakeGpu:
 
 
 def test_returns_value_when_present() -> None:
-    gpu = _FakeGpu({"memory.used": 2048, "memory.total": 16384, "utilization.gpu": 42})
+    gpu = _FakeGpu(
+        {
+            "memory.used": 2048,
+            "memory.total": 16384,
+            "utilization.gpu": 42,
+            "power.draw": 150,
+            "power.limit": 250,
+        }
+    )
     assert _safe_gpu_attr(gpu, "memory_used", 0) == 2048
     assert _safe_gpu_attr(gpu, "memory_total", 0) == 16384
     assert _safe_gpu_attr(gpu, "utilization", 0.0) == 42
+    # default=None must not collapse a real reading to None — covers both
+    # gpustat shapes: power_draw returns the value directly, power_limit
+    # comes back through an int(...) coercion.
+    assert _safe_gpu_attr(gpu, "power_draw", None) == 150
+    assert _safe_gpu_attr(gpu, "power_limit", None) == 250
 
 
 def test_returns_default_when_property_raises_type_error() -> None:
