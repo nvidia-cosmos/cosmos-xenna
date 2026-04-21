@@ -17,7 +17,19 @@
 from __future__ import annotations
 
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import allocator as rust  # type: ignore
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling.allocator import (  # type: ignore
+    AllocationError,
+    DuplicateWorkerIdError,
+    WorkerNotFoundError,
+)
 from cosmos_xenna.pipelines.private import resources
+
+__all__ = [
+    "AllocationError",
+    "DuplicateWorkerIdError",
+    "WorkerAllocator",
+    "WorkerNotFoundError",
+]
 
 
 class WorkerAllocator:

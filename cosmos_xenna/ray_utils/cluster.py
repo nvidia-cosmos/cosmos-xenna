@@ -92,5 +92,6 @@ def init_or_connect_to_cluster(
         _metrics_export_port=ray_metrics_port,
         **({"_tracing_startup_hook": tracing_hook} if tracing_hook else {}),
     )
+    logger.info("Initialized Ray cluster.")
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context
