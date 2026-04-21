@@ -39,7 +39,7 @@ import pathlib
 import resource
 import threading
 import time
-from typing import Optional
+from typing import Optional, TypeVar
 
 import attrs
 import jinja2
@@ -264,6 +264,26 @@ def get_filesystem_usage(path: pathlib.Path) -> tuple[int, int]:
     return used_bytes, total_bytes
 
 
+_T = TypeVar("_T")
+
+
+def _safe_gpu_attr(gpu: object, name: str, default: _T) -> _T:
+    """Read a ``gpustat`` GPU attribute, returning ``default`` when unavailable.
+
+    ``gpustat`` eagerly coerces some NVML fields with ``int(...)`` inside
+    ``@property`` getters, which raises ``TypeError`` when NVML returns ``None``
+    (e.g. ``memory.used`` / ``memory.total`` / ``power.limit`` on DGX Spark's
+    GB10 integrated GPU, which shares unified memory with the CPU). Other
+    getters return ``None`` directly. Collapse both cases to ``default`` so a
+    single missing field does not break the whole metrics loop.
+    """
+    try:
+        value = getattr(gpu, name)
+    except (TypeError, KeyError, AttributeError):
+        return default
+    return default if value is None else value
+
+
 class ResourceMonitor:
     """Class to fetch real-time metrics of system resources."""
 
@@ -306,11 +326,11 @@ class ResourceMonitor:
             else:
                 gpus = [
                     GPUData(
-                        utilization=gpu.utilization,
-                        memory_used=gpu.memory_used,
-                        memory_total=gpu.memory_total,
-                        power_usage_percentage=gpu.power_draw,
-                        power_limit_w=gpu.power_limit,
+                        utilization=_safe_gpu_attr(gpu, "utilization", 0.0),
+                        memory_used=_safe_gpu_attr(gpu, "memory_used", 0),
+                        memory_total=_safe_gpu_attr(gpu, "memory_total", 0),
+                        power_usage_percentage=_safe_gpu_attr(gpu, "power_draw", None),
+                        power_limit_w=_safe_gpu_attr(gpu, "power_limit", None),
                     )
                     for gpu in gpu_stats
                 ]
