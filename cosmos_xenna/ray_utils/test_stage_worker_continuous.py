@@ -40,8 +40,7 @@ from cosmos_xenna.ray_utils.continuous_stage import (
 
 
 def _mock_object_ref(name: str = "ref") -> "ObjectRef[Any]":
-    """Return a ``MagicMock`` cast to ``ObjectRef[Any]`` for typed tests.
-    """
+    """Return a ``MagicMock`` cast to ``ObjectRef[Any]`` for typed tests."""
     return typing.cast("ObjectRef[Any]", MagicMock(name=name))
 
 
@@ -387,44 +386,6 @@ class TestCollectorDrainsAfterStop:
         results = self._drive_collector(publishes_after_drain_done=0)
 
         assert results == {}
-
-
-class TestUnwrapExceptionGroup:
-    """Verify exception-group unwrapping semantics for continuous mode."""
-
-    def test_returns_single_non_cancelled_exception(self) -> None:
-        """Return the concrete exception when exactly one non-cancelled error exists."""
-        eg = BaseExceptionGroup("outer", [RuntimeError("boom"), asyncio.CancelledError()])
-
-        result = sw_module.StageWorker._unwrap_exception_group(eg)
-
-        assert isinstance(result, RuntimeError)
-        assert str(result) == "boom"
-
-    def test_returns_exception_group_for_multiple_non_cancelled_errors(self) -> None:
-        """Preserve multi-failure detail by returning an ``ExceptionGroup``."""
-        eg = BaseExceptionGroup(
-            "outer",
-            [
-                BaseExceptionGroup("inner", [ValueError("left"), RuntimeError("right")]),
-                asyncio.CancelledError(),
-            ],
-        )
-
-        result = sw_module.StageWorker._unwrap_exception_group(eg)
-
-        assert isinstance(result, ExceptionGroup)
-        assert [type(exc) for exc in result.exceptions] == [ValueError, RuntimeError]
-        assert [str(exc) for exc in result.exceptions] == ["left", "right"]
-
-    def test_returns_runtime_error_when_only_cancellations_exist(self) -> None:
-        """Return a clear fallback error when only cancellation failures exist."""
-        eg = BaseExceptionGroup("outer", [asyncio.CancelledError()])
-
-        result = sw_module.StageWorker._unwrap_exception_group(eg)
-
-        assert isinstance(result, RuntimeError)
-        assert "cancellations only" in str(result)
 
 
 class TestFeederTimestampsAtQueueHandoff:

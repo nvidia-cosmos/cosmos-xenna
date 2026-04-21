@@ -97,6 +97,7 @@ from cosmos_xenna.ray_utils.task_metadata import (
 )
 from cosmos_xenna.utils import gpu, retry
 from cosmos_xenna.utils import python_log as logger
+from cosmos_xenna.utils.exception_utils import unwrap_taskgroup_exception_group
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -818,43 +819,10 @@ class StageWorker(abc.ABC, Generic[T, V]):
             with asyncio.Runner() as runner:
                 runner.run(self._run_continuous_async())
         except BaseExceptionGroup as eg:
-            inner = self._unwrap_exception_group(eg)
+            inner = unwrap_taskgroup_exception_group(eg)
             self._handle_thread_exception("run_continuous", None, inner)
         except Exception as e:  # noqa: BLE001 - last-line-of-defense, matches batch-mode pattern
             self._handle_thread_exception("run_continuous", None, e)
-
-    @staticmethod
-    def _unwrap_exception_group(eg: BaseExceptionGroup) -> Exception:
-        """Return the non-cancellation failure payload from a TaskGroup error."""
-
-        def _flatten_non_cancelled(exc: BaseException) -> list[BaseException]:
-            if isinstance(exc, BaseExceptionGroup):
-                flattened: list[BaseException] = []
-                for inner in exc.exceptions:
-                    flattened.extend(_flatten_non_cancelled(inner))
-                return flattened
-            if isinstance(exc, asyncio.CancelledError):
-                return []
-            return [exc]
-
-        non_cancelled: list[BaseException] = []
-        for exc in eg.exceptions:
-            non_cancelled.extend(_flatten_non_cancelled(exc))
-
-        if not non_cancelled:
-            return RuntimeError(f"TaskGroup exited with cancellations only: {eg!r}")
-
-        normalized: list[Exception] = []
-        for exc in non_cancelled:
-            if isinstance(exc, Exception):
-                normalized.append(exc)
-            else:
-                normalized.append(RuntimeError(f"Non-Exception failure inside continuous-mode TaskGroup: {exc!r}"))
-
-        if len(normalized) == 1:
-            return normalized[0]
-
-        return ExceptionGroup("Multiple failures inside continuous-mode TaskGroup", normalized)
 
     async def _run_continuous_async(self) -> None:
         """Run watcher, feeder, collector, and the stage loop in one TaskGroup.
