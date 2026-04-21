@@ -328,7 +328,7 @@ def test_does_not_amplify_rust_proposal() -> None:
 
 
 def test_pool_queue_units_are_tasks_not_samples_under_batch_gt_one() -> None:
-    """Pool's ``num_queued_tasks`` is sample-normalized when ``stage_batch_size > 1``.
+    """Pool's ``num_queued_tasks`` must be sample-normalized when ``stage_batch_size > 1``.
 
     Each entry in ``ActorPool._task_queue`` is a pre-batched ``Task``, but
     ``Queue.__len__`` (upstream) counts individual sample ``ObjectRef``s.
