@@ -27,9 +27,16 @@ import attrs
 
 from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.pipelines.private.continuous_wrapped_stage import ContinuousWrappedStage
 from cosmos_xenna.ray_utils import runtime_envs, stage
-from cosmos_xenna.utils import approx
+from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface
+from cosmos_xenna.utils import approx, attrs_utils
 from cosmos_xenna.utils.verbosity import VerbosityLevel
+
+# Aliased to avoid shadowing the ``stage`` module import inside the
+# ``StageAndParams`` class body, where the field name ``stage`` makes
+# the bare module reference ambiguous to type checkers.
+StageParams = stage.Params
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
@@ -303,7 +310,7 @@ class StageSpec(typing.Generic[T, V]):
     num_run_attempts_python: int | None = None
     ignore_failures: bool | None = None
     reset_workers_on_failure: bool | None = None
-    slots_per_actor: int | None = None
+    slots_per_actor: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
     worker_max_lifetime_m: int | None = None
     worker_restart_interval_m: int | None = None
     max_setup_failure_percentage: float | None = None
@@ -409,7 +416,7 @@ class PipelineConfig:
     # Number of tasks to request concurrently per actor. This is an internal detail for streaming pipelines. We request
     # ray to process multiple tasks per worker (default 2). This forces Ray to pre-fetch data and should make it so we
     # are very unlikely to be blocked on IO.
-    slots_per_actor: int = _DEFAULT_SLOTS_PER_ACTOR
+    slots_per_actor: int = attrs.field(default=_DEFAULT_SLOTS_PER_ACTOR, validator=attrs_utils.validate_positive_int)
     # When work stealing is enabled, Xenna will steal queued tasks from busy actors and give them to idle actors.
     # Without this, Xenna can leave some nodes idle when the number of tasks supplied to the pipeline are less than
     # num_actors * num_slots_per_actor (typically == 2); i.e. when there are very few tasks.
@@ -531,8 +538,8 @@ class WrappedStage(stage.Interface):
 
 @attrs.define
 class StageAndParams:
-    stage: WrappedStage
-    params: stage.Params
+    stage: stage.Interface
+    params: StageParams
 
 
 def make_actor_pool_stage_from_stage_spec(
@@ -553,8 +560,15 @@ def make_actor_pool_stage_from_stage_spec(
         # This means that (assuming the node has gpus) the stage will have the same CUDA_VISIBLE_DEVICES as the rest of
         # the node.
         modify_cuda_visible_devices_env_var = pipeline_config.clear_cuda_visible_devices_on_cpu_actors
+
+    wrapped_stage: stage.Interface
+    if isinstance(spec.stage, ContinuousInterface):
+        wrapped_stage = ContinuousWrappedStage(spec.stage)
+    else:
+        wrapped_stage = WrappedStage(spec.stage)
+
     return StageAndParams(
-        WrappedStage(spec.stage),
+        wrapped_stage,
         stage.Params(
             shape=spec.stage.required_resources.to_worker_shape(cluster_resources),
             stage_batch_size=spec.stage.stage_batch_size,
