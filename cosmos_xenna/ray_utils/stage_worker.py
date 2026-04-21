@@ -982,7 +982,13 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self.stop_flag.set()  # Stop all threads
 
     def get_pid_tree(self) -> list[tuple[int, float]]:
-        """Return this process tree as ``(pid, create_time)`` pairs."""
+        """Return this process's PID and all descendant PIDs, each paired with its create_time.
+        Called by the actor pool before ray.kill() to snapshot the full process tree.
+        The create_time is used by the reaper to guard against PID reuse: if the OS recycles
+        a PID before the reap task runs, the create_time mismatch will prevent killing an
+        innocent process. Survivors are reaped after the kill to handle processes that outlive
+        their actor shutdown.
+        """
         try:
             p = psutil.Process(os.getpid())
             procs = [p, *p.children(recursive=True)]
