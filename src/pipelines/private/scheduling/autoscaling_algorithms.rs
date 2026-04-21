@@ -276,11 +276,7 @@ impl SpeedAndNumberOfReturnsEstimator {
             .iter_mut()
             .map(|e| e.maybe_get_average_num_returns(now))
             .collect();
-        for (i, (ms, mr)) in maybe_speeds
-            .into_iter()
-            .zip(maybe_returns)
-            .enumerate()
-        {
+        for (i, (ms, mr)) in maybe_speeds.into_iter().zip(maybe_returns).enumerate() {
             if ms.is_some() {
                 self.last_valid_speeds[i] = ms;
             }
