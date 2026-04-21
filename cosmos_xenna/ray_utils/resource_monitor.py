@@ -39,7 +39,7 @@ import pathlib
 import resource
 import threading
 import time
-from typing import Any, Optional, TypeVar, overload
+from typing import Any, Optional
 
 import attrs
 import jinja2
@@ -264,18 +264,7 @@ def get_filesystem_usage(path: pathlib.Path) -> tuple[int, int]:
     return used_bytes, total_bytes
 
 
-_T = TypeVar("_T")
-
-
-@overload
-def _safe_gpu_attr(gpu: object, name: str, default: None) -> Any: ...
-
-
-@overload
-def _safe_gpu_attr(gpu: object, name: str, default: _T) -> _T: ...
-
-
-def _safe_gpu_attr(gpu: object, name: str, default: object) -> object:
+def _safe_gpu_attr(gpu: object, name: str, default: Any) -> Any:
     """Read a ``gpustat`` GPU attribute, returning ``default`` when unavailable.
 
     ``gpustat`` eagerly coerces some NVML fields with ``int(...)`` inside
@@ -284,11 +273,6 @@ def _safe_gpu_attr(gpu: object, name: str, default: object) -> object:
     GB10 integrated GPU, which shares unified memory with the CPU). Other
     getters return ``None`` directly. Collapse both cases to ``default`` so a
     single missing field does not break the whole metrics loop.
-
-    The ``default=None`` overload returns ``Any`` because the real value (when
-    present) is whatever ``gpustat`` exposes for that field — typically ``int``
-    or ``float`` — and forcing callers to cast through ``object`` would just
-    add noise.
     """
     try:
         value = getattr(gpu, name)
