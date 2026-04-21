@@ -37,7 +37,7 @@ class _FakeGpu:
     either raises ``TypeError`` (eager ``int()`` coercion) or returns ``None``.
     """
 
-    def __init__(self, entry: dict[str, object]) -> None:
+    def __init__(self, entry: dict[str, int | None]) -> None:
         self._entry = entry
 
     @property
@@ -45,13 +45,16 @@ class _FakeGpu:
         v = self._entry.get("utilization.gpu")
         return int(v) if v is not None else None
 
+    # The int(...) calls below are deliberately unsafe — they reproduce gpustat's
+    # eager coercion that raises TypeError on None. The type: ignore comments
+    # acknowledge the unsafety pyright would otherwise flag.
     @property
     def memory_used(self) -> int:
-        return int(self._entry["memory.used"])  # raises TypeError when None
+        return int(self._entry["memory.used"])  # type: ignore[arg-type]
 
     @property
     def memory_total(self) -> int:
-        return int(self._entry["memory.total"])  # raises TypeError when None
+        return int(self._entry["memory.total"])  # type: ignore[arg-type]
 
     @property
     def power_draw(self) -> int | None:
@@ -60,7 +63,7 @@ class _FakeGpu:
 
     @property
     def power_limit(self) -> int:
-        return int(self._entry["power.limit"])  # raises TypeError when None
+        return int(self._entry["power.limit"])  # type: ignore[arg-type]
 
 
 def test_returns_value_when_present() -> None:
