@@ -507,10 +507,10 @@ class Autoscaler:
         Args:
             pools: Actor pools to update with the new scaling results.
             upstream_queue_lens: Per-stage upstream queue lengths. Entry
-                ``[i]`` is the number of tasks waiting to be pulled into
-                ``pools[i]`` (the pipeline's input queue for stage ``0``, or
-                ``queues[i - 1]`` for downstream stages). Must have the same
-                length as ``pools``.
+                ``[i]`` is the number of queued samples/items waiting to be
+                pulled into ``pools[i]`` (the pipeline's input queue for
+                stage ``0``, or ``queues[i - 1]`` for downstream stages).
+                Must have the same length as ``pools``.
             stage_batch_sizes: Per-stage declared ``stage_batch_size`` values
                 (each must be ``>= 1``). Must have the same length as
                 ``pools``.
