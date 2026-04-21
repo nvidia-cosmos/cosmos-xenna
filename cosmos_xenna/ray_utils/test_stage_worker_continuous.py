@@ -39,8 +39,9 @@ from cosmos_xenna.ray_utils.continuous_stage import (
 )
 
 
-def _mock_object_ref(name: str = "ref") -> ObjectRef[Any]:
-    """Return a ``MagicMock`` cast to ``ObjectRef[Any]`` for typed tests."""
+def _mock_object_ref(name: str = "ref") -> "ObjectRef[Any]":
+    """Return a ``MagicMock`` cast to ``ObjectRef[Any]`` for typed tests.
+    """
     return typing.cast("ObjectRef[Any]", MagicMock(name=name))
 
 
