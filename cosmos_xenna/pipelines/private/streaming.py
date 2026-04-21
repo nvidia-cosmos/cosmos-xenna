@@ -255,8 +255,10 @@ def _required_workers_for_stage(
         stage_batch_size: Batch size declared by the stage. Must be ``> 0``.
         inflight_slots: Actor slots currently executing tasks. Must be
             ``>= 0``.
-        backlog_samples: Tasks waiting for an actor slot (upstream queue
-            + pool's internal task queue). Must be ``>= 0``.
+        backlog_samples: Outstanding work waiting for an actor slot,
+            expressed in samples (upstream queue length plus pool task
+            queue size multiplied by ``stage_batch_size``). Must be
+            ``>= 0``.
 
     Returns:
         The minimum worker count a proposed scale-down must leave alive.
@@ -573,7 +575,13 @@ class Autoscaler:
             deletions = list(result.deleted_workers)
             proposed_delete_count = len(deletions)
             if self._enable_backlog_guard and proposed_delete_count > 0 and not stages_is_dones[idx]:
-                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued
+                # Unit normalization: ``upstream_queue_lens[idx]`` is sample-
+                # denominated (``Queue.__len__`` counts individual ObjectRefs),
+                # but ``pool.num_queued_tasks`` returns pre-batched Tasks.
+                # Multiply the pool count by ``stage_batch_sizes[idx]`` so the
+                # combined ``backlog_samples`` value passed to the helper is
+                # uniformly in samples.
+                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued * stage_batch_sizes[idx]
                 required_workers = _required_workers_for_stage(
                     slots_per_actor=pre_slots_per_actor,
                     stage_batch_size=stage_batch_sizes[idx],

@@ -327,6 +327,67 @@ def test_does_not_amplify_rust_proposal() -> None:
     assert pool.add_actor_to_delete.call_count == 3
 
 
+def test_pool_queue_units_are_tasks_not_samples_under_batch_gt_one() -> None:
+    """Pool's ``num_queued_tasks`` is sample-normalized when ``stage_batch_size > 1``.
+
+    Each entry in ``ActorPool._task_queue`` is a pre-batched ``Task``, but
+    ``Queue.__len__`` (upstream) counts individual sample ``ObjectRef``s.
+    The guard's call site must multiply the pool count by ``stage_batch_size``
+    before summing, otherwise the pool contribution is undercounted by a
+    factor of ``stage_batch_size`` and the guard authorises too many
+    deletions during drain-tail.
+    """
+    # ready=10, slots=1, batch=4, num_queued_tasks=4, upstream_q=0
+    #   buggy: backlog_samples = 0 + 4   = 4  -> required = ceil(4 /4) = 1 -> max_safe = 9
+    #   fixed: backlog_samples = 0 + 4*4 = 16 -> required = ceil(16/4) = 4 -> max_safe = 6
+    pool = _make_mock_pool(
+        num_ready_actors=10,
+        num_used_slots=0,
+        slots_per_actor=1,
+        num_queued_tasks=4,
+    )
+    solution = _make_solution([_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(9)])])
+    autoscaler = _make_autoscaler_with_solution(solution)
+
+    autoscaler.apply_autoscale_result_if_ready(
+        pools=[pool],
+        upstream_queue_lens=[0],
+        stage_batch_sizes=[4],
+        stages_is_dones=[False],
+    )
+
+    assert pool.add_actor_to_delete.call_count == 6
+
+
+def test_mixed_upstream_samples_and_pool_tasks_with_batch_gt_one() -> None:
+    """Both queues contribute when ``batch > 1``; their drain demand sums in samples.
+
+    With non-zero upstream samples AND non-zero pool tasks, the buggy formula
+    silently undercounts the pool contribution. The chosen tuple makes the
+    divergence observable: fixed allows 6 deletions, buggy allows 7.
+    """
+    # ready=8, slots=2, batch=4, num_queued_tasks=3, upstream_q=4
+    #   buggy: backlog_samples = 4 + 3   = 7  -> required = ceil(7 /(2*4)) = 1 -> max_safe = 7
+    #   fixed: backlog_samples = 4 + 3*4 = 16 -> required = ceil(16/(2*4)) = 2 -> max_safe = 6
+    pool = _make_mock_pool(
+        num_ready_actors=8,
+        num_used_slots=0,
+        slots_per_actor=2,
+        num_queued_tasks=3,
+    )
+    solution = _make_solution([_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(7)])])
+    autoscaler = _make_autoscaler_with_solution(solution)
+
+    autoscaler.apply_autoscale_result_if_ready(
+        pools=[pool],
+        upstream_queue_lens=[4],
+        stage_batch_sizes=[4],
+        stages_is_dones=[False],
+    )
+
+    assert pool.add_actor_to_delete.call_count == 6
+
+
 def test_first_stage_uses_input_queue_length() -> None:
     """Stage index 0 reads ``upstream_queue_lens[0]`` (the pipeline input queue)."""
     pool = _make_mock_pool(
@@ -491,6 +552,12 @@ def test_logs_clamping_at_info_level(loguru_caplog: pytest.LogCaptureFixture) ->
         # No clamping happens, so no log line under guard=True either.
         pytest.param(20, 2, 1, 0, 0, 0, 3, True, 3, False, id="no_clamp_needed_guard_on"),
         pytest.param(20, 2, 1, 0, 0, 0, 3, False, 3, False, id="no_clamp_needed_guard_off"),
+        # Pool queue with batch>1 (locks the unit-conversion fix into the matrix):
+        # ready=10, slots=1, batch=4, queued_tasks=4 -> backlog_samples = 4*4 = 16,
+        # required = ceil(16/(1*4)) = 4, max_safe = 6, proposed=9 -> allowed=6.
+        # Disabled bypass authorises all 9 deletions.
+        pytest.param(10, 1, 4, 0, 4, 0, 9, True, 6, True, id="pool_queue_batch_gt_one_guard_on"),
+        pytest.param(10, 1, 4, 0, 4, 0, 9, False, 9, False, id="pool_queue_batch_gt_one_guard_off"),
     ],
 )
 def test_guard_flag_governs_deletion_clamping(
