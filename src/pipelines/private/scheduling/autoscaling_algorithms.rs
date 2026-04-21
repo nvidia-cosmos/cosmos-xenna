@@ -278,7 +278,7 @@ impl SpeedAndNumberOfReturnsEstimator {
             .collect();
         for (i, (ms, mr)) in maybe_speeds
             .into_iter()
-            .zip(maybe_returns.into_iter())
+            .zip(maybe_returns)
             .enumerate()
         {
             if ms.is_some() {
@@ -996,7 +996,7 @@ pub fn run_fragmentation_autoscaler(
         .collect();
     let input_samples_per_sample =
         calculate_input_samples_per_sample(&stage_batch_sizes, &num_returns_per_batch);
-    for (stage, val) in stages.iter_mut().zip(input_samples_per_sample.into_iter()) {
+    for (stage, val) in stages.iter_mut().zip(input_samples_per_sample) {
         stage.num_input_samples_per_sample = Some(val);
     }
 
