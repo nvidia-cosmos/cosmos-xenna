@@ -277,6 +277,7 @@ class Autoscaler:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
+        self._max_scale_down_fraction: float = pipeline_spec.config.mode_specific.autoscale_max_scale_down_fraction
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -354,6 +355,10 @@ class Autoscaler:
         result is applied, it updates the actor pools with new worker
         configurations.
 
+        A rate-limit guard caps the number of deletions per stage to
+        ``max_scale_down_fraction`` of the current ready actor count, preventing
+        aggressive cliff-effect scale-downs (e.g. 20 -> 2 in one cycle).
+
         Args:
             pools: The list of actor pools to update with the new scaling results.
         """
@@ -362,15 +367,38 @@ class Autoscaler:
 
             for result, pool in zip(autoscale_result.stages, pools):
                 pool.set_num_slots_per_actor(result.slots_per_worker)
+
+                workers_to_delete = result.deleted_workers
+                workers_to_create = result.new_workers
+
                 logger.debug(
-                    f"Autoscale result for pool {pool.name}: {len(result.new_workers)} new workers, "
-                    f"{len(result.deleted_workers)} deleted workers"
+                    f"Autoscale result for pool {pool.name}: {len(workers_to_create)} new workers, "
+                    f"{len(workers_to_delete)} deleted workers"
                 )
-                for w in result.new_workers:
+
+                # Cap deletions to at most max_scale_down_fraction of current actors,
+                # preventing aggressive cliffs (e.g. 20->2 in one cycle).
+                if workers_to_delete and self._max_scale_down_fraction < 1.0:
+                    current = pool.num_ready_actors
+                    if current == 0:
+                        # No ready actors - skip clamping, let deletions target
+                        # pending/setup actors if the Rust layer requested them.
+                        max_delete = len(workers_to_delete)
+                    else:
+                        max_delete = max(1, int(current * self._max_scale_down_fraction))
+                    if len(workers_to_delete) > max_delete:
+                        logger.info(
+                            f"Rate-limit guard: clamping {pool.name} deletions from "
+                            f"{len(workers_to_delete)} to {max_delete} "
+                            f"(current_actors={current}, fraction={self._max_scale_down_fraction})"
+                        )
+                        workers_to_delete = workers_to_delete[:max_delete]
+
+                for w in workers_to_create:
                     logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_create(w.to_worker_group(pool.name))
 
-                for w in result.deleted_workers:
+                for w in workers_to_delete:
                     logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
                     pool.add_actor_to_delete(w.to_worker_group(pool.name))
 
