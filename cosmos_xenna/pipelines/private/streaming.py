@@ -247,8 +247,9 @@ def _required_workers_for_stage(
         every task already dispatched to a slot; deleting below this would
         forcefully return tasks to the queue and starve downstream stages.
       * ``ceil(backlog_samples / (slots_per_actor * stage_batch_size))`` -
-        enough actors to drain the queued backlog at full per-actor
-        utilisation within one autoscale cycle.
+        enough actors to provide slot-and-batch capacity for the currently
+        queued backlog so work is not stranded waiting for actor capacity
+        and downstream stages are less likely to be starved.
 
     Args:
         slots_per_actor: Concurrent task slots per actor. Must be ``> 0``.
