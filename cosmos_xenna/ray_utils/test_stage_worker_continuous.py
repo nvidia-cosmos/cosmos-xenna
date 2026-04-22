@@ -501,3 +501,44 @@ class TestFeederShutdownUnderBackpressure:
         # this worker during shutdown. Only the original blocker remains.
         remaining = [input_q.get_nowait() for _ in range(input_q.qsize())]
         assert [item.task_id for item in remaining] == ["blocker"]
+
+
+class TestStageEarlyExitTerminatesCleanly:
+    """Stage returning without setting ``stop_event`` must not hang the TaskGroup."""
+
+    class _EarlyExitStage(ContinuousInterface):
+        """Returns immediately without touching ``stop_event``."""
+
+        async def run_continuous(
+            self,
+            input_queue: asyncio.Queue[ContinuousTaskInput],
+            output_queue: asyncio.Queue[ContinuousTaskOutput],
+            stop_event: asyncio.Event,
+        ) -> None:
+            return
+
+    class _OrchestratorHostStub:
+        """Minimal stand-in providing the attributes the orchestrator touches."""
+
+        def __init__(self, stage: ContinuousInterface, slots_per_actor: int = 2) -> None:
+            self._stage_interface = stage
+            self._params = MagicMock(spec_set=["slots_per_actor"])
+            self._params.slots_per_actor = slots_per_actor
+            self.stop_flag = threading.Event()
+            self.deserialized_queue: queue.Queue[sw_module._DeserializedTaskDataWithId[Any]] = queue.Queue()
+            self.results_lock = threading.Lock()
+            self._results: dict[str, sw_module._Result[Any]] = {}
+            # Bind sibling helpers the orchestrator dispatches to as ``self.<name>(...)``.
+            self._watch_stop_flag = sw_module.StageWorker._watch_stop_flag.__wrapped__.__get__(self)  # type: ignore[attr-defined]
+            self._feed_continuous_async = sw_module.StageWorker._feed_continuous_async.__wrapped__.__get__(self)  # type: ignore[attr-defined]
+            self._collect_continuous_async = sw_module.StageWorker._collect_continuous_async.__wrapped__.__get__(self)  # type: ignore[attr-defined]
+
+    def test_orchestrator_exits_when_stage_returns_without_stop_event(self) -> None:
+        """``_run_continuous_async`` must complete when the stage returns early."""
+        host = self._OrchestratorHostStub(stage=self._EarlyExitStage())
+        orchestrator_fn = sw_module.StageWorker._run_continuous_async.__wrapped__  # type: ignore[attr-defined]
+
+        # Returning within the timeout is the assertion; without the fix the TaskGroup hangs.
+        asyncio.run(asyncio.wait_for(orchestrator_fn(host), timeout=2.0))
+
+        assert not host.stop_flag.is_set(), "worker stop_flag must not fire on stage exit"

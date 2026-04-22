@@ -842,15 +842,15 @@ class StageWorker(abc.ABC, Generic[T, V]):
         input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=slots)
         output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
         stop_event = asyncio.Event()
-        # Set in the ``finally`` of ``_run_stage_then_signal``; the
-        # collector exits on this (not ``stop_event``) so results
-        # published during the stage's drain still get delivered.
+        # output_drain_done unblocks the collector; stop_event unblocks
+        # the watcher and feeder. Both are set when the stage returns.
         output_drain_done = asyncio.Event()
 
         async def _run_stage_then_signal() -> None:
             try:
                 await continuous_stage.run_continuous(input_q, output_q, stop_event)
             finally:
+                stop_event.set()
                 output_drain_done.set()
 
         async with asyncio.TaskGroup() as tg:
@@ -863,8 +863,11 @@ class StageWorker(abc.ABC, Generic[T, V]):
             tg.create_task(_run_stage_then_signal(), name="continuous-stage")
 
     async def _watch_stop_flag(self, stop_event: asyncio.Event) -> None:
-        """Bridge the worker's ``threading.Event`` stop_flag to ``asyncio``."""
-        while not self.stop_flag.is_set():
+        """Bridge the worker's ``threading.Event`` stop_flag to ``asyncio.Event``.
+
+        Exits when either ``stop_flag`` fires or ``stop_event`` is already set.
+        """
+        while not self.stop_flag.is_set() and not stop_event.is_set():
             await asyncio.sleep(_CONTINUOUS_POLL_INTERVAL_S)
         stop_event.set()
 
