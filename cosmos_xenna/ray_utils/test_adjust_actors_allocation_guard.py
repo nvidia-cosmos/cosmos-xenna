@@ -355,7 +355,7 @@ class TestSpmdAllocationOrdering:
 
         pool._find_rendevous_params_for_worker_group = MagicMock(side_effect=_rendezvous_then_fail)
 
-        with pytest.raises(RuntimeError, match="simulated ray.get RPC failure"):
+        with pytest.raises(RuntimeError, match=r"simulated ray\.get RPC failure"):
             pool._add_worker_group(wg)
 
         pool._allocator.remove_worker.assert_called_once_with("wg-spmd-rollback")
