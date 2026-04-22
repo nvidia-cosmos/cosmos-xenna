@@ -827,8 +827,10 @@ class StageWorker(abc.ABC, Generic[T, V]):
     async def _run_continuous_async(self) -> None:
         """Run watcher, feeder, collector, and the stage loop in one TaskGroup.
 
-        ``input_q`` is sized to ``slots_per_actor`` so per-actor
-        backpressure matches what the autoscaler computes.
+        ``input_q`` is sized to ``slots_per_actor`` so per-actor backpressure
+        matches what the autoscaler computes. Any of (worker ``stop_flag``,
+        stage return, stage exception) sets ``stop_event``, unblocking the
+        watcher and feeder so the ``TaskGroup`` always completes.
         """
         if not isinstance(self._stage_interface, ContinuousInterface):
             msg = (
@@ -869,6 +871,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
         """
         while not self.stop_flag.is_set() and not stop_event.is_set():
             await asyncio.sleep(_CONTINUOUS_POLL_INTERVAL_S)
+        logger.debug(
+            f"continuous watcher exiting: stop_flag={self.stop_flag.is_set()} stop_event={stop_event.is_set()}"
+        )
         stop_event.set()
 
     async def _feed_continuous_async(

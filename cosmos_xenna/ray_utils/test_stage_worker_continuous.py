@@ -37,6 +37,7 @@ from cosmos_xenna.ray_utils.continuous_stage import (
     ContinuousTaskInput,
     ContinuousTaskOutput,
 )
+from cosmos_xenna.utils import exception_utils
 
 
 def _mock_object_ref(name: str = "ref") -> "ObjectRef[Any]":
@@ -517,6 +518,17 @@ class TestStageEarlyExitTerminatesCleanly:
         ) -> None:
             return
 
+    class _RaisingStage(ContinuousInterface):
+        """Raises immediately without touching ``stop_event``."""
+
+        async def run_continuous(
+            self,
+            input_queue: asyncio.Queue[ContinuousTaskInput],
+            output_queue: asyncio.Queue[ContinuousTaskOutput],
+            stop_event: asyncio.Event,
+        ) -> None:
+            raise RuntimeError("simulated stage crash")
+
     class _OrchestratorHostStub:
         """Minimal stand-in providing the attributes the orchestrator touches."""
 
@@ -542,3 +554,16 @@ class TestStageEarlyExitTerminatesCleanly:
         asyncio.run(asyncio.wait_for(orchestrator_fn(host), timeout=2.0))
 
         assert not host.stop_flag.is_set(), "worker stop_flag must not fire on stage exit"
+
+    def test_orchestrator_exits_when_stage_raises_without_stop_event(self) -> None:
+        """``_run_continuous_async`` must propagate the stage exception, not hang."""
+        host = self._OrchestratorHostStub(stage=self._RaisingStage())
+        orchestrator_fn = sw_module.StageWorker._run_continuous_async.__wrapped__  # type: ignore[attr-defined]
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            asyncio.run(asyncio.wait_for(orchestrator_fn(host), timeout=2.0))
+        leaves = list(exception_utils.iter_exception_group_leaves(exc_info.value))
+        assert any(isinstance(leaf, RuntimeError) for leaf in leaves), (
+            "stage RuntimeError must propagate through the TaskGroup"
+        )
+        assert not host.stop_flag.is_set(), "worker stop_flag must not fire on stage exception"
