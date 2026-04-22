@@ -1190,7 +1190,7 @@ class ActorPool(Generic[T, V]):
             return
 
         # Create a map from ObjectRef back to actor ID for quick lookup
-        ref_to_id_map = {ref: actor_id for ref, actor_id in zip(setup_refs, actor_ids)}
+        ref_to_id_map = {ref: actor_id for ref, actor_id in zip(setup_refs, actor_ids, strict=True)}
 
         for ready_ref in ready_refs:
             actor_id = ref_to_id_map.get(ready_ref)
@@ -1250,7 +1250,7 @@ class ActorPool(Generic[T, V]):
         if not ready_refs:
             return
 
-        ref_to_node_id_map = {ref: node_id for ref, node_id in zip(node_setup_refs, node_ids)}
+        ref_to_node_id_map = {ref: node_id for ref, node_id in zip(node_setup_refs, node_ids, strict=True)}
 
         for ready_ref in ready_refs:
             node_id = ref_to_node_id_map.get(ready_ref)

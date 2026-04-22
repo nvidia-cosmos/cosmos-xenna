@@ -132,7 +132,7 @@ def run_pipeline(
         pools,
         pipeline_spec.config.monitoring_verbosity_level,
     ) as monitor:
-        for idx, (spec, pool) in enumerate(zip(pipeline_spec.stages, pools)):
+        for idx, (spec, pool) in enumerate(zip(pipeline_spec.stages, pools, strict=True)):
             assert isinstance(spec, specs.StageSpec)
             logger.info(f"Starting stage={pool.name}")
             if idx != 0:
