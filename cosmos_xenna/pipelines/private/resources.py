@@ -766,7 +766,9 @@ def make_cluster_resources_for_ray_cluster(
         node_gpus = _get_gpus(reported_resources[node_id], info)
         out_dict[str(node_id)] = NodeResources(
             used_cpus=0.0,
-            total_cpus=math.floor(_get_cpu_count(reported_resources[node_id], info) * cpu_allocation_percentage),
+            total_cpus=max(
+                0, math.floor(_get_cpu_count(reported_resources[node_id], info) * cpu_allocation_percentage)
+            ),
             gpus=[
                 GpuResources(
                     index=x.index,
