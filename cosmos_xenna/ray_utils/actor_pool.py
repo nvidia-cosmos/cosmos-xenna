@@ -1728,16 +1728,13 @@ class ActorPool(Generic[T, V]):
         # Only update metrics for the primary actor. This is rank=0 for spmd.
         if is_primary:
             self._task_result_metadatas.append(metadata)
-            # Rate-estimator duration: prefer the worker-supplied
-            # ``rate_duration_s`` (continuous mode - inter-completion interval)
-            # over wall-clock per-task ``process_dur``. Continuous-mode workers
-            # may overlap N tasks in a single ``run_continuous`` async loop,
-            # which inflates per-task wall-clock duration by ~N relative to
-            # the actor's true throughput. ``rate_duration_s`` measures the
-            # gap between successive completions on this actor, which is the
-            # per-slot service rate the autoscaler actually wants. Batch-mode
-            # workers always leave ``rate_duration_s`` ``None`` and fall
-            # through to the original wall-clock formula.
+            # Prefer worker-supplied ``rate_duration_s`` (inter-completion
+            # interval) over wall-clock per-task duration. Workers that
+            # pipeline overlapping tasks inflate wall-clock per-task by the
+            # overlap factor; the inter-completion interval is the per-slot
+            # service rate the autoscaler actually needs. Workers that
+            # process tasks serially leave ``rate_duration_s`` as ``None``
+            # and fall through to the wall-clock formula.
             if metadata.rate_duration_s is not None:
                 actor.rate_estimator.update(metadata.rate_duration_s)
             else:
