@@ -636,20 +636,31 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
         resources_per_worker = stage.stage.required_resources.to_pool()
         required_resources = required_resources.add(resources_per_worker.multiply_by(num_required))
 
+    mode_name = pipeline_spec.config.execution_mode.name
+    remediation = (
+        "To fit, reduce per-worker CPU/GPU on individual stages (Stage.required_resources) or their worker counts "
+        "(num_workers / num_workers_per_node)."
+    )
+    if pipeline_spec.config.execution_mode == specs.ExecutionMode.STREAMING:
+        remediation += (
+            " BATCH mode (config.execution_mode=BATCH) is another option: stages run sequentially, so resource "
+            "demand is the max of any single stage instead of the sum across stages -- this won't help if a "
+            "single stage alone requires more than what is available."
+        )
     summary_string = (
-        f"If running locally, you can run the pipeline in batch mode by setting the config.execution_mode to BATCH.\n"
-        f"Cluster resources: {cluster_resource_totals}\n"
-        f"Required resources: {required_resources}"
+        f"{remediation}\nCluster resources: {cluster_resource_totals}\nRequired resources: {required_resources}"
     )
     if approx.float_lt(cluster_resource_totals.cpus, required_resources.cpus):
         raise ValueError(
-            f"Not enough CPU resources to run pipeline in streaming mode. Pipeline requires "
-            f"{required_resources.cpus} but only {cluster_resource_totals.cpus} are available.\n{summary_string}"
+            f"Not enough CPU resources to run pipeline in {mode_name} mode. Pipeline requires "
+            f"{required_resources.cpus:.2f} CPUs but only {cluster_resource_totals.cpus:.2f} are available.\n"
+            f"{summary_string}"
         )
     if approx.float_lt(cluster_resource_totals.gpus, required_resources.gpus):
         raise ValueError(
-            f"Not enough GPU resources to run pipeline in streaming mode. Pipeline requires "
-            f"{required_resources.gpus} but only {cluster_resource_totals.gpus} are available.\n{summary_string}"
+            f"Not enough GPU resources to run pipeline in {mode_name} mode. Pipeline requires "
+            f"{required_resources.gpus:.2f} GPUs but only {cluster_resource_totals.gpus:.2f} are available.\n"
+            f"{summary_string}"
         )
 
 
