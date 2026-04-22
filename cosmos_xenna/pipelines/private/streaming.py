@@ -658,7 +658,7 @@ def _verify_enough_resources(pipeline_spec: specs.PipelineSpec, cluster_resource
     if approx.float_lt(cluster_resource_totals.gpus, required_resources.gpus):
         raise ValueError(
             f"Not enough GPU resources to run pipeline in {mode_name} mode. Pipeline requires "
-            f"{required_resources.gpus} GPUs but only {cluster_resource_totals.gpus} are available.\n{summary_string}"
+            f"{required_resources.gpus:.2f} GPUs but only {cluster_resource_totals.gpus:.2f} are available.\n{summary_string}"
         )
 
 
