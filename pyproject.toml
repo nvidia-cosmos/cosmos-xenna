@@ -67,6 +67,8 @@ log_cli_level = "INFO"
 addopts = "-m 'not slow'"
 markers = [
     "slow: marks tests as slow to run",
+    "L1: level-1 test tier (used by external CI runners)",
+    "CPU: test runs on CPU-only hardware (used by external CI runners)",
 ]
 
 

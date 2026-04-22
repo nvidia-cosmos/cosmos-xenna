@@ -54,6 +54,8 @@ class TestS3Object:
     key: str
     bytes: bytes
 
+    __test__ = False  # Not a pytest test class; the "Test" prefix is incidental.
+
 
 @pytest.fixture
 def testing_info():
