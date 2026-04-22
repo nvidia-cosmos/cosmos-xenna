@@ -157,7 +157,7 @@ impl WorkerAllocator {
         };
 
         if let Some(initial_workers) = workers {
-            this.add_workers(initial_workers.into_iter())?;
+            this.add_workers(initial_workers)?;
         }
         Ok(this)
     }
