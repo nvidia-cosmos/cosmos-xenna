@@ -2,6 +2,29 @@
 
 ## Latest
 
+## [0.3.0]
+
+### Released
+
+- 2026-04-23
+
+### Added
+
+- Added a GitHub Actions CI workflow for Rust and Python tests and lints; P2P bind failures now surface as a typed `RuntimeError` instead of a panic.
+
+### Fixed
+
+- Prevented GPU stage starvation at drain-tail by clamping autoscaler scale-downs to keep enough workers for in-flight and queued tasks per active stage.
+- Caught the autoscaler TOCTOU race in `WorkerAllocator.add_worker()` as a typed `AllocationError` instead of crashing the pipeline.
+- Tolerated `None` gpustat fields on DGX Spark GB10 so `NodeResourceMonitor`'s metrics loop keeps running on unified-memory GPUs.
+- Made resource-shortage errors actionable (per-stage / worker-count remediation first, BATCH hint scoped to STREAMING, mode name in prefix, CPU / GPU units on requires/available).
+- Used `math.floor` for CPU-count truncation and clamped the result to `>= 0` to guard against misconfigured `cpu_allocation_percentage`.
+- Moved the Ray cluster startup log to after initialization completes.
+
+### Changed
+
+- Registered `L1` and `CPU` pytest markers and silenced the `TestS3Object` collection warning under external CI runners.
+
 ## [0.2.3]
 
 ### Released
