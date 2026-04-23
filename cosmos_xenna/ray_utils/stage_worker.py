@@ -1005,8 +1005,9 @@ class StageWorker(abc.ABC, Generic[T, V]):
         last_completion_time: float | None = None
         while not stop_event.is_set():
             try:
-                result = await asyncio.wait_for(output_q.get(), timeout=0.1)
-            except asyncio.TimeoutError:
+                async with asyncio.timeout(0.1):
+                    result = await output_q.get()
+            except TimeoutError:
                 continue
 
             now = time.time()
