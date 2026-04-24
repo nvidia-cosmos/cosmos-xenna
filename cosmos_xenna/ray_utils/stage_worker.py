@@ -83,11 +83,43 @@ from ray.util.metrics import Gauge
 
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import stage
+from cosmos_xenna.ray_utils.continuous_stage import (
+    ContinuousInterface,
+    ContinuousTaskInput,
+    ContinuousTaskOutput,
+)
+from cosmos_xenna.ray_utils.task_metadata import (
+    FailureInfo,
+    TaskData,
+    TaskDataInfo,
+    TaskResultMetadata,
+    TimingInfo,
+)
 from cosmos_xenna.utils import gpu, retry
 from cosmos_xenna.utils import python_log as logger
+from cosmos_xenna.utils.exception_utils import unwrap_taskgroup_exception_group
 
 T = typing.TypeVar("T")
 V = typing.TypeVar("V")
+
+# Re-export task-metadata types so that historic call sites can keep using
+# ``stage_worker.TaskResultMetadata`` etc. The canonical home is
+# ``cosmos_xenna.ray_utils.task_metadata`` - new code SHOULD import from
+# there. The list is explicit so that ``ruff`` recognizes these names as
+# part of this module's public API and does not flag them as unused.
+__all__ = [
+    "FailureInfo",
+    "StageWorker",
+    "TaskData",
+    "TaskDataInfo",
+    "TaskResultMetadata",
+    "TimingInfo",
+]
+
+# Wakeup interval (seconds) for the continuous-mode async helpers
+# (``_watch_stop_flag``, ``_feed_continuous_async``,
+# ``_collect_continuous_async``).
+_CONTINUOUS_POLL_INTERVAL_S = 0.1
 
 
 @attrs.define
@@ -154,102 +186,6 @@ class _ProcessDataResult(Generic[V]):
     out_data: list[V]
     # Information about potential failures and restart signals.
     pool_info: FailureInfo
-
-
-@attrs.define
-class TaskData(Generic[T]):
-    """Represents a task submitted to the worker for processing.
-
-    This is the input structure expected by the public `process_data` method.
-    """
-
-    # References to the data objects in the Ray object store.
-    data_refs: list[ray.ObjectRef[T]]
-
-
-@attrs.define
-class TimingInfo:
-    """Stores timestamps for various stages of task processing within the worker.
-
-    Allows calculating durations for different phases (pull, deserialize, process).
-    Timestamps are captured using `time.time()`.
-    """
-
-    # Time when the task was initially submitted via `process_data`.
-    requested_s: float = 0.0
-    # Time when `ray.wait` indicated the data ref was available locally.
-    pull_s: float = 0.0
-    # Time just before calling `ray.get`.
-    deserialize_start_s: float = 0.0
-    # Time just after `ray.get` returned.
-    deserialize_end_s: float = 0.0
-    # Time just before calling `stage_interface.process_data`.
-    process_start_time_s: float = 0.0
-    # Time just after `stage_interface.process_data` returned.
-    process_end_time_s: float = 0.0
-
-    @property
-    def pull_dur(self) -> float | None:
-        """Duration (in seconds) Ray spent making the data available locally."""
-        if self.pull_s and self.requested_s:
-            return self.pull_s - self.requested_s
-        else:
-            return None
-
-    @property
-    def deserialize_dur(self) -> float | None:
-        """Duration (in seconds) spent deserializing the data via `ray.get`."""
-        if self.deserialize_end_s and self.deserialize_start_s:
-            return self.deserialize_end_s - self.deserialize_start_s
-        else:
-            return None
-
-    @property
-    def process_dur(self) -> float | None:
-        """Duration (in seconds) spent executing the stage's process_data method."""
-        if self.process_end_time_s and self.process_start_time_s:
-            return self.process_end_time_s - self.process_start_time_s
-        else:
-            return None
-
-
-@attrs.define
-class FailureInfo:
-    """Contains information about task processing outcome relevant to the ActorPool.
-
-    Signals whether the task result should be passed to the next stage and whether
-    the worker encountered an error that warrants a restart.
-    """
-
-    # If False, the ActorPool will not submit this task's result (None) to the next stage.
-    should_process_further: bool
-    # If True, signals to the ActorPool that this worker should be killed and potentially replaced.
-    # Set based on stage_params.restart_workers_on_failure if an exception occurs during processing.
-    should_restart_worker: bool
-    # Deprecated/Unused? Original comment mentioned ignoring tasks, but logic seems tied to should_process_further.
-    failures_return_nones: bool = False
-
-
-@attrs.define
-class TaskDataInfo:
-    """Information about the input data size for a processed task."""
-
-    # Size (in bytes) of the task data in the Ray object store.
-    serialized_input_size: int
-
-
-@attrs.define
-class TaskResultMetadata:
-    """Aggregated metadata returned alongside the processed data reference.
-
-    Contains timing details, failure information, and input data size.
-    This is the second return value of the public `process_data` method.
-    """
-
-    timing: TimingInfo
-    failure_info: FailureInfo
-    task_data_info: TaskDataInfo
-    num_returns: int
 
 
 def _get_object_size(ref: ray.ObjectRef) -> int:
@@ -744,7 +680,18 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 break  # Break out of the loop as we are now ready to process data.
             time.sleep(0.01)
 
-        # Now process tasks continuously
+        # Continuous mode: stage opted in via the ContinuousInterface mixin.
+        # ``isinstance`` is the documented detection contract - the same check
+        # is performed in ``specs.make_actor_pool_stage_from_stage_spec`` to
+        # decide which adapter to wrap the user stage in. Branching here keeps
+        # the dispatch decision in exactly one place per side (specs vs worker)
+        # and guarantees that ``process_data`` is never called on a continuous
+        # stage from this thread.
+        if isinstance(self._stage_interface, ContinuousInterface):
+            self._run_continuous_mode()
+            return
+
+        # Batch mode: classic per-task ``process_data`` loop.
         while not self.stop_flag.is_set():
             try:
                 self._process_step()
@@ -862,24 +809,156 @@ class StageWorker(abc.ABC, Generic[T, V]):
                 logger.exception("Got an exception in process_data")
                 raise e
 
-    def _handle_thread_exception(self, thread_name: str, task_id: str | None, e: Exception) -> None:
-        """Handles exceptions occurring within the worker threads.
+    # Continuous-mode runtime:
+    # deserialized_queue -> feeder -> input_q -> stage.run_continuous -> output_q -> collector -> _results.
+    # stop_flag is bridged to stop_event by _watch_stop_flag.
 
-        Logs the exception, sets the `_global_error` flag to indicate a fatal error,
-        and triggers the `stop_flag` to terminate all worker threads.
+    def _run_continuous_mode(self) -> None:
+        """Run the continuous-mode async orchestrator on the processor thread."""
+        try:
+            with asyncio.Runner() as runner:
+                runner.run(self._run_continuous_async())
+        except BaseExceptionGroup as eg:
+            inner = unwrap_taskgroup_exception_group(eg)
+            self._handle_thread_exception("run_continuous", None, inner)
+        except Exception as e:  # noqa: BLE001 - last-line-of-defense, matches batch-mode pattern
+            self._handle_thread_exception("run_continuous", None, e)
 
-        Args:
-            thread_name: Name of the thread where the exception occurred ("downloader", "deserializer", "process_data").
-            task_id: The UUID of the task being processed when the error occurred (if applicable).
-            e: The exception object.
+    async def _run_continuous_async(self) -> None:
+        """Run watcher, feeder, collector, and the stage loop in one TaskGroup.
+
+        ``input_q`` is sized to ``slots_per_actor`` so per-actor backpressure
+        matches what the autoscaler computes. Any of (worker ``stop_flag``,
+        stage return, stage exception) sets ``stop_event``, unblocking the
+        watcher and feeder so the ``TaskGroup`` always completes.
         """
+        if not isinstance(self._stage_interface, ContinuousInterface):
+            msg = (
+                f"Continuous-mode runtime requires a ContinuousInterface stage, "
+                f"got {type(self._stage_interface).__name__}"
+            )
+            raise TypeError(msg)
+        continuous_stage = self._stage_interface
+
+        slots = self._params.slots_per_actor
+        input_q: asyncio.Queue[ContinuousTaskInput] = asyncio.Queue(maxsize=slots)
+        output_q: asyncio.Queue[ContinuousTaskOutput] = asyncio.Queue()
+        stop_event = asyncio.Event()
+        # output_drain_done unblocks the collector; stop_event unblocks
+        # the watcher and feeder. Both are set when the stage returns.
+        output_drain_done = asyncio.Event()
+
+        async def _run_stage_then_signal() -> None:
+            try:
+                await continuous_stage.run_continuous(input_q, output_q, stop_event)
+            finally:
+                stop_event.set()
+                output_drain_done.set()
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._watch_stop_flag(stop_event), name="continuous-stop-watcher")
+            tg.create_task(self._feed_continuous_async(input_q, stop_event), name="continuous-feeder")
+            tg.create_task(
+                self._collect_continuous_async(output_q, output_drain_done),
+                name="continuous-collector",
+            )
+            tg.create_task(_run_stage_then_signal(), name="continuous-stage")
+
+    async def _watch_stop_flag(self, stop_event: asyncio.Event) -> None:
+        """Bridge the worker's ``threading.Event`` stop_flag to ``asyncio.Event``.
+
+        Exits when either ``stop_flag`` fires or ``stop_event`` is already set.
+        """
+        while not self.stop_flag.is_set() and not stop_event.is_set():
+            await asyncio.sleep(_CONTINUOUS_POLL_INTERVAL_S)
+        logger.debug(
+            f"continuous watcher exiting: stop_flag={self.stop_flag.is_set()} stop_event={stop_event.is_set()}"
+        )
+        stop_event.set()
+
+    async def _feed_continuous_async(
+        self,
+        input_q: asyncio.Queue[ContinuousTaskInput],
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Move deserialized tasks into ``input_q`` with queue-aware timing."""
+        while not stop_event.is_set():
+            try:
+                task = await asyncio.to_thread(self.deserialized_queue.get, True, _CONTINUOUS_POLL_INTERVAL_S)
+            except queue.Empty:
+                continue
+
+            input_item = ContinuousTaskInput(
+                task_id=task.uuid,
+                data=task.data,
+                timing=task.timing,
+                object_sizes=task.object_sizes,
+            )
+
+            # Bounded blocking put: re-checks stop_event every interval so we
+            # never deadlock when the consumer stops draining under shutdown.
+            enqueued = False
+            while not stop_event.is_set():
+                try:
+                    async with asyncio.timeout(_CONTINUOUS_POLL_INTERVAL_S):
+                        await input_q.put(input_item)
+                    enqueued = True
+                    break
+                except TimeoutError:
+                    continue
+            if not enqueued:
+                return  # stop-wins: drop held task without force-draining input_q
+
+            # Stamp at handoff; consumer wakeup is scheduled via ``call_soon``
+            # so it cannot read the timing before the next event-loop tick.
+            input_item.timing.process_start_time_s = time.time()
+
+    async def _collect_continuous_async(
+        self,
+        output_q: asyncio.Queue[ContinuousTaskOutput],
+        drain_done: asyncio.Event,
+    ) -> None:
+        """Drain ``output_q`` into ``self._results`` until drain completion."""
+        last_completion_time: float | None = None
+        while not (drain_done.is_set() and output_q.empty()):
+            try:
+                result = await asyncio.wait_for(output_q.get(), timeout=_CONTINUOUS_POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                continue
+
+            now = time.time()
+            timing = result.timing
+            timing.process_end_time_s = now
+
+            rate_dur: float | None = None
+            if last_completion_time is not None:
+                rate_dur = now - last_completion_time
+            last_completion_time = now
+
+            with self.results_lock:
+                self._results[result.task_id] = _Result(
+                    result.task_id,
+                    result.out_data,
+                    TaskResultMetadata(
+                        timing,
+                        FailureInfo(
+                            should_process_further=True,
+                            should_restart_worker=False,
+                        ),
+                        TaskDataInfo(sum(result.object_sizes)),
+                        len(result.out_data),
+                        rate_duration_s=rate_dur,
+                    ),
+                )
+
+    def _handle_thread_exception(self, thread_name: str, task_id: str | None, e: Exception) -> None:
+        """Record a worker-thread error and trigger global stop."""
         logger.exception(f"Error in {thread_name}. Killing worker.")
         self._global_error = e
         self.stop_flag.set()  # Stop all threads
 
     def get_pid_tree(self) -> list[tuple[int, float]]:
         """Return this process's PID and all descendant PIDs, each paired with its create_time.
-
         Called by the actor pool before ray.kill() to snapshot the full process tree.
         The create_time is used by the reaper to guard against PID reuse: if the OS recycles
         a PID before the reap task runs, the create_time mismatch will prevent killing an
@@ -899,12 +978,43 @@ class StageWorker(abc.ABC, Generic[T, V]):
         except psutil.NoSuchProcess:
             return [(os.getpid(), 0.0)]
 
-    def shutdown(self) -> None:
-        """Signals the worker threads to stop and waits for them to exit."""
+    def shutdown(self, grace_period_s: float = 30.0) -> bool:
+        """Signal stop and wait up to ``grace_period_s`` for thread exit."""
         self.stop_flag.set()
-        self._downloader_thread.join()
-        self._deserializer_thread.join()
-        self._process_data_thread.join()
+        if grace_period_s <= 0.0:
+            # Non-blocking signal-only mode - caller will follow with
+            # ``ray.kill()`` and does not care whether we drained cleanly.
+            return False
+
+        # Split the budget: short caps for the I/O threads (they unblock on
+        # the next 100 ms poll), the remainder for the processor thread.
+        io_cap = min(1.0, grace_period_s / 4.0)
+        processor_cap = max(0.0, grace_period_s - 2 * io_cap)
+
+        self._downloader_thread.join(timeout=io_cap)
+        self._deserializer_thread.join(timeout=io_cap)
+        self._process_data_thread.join(timeout=processor_cap)
+
+        clean = not (
+            self._downloader_thread.is_alive()
+            or self._deserializer_thread.is_alive()
+            or self._process_data_thread.is_alive()
+        )
+        if not clean:
+            still_alive = [
+                name
+                for name, t in (
+                    ("downloader", self._downloader_thread),
+                    ("deserializer", self._deserializer_thread),
+                    ("processor", self._process_data_thread),
+                )
+                if t.is_alive()
+            ]
+            logger.warning(
+                f"StageWorker.shutdown: grace period {grace_period_s:.1f}s expired with threads still alive: "
+                f"{still_alive!r}; caller should follow with ray.kill()"
+            )
+        return clean
 
     def __repr__(self) -> str:
         """Return the name for this stage.

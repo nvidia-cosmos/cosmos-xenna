@@ -23,6 +23,7 @@ import attrs
 
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.ray_utils import runtime_envs
+from cosmos_xenna.utils import attrs_utils
 
 
 @attrs.define
@@ -52,7 +53,10 @@ def open_context(openable: Optional[Openable]) -> Iterator[None]:
 class Params:
     shape: resources.WorkerShape
     stage_batch_size: int = 1
-    slots_per_actor: int = 2
+    # Per-actor input depth. Validated at construction so that an invalid
+    # 0/negative value fails fast at the call site rather than as a downstream
+    # hang or divide-by-zero in the autoscaler.
+    slots_per_actor: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
     # Maxmum lifetime in minutes before we internally terminate and restart a worker. 0 means disabled.
     # Not enabled for SPMD actor pools.
     worker_max_lifetime_m: int = 0

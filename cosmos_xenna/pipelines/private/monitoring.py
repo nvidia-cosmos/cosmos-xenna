@@ -230,7 +230,7 @@ class RayResourceMonitor:
         """Collect stats from each node."""
         results = ray.get([monitor.get_latest_metrics.remote() for monitor in self._monitors])  # type: ignore
         out = {}
-        for node_id, result in zip(self._node_ids, results):
+        for node_id, result in zip(self._node_ids, results, strict=True):
             out[node_id] = result
         return out
 
@@ -471,7 +471,7 @@ class PipelineMonitor:
         t = time.time()
 
         extra_outputs = collections.defaultdict(list)
-        for pool, metadatas in zip(self._actor_pools, task_metadata_per_pool):
+        for pool, metadatas in zip(self._actor_pools, task_metadata_per_pool, strict=True):
             extra_outputs[pool.name] = metadatas
 
         contents = PipelineStats(

@@ -762,7 +762,7 @@ def make_cluster_resources_for_ray_cluster(
     infos: list[ResourceInfoFromNode] = ray.get(futures)
     logger.debug(f"Node info futures completed. Results: {infos}")
 
-    for node_id, info in zip(alive_nodes, infos):
+    for node_id, info in zip(alive_nodes, infos, strict=True):
         node_gpus = _get_gpus(reported_resources[node_id], info)
         out_dict[str(node_id)] = NodeResources(
             used_cpus=0.0,

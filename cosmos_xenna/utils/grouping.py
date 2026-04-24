@@ -98,7 +98,9 @@ def pairwise(iterable: Iterable[T]) -> Iterable[tuple[T, T]]:
     """
     a, b = itertools.tee(iterable)
     next(b, None)
-    return zip(a, b)
+    # strict=False is intentional: ``b`` is one shorter than ``a`` by design
+    # (``next(b, None)`` advances it past the first element).
+    return zip(a, b, strict=False)
 
 
 K = typing.TypeVar("K")
