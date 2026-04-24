@@ -2800,8 +2800,10 @@ mod tests {
             HashMap::new();
         worker_groups_to_remove_map.insert(stage_name.to_string(), Vec::new());
 
-        let mut current_worker_groups_per_stage: HashMap<String, HashMap<String, rds::WorkerGroup>> =
-            HashMap::new();
+        let mut current_worker_groups_per_stage: HashMap<
+            String,
+            HashMap<String, rds::WorkerGroup>,
+        > = HashMap::new();
         current_worker_groups_per_stage.insert(stage_name.to_string(), HashMap::new());
 
         AutoscaleContext {
@@ -2871,7 +2873,10 @@ mod tests {
         remove_best_worker_fn(&mut stage, &workload, &mut metrics, &mut c);
 
         // Post-remove invariants
-        assert_eq!(stage.current_workers, 0, "remove must decrement stage count");
+        assert_eq!(
+            stage.current_workers, 0,
+            "remove must decrement stage count"
+        );
         let to_remove_for_stage = c
             .workers_to_remove_map
             .get("stage-a")

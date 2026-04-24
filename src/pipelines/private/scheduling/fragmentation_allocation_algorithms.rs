@@ -1035,11 +1035,7 @@ mod tests {
     }
 
     fn canonicalize_zero(value: f32) -> f32 {
-        if value == 0.0 {
-            0.0
-        } else {
-            value
-        }
+        if value == 0.0 { 0.0 } else { value }
     }
 
     // --------------------
