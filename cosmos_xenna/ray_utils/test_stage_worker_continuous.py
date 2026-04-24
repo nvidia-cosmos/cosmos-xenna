@@ -22,6 +22,7 @@ import queue
 import threading
 import time
 import typing
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -31,6 +32,9 @@ from ray import ObjectRef
 import cosmos_xenna.ray_utils.actor_pool as ap_module
 import cosmos_xenna.ray_utils.stage_worker as sw_module
 from cosmos_xenna.pipelines import v1 as pipelines_v1
+from cosmos_xenna.pipelines.private import allocator as alloc_mod
+from cosmos_xenna.pipelines.private import data_structures
+from cosmos_xenna.pipelines.private import resources as res_mod
 from cosmos_xenna.pipelines.private import resources as resources_mod
 from cosmos_xenna.ray_utils.continuous_stage import (
     ContinuousInterface,
@@ -567,3 +571,86 @@ class TestStageEarlyExitTerminatesCleanly:
             "stage RuntimeError must propagate through the TaskGroup"
         )
         assert not host.stop_flag.is_set(), "worker stop_flag must not fire on stage exception"
+
+
+def _make_single_gpu_node_cluster(node_id: str = "node-A") -> res_mod.ClusterResources:
+    """Return a ``ClusterResources`` with one node holding one whole GPU.
+
+    Picks the smallest cluster shape where the offset/index distinction
+    is uncontroversial: offset 0 == GPU index 0.
+    """
+    gpu = res_mod.GpuResources(index=0, uuid_=uuid.uuid4(), used_fraction=0.0)
+    node = res_mod.NodeResources(used_cpus=0.0, total_cpus=8.0, gpus=[gpu], name=node_id)
+    return res_mod.ClusterResources(nodes={node_id: node})
+
+
+def _make_full_gpu_worker_group(
+    worker_id: str,
+    stage_name: str,
+    node_id: str,
+    gpu_offset: int,
+    cpus: float = 1.0,
+) -> res_mod.WorkerGroup:
+    """Build a ``WorkerGroup`` requesting a whole GPU at ``gpu_offset`` on ``node_id``.
+
+    Constructs the group via ``ProblemWorkerGroupState.make().to_worker_group()``
+    because the compiled Rust extension does not expose a direct
+    ``WorkerGroup`` constructor; this is the same path used by the
+    autoscaler in ``streaming.py``.
+    """
+    allocation = res_mod.WorkerResourcesInternal(
+        node=node_id,
+        cpus=cpus,
+        gpus=[res_mod.GpuAllocationInternal(offset=gpu_offset, used_fraction=1.0)],
+    )
+    state = data_structures.ProblemWorkerGroupState.make(worker_id, [allocation])
+    return state.to_worker_group(stage_name)
+
+
+class TestSameOffsetDoubleAllocationGate:
+    """Pin the Rust ``WorkerAllocator``'s same-offset rejection contract.
+
+    Two whole-GPU workers cannot coexist on the same ``GpuAllocationInternal.offset``
+    of the same node. ``WorkerAllocator.add_worker`` must reject the
+    second add with ``AllocationError``, and ``remove_worker`` must
+    release the offset so a different worker id can re-acquire it.
+    """
+
+    def test_second_full_gpu_allocation_on_same_offset_is_rejected(self) -> None:
+        """Two whole-GPU workers on the same offset must be a hard reject."""
+        cluster = _make_single_gpu_node_cluster(node_id="node-A")
+        allocator = alloc_mod.WorkerAllocator.make(cluster)
+
+        first = _make_full_gpu_worker_group(
+            worker_id="worker-1",
+            stage_name="test-stage",
+            node_id="node-A",
+            gpu_offset=0,
+        )
+        allocator.add_worker(first)
+
+        second = _make_full_gpu_worker_group(
+            worker_id="worker-2",
+            stage_name="test-stage",
+            node_id="node-A",
+            gpu_offset=0,
+        )
+
+        with pytest.raises(alloc_mod.AllocationError):
+            allocator.add_worker(second)
+
+    def test_second_allocation_succeeds_after_first_is_removed(self) -> None:
+        """Releasing a worker frees its GPU offset for a different worker id."""
+        cluster = _make_single_gpu_node_cluster(node_id="node-A")
+        allocator = alloc_mod.WorkerAllocator.make(cluster)
+
+        first = _make_full_gpu_worker_group("worker-1", "test-stage", "node-A", gpu_offset=0)
+        allocator.add_worker(first)
+        allocator.remove_worker("worker-1")
+
+        second = _make_full_gpu_worker_group("worker-2", "test-stage", "node-A", gpu_offset=0)
+        allocator.add_worker(second)
+
+        live = allocator.get_workers_in_stage("test-stage")
+        assert len(live) == 1
+        assert live[0].id == "worker-2"
