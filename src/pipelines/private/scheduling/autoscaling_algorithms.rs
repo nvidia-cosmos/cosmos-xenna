@@ -2713,4 +2713,370 @@ mod tests {
             (estimated_gpu_usage / total_cluster_gpus as f32) * 100.0
         );
     }
+
+    // --------------------
+    // Reuse-bookkeeping regression tests
+    // --------------------
+    //
+    // These tests exercise `remove_best_worker_fn` → `add_worker_fn` back-to-back on the
+    // same stage within one planning pass. This is the production code path that consumes
+    // the new `AllocationResult::reused_worker_id` field, and the path whose correctness
+    // depends on the tightened borrowing / `HashMap::remove`-consume pattern in
+    // `autoscaling_algorithms.rs`. A regression in any of those areas (stale to-remove
+    // entries, accidental `Worker` clones, missed cluster re-allocation, desynced
+    // `stage.current_workers`, etc.) will surface here.
+
+    // FGD's `worker_reuse_fragmentation_equivalent` knob: large enough to make any
+    // in-pool reuse candidate strictly preferred over a fresh allocation. The exact
+    // magnitude doesn't matter when the reuse pool is empty — the fresh-allocation
+    // test re-uses this constant to document that the bonus is inert on that path.
+    const REUSE_BONUS_FORCING_REUSE: f32 = 10.0;
+
+    /// Builds a tiny `StageInternal` suitable for driving `add_worker_fn` /
+    /// `remove_best_worker_fn` directly in tests.
+    ///
+    /// The `speed_per_worker` / `stage_batch_size` / `num_returns_per_batch` /
+    /// `num_input_samples_per_sample` fields are unused on the add/remove bookkeeping
+    /// path (those are `throughput()`-only inputs), but `StageInternal` requires them.
+    fn make_stage_internal(
+        name: &str,
+        shape: rds::WorkerShape,
+        current_workers: usize,
+    ) -> StageInternal {
+        StageInternal {
+            name: name.to_string(),
+            current_workers,
+            speed_per_worker: Some(1.0),
+            stage_batch_size: 1,
+            num_returns_per_batch: Some(1.0),
+            num_input_samples_per_sample: Some(1.0),
+            shape,
+            requested_num_workers: None,
+            is_finished: false,
+        }
+    }
+
+    fn make_workload_for_stage(stage: &StageInternal) -> frag::Workload {
+        frag::Workload {
+            stages: vec![frag::Stage {
+                frequency: 1.0,
+                shape: stage.shape.clone(),
+            }],
+        }
+    }
+
+    /// Seeds an `AutoscaleContext` with a cluster and a single pre-existing worker for
+    /// `stage`. The worker is registered in `current_workers_per_stage` and its
+    /// allocation is applied to the cluster, mirroring what `run_fragmentation_autoscaler`
+    /// does after ingesting `ProblemState`.
+    fn seed_context<'a>(
+        cluster: rds::ClusterResources,
+        worker_id_factory: &'a mut WorkerIdFactory,
+        stage_name: &str,
+        seeded_worker: rds::Worker,
+    ) -> AutoscaleContext<'a> {
+        let mut cluster = cluster;
+        cluster
+            .allocate(&seeded_worker.allocation)
+            .expect("seed worker allocation");
+
+        let mut current_workers_per_stage: HashMap<String, HashMap<String, rds::Worker>> =
+            HashMap::new();
+        let mut workers = HashMap::new();
+        workers.insert(seeded_worker.id.clone(), seeded_worker);
+        current_workers_per_stage.insert(stage_name.to_string(), workers);
+
+        let mut workers_to_add_map: HashMap<String, Vec<rds::Worker>> = HashMap::new();
+        workers_to_add_map.insert(stage_name.to_string(), Vec::new());
+
+        let mut workers_to_remove_map: HashMap<String, HashMap<String, rds::Worker>> =
+            HashMap::new();
+        workers_to_remove_map.insert(stage_name.to_string(), HashMap::new());
+
+        let mut worker_groups_to_add_map: HashMap<String, Vec<rds::WorkerGroup>> = HashMap::new();
+        worker_groups_to_add_map.insert(stage_name.to_string(), Vec::new());
+
+        let mut worker_groups_to_remove_map: HashMap<String, Vec<rds::WorkerGroup>> =
+            HashMap::new();
+        worker_groups_to_remove_map.insert(stage_name.to_string(), Vec::new());
+
+        let mut current_worker_groups_per_stage: HashMap<String, HashMap<String, rds::WorkerGroup>> =
+            HashMap::new();
+        current_worker_groups_per_stage.insert(stage_name.to_string(), HashMap::new());
+
+        AutoscaleContext {
+            cluster,
+            worker_id_factory,
+            workers_to_add_map,
+            workers_to_remove_map,
+            worker_groups_to_add_map,
+            worker_groups_to_remove_map,
+            current_workers_per_stage,
+            current_worker_groups_per_stage,
+        }
+    }
+
+    /// Remove a worker and then re-add to the same stage in a single planning pass.
+    /// Exercises the production bookkeeping:
+    ///   - `remove_best_worker_fn` moves the worker from `current_workers_per_stage`
+    ///     into `workers_to_remove_map` and releases the cluster allocation.
+    ///   - `add_worker_fn` sees the to-remove map as a reuse pool, has FGD pick it, and
+    ///     moves it back into `current_workers_per_stage` without cloning.
+    ///
+    /// Post-conditions assert the full round-trip is a no-op in terms of observable state
+    /// (cluster usage, worker identity, per-stage maps, and `stage.current_workers`).
+    #[test]
+    fn test_autoscaler_bookkeeping_remove_then_reuse_in_single_pass() {
+        // 1-node cluster with 8 CPUs and 2 GPUs — enough to host exactly one 4-CPU / 0.5-GPU
+        // worker with some headroom for ScratchView to evaluate alternatives.
+        let cluster = make_cluster(1, 8, 2, false);
+
+        // The seeded worker's shape. `Worker::new` takes the worker's resource claim
+        // (`WorkerResources`) rather than a shape; FGD derives the shape from the Problem.
+        let shape = rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+            gpu_fraction: rds::FixedUtil::from_num(0.5),
+            num_cpus: rds::FixedUtil::from_num(4.0),
+        });
+        let seeded_worker = rds::Worker::new(
+            "worker-seeded".into(),
+            "stage-a".into(),
+            rds::WorkerResources {
+                node: "node0".into(),
+                cpus: rds::FixedUtil::from_num(4.0),
+                gpus: vec![rds::GpuAllocation {
+                    offset: 0,
+                    used_fraction: rds::FixedUtil::from_num(0.5),
+                }],
+            },
+        );
+
+        let mut worker_id_factory = WorkerIdFactory::new();
+        let mut c = seed_context(
+            cluster,
+            &mut worker_id_factory,
+            "stage-a",
+            seeded_worker.clone(),
+        );
+        let mut stage = make_stage_internal("stage-a", shape, 1);
+        let workload = make_workload_for_stage(&stage);
+        let mut metrics = AutoscalerOpMetrics::new();
+
+        // --- snapshot pre-state so we can assert full round-trip equivalence ---
+        let pool_before = c.cluster.used_pool();
+        assert_eq!(pool_before.cpus, 4.0);
+        assert_eq!(pool_before.gpus, 0.5);
+        assert_eq!(stage.current_workers, 1);
+
+        // (1) Remove the worker — exercises the production remove path.
+        remove_best_worker_fn(&mut stage, &workload, &mut metrics, &mut c);
+
+        // Post-remove invariants
+        assert_eq!(stage.current_workers, 0, "remove must decrement stage count");
+        let to_remove_for_stage = c
+            .workers_to_remove_map
+            .get("stage-a")
+            .expect("stage entry present");
+        assert_eq!(
+            to_remove_for_stage.len(),
+            1,
+            "worker should have moved into workers_to_remove_map"
+        );
+        assert!(
+            to_remove_for_stage.contains_key(&seeded_worker.id),
+            "to_remove_map must key by the worker's own id"
+        );
+        assert!(
+            c.current_workers_per_stage
+                .get("stage-a")
+                .expect("stage present")
+                .is_empty(),
+            "current_workers_per_stage must be drained by the remove"
+        );
+        // Remove must not speculatively populate the add map — that would cause the
+        // final `Solution` to double-count the worker (once as new, once as deleted).
+        assert!(
+            c.workers_to_add_map
+                .get("stage-a")
+                .expect("stage present")
+                .is_empty(),
+            "remove must NOT populate workers_to_add_map"
+        );
+        let pool_after_remove = c.cluster.used_pool();
+        assert_eq!(
+            pool_after_remove.cpus, 0.0,
+            "cluster CPUs must be released after remove"
+        );
+        assert_eq!(
+            pool_after_remove.gpus, 0.0,
+            "cluster GPUs must be released after remove"
+        );
+        assert_eq!(metrics.remove_calls, 1, "remove metric must be recorded");
+
+        // (2) Add a worker for the same stage — FGD should see the to-remove entry as a
+        //     reuse candidate and pick it. This exercises the production reuse bookkeeping.
+        let ok = add_worker_fn(
+            &mut stage,
+            &workload,
+            REUSE_BONUS_FORCING_REUSE,
+            &mut metrics,
+            &mut c,
+        );
+        assert!(ok, "add_worker_fn must succeed when the cluster has room");
+
+        // Post-reuse invariants: the full round-trip must be a no-op.
+        assert_eq!(
+            stage.current_workers, 1,
+            "add must increment stage count back to 1"
+        );
+        assert!(
+            c.workers_to_remove_map
+                .get("stage-a")
+                .expect("stage present")
+                .is_empty(),
+            "workers_to_remove_map must be drained by the reuse (no stale clone)"
+        );
+        let current_after = c
+            .current_workers_per_stage
+            .get("stage-a")
+            .expect("stage present");
+        assert_eq!(
+            current_after.len(),
+            1,
+            "current_workers_per_stage must have the reused worker back"
+        );
+        let restored = current_after
+            .get(&seeded_worker.id)
+            .expect("reused worker must live under its ORIGINAL id (not a freshly minted one)");
+        // Full `Worker` equality catches any field that might silently change across
+        // the remove→reuse round-trip (allocation, stage_name, or any future field).
+        assert_eq!(
+            *restored, seeded_worker,
+            "reuse must restore the original Worker in full"
+        );
+
+        // The reuse path intentionally does NOT add to workers_to_add_map — the worker was
+        // never really removed from the caller's perspective. Confirm that invariant, since
+        // leaking the worker into the add map would cause the final `Solution` to
+        // double-count it (as both new and deleted).
+        assert!(
+            c.workers_to_add_map
+                .get("stage-a")
+                .expect("stage present")
+                .is_empty(),
+            "reuse must NOT push the worker into workers_to_add_map"
+        );
+
+        // Cluster usage is back to the pre-remove snapshot.
+        let pool_after_reuse = c.cluster.used_pool();
+        assert_eq!(
+            pool_after_reuse.cpus, pool_before.cpus,
+            "cluster CPUs must be restored by the reuse re-allocation"
+        );
+        assert_eq!(
+            pool_after_reuse.gpus, pool_before.gpus,
+            "cluster GPUs must be restored by the reuse re-allocation"
+        );
+        assert_eq!(metrics.add_calls, 1, "add metric must be recorded");
+    }
+
+    /// Fresh-allocation companion: when the reuse pool is empty, `add_worker_fn` must
+    /// fall back to minting a new worker, push it into `workers_to_add_map`, and use a
+    /// freshly generated id — i.e. *not* accidentally reuse state from a prior remove.
+    /// This guards the other side of the `reused_worker_id.is_some()` branch.
+    #[test]
+    fn test_autoscaler_bookkeeping_fresh_allocation_does_not_touch_reuse_map() {
+        let cluster = make_cluster(1, 8, 2, false);
+        let shape = rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+            gpu_fraction: rds::FixedUtil::from_num(0.5),
+            num_cpus: rds::FixedUtil::from_num(4.0),
+        });
+        let seeded_worker = rds::Worker::new(
+            "worker-seeded".into(),
+            "stage-a".into(),
+            rds::WorkerResources {
+                node: "node0".into(),
+                cpus: rds::FixedUtil::from_num(4.0),
+                gpus: vec![rds::GpuAllocation {
+                    offset: 0,
+                    used_fraction: rds::FixedUtil::from_num(0.5),
+                }],
+            },
+        );
+
+        let mut worker_id_factory = WorkerIdFactory::new();
+        let mut c = seed_context(
+            cluster,
+            &mut worker_id_factory,
+            "stage-a",
+            seeded_worker.clone(),
+        );
+        let mut stage = make_stage_internal("stage-a", shape, 1);
+        let workload = make_workload_for_stage(&stage);
+        let mut metrics = AutoscalerOpMetrics::new();
+
+        let pool_before = c.cluster.used_pool();
+        assert_eq!(pool_before.cpus, 4.0, "seeded worker consumes 4 CPUs");
+        assert_eq!(pool_before.gpus, 0.5, "seeded worker consumes half a GPU");
+
+        // Reuse pool is empty for this stage — `add_worker_fn` must take the fresh path.
+        // The reuse bonus is still passed (and non-zero) to confirm it is inert when
+        // there's nothing in the reuse map.
+        let ok = add_worker_fn(
+            &mut stage,
+            &workload,
+            REUSE_BONUS_FORCING_REUSE,
+            &mut metrics,
+            &mut c,
+        );
+        assert!(ok, "fresh allocation must succeed with 4 CPUs + 1 GPU free");
+
+        assert_eq!(stage.current_workers, 2);
+        assert_eq!(metrics.add_calls, 1, "add metric must be recorded");
+
+        // The fresh path appends to `workers_to_add_map` and `current_workers_per_stage`
+        // with a NEWLY minted id — not the seeded worker's id.
+        let to_add = c.workers_to_add_map.get("stage-a").expect("stage present");
+        assert_eq!(to_add.len(), 1, "fresh add must push exactly one worker");
+        let new_worker = &to_add[0];
+        assert_ne!(
+            new_worker.id, seeded_worker.id,
+            "fresh add must use a freshly minted id, not the seeded worker's id"
+        );
+
+        let current = c
+            .current_workers_per_stage
+            .get("stage-a")
+            .expect("stage present");
+        assert_eq!(
+            current.len(),
+            2,
+            "current_workers_per_stage must contain both seeded and fresh workers"
+        );
+        assert!(current.contains_key(&seeded_worker.id));
+        assert!(current.contains_key(&new_worker.id));
+
+        // The cluster must have actually allocated the new worker's resources. Guards
+        // against a regression where the fresh path forgets to call `cluster.allocate`
+        // (which would still grow the maps but leave the cluster pool stale).
+        let pool_after = c.cluster.used_pool();
+        assert_eq!(
+            pool_after.cpus,
+            pool_before.cpus + 4.0,
+            "fresh add must allocate the new worker's CPUs on the cluster"
+        );
+        assert_eq!(
+            pool_after.gpus,
+            pool_before.gpus + 0.5,
+            "fresh add must allocate the new worker's GPU fraction on the cluster"
+        );
+
+        // The reuse map was never populated for this test, so it must remain empty.
+        assert!(
+            c.workers_to_remove_map
+                .get("stage-a")
+                .expect("stage present")
+                .is_empty(),
+            "workers_to_remove_map must remain empty on the fresh path"
+        );
+    }
 }

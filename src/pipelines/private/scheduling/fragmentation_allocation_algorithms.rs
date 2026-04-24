@@ -947,6 +947,101 @@ mod tests {
         assert_float_eq(actual, expected, 1e-4); // More lenient tolerance for FixedUtil precision
     }
 
+    fn manual_cpus_needed_for_shape(shape: &rds::WorkerShape) -> rds::FixedUtil {
+        match shape {
+            rds::WorkerShape::CpuOnly(s) => s.num_cpus,
+            rds::WorkerShape::FractionalGpu(s) => s.num_cpus,
+            rds::WorkerShape::WholeNumberedGpu(s) => {
+                s.num_cpus * rds::FixedUtil::from_num(s.num_gpus)
+            }
+            rds::WorkerShape::SpmdSmallerThanNode(s) => {
+                s.num_cpus_per_actor * rds::FixedUtil::from_num(s.num_gpu_actors_in_group)
+            }
+            rds::WorkerShape::SpmdNodeMultiple(s) => s.num_cpus_needed_per_node(),
+        }
+    }
+
+    fn manual_gpu_can_be_used(used_fraction: rds::FixedUtil, shape: &rds::WorkerShape) -> bool {
+        match shape {
+            rds::WorkerShape::CpuOnly(_) => false,
+            rds::WorkerShape::FractionalGpu(s) => {
+                used_fraction + s.gpu_fraction <= rds::FixedUtil::ONE
+            }
+            rds::WorkerShape::WholeNumberedGpu(_)
+            | rds::WorkerShape::SpmdNodeMultiple(_)
+            | rds::WorkerShape::SpmdSmallerThanNode(_) => used_fraction == rds::FixedUtil::ZERO,
+        }
+    }
+
+    fn manual_can_allocate(node: &rds::NodeResources, shape: &rds::WorkerShape) -> bool {
+        if node.used_cpus + manual_cpus_needed_for_shape(shape) > node.total_cpus {
+            return false;
+        }
+        match shape {
+            rds::WorkerShape::CpuOnly(_) => true,
+            rds::WorkerShape::FractionalGpu(_) => node
+                .gpus
+                .iter()
+                .any(|gpu| manual_gpu_can_be_used(gpu.used_fraction, shape)),
+            rds::WorkerShape::WholeNumberedGpu(s) => {
+                node.num_fully_unallocated_gpus() >= s.num_gpus as usize
+            }
+            rds::WorkerShape::SpmdSmallerThanNode(s) => {
+                node.num_fully_unallocated_gpus() >= s.num_gpu_actors_in_group as usize
+            }
+            rds::WorkerShape::SpmdNodeMultiple(s) => {
+                node.gpus.len() == s.num_gpus_in_node as usize
+                    && node
+                        .gpus
+                        .iter()
+                        .all(|gpu| gpu.used_fraction == rds::FixedUtil::ZERO)
+            }
+        }
+    }
+
+    fn manual_unallocatable_gpus_for_shape(
+        node: &rds::NodeResources,
+        shape: &rds::WorkerShape,
+    ) -> f32 {
+        let total_available_gpus: f32 = node
+            .gpus
+            .iter()
+            .map(|gpu| 1.0 - gpu.used_fraction.to_num::<f32>())
+            .sum();
+
+        if matches!(shape, rds::WorkerShape::CpuOnly(_)) {
+            return total_available_gpus;
+        }
+        if !manual_can_allocate(node, shape) {
+            return total_available_gpus;
+        }
+
+        node.gpus
+            .iter()
+            .filter(|gpu| !manual_gpu_can_be_used(gpu.used_fraction, shape))
+            .map(|gpu| 1.0 - gpu.used_fraction.to_num::<f32>())
+            .sum()
+    }
+
+    fn manual_estimate_fragmentation_on_node(
+        node: &rds::NodeResources,
+        workload: &Workload,
+    ) -> f32 {
+        workload
+            .stages
+            .iter()
+            .map(|stage| stage.frequency * manual_unallocatable_gpus_for_shape(node, &stage.shape))
+            .sum()
+    }
+
+    fn canonicalize_zero(value: f32) -> f32 {
+        if value == 0.0 {
+            0.0
+        } else {
+            value
+        }
+    }
+
     // --------------------
     // Fragmentation Calculation Tests
     // --------------------
@@ -2730,5 +2825,247 @@ mod tests {
 
         // Should allocate to one of the available nodes
         assert_eq!(allocation.node, "1");
+    }
+
+    // --------------------
+    // ScratchView correctness tests
+    // --------------------
+    //
+    // These tests guard the refactor that replaced the legacy "mutate the cluster, score,
+    // restore" simulation with the side-effect-free [`ScratchView`] overlay used by FGD.
+    // The contract we care about is: for any (node, candidate allocation, workload),
+    // overlay-based scoring must produce the *same* fragmentation value as physically
+    // applying the allocation to a clone of the node and scoring it. If this ever
+    // diverges, FGD's per-candidate ranking would silently drift.
+
+    /// Builds a randomized workload with 1..=4 stages, normalized frequencies, and a mix
+    /// of CPU-only / fractional / whole-GPU shapes so the property test exercises all
+    /// branches of `unallocatable_gpus_for_shape`.
+    fn random_workload(rng: &mut impl rand::Rng) -> Workload {
+        let num_stages = rng.random_range(1usize..=4);
+
+        let candidate_shapes = [
+            rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.1),
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.25),
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.5),
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.75),
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                num_gpus: 1,
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                num_gpus: 2,
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::SpmdSmallerThanNode(rds::SpmdSmallerThanNodeResources {
+                num_gpu_actors_in_group: 1,
+                num_cpus_per_actor: rds::FixedUtil::ONE,
+                num_gpus_in_node: 2,
+            }),
+            rds::WorkerShape::SpmdSmallerThanNode(rds::SpmdSmallerThanNodeResources {
+                num_gpu_actors_in_group: 2,
+                num_cpus_per_actor: rds::FixedUtil::from_num(1.5),
+                num_gpus_in_node: 4,
+            }),
+        ];
+
+        // Raw weights → normalized frequencies summing to 1.0 (matching the production
+        // `make_workload_from_state` output format). Clamp to >= 1 so we never divide by 0.
+        let weights: Vec<f32> = (0..num_stages)
+            .map(|_| rng.random_range(1u32..=10) as f32)
+            .collect();
+        let total: f32 = weights.iter().sum();
+
+        let stages = weights
+            .iter()
+            .map(|w| Stage {
+                frequency: w / total,
+                shape: candidate_shapes[rng.random_range(0..candidate_shapes.len())].clone(),
+            })
+            .collect();
+        Workload { stages }
+    }
+
+    /// Cross-checks [`ScratchView::score_after_allocate`] / [`score_after_release`] against
+    /// the hand-rolled reference implementations (`manual_estimate_fragmentation_on_node` &
+    /// friends) defined above, across many randomized nodes, shapes, initial usages, GPU
+    /// counts, and workload compositions. The reference impl is intentionally independent
+    /// of `ScratchView::estimate_fragmentation`, so a bug introduced in *either* the overlay
+    /// plumbing or the production scoring function will trip this test.
+    ///
+    /// Each trial scores the real candidate *after* first polluting the `ScratchView` with
+    /// an unrelated allocation. This forces `reset()` to actually do work — the way it is
+    /// used in production (FGD reuses a single `ScratchView` across every candidate on a
+    /// node) — rather than being a no-op on a fresh overlay.
+    ///
+    /// Bit-exact equality via [`f32::to_bits`] is the contract here; if `estimate_fragmentation`
+    /// ever changes its reduction order, this assertion will need to be relaxed to an
+    /// approximate comparison. That's intentional: a bit-level regression is noise-proof.
+    #[test]
+    fn test_scratch_view_overlay_matches_manual_reference() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Fixed seed so CI failures are genuine regressions, not sampling variance.
+        const OVERLAY_PROPERTY_TEST_SEED: u64 = 0x00C0_FFEE_F0F0;
+        let mut rng = StdRng::seed_from_u64(OVERLAY_PROPERTY_TEST_SEED);
+
+        let candidate_shapes = [
+            rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.25),
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            rds::WorkerShape::FractionalGpu(rds::FractionalGpu {
+                gpu_fraction: rds::FixedUtil::from_num(0.5),
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                num_gpus: 1,
+                num_cpus: rds::FixedUtil::from_num(2.0),
+            }),
+            rds::WorkerShape::SpmdSmallerThanNode(rds::SpmdSmallerThanNodeResources {
+                num_gpu_actors_in_group: 2,
+                num_cpus_per_actor: rds::FixedUtil::from_num(1.5),
+                num_gpus_in_node: 4,
+            }),
+        ];
+
+        // Iterate enough trials to cover the cartesian product of shape × usage patterns
+        // × workload compositions we care about; 500 keeps the test fast (<200ms) while
+        // still randomizing widely.
+        let mut trials_run = 0;
+        for trial in 0..500 {
+            let num_gpus = rng.random_range(1usize..=8);
+            let total_cpus_int = rng.random_range(8u8..=64);
+            let total_cpus = total_cpus_int as f32;
+
+            // Mix of free, partially-used, and (occasionally) nearly-full GPUs so we
+            // exercise both the fractional and whole-GPU branches of `unallocatable_gpus_for_shape`.
+            let gpus: Vec<rds::GpuResources> = (0..num_gpus)
+                .map(|i| {
+                    let bucket = rng.random_range(0u8..6);
+                    let used = match bucket {
+                        0 | 1 => 0.0, // ~33% fully free
+                        2 => 0.25,
+                        3 => 0.5,
+                        4 => 0.75,
+                        _ => 0.95,
+                    };
+                    gpu_with_usage(i as u8, used)
+                })
+                .collect();
+
+            let used_cpus = rng.random_range(0u8..=(total_cpus_int / 2)) as f32;
+            let node = node_with_usage("rand", used_cpus, total_cpus, gpus);
+
+            // Workload is randomized per trial so the test actually exercises the
+            // weighting and shape-mix logic in `estimate_fragmentation`.
+            let workload = random_workload(&mut rng);
+            let shape = &candidate_shapes[rng.random_range(0..candidate_shapes.len())];
+
+            // Use the production candidate generator so we score *real* allocations.
+            let allocs = find_possible_allocations_on_node(&node, shape, "rand");
+            if allocs.is_empty() {
+                continue;
+            }
+            let alloc = &allocs[rng.random_range(0..allocs.len())];
+
+            // ---- allocate path: manual reference (clone + mutate + score) vs overlay ----
+            let mut legacy_node = node.clone();
+            legacy_node
+                .allocate(alloc)
+                .expect("legacy allocate should succeed for a valid candidate");
+            let legacy_after = canonicalize_zero(manual_estimate_fragmentation_on_node(
+                &legacy_node,
+                &workload,
+            ));
+
+            // Pollute the overlay with an unrelated scratch allocation first, so
+            // `score_after_allocate` must call `reset()` to recover clean state. In
+            // production, FGD reuses one `ScratchView` across every candidate on a node;
+            // scoring on a fresh view would leave that hot path untested.
+            let mut sv = ScratchView::from_node(&node);
+            if let Some(pollutant) = allocs.iter().find(|a| a != &alloc) {
+                let _ = sv.score_after_allocate(pollutant, &workload);
+            } else {
+                let _ = sv.score_after_allocate(alloc, &workload);
+            }
+            let overlay_after = canonicalize_zero(sv.score_after_allocate(alloc, &workload));
+
+            assert_eq!(
+                legacy_after.to_bits(),
+                overlay_after.to_bits(),
+                "overlay/legacy divergence on allocate (trial {trial}): \
+                 num_gpus={num_gpus} alloc.cpus={} alloc.gpus={:?} \
+                 workload.stages={} legacy={legacy_after} overlay={overlay_after}",
+                alloc.cpus,
+                alloc.gpus,
+                workload.stages.len(),
+            );
+
+            // ---- release path: start from a node that already has `alloc` applied,
+            // then verify that releasing it via overlay matches releasing it physically.
+            let node_with_alloc = legacy_node;
+            let mut legacy_after_release = node_with_alloc.clone();
+            legacy_after_release.release_allocation(alloc);
+            let legacy_release = canonicalize_zero(manual_estimate_fragmentation_on_node(
+                &legacy_after_release,
+                &workload,
+            ));
+
+            // Same pollution trick for the release path — `score_after_release` must
+            // also call `reset()`, and fresh views would leave that uncovered.
+            let mut sv_release = ScratchView::from_node(&node_with_alloc);
+            if let Some(other_alloc_on_full_node) =
+                find_possible_allocations_on_node(&node_with_alloc, shape, "rand")
+                    .into_iter()
+                    .next()
+            {
+                let _ = sv_release.score_after_allocate(&other_alloc_on_full_node, &workload);
+            }
+            let overlay_release =
+                canonicalize_zero(sv_release.score_after_release(alloc, &workload));
+
+            assert_eq!(
+                legacy_release.to_bits(),
+                overlay_release.to_bits(),
+                "overlay/legacy divergence on release (trial {trial}): \
+                 num_gpus={num_gpus} alloc.cpus={} alloc.gpus={:?} \
+                 workload.stages={} legacy={legacy_release} overlay={overlay_release}",
+                alloc.cpus,
+                alloc.gpus,
+                workload.stages.len(),
+            );
+
+            trials_run += 1;
+        }
+
+        // Sanity: ensure the trial loop was not pathologically pruned by the
+        // empty-allocations early-continue (would silently weaken the guarantee).
+        assert!(
+            trials_run >= 100,
+            "expected at least 100 randomized trials to actually run, got {trials_run}"
+        );
     }
 }
