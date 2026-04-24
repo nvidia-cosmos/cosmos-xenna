@@ -28,6 +28,12 @@
    The inter-completion interval stamped in ``_collect_continuous_async``
    yields a different rate-estimate semantics than batch mode (which
    leaves ``rate_duration_s = None`` and falls through to ``timing.process_dur``).
+
+4. **Lifecycle ordering inside ``_delete_worker_group``.** The current
+   order ``allocator.remove_worker -> actor.kill`` is pinned as a
+   regression guard. The desired ordering ``actor.kill -> allocator.remove_worker``
+   (which would prevent a same-offset add from racing a still-alive
+   WorkerProc) is pinned as ``xfail`` until the lifecycle is reordered.
 """
 
 import collections
@@ -207,3 +213,110 @@ class TestContinuousModeRateDurationSemantics:
         per_actor_rate_hz = float(slots_per_actor) / per_slot_service_time_s
         assert estimator.get_rate(current_time=10.0) == pytest.approx(per_actor_rate_hz, rel=1e-6)
         assert estimator.get_rate(current_time=10.0) == pytest.approx(slots_per_actor * (1.0 / per_slot_service_time_s))
+
+
+def _build_pool_with_one_worker_group(
+    call_order: list[str],
+) -> tuple[MagicMock, MagicMock, _TrackingAllocator]:
+    """Wire an ``ActorPool`` mock with one worker group and one ready actor.
+
+    The returned ``call_order`` list is shared by the recording wrappers
+    on ``allocator.remove_worker`` and ``actor.kill``; the test asserts
+    on its sequence to pin ``_delete_worker_group``'s call ordering.
+
+    ``_delete_actor`` is replaced with a tiny stub that calls
+    ``actor.kill`` directly, sidestepping the ``_try_delete_*`` dispatch
+    chain. The contract under test is the order in which
+    ``_delete_worker_group`` invokes (a) the allocator release and
+    (b) the per-actor kill - not the dispatch chain that picks which
+    ``_try_delete_*`` helper handles a given actor id.
+
+    Returns:
+        Tuple of ``(pool, actor, allocator)`` for the test to drive.
+
+    """
+    actor = MagicMock()
+
+    def _record_kill(*_args: object, **_kwargs: object) -> None:
+        call_order.append("actor.kill")
+
+    actor.kill.side_effect = _record_kill
+
+    inner_wg = MagicMock()
+    inner_wg.id = "wg-1"
+    wrapped = MagicMock()
+    wrapped.worker_group = inner_wg
+    wrapped.actors = ["actor-1"]
+    wrapped.primary_node_id = "node-A"
+
+    allocator = _TrackingAllocator()
+    allocator.added_ids.add("wg-1")  # pre-seed so the post-condition `live == set()` is non-trivial
+    original_remove = allocator.remove_worker
+
+    def _record_remove(worker_id: str) -> None:
+        call_order.append("allocator.remove_worker")
+        original_remove(worker_id)
+
+    allocator.remove_worker = _record_remove  # type: ignore[method-assign]
+
+    pool = MagicMock(spec=ap_module.ActorPool)
+    pool._is_spmd = False
+    pool._allocator = allocator
+    pool._worker_groups = {"wg-1": wrapped}
+
+    def _stub_delete_actor(actor_id: str) -> None:
+        if actor_id == "actor-1":
+            actor.kill()
+
+    pool._delete_actor = _stub_delete_actor
+    pool._delete_worker_group = ap_module.ActorPool._delete_worker_group.__get__(pool)
+
+    return pool, actor, allocator
+
+
+class TestDeleteWorkerGroupLifecycleOrdering:
+    """Pin the call ordering between allocator release and per-actor kill.
+
+    ``_delete_worker_group`` releases the allocator slot before killing
+    the group's actors. The kill is asynchronous from the WorkerProc
+    child's point of view, so OS-level GPU release can lag allocator
+    release; a subsequent same-offset ``_add_worker_group`` then
+    succeeds against the allocator while the doomed actor still holds
+    the device.
+
+    The first test pins the present ordering as a regression guard.
+    The second test pins the desired ordering as ``xfail strict`` so
+    that reordering ``_delete_worker_group`` is advertised by an XPASS.
+    """
+
+    def test_delete_releases_allocator_before_killing_actors(self) -> None:
+        """``_delete_worker_group`` releases the allocator slot before killing actors."""
+        call_order: list[str] = []
+        pool, _actor, allocator = _build_pool_with_one_worker_group(call_order)
+
+        pool._delete_worker_group("wg-1")
+
+        assert call_order == ["allocator.remove_worker", "actor.kill"]
+        assert allocator.remove_calls == 1
+        assert allocator.live_worker_ids == set()
+        assert "wg-1" not in pool._worker_groups
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Necessary precondition for closing the same-offset add-after-delete "
+            "race: actor.kill must be invoked before allocator.remove_worker so "
+            "the cooperative drain in _kill_actor_and_reap runs while the slot "
+            "is still claimed. This is a necessary-not-sufficient pin -- closing "
+            "the race in full additionally requires the kill path to wait for "
+            "OS-level GPU release before _delete_worker_group returns."
+        ),
+    )
+    def test_kill_invoked_before_allocator_release(self) -> None:
+        """``actor.kill`` must precede ``allocator.remove_worker`` inside ``_delete_worker_group``."""
+        call_order: list[str] = []
+        pool, _actor, _allocator = _build_pool_with_one_worker_group(call_order)
+
+        pool._delete_worker_group("wg-1")
+
+        assert call_order == ["actor.kill", "allocator.remove_worker"]
