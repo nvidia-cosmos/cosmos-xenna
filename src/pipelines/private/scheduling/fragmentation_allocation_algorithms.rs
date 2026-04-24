@@ -25,7 +25,6 @@
 //! complex algorithm. We also consider the removal of workers, which is a simple extension.
 
 use super::resources as rds;
-
 // --------------------
 // Stages and workloads
 // --------------------
@@ -100,11 +99,15 @@ impl FragmentationResult {
 }
 
 /// Result of an allocation attempt, indicating success and resource details.
+///
+/// `reused_worker_id` is set when the chosen allocation came from the `reusable_workers`
+/// map passed to FGD. Callers can look the worker up directly in their own bookkeeping
+/// (avoids cloning the entire `Worker` out of FGD for every reuse decision).
 #[derive(Debug, Clone)]
 pub struct AllocationResult {
     pub did_allocate: bool,
     pub resources: Option<rds::WorkerResources>,
-    pub reused_worker: Option<rds::Worker>,
+    pub reused_worker_id: Option<String>,
 }
 
 /// Determines if this GPU can accommodate the given worker shape requirements.
@@ -125,46 +128,28 @@ pub struct AllocationResult {
 /// # Returns
 /// True if the GPU can accommodate this shape, False otherwise
 pub fn gpu_can_be_used_to_allocate(gpu: &rds::GpuResources, shape: &rds::WorkerShape) -> bool {
+    gpu_can_be_used_to_allocate_inner(gpu.used_fraction, shape)
+}
+
+/// Same as [`gpu_can_be_used_to_allocate`] but takes the effective `used_fraction` directly,
+/// so the caller can score *what-if* allocations without mutating the GPU.
+#[inline]
+fn gpu_can_be_used_to_allocate_inner(
+    used_fraction: rds::FixedUtil,
+    shape: &rds::WorkerShape,
+) -> bool {
     match shape {
         rds::WorkerShape::CpuOnly(_) => false,
-        rds::WorkerShape::FractionalGpu(s) => {
-            gpu.used_fraction + s.gpu_fraction <= rds::FixedUtil::ONE
-        }
-        rds::WorkerShape::WholeNumberedGpu(_) => gpu.is_fully_unallocated(),
-        rds::WorkerShape::SpmdNodeMultiple(_) => gpu.is_fully_unallocated(),
-        rds::WorkerShape::SpmdSmallerThanNode(_) => gpu.is_fully_unallocated(),
+        rds::WorkerShape::FractionalGpu(s) => used_fraction + s.gpu_fraction <= rds::FixedUtil::ONE,
+        rds::WorkerShape::WholeNumberedGpu(_)
+        | rds::WorkerShape::SpmdNodeMultiple(_)
+        | rds::WorkerShape::SpmdSmallerThanNode(_) => used_fraction == rds::FixedUtil::ZERO,
     }
 }
 
 // --------------------
 // Node helpers
 // --------------------
-
-/// Counts number of GPUs on node that can accommodate given shape.
-///
-/// # Arguments
-/// * `shape` - WorkerShape describing resource requirements
-///
-/// # Returns
-/// Number of GPUs that can be used for this shape
-fn number_of_gpus_which_can_be_used_for_shape(
-    node_resources: &rds::NodeResources,
-    shape: &rds::WorkerShape,
-) -> usize {
-    node_resources
-        .gpus
-        .iter()
-        .filter(|g| gpu_can_be_used_to_allocate(g, shape))
-        .count()
-}
-
-fn num_fully_unallocated_gpus(node_resources: &rds::NodeResources) -> usize {
-    node_resources
-        .gpus
-        .iter()
-        .filter(|g| g.is_fully_unallocated())
-        .count()
-}
 
 /// Determines if node has sufficient resources for given shape.
 ///
@@ -177,8 +162,13 @@ fn num_fully_unallocated_gpus(node_resources: &rds::NodeResources) -> usize {
 /// # Returns
 /// True if node can accommodate shape, False otherwise
 pub fn node_can_allocate(node_resources: &rds::NodeResources, shape: &rds::WorkerShape) -> bool {
-    // CPU check
-    let needed_cpus = match shape {
+    ScratchView::from_node(node_resources).can_allocate(shape)
+}
+
+/// CPU resources required by `shape` on a single node.
+#[inline]
+fn cpus_needed_for_shape(shape: &rds::WorkerShape) -> rds::FixedUtil {
+    match shape {
         rds::WorkerShape::CpuOnly(s) => s.num_cpus,
         rds::WorkerShape::FractionalGpu(s) => s.num_cpus,
         rds::WorkerShape::WholeNumberedGpu(s) => s.num_cpus * rds::FixedUtil::from_num(s.num_gpus),
@@ -186,27 +176,6 @@ pub fn node_can_allocate(node_resources: &rds::NodeResources, shape: &rds::Worke
             s.num_cpus_per_actor * rds::FixedUtil::from_num(s.num_gpu_actors_in_group)
         }
         rds::WorkerShape::SpmdNodeMultiple(s) => s.num_cpus_needed_per_node(),
-    };
-
-    if node_resources.used_cpus + needed_cpus > node_resources.total_cpus {
-        return false;
-    }
-
-    match shape {
-        rds::WorkerShape::CpuOnly(_) => true,
-        rds::WorkerShape::FractionalGpu(_) => {
-            number_of_gpus_which_can_be_used_for_shape(node_resources, shape) > 0
-        }
-        rds::WorkerShape::WholeNumberedGpu(s) => {
-            num_fully_unallocated_gpus(node_resources) >= s.num_gpus as usize
-        }
-        rds::WorkerShape::SpmdSmallerThanNode(s) => {
-            num_fully_unallocated_gpus(node_resources) >= s.num_gpu_actors_in_group as usize
-        }
-        rds::WorkerShape::SpmdNodeMultiple(s) => {
-            node_resources.num_gpus() == s.num_gpus_in_node as usize
-                && node_resources.all_gpus_fully_unallocated()
-        }
     }
 }
 
@@ -325,51 +294,178 @@ pub fn find_possible_allocations_on_node(
     }
 }
 
-/// Calculates amount of GPU resources that cannot be allocated to a specific shape.
+/// A side-effect-free view of a node with overlayed CPU / per-GPU usage.
+///
+/// FGD scoring is hot — it evaluates many candidate allocations per node and previously did so
+/// by mutating the cluster (`allocate` then `release`) just to peek at fragmentation. That
+/// pattern made parallelism impossible. `ScratchView` captures the *effective* state we want
+/// to score against so the entire candidate evaluation can run on `&NodeResources`.
+///
+/// The `effective_used` slice is parallel to `node.gpus` (same length, same offsets). The
+/// buffer is owned so the FGD inner loop can reuse it across many candidates on the same
+/// node without per-candidate allocation.
+struct ScratchView<'a> {
+    node: &'a rds::NodeResources,
+    effective_used: Vec<rds::FixedUtil>,
+    effective_used_cpus: rds::FixedUtil,
+}
+
+impl<'a> ScratchView<'a> {
+    /// Build a view of `node` with no overlay applied.
+    #[inline]
+    fn from_node(node: &'a rds::NodeResources) -> Self {
+        Self {
+            node,
+            effective_used: node.gpus.iter().map(|g| g.used_fraction).collect(),
+            effective_used_cpus: node.used_cpus,
+        }
+    }
+
+    /// Resets the overlay so the view reflects the underlying node's current state.
+    #[inline]
+    fn reset(&mut self) {
+        for (slot, gpu) in self.effective_used.iter_mut().zip(self.node.gpus.iter()) {
+            *slot = gpu.used_fraction;
+        }
+        self.effective_used_cpus = self.node.used_cpus;
+    }
+
+    /// Applies a hypothetical allocation on top of the current overlay.
+    #[inline]
+    fn apply_allocate(&mut self, alloc: &rds::WorkerResources) {
+        self.effective_used_cpus += alloc.cpus;
+        for gpu_alloc in &alloc.gpus {
+            self.effective_used[gpu_alloc.offset] += gpu_alloc.used_fraction;
+        }
+    }
+
+    /// Applies a hypothetical release on top of the current overlay.
+    #[inline]
+    fn apply_release(&mut self, alloc: &rds::WorkerResources) {
+        self.effective_used_cpus -= alloc.cpus;
+        for gpu_alloc in &alloc.gpus {
+            self.effective_used[gpu_alloc.offset] -= gpu_alloc.used_fraction;
+        }
+    }
+
+    /// Resets and re-applies an allocate overlay; returns the post-allocation fragmentation.
+    /// The overlay is left in the post-allocation state so callers can read tiebreakers
+    /// (e.g. [`ScratchView::free_pool_total_num`]) without re-doing the work.
+    #[inline]
+    fn score_after_allocate(&mut self, alloc: &rds::WorkerResources, workload: &Workload) -> f32 {
+        self.reset();
+        self.apply_allocate(alloc);
+        self.estimate_fragmentation(workload)
+    }
+
+    /// Same as [`score_after_allocate`] but for the deletion path.
+    #[inline]
+    fn score_after_release(&mut self, alloc: &rds::WorkerResources, workload: &Workload) -> f32 {
+        self.reset();
+        self.apply_release(alloc);
+        self.estimate_fragmentation(workload)
+    }
+
+    /// `true` iff a hypothetical worker of `shape` could fit on top of the current effective state.
+    fn can_allocate(&self, shape: &rds::WorkerShape) -> bool {
+        if self.effective_used_cpus + cpus_needed_for_shape(shape) > self.node.total_cpus {
+            return false;
+        }
+        match shape {
+            rds::WorkerShape::CpuOnly(_) => true,
+            rds::WorkerShape::FractionalGpu(_) => self
+                .effective_used
+                .iter()
+                .any(|u| gpu_can_be_used_to_allocate_inner(*u, shape)),
+            rds::WorkerShape::WholeNumberedGpu(s) => {
+                self.count_fully_unallocated_gpus() >= s.num_gpus as usize
+            }
+            rds::WorkerShape::SpmdSmallerThanNode(s) => {
+                self.count_fully_unallocated_gpus() >= s.num_gpu_actors_in_group as usize
+            }
+            rds::WorkerShape::SpmdNodeMultiple(s) => {
+                self.node.gpus.len() == s.num_gpus_in_node as usize
+                    && self
+                        .effective_used
+                        .iter()
+                        .all(|u| *u == rds::FixedUtil::ZERO)
+            }
+        }
+    }
+
+    #[inline]
+    fn count_fully_unallocated_gpus(&self) -> usize {
+        self.effective_used
+            .iter()
+            .filter(|u| **u == rds::FixedUtil::ZERO)
+            .count()
+    }
+
+    /// Sum of `(1 - used)` across all GPUs.
+    #[inline]
+    fn total_available_gpus(&self) -> f32 {
+        self.effective_used
+            .iter()
+            .map(|u| 1.0 - u.to_num::<f32>())
+            .sum()
+    }
+
+    /// `f32` mirror of `NodeResources::free_pool().total_num()` (free CPUs + free GPU compute).
+    #[inline]
+    fn free_pool_total_num(&self) -> f32 {
+        let free_cpus = (self.node.total_cpus - self.effective_used_cpus).to_num::<f32>();
+        free_cpus + self.total_available_gpus()
+    }
+
+    /// `f32` mirror of `NodeResources::used_pool().total_num()` (used CPUs + used GPU fraction).
+    #[inline]
+    fn used_pool_total_num(&self) -> f32 {
+        let used_cpus = self.effective_used_cpus.to_num::<f32>();
+        let used_gpus: f32 = self.effective_used.iter().map(|u| u.to_num::<f32>()).sum();
+        used_cpus + used_gpus
+    }
+
+    /// Calculates GPU resources that cannot be allocated to `shape` given the effective state.
+    fn unallocatable_gpus_for_shape(&self, shape: &rds::WorkerShape) -> f32 {
+        let total_available_gpus = self.total_available_gpus();
+
+        if let rds::WorkerShape::CpuOnly(_) = shape {
+            return total_available_gpus;
+        }
+        if !self.can_allocate(shape) {
+            return total_available_gpus;
+        }
+
+        let mut out = 0.0;
+        for &used in &self.effective_used {
+            if !gpu_can_be_used_to_allocate_inner(used, shape) {
+                out += 1.0 - used.to_num::<f32>();
+            }
+        }
+        out
+    }
+
+    /// Estimated fragmentation across the whole workload, weighted by stage frequency.
+    fn estimate_fragmentation(&self, workload: &Workload) -> f32 {
+        let mut out = 0.0;
+        for stage in &workload.stages {
+            out += stage.frequency * self.unallocatable_gpus_for_shape(&stage.shape);
+        }
+        out
+    }
+}
+
+/// Calculates GPU resources that cannot be allocated to a specific shape on a node.
 ///
 /// This implements the task-level fragmentation measure F_n(m) described in Section 3.2
-/// of the paper. It measures how many GPU resources cannot be allocated to a given
-/// task shape due to various constraints.
-///
-/// # Arguments
-/// * `shape` - WorkerShape describing resource requirements
-///
-/// # Returns
-/// Amount of GPU resources that cannot be allocated to this shape.
-/// A higher value indicates more fragmentation from this shape's perspective.
+/// of the paper. Thin wrapper over the [`ScratchView`] machinery so tests retain a stable
+/// function-style entry point.
+#[cfg(test)]
 fn calculate_unallocatable_gpus_fragment_for_shape_on_node(
     node_resources: &rds::NodeResources,
     shape: &rds::WorkerShape,
 ) -> f32 {
-    // Calculate total GPU compute resources available on this node
-    let total_available_gpus = node_resources
-        .gpus
-        .iter()
-        .map(|g| 1.0 - g.used_fraction.to_num::<f32>())
-        .sum();
-
-    // Case 1: Task requests no GPU compute resources
-    // All available GPU resources are "fragmented" since they can't be used by this task type
-    if let rds::WorkerShape::CpuOnly(_) = shape {
-        return total_available_gpus;
-    }
-
-    // Case 2: Shape cannot be allocated to the node at all
-    // All available GPU resources are fragmented since the task can't be satisfied
-    if !node_can_allocate(node_resources, shape) {
-        return total_available_gpus;
-    }
-
-    // Case 3: Shape can be allocated, but some GPUs may be unusable
-    // Count GPU resources that cannot contribute to allocating this shape
-    let mut out = 0.0;
-    for node_gpu in &node_resources.gpus {
-        // If this GPU cannot contribute to the allocation, its resources are fragmented
-        if !gpu_can_be_used_to_allocate(node_gpu, shape) {
-            out += 1.0 - node_gpu.used_fraction.to_num::<f32>();
-        }
-    }
-    out
+    ScratchView::from_node(node_resources).unallocatable_gpus_for_shape(shape)
 }
 
 /// Estimates overall fragmentation from perspective of entire workload.
@@ -387,16 +483,7 @@ pub fn estimate_fragmentation_on_node(
     node_resources: &rds::NodeResources,
     workload: &Workload,
 ) -> f32 {
-    let mut out = 0.0;
-    // Calculate weighted fragmentation across all workload stages
-    for stage in &workload.stages {
-        // Get fragmentation for this specific task type
-        let unallocatable_gpus =
-            calculate_unallocatable_gpus_fragment_for_shape_on_node(node_resources, &stage.shape);
-        // Weight by how frequently this task type occurs
-        out += stage.frequency * unallocatable_gpus;
-    }
-    out
+    ScratchView::from_node(node_resources).estimate_fragmentation(workload)
 }
 
 // --------------------
@@ -424,6 +511,13 @@ pub fn estimate_fragmentation_on_cluster(
 /// in Section 4.2 of the paper. It tries all possible allocations and chooses
 /// the one that causes the minimum increase in fragmentation.
 ///
+/// Optimization notes:
+/// * The cluster is borrowed immutably — candidate scoring is pure (uses [`ScratchView`]
+///   to evaluate "what-if" overlays without mutating any node), which avoids the
+///   redundant allocate/release round-trips the original implementation performed.
+/// * Candidates are reduced with a streaming "best so far" rather than collected into a
+///   `Vec<FragmentationResult>` and post-sorted, so we don't allocate per-candidate.
+///
 /// # Arguments
 /// * `cluster` - Cluster resource helper
 /// * `workload` - Workload object describing expected task distribution
@@ -433,126 +527,115 @@ pub fn estimate_fragmentation_on_cluster(
 /// * `worker_reuse_fragmentation_equivalent` - A reward for re-using workers.
 ///
 /// # Returns
-/// WorkerResources describing best allocation, or None if no allocation possible
+/// `AllocationResult` describing the chosen allocation. If no allocation is possible
+/// `did_allocate` is `false` and the other fields are `None`.
 pub fn find_best_allocation_using_fragmentation_gradient_descent(
-    cluster: &mut rds::ClusterResources,
+    cluster: &rds::ClusterResources,
     workload: &Workload,
     shape: &rds::WorkerShape,
     reusable_workers: Option<&std::collections::HashMap<String, rds::Worker>>,
     worker_reuse_fragmentation_equivalent: f32,
 ) -> AllocationResult {
-    // Shape::SpmdNodeMultiple is not implemented. This code path should not be reached.
+    // SpmdNodeMultiple has its own dedicated allocation function and should never reach here.
     if let rds::WorkerShape::SpmdNodeMultiple(_) = shape {
         panic!("SpmdNodeMultiple is not implemented. This code path should not be reached.");
     }
 
-    // Store all possible allocation options with their fragmentation impact
-    let mut results: Vec<FragmentationResult> = Vec::new();
+    /// A streaming "best candidate" for the allocate path. Cost is `(primary, secondary)`
+    /// compared lexicographically; lower is better.
+    struct Candidate {
+        primary: f32,
+        secondary: f32,
+        worker_allocation: rds::WorkerResources,
+        reused_worker_id: Option<String>,
+    }
 
-    // First, try reusing recently removed workers to avoid allocation thrashing
-    // This helps prevent oscillation between creating and destroying workers
-    if let Some(reuse_map) = reusable_workers {
+    #[inline]
+    fn pick_better(a: Candidate, b: Candidate) -> Candidate {
+        if (a.primary, a.secondary) <= (b.primary, b.secondary) {
+            a
+        } else {
+            b
+        }
+    }
+
+    #[inline]
+    fn merge(a: Option<Candidate>, b: Option<Candidate>) -> Option<Candidate> {
+        match (a, b) {
+            (None, x) | (x, None) => x,
+            (Some(a), Some(b)) => Some(pick_better(a, b)),
+        }
+    }
+
+    // ---------- reuse path (sequential; reuse_map is small) ----------
+    let reuse_best: Option<Candidate> = reusable_workers.and_then(|reuse_map| {
+        let mut best: Option<Candidate> = None;
         for worker in reuse_map.values() {
-            let node = cluster
-                .nodes
-                .get_mut(&worker.allocation.node)
-                .expect("node");
-            // Check if this worker's allocation is still feasible
+            let node = match cluster.nodes.get(&worker.allocation.node) {
+                Some(n) => n,
+                None => continue,
+            };
             if !node.can_allocate(&worker.allocation) {
                 continue;
             }
 
-            // Calculate fragmentation impact of reusing this worker
-            let current_frag = estimate_fragmentation_on_node(node, workload);
+            // `score_after_allocate` leaves the overlay in the post-allocation state, so
+            // we can read the tiebreaker (`used_pool_total_num`) directly without redoing
+            // the work. The "before" frag is computed once per reuse candidate (matches
+            // the original code's per-candidate pattern, which was correct here).
+            let mut sv = ScratchView::from_node(node);
+            let before = sv.estimate_fragmentation(workload);
+            let after = sv.score_after_allocate(&worker.allocation, workload);
+            let remaining = sv.used_pool_total_num();
 
-            node.allocate(&worker.allocation).expect("allocate");
-            let new_frag = estimate_fragmentation_on_node(node, workload);
-            let new_remaining_resources = node.used_pool().total_num();
-            node.release_allocation(&worker.allocation);
-
-            // Record this reuse option for comparison
-            results.push(FragmentationResult {
-                fragmentation_before: current_frag,
-                fragmentation_after: new_frag,
-                node_remaining_resources: new_remaining_resources,
+            let primary = (after - before) - worker_reuse_fragmentation_equivalent;
+            let cand = Candidate {
+                primary,
+                secondary: -remaining,
                 worker_allocation: worker.allocation.clone(),
-                maybe_reused_worker: Some(worker.clone()),
-            });
+                reused_worker_id: Some(worker.id.clone()),
+            };
+            best = merge(best, Some(cand));
         }
-    }
+        best
+    });
 
-    // Now explore all possible fresh allocations across the cluster
-    for (node_id, node) in &mut cluster.nodes {
-        // Skip nodes that cannot accommodate this shape
-        if !node_can_allocate(node, shape) {
-            continue;
+    // ---------- fresh path ----------
+    let fresh_best: Option<Candidate> = {
+        let mut best: Option<Candidate> = None;
+        for (node_id, node) in &cluster.nodes {
+            if !node_can_allocate(node, shape) {
+                continue;
+            }
+            let mut sv = ScratchView::from_node(node);
+            let before = sv.estimate_fragmentation(workload);
+
+            for allocation in find_possible_allocations_on_node(node, shape, node_id) {
+                let after = sv.score_after_allocate(&allocation, workload);
+                let remaining = sv.free_pool_total_num();
+                let cand = Candidate {
+                    primary: after - before,
+                    secondary: -remaining,
+                    worker_allocation: allocation,
+                    reused_worker_id: None,
+                };
+                best = merge(best, Some(cand));
+            }
         }
+        best
+    };
 
-        // Calculate current fragmentation level for this node
-        let current_frag = estimate_fragmentation_on_node(node, workload);
-
-        // Find all possible ways to allocate this shape on this node
-        let possible_allocations = find_possible_allocations_on_node(node, shape, node_id);
-
-        // Evaluate the fragmentation impact of each possible allocation
-        for allocation in possible_allocations {
-            node.allocate(&allocation).expect("allocate");
-            let new_frag = estimate_fragmentation_on_node(node, workload);
-            let new_remaining_resources = node.free_pool().total_num();
-            node.release_allocation(&allocation);
-            // Record this allocation option for comparison
-            results.push(FragmentationResult {
-                fragmentation_before: current_frag,
-                fragmentation_after: new_frag,
-                node_remaining_resources: new_remaining_resources,
-                worker_allocation: allocation,
-                maybe_reused_worker: None, // This is a fresh allocation
-            });
-        }
-    }
-
-    // Return failure if no allocations are possible
-    if results.is_empty() {
-        return AllocationResult {
+    match merge(reuse_best, fresh_best) {
+        None => AllocationResult {
             did_allocate: false,
             resources: None,
-            reused_worker: None,
-        };
-    }
-
-    /// Cost function for comparing allocation options.
-    ///
-    /// Returns a tuple (fragmentation_change, -remaining_resources) for lexicographic ordering.
-    /// Lower fragmentation change is preferred, with more remaining resources as tiebreaker.
-    fn cost(x: &FragmentationResult, worker_reuse_fragmentation_equivalent: f32) -> (f32, f32) {
-        let mut fragmentation_change = x.fragmentation_change();
-
-        // Apply reuse bonus: reusing workers gets an equivalent fragmentation reduction
-        // This helps prevent thrashing between allocation and deallocation
-        if x.is_reused_worker() {
-            fragmentation_change -= worker_reuse_fragmentation_equivalent;
-        }
-
-        // Return (primary_cost, secondary_cost) where:
-        // - primary_cost: fragmentation change (lower is better)
-        // - secondary_cost: negative remaining resources (higher remaining is better)
-        (fragmentation_change, -x.node_remaining_resources)
-    }
-
-    // Select the allocation option with the best cost (minimum fragmentation increase)
-    let best = results
-        .into_iter()
-        .min_by(|a, b| {
-            let ca = cost(a, worker_reuse_fragmentation_equivalent);
-            let cb = cost(b, worker_reuse_fragmentation_equivalent);
-            ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap();
-
-    AllocationResult {
-        did_allocate: true,
-        resources: Some(best.worker_allocation.clone()),
-        reused_worker: best.maybe_reused_worker.clone(),
+            reused_worker_id: None,
+        },
+        Some(best) => AllocationResult {
+            did_allocate: true,
+            resources: Some(best.worker_allocation),
+            reused_worker_id: best.reused_worker_id,
+        },
     }
 }
 
@@ -570,60 +653,67 @@ pub fn find_best_allocation_using_fragmentation_gradient_descent(
 /// # Returns
 /// Worker that should be removed to minimize fragmentation impact
 pub fn find_worker_to_delete_using_fragmentation_gradient_descent(
-    cluster: &mut rds::ClusterResources,
+    cluster: &rds::ClusterResources,
     workload: &Workload,
     potential_workers: &std::collections::HashMap<String, rds::Worker>,
 ) -> String {
     assert!(!potential_workers.is_empty());
 
-    #[derive(Debug, Clone)]
-    struct CandidateCost {
+    // Group candidate workers by their host node. The "before" fragmentation only depends
+    // on the node's current state, so this lets us compute it once per node instead of
+    // once per worker — a sizeable win when a stage has many workers concentrated on a
+    // few nodes.
+    let mut by_node: std::collections::HashMap<&str, Vec<&rds::Worker>> =
+        std::collections::HashMap::new();
+    for w in potential_workers.values() {
+        by_node
+            .entry(w.allocation.node.as_str())
+            .or_default()
+            .push(w);
+    }
+
+    /// Lifetime `'a` ties the chosen id back to `potential_workers` so we don't allocate a
+    /// `String` for every losing candidate — only the winner is converted to `String` at
+    /// the very end of the call.
+    struct Candidate<'a> {
         frag_delta: f32,
-        used_resources_before: f32,
-        worker_id: String,
+        // Negated so smaller-is-better matches the (primary, secondary) tuple convention
+        // and lets the reduce step use a simple `<=` comparison.
+        neg_used_before: f32,
+        worker_id: &'a str,
     }
 
-    let mut changes: Vec<CandidateCost> = Vec::new();
-
-    // Evaluate the fragmentation impact of removing each candidate worker
-    for (worker_id, worker) in potential_workers.iter() {
-        let node = cluster
-            .nodes
-            .get_mut(&worker.allocation.node)
-            .expect("node");
-        // Fragmentation before on this node
-        let frag_before = estimate_fragmentation_on_node(node, workload);
-        let used_resources_before = node.used_pool().total_num();
-
-        // Simulate releasing the worker on a cloned NodeResources
-        node.release_allocation(&worker.allocation);
-        // Fragmentation after on this node
-        let frag_after = estimate_fragmentation_on_node(node, workload);
-        // Re-allocate the worker so that we do not actually mutate the cluster
-        node.allocate(&worker.allocation).expect("allocate");
-
-        changes.push(CandidateCost {
-            frag_delta: frag_after - frag_before,
-            used_resources_before,
-            worker_id: worker_id.clone(),
-        });
+    #[inline]
+    fn pick_better<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
+        if (a.frag_delta, a.neg_used_before) <= (b.frag_delta, b.neg_used_before) {
+            a
+        } else {
+            b
+        }
     }
 
-    log::trace!("changes: {:?}", changes);
-    // Select the worker whose removal results in the lowest cluster fragmentation
-    // If multiple workers result in the same fragmentation, prefer removing the one
-    // from the highest-utilized node.
-    changes
-        .into_iter()
-        .min_by(|a, b| {
-            // Cost tuples: (frag_delta, -remaining_resources_after)
-            // Lower delta is preferred; if equal, prefer higher-utilized nodes.
-            let ka = (a.frag_delta, -a.used_resources_before);
-            let kb = (b.frag_delta, -b.used_resources_before);
-            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .expect("non-empty")
-        .worker_id
+    let mut best: Option<Candidate<'_>> = None;
+    for (name, workers) in &by_node {
+        let node = cluster.nodes.get(*name).expect("node");
+        let mut sv = ScratchView::from_node(node);
+        let frag_before = sv.estimate_fragmentation(workload);
+        let neg_used_before = -sv.used_pool_total_num();
+
+        for w in workers {
+            let frag_after = sv.score_after_release(&w.allocation, workload);
+            let cand = Candidate {
+                frag_delta: frag_after - frag_before,
+                neg_used_before,
+                worker_id: &w.id,
+            };
+            best = match best {
+                None => Some(cand),
+                Some(b) => Some(pick_better(b, cand)),
+            };
+        }
+    }
+
+    best.expect("non-empty").worker_id.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1065,7 +1155,7 @@ mod tests {
     #[test]
     fn test_allocation_success_fractional_gpu() {
         // Test successful allocation of fractional GPU workload
-        let mut cluster = uniform_cluster(1, 16.0, 2);
+        let cluster = uniform_cluster(1, 16.0, 2);
         let workload = simple_workload(&cluster);
 
         let shape = rds::Resources {
@@ -1077,11 +1167,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0, // No reuse bonus
+            &cluster, &workload, &shape, None, 0.0, // No reuse bonus
         );
 
         assert!(result.did_allocate, "Should successfully allocate");
@@ -1098,7 +1184,7 @@ mod tests {
     #[test]
     fn test_allocation_success_whole_gpu() {
         // Test successful allocation of whole GPU workload
-        let mut cluster = uniform_cluster(1, 16.0, 2);
+        let cluster = uniform_cluster(1, 16.0, 2);
         let workload = simple_workload(&cluster);
 
         let shape = rds::Resources {
@@ -1110,11 +1196,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0,
+            &cluster, &workload, &shape, None, 0.0,
         );
 
         assert!(result.did_allocate, "Should successfully allocate");
@@ -1127,7 +1209,7 @@ mod tests {
     #[test]
     fn test_allocation_success_cpu_only() {
         // Test successful allocation of CPU-only workload
-        let mut cluster = uniform_cluster(1, 16.0, 2);
+        let cluster = uniform_cluster(1, 16.0, 2);
         let workload = simple_workload(&cluster);
 
         let shape = rds::Resources {
@@ -1139,11 +1221,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0,
+            &cluster, &workload, &shape, None, 0.0,
         );
 
         assert!(result.did_allocate, "Should successfully allocate");
@@ -1175,11 +1253,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0,
+            &cluster, &workload, &shape, None, 0.0,
         );
 
         assert!(!result.did_allocate, "Should fail to allocate");
@@ -1189,7 +1263,7 @@ mod tests {
     #[test]
     fn test_allocation_prefers_lower_fragmentation() {
         // Test that allocation chooses the option with lower fragmentation impact
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage("node-0", 0.0, 16.0, vec![gpu_with_usage(0, 0.3)]), // 0.7 available
             node_with_usage("node-1", 0.0, 16.0, vec![gpu_with_usage(0, 0.0)]), // 1.0 available
         ]);
@@ -1229,11 +1303,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0,
+            &cluster, &workload, &shape, None, 0.0,
         );
 
         let allocation = result.resources.unwrap();
@@ -1245,7 +1315,7 @@ mod tests {
     #[test]
     fn test_worker_reuse_functionality() {
         // Test that worker reuse works correctly and gets preference
-        let mut cluster = uniform_cluster(1, 16.0, 2);
+        let cluster = uniform_cluster(1, 16.0, 2);
         let workload = simple_workload(&cluster);
 
         // Create a reusable worker
@@ -1262,7 +1332,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &shape,
             Some(&reuse_map),
@@ -1270,9 +1340,9 @@ mod tests {
         );
 
         assert!(result.did_allocate, "Should successfully allocate");
-        assert!(result.reused_worker.is_some(), "Should reuse the worker");
-        let reused = result.reused_worker.unwrap();
-        assert_eq!(reused.id, "reusable");
+        assert!(result.reused_worker_id.is_some(), "Should reuse the worker");
+        let reused_id = result.reused_worker_id.unwrap();
+        assert_eq!(reused_id, "reusable");
     }
 
     #[test]
@@ -1300,7 +1370,7 @@ mod tests {
 
         // Without reuse bonus, should prefer fresh node
         let result_no_bonus = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &shape,
             Some(&reuse_map),
@@ -1309,7 +1379,7 @@ mod tests {
 
         // With significant reuse bonus, should prefer reuse
         let result_with_bonus = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &shape,
             Some(&reuse_map),
@@ -1317,8 +1387,8 @@ mod tests {
         );
 
         // The behavior should be different based on reuse bonus
-        let no_bonus_reused = result_no_bonus.reused_worker.is_some();
-        let with_bonus_reused = result_with_bonus.reused_worker.is_some();
+        let no_bonus_reused = result_no_bonus.reused_worker_id.is_some();
+        let with_bonus_reused = result_with_bonus.reused_worker_id.is_some();
 
         // With a large bonus, reuse should be more likely
         assert!(
@@ -1367,7 +1437,7 @@ mod tests {
             workers.into_iter().map(|w| (w.id.clone(), w)).collect();
 
         let to_delete = find_worker_to_delete_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &worker_map,
         );
@@ -1398,7 +1468,7 @@ mod tests {
             workers.into_iter().map(|w| (w.id.clone(), w)).collect();
 
         let to_delete = find_worker_to_delete_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &worker_map,
         );
@@ -1533,7 +1603,7 @@ mod tests {
     #[test]
     fn test_allocation_with_no_available_nodes() {
         // Test allocation when no nodes can satisfy the request
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage("node-0", 15.0, 16.0, vec![gpu_with_usage(0, 1.0)]), // Almost full
             node_with_usage("node-1", 14.0, 16.0, vec![gpu_with_usage(0, 0.9)]), // Almost full
         ]);
@@ -1548,7 +1618,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &large_shape,
             None,
@@ -1560,7 +1630,7 @@ mod tests {
             "Should fail when no nodes can satisfy request"
         );
         assert!(result.resources.is_none());
-        assert!(result.reused_worker.is_none());
+        assert!(result.reused_worker_id.is_none());
     }
 
     #[test]
@@ -1580,7 +1650,7 @@ mod tests {
     #[test]
     fn test_allocation_prefers_less_utilized_nodes() {
         // Test that allocation prefers nodes with more available resources
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage("node-0", 12.0, 16.0, vec![fresh_gpu(0)]), // High CPU usage
             node_with_usage("node-1", 2.0, 16.0, vec![fresh_gpu(0)]),  // Low CPU usage
         ]);
@@ -1595,11 +1665,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &shape,
-            None,
-            0.0,
+            &cluster, &workload, &shape, None, 0.0,
         );
 
         let allocation = result.resources.unwrap();
@@ -1616,7 +1682,7 @@ mod tests {
         init();
 
         // Test fragmentation decisions with very small fractional GPU requirements
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -1672,7 +1738,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &tiny_shape,
             None,
@@ -1693,7 +1759,7 @@ mod tests {
         init();
 
         // Test with shapes that require most of a GPU but not all
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -1749,7 +1815,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &large_frac_shape,
             None,
@@ -1816,7 +1882,7 @@ mod tests {
             workers.into_iter().map(|w| (w.id.clone(), w)).collect();
 
         let to_delete = find_worker_to_delete_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &worker_map,
         );
@@ -1834,7 +1900,7 @@ mod tests {
         init();
 
         // Test allocation of multi-GPU shapes when cluster is fragmented
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -1891,7 +1957,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &multi_gpu_shape,
             None,
@@ -1916,7 +1982,7 @@ mod tests {
         init();
 
         // Test allocation decisions with workloads that have very different CPU/GPU ratios
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage("cpu-heavy", 8.0, 64.0, vec![gpu_with_usage(0, 0.0)]), // Lots of CPU available
             node_with_usage("gpu-heavy", 60.0, 64.0, vec![gpu_with_usage(0, 0.0)]), // Little CPU available
         ]);
@@ -1956,7 +2022,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &cpu_workload,
             &cpu_shape,
             None,
@@ -1975,7 +2041,7 @@ mod tests {
         init();
 
         // Test SPMD allocation that uses part of a node
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -2033,7 +2099,7 @@ mod tests {
         });
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &spmd_shape,
             None,
@@ -2058,7 +2124,7 @@ mod tests {
         init();
 
         // Test with extremely skewed workload frequencies
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -2114,7 +2180,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &skewed_workload,
             &tiny_shape,
             None,
@@ -2137,7 +2203,7 @@ mod tests {
     #[test]
     fn test_multi_gpu_allocation() {
         // Test allocation of multi-GPU workloads
-        let mut cluster = uniform_cluster(1, 32.0, 4);
+        let cluster = uniform_cluster(1, 32.0, 4);
         let workload = simple_workload(&cluster);
 
         let multi_gpu_shape = rds::Resources {
@@ -2149,7 +2215,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &multi_gpu_shape,
             None,
@@ -2301,7 +2367,7 @@ mod tests {
 
         // Use the fragmentation gradient descent algorithm
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &spmd_shape,
             None,
@@ -2355,7 +2421,7 @@ mod tests {
 
         // Try to allocate another 2-GPU SPMD task
         let result2 = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &spmd_shape,
             None,
@@ -2447,11 +2513,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
-            &workload,
-            &new_shape,
-            None,
-            0.0,
+            &cluster, &workload, &new_shape, None, 0.0,
         );
 
         assert!(
@@ -2481,7 +2543,7 @@ mod tests {
         init();
 
         // Test that worker reuse considers fragmentation impact
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -2545,7 +2607,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &shape,
             Some(&reuse_map),
@@ -2557,9 +2619,9 @@ mod tests {
             "Should allocate with reuse consideration"
         );
 
-        if let Some(reused) = result.reused_worker {
+        if let Some(reused_id) = result.reused_worker_id {
             // Should prefer reusing the fragmented worker to avoid further fragmenting fresh GPUs
-            assert_eq!(reused.id, "fragmented");
+            assert_eq!(reused_id, "fragmented");
         }
     }
 
@@ -2598,7 +2660,7 @@ mod tests {
             workers.into_iter().map(|w| (w.id.clone(), w)).collect();
 
         let to_delete = find_worker_to_delete_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &worker_map,
         );
@@ -2612,7 +2674,7 @@ mod tests {
         init();
 
         // Test allocation decisions when GPUs are nearly full
-        let mut cluster = cluster_from_nodes(vec![
+        let cluster = cluster_from_nodes(vec![
             node_with_usage(
                 "node-0",
                 0.0,
@@ -2656,7 +2718,7 @@ mod tests {
         .unwrap();
 
         let result = find_best_allocation_using_fragmentation_gradient_descent(
-            &mut cluster,
+            &cluster,
             &workload,
             &tiny_shape,
             None,

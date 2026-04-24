@@ -669,30 +669,35 @@ fn add_worker_fn(
             // Prepare a slice of reusable workers for this stage if we have pending removals
             let reusable_workers = c.workers_to_remove_map.get(&stage.name).unwrap();
             let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
-                &mut c.cluster,
+                &c.cluster,
                 workload_estimate,
                 &stage.shape,
                 Some(reusable_workers),
                 worker_reuse_fragmentation_equivalent,
             );
             if allocation.did_allocate {
-                if let Some(reused) = allocation.reused_worker.clone() {
-                    // Reuse a previously deleted worker
+                if let Some(reused_id) = allocation.reused_worker_id {
+                    // Reuse a previously deleted worker. Move the original out of the
+                    // pending-remove map so we don't clone the whole `Worker`.
+                    let original = c
+                        .workers_to_remove_map
+                        .get_mut(&stage.name)
+                        .expect("stage exists")
+                        .remove(&reused_id)
+                        .expect("reusable worker still in workers_to_remove_map");
                     c.cluster
-                        .allocate(&reused.allocation)
+                        .allocate(&original.allocation)
                         .expect("re-allocate reused worker");
                     c.current_workers_per_stage
                         .get_mut(&stage.name)
                         .expect("stage exists")
-                        .insert(reused.id.clone(), reused.clone());
-                    c.workers_to_remove_map
-                        .get_mut(&stage.name)
-                        .expect("stage exists")
-                        .remove(&reused.id);
+                        .insert(reused_id, original);
                     stage.current_workers += 1;
                     ok = true;
-                } else if let Some(resources) = allocation.resources.clone() {
-                    // Fresh allocation
+                } else if let Some(resources) = allocation.resources {
+                    // Fresh allocation. We need the worker in two maps (active + to-add),
+                    // so one clone is unavoidable; clone the cheaper id rather than the
+                    // whole `Worker`.
                     let worker = rds::Worker::new(
                         c.worker_id_factory.make_new_id(),
                         stage.name.clone(),
@@ -701,14 +706,15 @@ fn add_worker_fn(
                     c.cluster
                         .allocate(&worker.allocation)
                         .expect("allocate worker");
-                    c.current_workers_per_stage
-                        .get_mut(&stage.name)
-                        .expect("stage exists")
-                        .insert(worker.id.clone(), worker.clone());
+                    let id_for_active = worker.id.clone();
                     c.workers_to_add_map
                         .entry(stage.name.clone())
                         .or_default()
-                        .push(worker);
+                        .push(worker.clone());
+                    c.current_workers_per_stage
+                        .get_mut(&stage.name)
+                        .expect("stage exists")
+                        .insert(id_for_active, worker);
                     stage.current_workers += 1;
                     ok = true;
                 }
@@ -758,32 +764,33 @@ fn remove_best_worker_fn(
                 .remove(&chosen_worker_id);
         }
         _ => {
-            // Get references to workers in this stage without cloning
-            let worker_map = c
+            // Choose deletion using the fragmentation heuristic. The borrow of
+            // `current_workers_per_stage` ends with the call so we can move the worker
+            // out of the same map immediately afterwards (no Worker clones).
+            let chosen_worker_id = {
+                let worker_map = c
+                    .current_workers_per_stage
+                    .get(&stage.name)
+                    .expect("stage exists");
+                frag::find_worker_to_delete_using_fragmentation_gradient_descent(
+                    &c.cluster,
+                    workload_estimate,
+                    worker_map,
+                )
+            };
+            let worker = c
                 .current_workers_per_stage
-                .get(&stage.name)
-                .expect("stage exists");
-            // Choose deletion using the fragmentation heuristic
-            let chosen_worker_id = frag::find_worker_to_delete_using_fragmentation_gradient_descent(
-                &mut c.cluster,
-                workload_estimate,
-                worker_map,
-            );
-            let worker = worker_map
-                .get(&chosen_worker_id)
-                .expect("worker exists")
-                .clone();
+                .get_mut(&stage.name)
+                .expect("stage exists")
+                .remove(&chosen_worker_id)
+                .expect("worker exists");
             c.cluster
                 .release_allocation(&worker.allocation)
                 .expect("release worker");
             c.workers_to_remove_map
                 .get_mut(&stage.name)
                 .expect("stage exists")
-                .insert(worker.id.clone(), worker.clone());
-            c.current_workers_per_stage
-                .get_mut(&stage.name)
-                .expect("stage exists")
-                .remove(&chosen_worker_id);
+                .insert(chosen_worker_id, worker);
         }
     }
 
