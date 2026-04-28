@@ -2,6 +2,30 @@
 
 ## Latest
 
+## [0.4.0]
+
+### Released
+
+- 2026-04-28
+
+### Added
+
+- Added **continuous mode** — a new execution model where stages opt in via the `ContinuousInterface` mixin and implement `run_continuous(input_queue, output_queue, stop_event)`. The runtime feeds deserialized tasks through an `asyncio.Queue` and collects results asynchronously, enabling stages that pipeline overlapping work (e.g. long-running inference engines) to sustain higher GPU utilization than the classic batch-per-call model.
+- Added graceful actor shutdown: `_attempt_graceful_shutdown()` cooperatively drains in-flight work before `ray.kill()`, bounded by a configurable grace period (default 30 s). Continuous-mode stages benefit most — batch-mode stages return immediately.
+- Added `validate_positive_int` and `validate_optional_positive_int` attrs validators in `cosmos_xenna.utils.attrs_utils`; applied to `slots_per_actor` on `StageSpec`, `PipelineConfig`, and `stage.Params` to fail fast on invalid values.
+- Added abandoned-task warning in `ActorPool.stop()` — logs per-origin-node counts for tasks still queued at shutdown.
+
+### Fixed
+
+- Refactored the Rust autoscaler FGD (Fragmented GPU Distribution) algorithm to use a pure scoring overlay instead of in-place mutation, improving correctness and testability.
+- Enforced `strict=True` on `zip()` calls in `streaming.py` and `actor_pool.py` to catch length mismatches between pools and stage-done flags.
+- CI: pinned `maturin-action` to a SHA-versioned release for reproducible builds.
+
+### Changed
+
+- **BREAKING**: Minimum Python version raised from **3.9** to **3.12**. The `requires-python` field and Pyright `pythonVersion` now both target `>=3.12`. Consumers on older Python versions must upgrade before adopting this release.
+- `_ReadyActor.kill()` now accepts a `graceful` flag (default `True`); `_try_delete_ready_actor` passes `graceful=False` since re-queued tasks make drained results useless.
+
 ## [0.3.0]
 
 ### Released
