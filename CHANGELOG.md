@@ -17,9 +17,7 @@
 
 ### Fixed
 
-- Refactored the Rust autoscaler FGD (Fragmented GPU Distribution) algorithm to use a pure scoring overlay instead of in-place mutation, improving correctness and testability.
 - Enforced `strict=True` on `zip()` calls in `streaming.py` and `actor_pool.py` to catch length mismatches between pools and stage-done flags.
-- CI: pinned `maturin-action` to a SHA-versioned release for reproducible builds.
 
 ### Changed
 
@@ -44,6 +42,7 @@
 - Made resource-shortage errors actionable (per-stage / worker-count remediation first, BATCH hint scoped to STREAMING, mode name in prefix, CPU / GPU units on requires/available).
 - Used `math.floor` for CPU-count truncation and clamped the result to `>= 0` to guard against misconfigured `cpu_allocation_percentage`.
 - Moved the Ray cluster startup log to after initialization completes.
+- Refactored the Rust autoscaler FGD (Fragmented GPU Distribution) algorithm to use a pure scoring overlay instead of in-place mutation, improving correctness and testability.
 
 ### Changed
 
