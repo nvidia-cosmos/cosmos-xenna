@@ -453,7 +453,7 @@ def _ray_get_with_progress(object_refs: List[ray.ObjectRef], description: str) -
             # Get results from completed tasks
             if ready_refs:
                 ready_results = ray.get(ready_refs)
-                for ref, result in zip(ready_refs, ready_results):
+                for ref, result in zip(ready_refs, ready_results, strict=True):
                     results[ref] = result
 
                 pbar.update(len(ready_refs))

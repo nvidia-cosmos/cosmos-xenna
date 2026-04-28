@@ -208,7 +208,7 @@ def run_autoscaling_test(test_name: str) -> None:
         solution = algorithm.autoscale(time.time(), problem_state)
 
         # dump solution
-        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages)):
+        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages, strict=True)):
             stage_name = stage_spec.name(idx)  # pyright: ignore[reportAttributeAccessIssue]
             logger.info(
                 f"Solution for {stage_name}: adding {len(result.new_workers)} workers "
@@ -216,13 +216,13 @@ def run_autoscaling_test(test_name: str) -> None:
             )
 
         # remove to-be-deleted workers
-        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages)):
+        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages, strict=True)):
             stage_name = stage_spec.name(idx)  # pyright: ignore[reportAttributeAccessIssue]
             for w in result.deleted_workers:
                 worker_allocator.remove_worker(w.id)
 
         # add to-be-added workers
-        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages)):
+        for idx, (result, stage_spec) in enumerate(zip(solution.stages, pipeline_spec.stages, strict=True)):
             stage_name = stage_spec.name(idx)  # pyright: ignore[reportAttributeAccessIssue]
             for w in result.new_workers:
                 worker_allocator.add_worker(w.to_worker_group(stage_name))

@@ -34,3 +34,19 @@ def format_attrs_object(obj: Any) -> str:
 
 def format_attrs_list(obj: list[Any]) -> str:
     return "\n".join([format_attrs_object(x) for x in obj])
+
+
+def validate_positive_int(_: Any, attribute: "attrs.Attribute[int]", value: int) -> None:
+    """Reject integer values < 1 (require >= 1)."""
+    if value < 1:
+        msg = f"{attribute.name} must be >= 1, got {value}"
+        raise ValueError(msg)
+
+
+def validate_optional_positive_int(_: Any, attribute: "attrs.Attribute[int | None]", value: int | None) -> None:
+    """Reject integer values < 1 (require >= 1 or None)."""
+    if value is None:
+        return
+    if value < 1:
+        msg = f"{attribute.name} must be >= 1 (or None), got {value}"
+        raise ValueError(msg)

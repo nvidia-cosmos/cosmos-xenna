@@ -431,7 +431,7 @@ class Autoscaler:
             A `ProblemState` object representing the current state of the pipeline.
         """
         stages = []
-        for pool, is_done in zip(actor_pools, stages_is_dones):
+        for pool, is_done in zip(actor_pools, stages_is_dones, strict=True):
             workers = self._allocator.get_workers_in_stage(pool.name)
             stages.append(
                 data_structures.ProblemStageState(
@@ -552,7 +552,7 @@ class Autoscaler:
                 f"does not match pool count {len(pools)}; planner contract violated."
             )
 
-        for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools)):
+        for idx, (result, pool) in enumerate(zip(autoscale_result.stages, pools, strict=True)):
             # Snapshot pre-mutation state: the guard must reason about the
             # ``slots_per_actor`` value under which the current in-flight work
             # was committed. ``set_num_slots_per_actor`` below only *increases*
@@ -922,12 +922,12 @@ def run_pipeline(
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
             # to clear room for new actors.
-            for pool, is_done in zip(pools, stage_is_dones):
+            for pool, is_done in zip(pools, stage_is_dones, strict=True):
                 if not is_done:
                     pool.delete_worker_groups()
 
             # Update all the pools.
-            for pool, is_done in zip(pools, stage_is_dones):
+            for pool, is_done in zip(pools, stage_is_dones, strict=True):
                 if not is_done:
                     pool.update()
             new_stats.pool_update_end = time.time()
