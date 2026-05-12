@@ -102,6 +102,11 @@ _REAP_GRACE_PERIOD_S = 15
 
 _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S = 30.0
 _GRACEFUL_SHUTDOWN_RPC_BUFFER_S = 5.0
+# Worker-side budget for the user stage's destroy() during shutdown. Must be at least
+# ``stage_worker._USER_STAGE_DESTROY_TIMEOUT_S`` so the RPC does not time out before
+# destroy() finishes. Duplicated here (rather than imported) to avoid creating a
+# stage_worker -> actor_pool import cycle.
+_USER_STAGE_DESTROY_BUDGET_S = 10.0
 
 
 @ray.remote(num_cpus=0)
@@ -152,37 +157,41 @@ def _reap_pids(pid_entries: list[tuple[int, float | None]]) -> None:
 
 
 def _attempt_graceful_shutdown(actor_ref: ActorHandle, label: str, grace_period_s: float) -> bool:
-    """Ask the worker to drain in-flight work before we ``ray.kill()`` it.
+    """Ask the worker to drain in-flight work and release per-worker resources.
 
-    This is a *cooperative* pre-step: ``StageWorker.shutdown`` sets the stop
-    flag, joins its internal threads up to ``grace_period_s``, and returns
-    a bool indicating whether the join completed. We always proceed to
-    ``ray.kill()`` regardless of the outcome - a graceful drain just lets
-    the actor publish results from in-flight tasks first (continuous mode)
-    or finish a batch (batch mode); the kill is what releases Ray
-    resources.
+    Two-phase cooperative pre-step before ``ray.kill()``:
 
-    The ``ray.get`` timeout adds ``_GRACEFUL_SHUTDOWN_RPC_BUFFER_S`` over
-    ``grace_period_s`` so that the worker's own join can finish and return
-    its bool to the caller before we abandon the wait. If the worker never
-    returns (e.g. it is wedged in C extension code), we still bound the
-    total cost at ``grace_period_s + buffer`` and continue to the kill.
+      * ``StageWorker.shutdown`` always invokes the user stage's ``destroy()`` with a
+        fixed budget (``_USER_STAGE_DESTROY_BUDGET_S``) so per-worker GPU/native
+        resources are released even when no drain is requested. Skipping this is what
+        leaks vLLM EngineCore subprocesses as ghost CUDA contexts after ``ray.kill()``.
+      * If ``grace_period_s > 0``, the worker also joins its internal threads up to
+        ``grace_period_s``. With ``grace_period_s == 0`` (autoscaler downsizes and
+        pipeline-end ``stop()`` - paths where drained results would be discarded
+        anyway), the thread join is skipped but destroy still runs.
 
-    Returns ``True`` if the worker reported a clean drain, ``False`` if it
-    reported timeout or if the RPC itself timed out / raised. The caller
-    uses this only for logging; the kill happens unconditionally.
+    The ``ray.get`` timeout covers both phases plus an RPC buffer. We always proceed
+    to ``ray.kill()`` regardless of the outcome - a graceful drain just lets the actor
+    publish in-flight results first; the kill is what releases Ray resources.
+
+    Returns ``True`` if the worker reported a clean drain, ``False`` if drain was
+    skipped or timed out, or if the RPC itself raised. The caller uses this only for
+    logging; the kill happens unconditionally.
     """
-    if grace_period_s <= 0.0:
-        return False
+    drain_s = max(0.0, grace_period_s)
+    rpc_timeout = drain_s + _USER_STAGE_DESTROY_BUDGET_S + _GRACEFUL_SHUTDOWN_RPC_BUFFER_S
     try:
         return bool(
             ray.get(
-                actor_ref.shutdown.remote(grace_period_s),  # type: ignore[attr-defined]
-                timeout=grace_period_s + _GRACEFUL_SHUTDOWN_RPC_BUFFER_S,
+                actor_ref.shutdown.remote(drain_s),  # type: ignore[attr-defined]
+                timeout=rpc_timeout,
             )
         )
     except ray.exceptions.GetTimeoutError:
-        logger.warning(f"graceful shutdown of {label} timed out after {grace_period_s:.1f}s; will hard-kill")
+        logger.warning(
+            f"graceful shutdown of {label} timed out after {rpc_timeout:.1f}s "
+            f"(drain={drain_s:.1f}s, destroy_budget={_USER_STAGE_DESTROY_BUDGET_S:.1f}s); will hard-kill"
+        )
         return False
     except Exception as e:  # noqa: BLE001 - best-effort, the kill is what guarantees cleanup
         logger.warning(f"graceful shutdown of {label} raised {type(e).__name__}: {e}; will hard-kill")
@@ -199,19 +208,19 @@ def _kill_actor_and_reap(
 
     Tear-down sequence::
 
-        1. _attempt_graceful_shutdown()   - cooperative drain (bounded)
+        1. _attempt_graceful_shutdown()   - destroy() + cooperative drain (bounded)
         2. _get_actor_pid_tree()           - snapshot for the reaper
         3. ray.kill(actor_ref)             - release Ray resources
         4. _reap_pids.remote()             - handle ray.kill() survivors
 
-    The graceful step is cheap when it succeeds (continuous-mode stages
-    drain in well under the grace period; batch-mode stages return
-    immediately because their threads were already idle between tasks).
-    When it fails, we bound the cost and proceed to the hard kill. The
-    PID-tree snapshot taken AFTER the graceful step is intentional: a
-    well-behaved stage may have already cleaned up its child processes
-    by then, leaving the snapshot small (or empty) and saving the
-    reaper from chasing PIDs that no longer exist.
+    The graceful step always runs the user stage's ``destroy()`` (bounded by
+    ``_USER_STAGE_DESTROY_BUDGET_S``) so GPU/native resources are released even
+    when ``grace_period_s == 0`` and no drain is requested. When
+    ``grace_period_s > 0`` an additional cooperative drain runs after destroy.
+    The PID-tree snapshot taken AFTER the graceful step is intentional: a
+    well-behaved stage (or one with a working ``destroy()``) will have already
+    cleaned up its child processes by then, leaving the snapshot small (or
+    empty) and saving the reaper from chasing PIDs that no longer exist.
     """
     drained = _attempt_graceful_shutdown(actor_ref, label, grace_period_s)
     pid_entries = _get_actor_pid_tree(actor_ref)

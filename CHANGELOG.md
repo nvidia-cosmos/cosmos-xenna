@@ -2,6 +2,16 @@
 
 ## Latest
 
+## [0.4.1]
+
+### Released
+
+- 2026-05-12
+
+### Fixed
+
+- Added Stage.destroy() lifecycle hook so workers can release resources before ray.kill()
+
 ## [0.4.0]
 
 ### Released

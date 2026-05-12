@@ -266,6 +266,22 @@ class Stage(abc.ABC, Generic[T, V]):
         """
         pass
 
+    def destroy(self) -> None:
+        """Release per-worker resources before the actor exits.
+
+        Called by ``StageWorker.shutdown`` while the worker still has its conda env, GPU
+        attachments, and Python interpreter intact - before ``ray.kill()`` SIGKILLs the
+        actor. Stages that own external resources (vLLM EngineCore subprocesses, torch
+        CUDA contexts, native handles) should override this to free them synchronously
+        so that ``ray.kill()`` never has to terminate them out from under the driver,
+        which would leak GPU memory as ghost CUDA contexts.
+
+        Default is a no-op for stages with no such ownership. Implementations should be
+        bounded in time and tolerate being called even when ``setup`` did not complete.
+        Exceptions are caught by the caller and logged; they will not block teardown.
+        """
+        pass
+
     @abc.abstractmethod
     def process_data(self, in_data: list[T]) -> list[V] | None:
         """Processes the input data.
@@ -544,6 +560,9 @@ class WrappedStage(stage.Interface):
 
     def process_data(self, data: Any) -> Any:
         return self._stage.process_data(data)
+
+    def destroy(self) -> None:
+        self._stage.destroy()
 
 
 @attrs.define
