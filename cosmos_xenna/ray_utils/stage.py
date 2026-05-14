@@ -98,3 +98,19 @@ class Interface(abc.ABC):
     @abc.abstractmethod
     def process_data(self, data: list[Any]) -> list[Any]:
         pass
+
+    def destroy(self) -> None:
+        """Release per-worker resources before the actor process exits.
+
+        Invoked by ``StageWorker.shutdown`` while the worker still has its conda env, GPU
+        attachments, and Python interpreter intact - i.e. before ``ray.kill()`` SIGKILLs
+        the actor. Stages that own external resources (vLLM EngineCore subprocesses,
+        torch CUDA contexts, native handles) should override this to free them
+        synchronously so that ``ray.kill()`` never has to terminate them out from under
+        the driver, which would leak GPU memory as ghost CUDA contexts.
+
+        Default is a no-op for stages with no such ownership. Implementations should be
+        bounded in time and tolerate being called even when ``setup`` did not complete.
+        Exceptions are caught by the caller and logged; they will not block teardown.
+        """
+        return

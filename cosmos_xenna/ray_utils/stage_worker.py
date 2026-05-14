@@ -121,6 +121,11 @@ __all__ = [
 # ``_collect_continuous_async``).
 _CONTINUOUS_POLL_INTERVAL_S = 0.1
 
+# Maximum time the user stage's ``destroy()`` is given to release per-worker resources
+# during graceful shutdown. Capped so a misbehaving destroy cannot stall the actor pool's
+# teardown sequence; the rest of the shutdown grace period is reserved for thread joins.
+_USER_STAGE_DESTROY_TIMEOUT_S = 10.0
+
 
 @attrs.define
 class _Result(Generic[V]):
@@ -978,16 +983,77 @@ class StageWorker(abc.ABC, Generic[T, V]):
         except psutil.NoSuchProcess:
             return [(os.getpid(), 0.0)]
 
+    def _call_user_stage_destroy(self, timeout_s: float) -> None:
+        """Invoke the user stage's ``destroy()`` with a bounded timeout.
+
+        Runs the call in a worker thread so that a misbehaving implementation (hung
+        native call, infinite loop) cannot stall the actor pool. Exceptions are logged
+        but never re-raised: teardown must always proceed to ``ray.kill()`` to release
+        Ray resources, even when the user destroy fails.
+        """
+        if timeout_s <= 0.0:
+            return
+
+        def _run() -> None:
+            try:
+                self._stage_interface.destroy()
+            except Exception:  # noqa: BLE001 - destroy is best-effort; we log and proceed
+                logger.exception("Error in user stage destroy() during shutdown")
+
+        t = threading.Thread(target=_run, name="user_stage_destroy", daemon=True)
+        t.start()
+        t.join(timeout=timeout_s)
+        if t.is_alive():
+            logger.warning(
+                f"StageWorker.shutdown: user stage destroy() did not complete within {timeout_s:.1f}s; "
+                "proceeding to thread joins. Hung destroy may leak GPU/native resources after ray.kill()."
+            )
+
     def shutdown(self, grace_period_s: float = 30.0) -> bool:
-        """Signal stop and wait up to ``grace_period_s`` for thread exit."""
+        """Signal stop, run the user stage's destroy(), and wait for thread exit.
+
+        Two-phase teardown:
+
+          1. Set the stop flag and call ``destroy()`` on the user stage with a fixed
+             ``_USER_STAGE_DESTROY_TIMEOUT_S`` budget that is independent of
+             ``grace_period_s``. This is the only point at which the user gets a
+             chance to release GPU/native handles while the actor still has a live
+             Python interpreter and the right conda env - the subsequent
+             ``ray.kill()`` SIGKILLs the actor and orphans any child processes (e.g.
+             vLLM EngineCore), which leaks GPU memory as ghost CUDA contexts.
+             ``destroy()`` runs even when ``grace_period_s == 0`` (autoscaler
+             downsizes, pipeline-end ``stop()``) because those paths still need GPU
+             resources released - only the *drain* of in-flight tasks is skipped.
+
+          2. If ``grace_period_s > 0``, join the worker threads. Calling ``destroy()``
+             first is intentional: tearing down e.g. a vLLM EngineCore unblocks any
+             in-flight RPC the processor thread is wedged in, letting the join
+             succeed instead of timing out and forcing a hard kill.
+
+        Returns ``True`` if all worker threads joined within budget, ``False`` if any
+        thread is still alive (caller should then ``ray.kill()`` to release Ray
+        resources). When ``grace_period_s == 0`` the return is always ``False``
+        (signal-only mode), but ``destroy()`` has still run.
+        """
         self.stop_flag.set()
+
+        # Phase 1: user-stage destroy. Always runs with the full destroy budget,
+        # independent of grace_period_s. The drain semantics (grace_period_s) only
+        # control whether we wait for in-flight tasks to complete; releasing per-worker
+        # GPU/native resources is orthogonal and must happen on every teardown path -
+        # including pipeline-end and autoscaler downsizes, which pass grace_period_s=0
+        # because they have no in-flight tasks to drain. Skipping destroy on the
+        # graceful=False path leaks vLLM EngineCore subprocesses as ghost CUDA contexts.
+        self._call_user_stage_destroy(_USER_STAGE_DESTROY_TIMEOUT_S)
+
         if grace_period_s <= 0.0:
             # Non-blocking signal-only mode - caller will follow with
-            # ``ray.kill()`` and does not care whether we drained cleanly.
+            # ``ray.kill()`` and does not care whether in-flight tasks drained.
             return False
 
-        # Split the budget: short caps for the I/O threads (they unblock on
-        # the next 100 ms poll), the remainder for the processor thread.
+        # Phase 2: thread joins on the remaining budget. Short caps for the I/O
+        # threads (they unblock on the next 100 ms poll), the remainder for the
+        # processor thread.
         io_cap = min(1.0, grace_period_s / 4.0)
         processor_cap = max(0.0, grace_period_s - 2 * io_cap)
 

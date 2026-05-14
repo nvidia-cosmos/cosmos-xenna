@@ -108,6 +108,10 @@ class ContinuousWrappedStage(stage.Interface, ContinuousInterface):
         )
         raise NotImplementedError(msg)
 
+    def destroy(self) -> None:
+        """Forward the pre-shutdown teardown hook to the wrapped stage."""
+        self._stage.destroy()
+
     async def run_continuous(
         self,
         input_queue: asyncio.Queue[ContinuousTaskInput],
