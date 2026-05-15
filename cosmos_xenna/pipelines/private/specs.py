@@ -332,8 +332,16 @@ class StageSpec(typing.Generic[T, V]):
     max_setup_failure_percentage: float | None = None
 
     # Over-provision factor for this stage. It is applied to the measured processing
-    # speed of the stage to influence the worker allocation.
+    # speed of the stage to influence the worker allocation. Honoured only when
+    # ``StreamingSpecificSpec.scheduler == SchedulerKind.FRAGMENTATION_BASED``;
+    # the saturation-aware scheduler ignores this field.
     over_provision_factor: float | None = None
+
+    # Per-stage override for the saturation-aware scheduler. When ``None`` the
+    # scheduler resolver falls through to ``SaturationAwareConfig.per_stage_overrides``
+    # and then ``SaturationAwareConfig.stage_defaults``. Honoured only when
+    # ``StreamingSpecificSpec.scheduler == SchedulerKind.SATURATION_AWARE``.
+    saturation_aware: Optional["SaturationAwareStageConfig"] = None
 
     def name(self, index: int | None = None) -> str:
         if index is None:
@@ -372,6 +380,373 @@ class StageSpec(typing.Generic[T, V]):
         return c
 
 
+class SchedulerKind(str, enum.Enum):
+    """Streaming-mode autoscaler implementation.
+
+    ``FRAGMENTATION_BASED`` (default) selects the Rust-backed
+    ``FragmentationBasedAutoscaler``. ``SATURATION_AWARE`` selects the
+    pure-Python saturation-aware scheduler. The flag is read once at
+    ``Autoscaler.__init__`` and frozen for the lifetime of the run.
+    """
+
+    FRAGMENTATION_BASED = "fragmentation_based"
+    SATURATION_AWARE = "saturation_aware"
+
+
+@attrs.define
+class SaturationAwareStageConfig:
+    """Per-stage tunables for the saturation-aware scheduler.
+
+    Each stage may use a different instance, allowing workloads with
+    materially different signal profiles to coexist on the same cluster
+    (e.g. a stage with multi-minute model warmup alongside a stage that
+    warms in seconds).
+
+    Default values apply unless overridden via:
+
+    1. ``StageSpec.saturation_aware`` (programmatic, per stage)
+    2. ``SaturationAwareConfig.per_stage_overrides[stage_name]`` (cluster-level keyed by name)
+    3. ``SaturationAwareConfig.stage_defaults`` (cluster-wide default)
+
+    Detailed tuning guidance per workload class lives in
+    ``docs/curator/scheduler-tuning.md``.
+    """
+
+    # --- Sampling sufficiency ---
+    # Minimum cycles with at least one ready actor before the classifier is
+    # trusted for that stage. Acts as a count-based data-sufficiency gate.
+    min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
+
+    # --- Classifier thresholds ---
+    # Slots-empty fraction below which a stage is classified SATURATED
+    # (sustained -> ordinary scale-up). Cross-field: must be > activation_threshold.
+    saturation_threshold: float = attrs.field(
+        default=0.15,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+    # Slots-empty fraction below which a stage is classified SATURATED_CRITICAL
+    # (burst response). Cross-field: must be < saturation_threshold.
+    activation_threshold: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+    # Slots-empty fraction above which a stage is classified OVER_PROVISIONED
+    # (sustained -> scale-down). Cross-field: must be > saturation_threshold.
+    over_provisioned_threshold: float = attrs.field(
+        default=0.50,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+
+    # --- Classifier deadbands ---
+    # Fractional band around saturation_threshold within which the classifier
+    # holds the previous state to prevent edge oscillation.
+    saturation_deadband_pct: float = attrs.field(
+        default=0.15,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+    # Fractional band around over_provisioned_threshold; conventionally larger
+    # than the saturation-side band so scale-down requires stronger evidence.
+    over_provisioned_deadband_pct: float = attrs.field(
+        default=0.30,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+
+    # --- Streak counters (in cycles) ---
+    # Cycles a stage must remain SATURATED before scale-up is applied.
+    saturated_streak_min_cycles: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
+    # Cycles in SATURATED_CRITICAL before burst delta is applied.
+    saturated_critical_streak_min_cycles: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # Cycles a stage must remain OVER_PROVISIONED before scale-down is applied.
+    # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
+    over_provisioned_streak_min_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+    # Cycles a stage must remain STARVED before logging the upstream-bottleneck warning.
+    starved_streak_min_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
+
+    # --- Growth mode (slow-start state machine) ---
+    # When True, per-stage growth mode (ACQUIRING / TRACKING / HOLD) shapes
+    # the per-cycle delta. When False, growth uses fixed TRACKING values.
+    enable_growth_mode_state_machine: bool = True
+    # ACQUIRING-mode multiplicative growth factor on SATURATED_CRITICAL:
+    # delta = ceil(factor * current_workers), capped by aggressive_growth_max_per_cycle.
+    acquiring_critical_growth_factor: float = attrs.field(default=0.5, validator=attrs.validators.gt(0.0))
+    # ACQUIRING-mode multiplicative growth factor on SATURATED.
+    acquiring_saturated_growth_factor: float = attrs.field(default=0.25, validator=attrs.validators.gt(0.0))
+    # TRACKING-mode absolute growth count on SATURATED_CRITICAL.
+    tracking_critical_growth_count: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
+    # TRACKING-mode absolute growth count on SATURATED.
+    tracking_saturated_growth_count: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # HOLD-mode growth count on SATURATED_CRITICAL (HOLD allows only burst response).
+    hold_critical_growth_count: int = attrs.field(default=1, validator=attrs.validators.ge(0))
+    # HOLD-mode growth count on SATURATED (typically zero so HOLD blocks
+    # all non-critical growth during post-shrink stabilization).
+    hold_saturated_growth_count: int = attrs.field(default=0, validator=attrs.validators.ge(0))
+    # Hard cap on the per-cycle additions any growth decision may produce.
+    aggressive_growth_max_per_cycle: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
+
+    # --- EWMA smoothing on slots_empty_ratio ---
+    # Weight on the NEW sample in the EWMA recursion:
+    #   smoothed = level * new + (1 - level) * prior
+    # Higher values are more responsive (less smoothing); 
+    # lower values smooth more heavily. 
+    # Default 0.20 gives ~3-cycle half-life. 
+    # 0.0 is rejected (would freeze the smoothed value forever).
+    slots_empty_ratio_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # --- Stabilization windows (recommendation history depth, in cycles) ---
+    # Recommendation history depth for the scale-up direction.
+    stabilization_window_cycles_up: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # Recommendation history depth for the scale-down direction.
+    # Cross-field: must be > stabilization_window_cycles_up for asymmetric stabilization.
+    stabilization_window_cycles_down: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+
+    # --- Rate limit on shrink ---
+    # Maximum fraction of a stage's current actors that may be deleted in a
+    # single cycle. Prevents cliff scale-downs that starve downstream stages.
+    max_scale_down_fraction_per_cycle: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # --- Slow-start mechanisms (orthogonal to cycle period) ---
+    # When True, suspend all decisions for a stage that has pending actors but
+    # no ready actors (initial setup phase).
+    setup_phase_quiescence_enabled: bool = True
+    # Per-worker grace window after the worker becomes ready, during which its
+    # samples are excluded from per-stage averages.
+    worker_warmup_measurement_grace_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
+    # Per-worker grace window after the worker becomes ready, during which it
+    # cannot be selected as a cross-stage donor. Cross-field: must be >=
+    # worker_warmup_measurement_grace_s.
+    donor_warmup_grace_s: float = attrs.field(default=180.0, validator=attrs.validators.ge(0.0))
+
+    # --- Per-stage hard caps and floors ---
+    # Optional cluster-wide minimum workers for this stage. ``None`` means the
+    # implicit one-worker floor (1) applies. Useful for pre-warming stages with
+    # long model load. When the cluster cannot satisfy the floor during the
+    # worker-floor enforcement step, the scheduler raises ``RuntimeError``
+    # (fail-fast on infeasible config).
+    min_workers: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional per-node minimum workers for this stage. ``None`` means no
+    # per-node floor. Composes with ``min_workers``: effective floor is
+    # ``max(min_workers, min_workers_per_node * num_nodes)`` when both are set.
+    min_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional cluster-wide cap on the number of workers for this stage.
+    # ``None`` means unbounded (cluster capacity is the ceiling). Cross-field:
+    # must be >= min_workers when both are set.
+    max_workers: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional per-node cap on workers of this stage. ``None`` means
+    # unbounded by this knob. Cross-field: must be >= min_workers_per_node.
+    max_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+
+    # --- Stage-local robustness toggle ---
+    # When True, lower the ``max_queued`` cap while the stage is in initial
+    # setup (pending actors > 0 and ready actors == 0) to prevent Ray
+    # object-store pressure during long warmups.
+    setup_aware_max_queued: bool = True
+
+    def __attrs_post_init__(self) -> None:
+        """Validate cross-field invariants only.
+
+        Single-field constraints (positive integers, fractions in [0, 1], ...)
+        are enforced by ``attrs.field(validator=...)`` on each field above.
+        This method handles invariants that span two or more fields.
+
+        Raises:
+            ValueError: When two or more fields are set to mutually
+                inconsistent values.
+        """
+        # Threshold ordering -- classifier zones must not overlap.
+        if not (self.activation_threshold < self.saturation_threshold < self.over_provisioned_threshold):
+            msg = (
+                f"Threshold ordering violated: "
+                f"activation_threshold={self.activation_threshold} must be < "
+                f"saturation_threshold={self.saturation_threshold} must be < "
+                f"over_provisioned_threshold={self.over_provisioned_threshold}"
+            )
+            raise ValueError(msg)
+
+        # Slow-start grace ordering -- donor grace must cover worker grace.
+        if self.donor_warmup_grace_s < self.worker_warmup_measurement_grace_s:
+            msg = (
+                f"donor_warmup_grace_s ({self.donor_warmup_grace_s}) must be >= "
+                f"worker_warmup_measurement_grace_s ({self.worker_warmup_measurement_grace_s})"
+            )
+            raise ValueError(msg)
+
+        # Streak ordering -- shrink streak must dominate growth streak.
+        if self.over_provisioned_streak_min_cycles <= self.saturated_streak_min_cycles:
+            msg = (
+                f"over_provisioned_streak_min_cycles ({self.over_provisioned_streak_min_cycles}) must be "
+                f"strictly > saturated_streak_min_cycles ({self.saturated_streak_min_cycles}) "
+                f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # Stabilization windows -- down dominates up.
+        if self.stabilization_window_cycles_down <= self.stabilization_window_cycles_up:
+            msg = (
+                f"stabilization_window_cycles_down ({self.stabilization_window_cycles_down}) must be > "
+                f"stabilization_window_cycles_up ({self.stabilization_window_cycles_up}) "
+                f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # Min <= max relations (when both sides set).
+        if self.min_workers is not None and self.max_workers is not None and self.min_workers > self.max_workers:
+            msg = f"min_workers ({self.min_workers}) must be <= max_workers ({self.max_workers})"
+            raise ValueError(msg)
+        if (
+            self.min_workers_per_node is not None
+            and self.max_workers_per_node is not None
+            and self.min_workers_per_node > self.max_workers_per_node
+        ):
+            msg = (
+                f"min_workers_per_node ({self.min_workers_per_node}) must be <= "
+                f"max_workers_per_node ({self.max_workers_per_node})"
+            )
+            raise ValueError(msg)
+
+
+@attrs.define
+class SaturationAwareConfig:
+    """Cluster-level (global) tunables for the saturation-aware scheduler.
+
+    Holds cluster-wide configuration plus the per-stage default and explicit
+    per-stage override registry. Stage-local tunables live on
+    ``SaturationAwareStageConfig``; see that class for resolution order.
+    Detailed tuning guidance per workload class lives in
+    ``docs/curator/scheduler-tuning.md``.
+    """
+
+    # --- Cycle (cluster-wide) ---
+    # Cycle period for the autoscaler control loop, in seconds. Effective
+    # response time is ``interval_s * streak_min_cycles``.
+    interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
+
+    # --- DAG priority + cross-stage donor (cluster-wide) ---
+    # When True, growth attempts are sorted by DAG depth descending
+    # (downstream stages first). Reflects the invariant that pipeline
+    # throughput is bounded by the tail stage.
+    enable_dag_priority_growth: bool = True
+    # When True, on allocation failure the scheduler may take a worker from
+    # an upstream stage to feed the receiver (cluster-full rebalance).
+    enable_cross_stage_donor: bool = True
+    # When True, a donor must have strictly smaller DAG depth than the
+    # receiver (never take from a downstream stage).
+    donor_must_be_strictly_upstream: bool = True
+
+    # --- Cross-stage donor anti-flap (5 layers) ---
+    # When True, donor candidates must be in OVER_PROVISIONED state with a
+    # full streak (not merely non-SATURATED). Strongest anti-flap layer.
+    cross_stage_donor_require_over_provisioned: bool = True
+    # When True, donors in HOLD growth mode are ineligible.
+    cross_stage_donor_exclude_hold_state: bool = True
+    # Cycles a stage must wait after donating before it can receive via
+    # cross-stage logic. Cross-field: must dominate the longest stage's
+    # over_provisioned_streak_min_cycles.
+    cross_stage_donor_anti_flap_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+    # Maximum cross-stage donations a single receiver may absorb in one cycle.
+    cross_stage_donor_max_per_cycle: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # Cycles a donor must wait between consecutive donations.
+    cross_stage_donor_min_donation_interval_cycles: int = attrs.field(
+        default=30, validator=attrs_utils.validate_positive_int
+    )
+
+    # --- Loop watchdog (cluster-wide) ---
+    # Fraction of ``interval_s`` above which a cycle's wall-clock duration
+    # triggers a WARN log. The watchdog records every cycle's duration as a
+    # histogram regardless of this threshold.
+    cycle_time_warn_threshold: float = attrs.field(
+        default=0.5,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # --- Cluster memory pressure gate (defensive kill-switch) ---
+    # When True, query Ray cluster object-store memory each cycle and freeze
+    # all scale-up when used fraction exceeds the threshold.
+    enable_memory_pressure_gate: bool = True
+    # Fraction of cluster object-store memory above which all scale-up is
+    # frozen. Defensive kill-switch for global OOM prevention.
+    memory_pressure_critical_threshold: float = attrs.field(
+        default=0.85,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Polling interval (seconds) for Ray cluster memory query. Independent of
+    # ``interval_s``; the cached value is read by every scale-up decision.
+    memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
+
+    # --- Robustness (cluster-wide) ---
+    # When True, a transient AllocationError causes the cycle to be skipped
+    # instead of raised. Tolerates allocator races during snapshot-then-apply.
+    skip_cycle_on_allocation_error: bool = True
+    # Consecutive cycles of stuck plan (proposed adds > 0, applied adds = 0)
+    # before an INFO log fires.
+    stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
+
+    # --- Per-stage default + explicit overrides ---
+    # Default ``SaturationAwareStageConfig`` applied to every stage that has
+    # no more specific override.
+    stage_defaults: SaturationAwareStageConfig = attrs.field(factory=SaturationAwareStageConfig)
+    # Optional explicit per-stage overrides keyed by stage name. Each value is
+    # a full ``SaturationAwareStageConfig``; copy ``stage_defaults`` and tweak
+    # the fields you want to change. Lower precedence than
+    # ``StageSpec.saturation_aware``.
+    per_stage_overrides: dict[str, SaturationAwareStageConfig] = attrs.field(factory=dict)
+
+    def __attrs_post_init__(self) -> None:
+        """Validate cluster-wide cross-field invariants.
+
+        Single-field constraints are enforced by ``attrs.field(validator=...)``
+        on each field above. This method validates invariants that span the
+        global config and any per-stage configs.
+
+        Raises:
+            ValueError: When two or more fields are set to mutually
+                inconsistent values.
+        """
+        # Anti-flap window vs the longest stage's expected shrink streak --
+        # the anti-flap cooldown must dominate every stage's
+        # OVER_PROVISIONED streak so reciprocal donations cannot fire within
+        # the same shrink-decision horizon.
+        all_stage_configs = [self.stage_defaults, *self.per_stage_overrides.values()]
+        longest_shrink_streak = max(cfg.over_provisioned_streak_min_cycles for cfg in all_stage_configs)
+        if self.cross_stage_donor_anti_flap_cycles < longest_shrink_streak:
+            msg = (
+                f"cross_stage_donor_anti_flap_cycles ({self.cross_stage_donor_anti_flap_cycles}) must be "
+                f">= the longest over_provisioned_streak_min_cycles across all stage configs "
+                f"({longest_shrink_streak}); otherwise the anti-flap safeguard is weaker than the "
+                f"streak it must dominate."
+            )
+            raise ValueError(msg)
+
+    def get_effective_stage_config(
+        self,
+        stage_name: str,
+        spec_override: SaturationAwareStageConfig | None = None,
+    ) -> SaturationAwareStageConfig:
+        """Resolve the effective stage config using three-tier precedence.
+
+        Args:
+            stage_name: Name of the stage being looked up.
+            spec_override: Override read from ``StageSpec.saturation_aware``,
+                or ``None`` if the stage spec did not set one.
+
+        Returns:
+            The resolved ``SaturationAwareStageConfig`` for the stage.
+            Lookup precedence: ``spec_override`` -> ``per_stage_overrides`` ->
+            ``stage_defaults``.
+
+        """
+        if spec_override is not None:
+            return spec_override
+        if stage_name in self.per_stage_overrides:
+            return self.per_stage_overrides[stage_name]
+        return self.stage_defaults
+
+
 @attrs.define
 class StreamingSpecificSpec:
     # How often to run the stage auto-scaler.
@@ -405,6 +780,16 @@ class StreamingSpecificSpec:
     # starvation pattern where source completion triggers aggressive CPU-stage scale-down before
     # queued work has drained.
     enable_backlog_aware_scaledown: bool = False
+
+    # --- Saturation-aware scheduler (opt-in) ---
+    # Selects the autoscaler implementation. ``FRAGMENTATION_BASED`` (default)
+    # uses the Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python
+    # saturation-aware scheduler. The flag is read once at
+    # ``Autoscaler.__init__`` and frozen for the lifetime of the run.
+    scheduler: SchedulerKind = SchedulerKind.FRAGMENTATION_BASED
+    # Configuration for the saturation-aware scheduler. Has no effect when
+    # ``scheduler == SchedulerKind.FRAGMENTATION_BASED``.
+    saturation_aware: SaturationAwareConfig = attrs.field(factory=SaturationAwareConfig)
 
 
 @attrs.define

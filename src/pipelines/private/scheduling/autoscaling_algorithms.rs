@@ -1495,6 +1495,7 @@ mod tests {
                     worker_groups: Vec::new(),
                     slots_per_worker: 2,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         }
@@ -1835,6 +1836,7 @@ mod tests {
                     worker_groups: Vec::new(),
                     slots_per_worker: 1,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         };
@@ -2222,6 +2224,7 @@ mod tests {
                 worker_groups: vec![existing_worker_group, existing_worker_group_2], // Start with 2 worker groups
                 slots_per_worker: 2,
                 is_finished: false,
+                ..Default::default()
             }],
         };
 
@@ -2341,6 +2344,7 @@ mod tests {
                     worker_groups: s.new_workers.clone(),
                     slots_per_worker: s.slots_per_worker,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         };

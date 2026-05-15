@@ -16,11 +16,22 @@
 
 from __future__ import annotations
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import data_structures as rust  # type: ignore
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore
+    autoscale_plan_context as rust_apc,
+    data_structures as rust,
+)
 from cosmos_xenna.pipelines.private import resources
 
 
 class ProblemStage:
+    """Static autoscaling description of one pipeline stage.
+
+    This is the per-stage entry inside ``Problem``. It describes what a
+    worker for this stage costs and how the stage batches work; it does
+    not describe the workers currently running.
+
+    """
+
     def __init__(
         self,
         name: str,
@@ -39,6 +50,15 @@ class ProblemStage:
 
 
 class Problem:
+    """Static autoscaling input for one pipeline.
+
+    ``Problem`` answers "what could this pipeline allocate?": total
+    cluster capacity plus the ordered ``ProblemStage`` definitions.
+    Autoscalers combine this static model with ``ProblemState`` to
+    produce an ordered ``Solution``.
+
+    """
+
     def __init__(self, cluster_resources: resources.ClusterResources, stages: list[ProblemStage]) -> None:
         self._r = rust.Problem(cluster_resources.to_rust(), [s.rust for s in stages])
 
@@ -48,6 +68,14 @@ class Problem:
 
 
 class ProblemWorkerGroupState:
+    """Runtime snapshot of one worker group assigned to a stage.
+
+    Holds the worker group's stable id and resource allocations. The
+    stage name is supplied later when converting this snapshot back into
+    a concrete ``WorkerGroup`` for actor-pool operations.
+
+    """
+
     @classmethod
     def make(cls, id: str, resources: list[resources.WorkerResourcesInternal]) -> ProblemWorkerGroupState:
         return cls(rust.ProblemWorkerGroupState(id, [x.to_rust() for x in resources]))
@@ -72,10 +100,57 @@ class ProblemWorkerGroupState:
 
 
 class ProblemStageState:
+    """Runtime autoscaling snapshot for one pipeline stage.
+
+    This is the per-stage entry inside ``ProblemState``. It records the
+    workers currently assigned to the stage, the active slots-per-worker
+    setting, whether the stage has finished, and optional slot/queue
+    signals sampled at the same instant as ``worker_groups``.
+
+    The slot-signal kwargs (``num_used_slots``, ``num_empty_slots``,
+    ``input_queue_depth``) default to 0, so existing call sites that pass
+    only the four positional arguments continue to work unchanged.
+    Consumers that do not populate these fields treat the default as
+    "no signal".
+
+    Args:
+        stage_name: Pipeline stage identifier; positional aligns with
+            ``ProblemStage`` in ``Problem``.
+        workers: Snapshot of ``ProblemWorkerGroupState`` objects currently
+            assigned to this stage.
+        slots_per_worker: Active per-worker slot count.
+        is_finished: True when the stage has drained and will not receive
+            further input.
+        num_used_slots: Number of currently-occupied task slots across all
+            workers in the stage at sample time.
+        num_empty_slots: Number of currently-free task slots across all
+            workers at sample time. ``num_used_slots + num_empty_slots``
+            is the total in-stage slot capacity at sample time.
+        input_queue_depth: Number of pre-batch tasks queued upstream of
+            this stage at sample time.
+
+    """
+
     def __init__(
-        self, stage_name: str, workers: list[ProblemWorkerGroupState], slots_per_worker: int, is_finished: bool
+        self,
+        stage_name: str,
+        workers: list[ProblemWorkerGroupState],
+        slots_per_worker: int,
+        is_finished: bool,
+        *,
+        num_used_slots: int = 0,
+        num_empty_slots: int = 0,
+        input_queue_depth: int = 0,
     ) -> None:
-        self._r = rust.ProblemStageState(stage_name, [w.rust for w in workers], slots_per_worker, is_finished)
+        self._r = rust.ProblemStageState(
+            stage_name,
+            [w.rust for w in workers],
+            slots_per_worker,
+            is_finished,
+            num_used_slots,
+            num_empty_slots,
+            input_queue_depth,
+        )
 
     @property
     def rust(self) -> rust.ProblemStageState:
@@ -83,6 +158,15 @@ class ProblemStageState:
 
 
 class ProblemState:
+    """Runtime autoscaling snapshot for the whole pipeline.
+
+    ``ProblemState`` answers "what is running right now?": one ordered
+    ``ProblemStageState`` per pipeline stage. Autoscalers compare it
+    with the static ``Problem`` to decide what a ``Solution`` should
+    add, remove, or leave unchanged.
+
+    """
+
     def __init__(self, stages: list[ProblemStageState]) -> None:
         self._r = rust.ProblemState([s.rust for s in stages])
 
@@ -92,6 +176,13 @@ class ProblemState:
 
 
 class TaskMeasurement:
+    """Runtime timing sample for one completed task.
+
+    Measurements are historical throughput inputs for autoscalers that
+    estimate processing rates from task durations and output counts.
+
+    """
+
     def __init__(self, start_time: float, end_time: float, num_returns: int) -> None:
         self._r = rust.TaskMeasurement(start_time, end_time, num_returns)
 
@@ -101,6 +192,13 @@ class TaskMeasurement:
 
 
 class StageMeasurements:
+    """Runtime timing samples for one pipeline stage.
+
+    Groups the task-level measurements observed for a single stage
+    during an autoscaling interval.
+
+    """
+
     def __init__(self, task_measurements: list[TaskMeasurement]) -> None:
         self._r = rust.StageMeasurements([t.rust for t in task_measurements])
 
@@ -110,6 +208,14 @@ class StageMeasurements:
 
 
 class Measurements:
+    """Runtime timing snapshot for the whole pipeline.
+
+    Carries the measurement timestamp and one ordered ``StageMeasurements``
+    entry per pipeline stage. Throughput-based autoscalers use it to
+    update their rate estimates between allocation decisions.
+
+    """
+
     def __init__(self, time: float, stage_measurements: list[StageMeasurements]) -> None:
         self._r = rust.Measurements(time, [s.rust for s in stage_measurements])
 
@@ -119,8 +225,55 @@ class Measurements:
 
 
 class StageSolution:
+    """Autoscale plan for one pipeline stage.
+
+    This is the per-stage entry inside ``Solution``. It describes what
+    to apply to one stage in this autoscale cycle: update
+    ``slots_per_worker``, create ``new_workers``, and delete
+    ``deleted_workers``. Stage identity is positional; the containing
+    ``Solution`` aligns each entry with the corresponding pipeline
+    stage.
+
+    Attributes:
+        deleted_workers: Worker groups to remove from this stage.
+        new_workers: Worker groups to add to this stage.
+        slots_per_worker: Task slots to configure on each worker.
+
+    """
+
     def __init__(self, rust_stage_solution: rust.StageSolution) -> None:
         self._r = rust_stage_solution
+
+    @classmethod
+    def make(
+        cls,
+        slots_per_worker: int,
+        new_workers: list[ProblemWorkerGroupState] | None = None,
+        deleted_workers: list[ProblemWorkerGroupState] | None = None,
+    ) -> StageSolution:
+        """Build a StageSolution from Python primitives.
+
+        Pure-Python schedulers use this factory to assemble per-stage
+        solutions without going through the Rust autoscaler. Mirrors
+        ``ProblemWorkerGroupState.make``.
+
+        Args:
+            slots_per_worker: Number of task slots to allocate per worker.
+            new_workers: Workers to add to the stage. Empty list when omitted.
+            deleted_workers: Workers to remove from the stage. Empty list
+                when omitted.
+
+        Returns:
+            A ``StageSolution`` wrapping a freshly-constructed Rust
+            ``rust.StageSolution`` populated with the given workers.
+
+        """
+        rust_ss = rust.StageSolution(slots_per_worker)
+        if new_workers:
+            rust_ss.new_workers = [w.rust for w in new_workers]
+        if deleted_workers:
+            rust_ss.deleted_workers = [w.rust for w in deleted_workers]
+        return cls(rust_ss)
 
     @property
     def deleted_workers(self) -> list[ProblemWorkerGroupState]:
@@ -140,8 +293,43 @@ class StageSolution:
 
 
 class Solution:
+    """Autoscale plan for the whole pipeline.
+
+    ``Solution`` answers "what should change this cycle?": one ordered
+    ``StageSolution`` per pipeline stage. The stage name is not stored
+    in each entry; callers apply each entry to the stage at the same
+    list index.
+
+    Attributes:
+        stages: Ordered per-stage allocation plans.
+
+    """
+
     def __init__(self, rust_solution: rust.Solution) -> None:
         self._r = rust_solution
+
+    @classmethod
+    def make(cls, stages: list[StageSolution] | None = None) -> Solution:
+        """Build a Solution from a list of StageSolutions.
+
+        Pure-Python schedulers use this factory to assemble the final
+        autoscale result. Mirrors ``ProblemWorkerGroupState.make`` and
+        ``StageSolution.make``.
+
+        Args:
+            stages: Per-stage solutions in the same order as the
+                pipeline's stages. ``None`` produces an empty solution
+                (no per-stage entries).
+
+        Returns:
+            A ``Solution`` wrapping a freshly-constructed Rust
+            ``rust.Solution`` populated with the given stages.
+
+        """
+        rust_sol = rust.Solution()
+        if stages:
+            rust_sol.stages = [s.rust for s in stages]
+        return cls(rust_sol)
 
     @property
     def stages(self) -> list[StageSolution]:
@@ -150,3 +338,75 @@ class Solution:
     @property
     def rust(self) -> rust.Solution:
         return self._r
+
+
+class AutoscalePlanContext:
+    """Per-cycle planning context for pure-Python schedulers.
+
+    Owns a working copy of the cluster snapshot seeded with the current
+    worker placements from ``ProblemState``, plus per-stage maps of
+    pending adds and pending removes that the scheduler stages during
+    one autoscale cycle. Construct one instance per cycle via
+    ``from_problem_state``; subsequent cycles MUST construct a fresh
+    context.
+
+    Method coverage tracks the granular sub-iterations:
+
+    * ``from_problem_state`` (1a-i, this iteration) - seeded
+      construction.
+    * ``try_add_worker`` (1a-ii, future) - runs FGD on the working
+      cluster and stages an add.
+    * ``try_remove_worker`` (1a-iii, future) - frees a placement and
+      stages a remove.
+    * ``into_solution`` (1a-iv, future) - consumes self, drains the
+      staged adds/removes into a ``Solution``.
+
+    See plan section 4f.J for the full lifecycle and the design rule
+    that motivates this class.
+
+    """
+
+    @classmethod
+    def from_problem_state(cls, problem: Problem, state: ProblemState) -> AutoscalePlanContext:
+        """Build a planning context seeded with the current cluster state.
+
+        Clones ``problem.cluster_resources`` and pre-allocates every worker
+        currently in ``state``, so subsequent ``try_add_worker`` /
+        ``try_remove_worker`` calls respect existing placements.
+
+        Args:
+            problem: Static autoscaling input (cluster shape + per-stage
+                shape definitions).
+            state: Runtime snapshot (per-stage current workers, slots,
+                finished flag).
+
+        Returns:
+            A fresh ``AutoscalePlanContext`` ready for the planning
+            sub-iterations to mutate.
+
+        Raises:
+            RuntimeError: If seeding fails because a current worker
+                cannot be allocated on the cluster (indicates a
+                corrupted snapshot).
+            ValueError: If ``problem.stages`` and ``state.stages`` do
+                not have the same length.
+
+        """
+        return cls(rust_apc.AutoscalePlanContext(problem.rust, state.rust))
+
+    def __init__(self, rust_context: rust_apc.AutoscalePlanContext) -> None:
+        self._r = rust_context
+
+    @property
+    def rust(self) -> rust_apc.AutoscalePlanContext:
+        """Underlying Rust planning-context object."""
+        return self._r
+
+    def num_stages(self) -> int:
+        """Number of stages this context tracks.
+
+        Useful for invariant checks (callers can confirm
+        ``len(stage_solutions) == ctx.num_stages()``) and for tests
+        that need to verify the seeding round-tripped the input shape.
+        """
+        return self._r.num_stages()

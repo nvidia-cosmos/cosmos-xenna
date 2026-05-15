@@ -35,6 +35,7 @@ from cosmos_xenna.pipelines.private import (
     data_structures,
     monitoring,
     resources,
+    scheduling_py,
     specs,
 )
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
@@ -283,6 +284,61 @@ def _required_workers_for_stage(
     return max(Autoscaler.MIN_WORKERS_PER_STAGE, workers_for_inflight, workers_for_backlog)
 
 
+class _SchedulerAlgorithm(typing.Protocol):
+    """Structural type for the algorithm slot inside ``Autoscaler``.
+
+    Both ``FragmentationBasedAutoscaler`` (Rust-backed) and
+    ``SaturationAwareScheduler`` (pure-Python) satisfy this protocol.
+    Defined as a Protocol so the dispatcher in ``_make_scheduler_algorithm``
+    can assign either implementation without a ``Union`` annotation.
+    """
+
+    def setup(self, problem: data_structures.Problem) -> None: ...
+
+    def update_with_measurements(
+        self,
+        time: float,
+        measurements: data_structures.Measurements,
+    ) -> None: ...
+
+    def autoscale(
+        self,
+        time: float,
+        problem_state: data_structures.ProblemState,
+    ) -> data_structures.Solution: ...
+
+
+def _make_scheduler_algorithm(mode_specific: specs.StreamingSpecificSpec) -> _SchedulerAlgorithm:
+    """Construct the algorithm for ``Autoscaler._algorithm`` based on the spec.
+
+    Reads ``mode_specific.scheduler`` once and returns the corresponding
+    instance. Selection is frozen for the lifetime of the run; switching
+    schedulers requires re-instantiating ``Autoscaler``.
+
+    Args:
+        mode_specific: ``StreamingSpecificSpec`` carrying the scheduler
+            kind plus the per-kind configuration blocks.
+
+    Returns:
+        An object satisfying the ``_SchedulerAlgorithm`` protocol.
+
+    Raises:
+        ValueError: If ``mode_specific.scheduler`` holds an unrecognized
+            ``SchedulerKind`` value (defensive against future enum values
+            that have not been wired up yet).
+
+    """
+    kind = mode_specific.scheduler
+    if kind is specs.SchedulerKind.FRAGMENTATION_BASED:
+        return autoscaling_algorithms.FragmentationBasedAutoscaler(
+            mode_specific.autoscale_speed_estimation_window_duration_s,
+            mode_specific.autoscale_speed_estimation_min_data_points,
+        )
+    if kind is specs.SchedulerKind.SATURATION_AWARE:
+        return scheduling_py.SaturationAwareScheduler(mode_specific.saturation_aware)
+    raise ValueError(f"Unrecognized SchedulerKind: {kind!r}")
+
+
 class Autoscaler:
     """Manages the autoscaling of pipeline stages in a streaming execution mode.
 
@@ -382,10 +438,7 @@ class Autoscaler:
         assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
-            mode_specific.autoscale_speed_estimation_window_duration_s,
-            mode_specific.autoscale_speed_estimation_min_data_points,
-        )
+        self._algorithm = _make_scheduler_algorithm(mode_specific)
         self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None

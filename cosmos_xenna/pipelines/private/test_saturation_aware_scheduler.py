@@ -1,0 +1,315 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Public-API tests for ``SaturationAwareScheduler.setup`` and ``autoscale``.
+
+Pins the scheduler's two integration points with the rest of the
+streaming executor:
+
+  * ``setup()`` walks ``problem.rust.stages`` and builds a per-stage
+    runtime state map keyed by stage name.
+  * ``autoscale()`` walks ``problem_state.rust.stages`` and emits one
+    ``StageSolution`` per stage in the same order, preserving the
+    existing ``slots_per_worker`` and producing no scaling work
+    (no-op until the per-stage pipeline is wired to real slot
+    signals).
+
+Tests use real ``Problem`` and ``ProblemState`` objects (not mocks)
+so the Python -> Rust round-trips are exercised end-to-end.
+"""
+
+from cosmos_xenna.pipelines.private import data_structures, resources
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
+from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
+
+
+def _cluster() -> resources.ClusterResources:
+    """Single-node CPU cluster sufficient for ProblemStage construction."""
+    return resources.ClusterResources(
+        nodes={
+            "node-0": resources.NodeResources(used_cpus=0, total_cpus=8, gpus=[], name="node-0"),
+        },
+    )
+
+
+def _problem_with_stages(stage_names: list[str]) -> data_structures.Problem:
+    """Build a real ``Problem`` with one CPU stage per name. Order preserved."""
+    cluster = _cluster()
+    cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(cluster)
+    stages = [
+        data_structures.ProblemStage(
+            name=name,
+            stage_batch_size=1,
+            worker_shape=cpu_shape,
+            requested_num_workers=None,
+            over_provision_factor=None,
+        )
+        for name in stage_names
+    ]
+    return data_structures.Problem(cluster, stages)
+
+
+def _problem_state(stage_specs: list[tuple[str, int, int]]) -> data_structures.ProblemState:
+    """Build a real ``ProblemState``.
+
+    Args:
+        stage_specs: list of (stage_name, num_workers, slots_per_worker).
+            For each entry, constructs a ``ProblemStageState`` carrying
+            the requested number of empty worker groups (one
+            ``ProblemWorkerGroupState`` per worker, no resources).
+    """
+    states = []
+    for name, num_workers, slots in stage_specs:
+        worker_groups = [data_structures.ProblemWorkerGroupState.make(f"{name}-w{i}", []) for i in range(num_workers)]
+        states.append(
+            data_structures.ProblemStageState(
+                stage_name=name,
+                workers=worker_groups,
+                slots_per_worker=slots,
+                is_finished=False,
+            )
+        )
+    return data_structures.ProblemState(states)
+
+
+class TestSetup:
+    """``setup()`` builds a per-stage runtime state map keyed by stage name."""
+
+    def test_state_map_keyed_by_stage_name(self) -> None:
+        """One ``_StageRuntimeState`` per stage, keyed by the stage's name."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B", "C"]))
+        assert set(scheduler._stage_states) == {"A", "B", "C"}
+        for name in ("A", "B", "C"):
+            assert isinstance(scheduler._stage_states[name], _StageRuntimeState)
+            assert scheduler._stage_states[name].stage_name == name
+
+    def test_stage_names_preserve_pipeline_order(self) -> None:
+        """``_stage_names`` reflects DAG order so deterministic iteration matches Solution order."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["upstream", "middle", "downstream"]))
+        assert scheduler._stage_names == ["upstream", "middle", "downstream"]
+
+    def test_runtime_state_starts_at_default_values(self) -> None:
+        """Newly constructed runtime state matches ``_StageRuntimeState`` defaults."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        state = scheduler._stage_states["A"]
+        assert state.slots_empty_ratio_ewma is None
+        assert state.last_valid_slots_empty_ratio_ewma is None
+        assert state.classifier_streak == 0
+        assert state.growth_streak == 0
+        assert state.prev_workers == 0
+
+    def test_handles_single_stage_pipeline(self) -> None:
+        """Smallest non-trivial pipeline -- one stage."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["only"]))
+        assert scheduler._stage_names == ["only"]
+        assert list(scheduler._stage_states) == ["only"]
+
+    def test_setup_can_be_called_again_to_rebuild_state(self) -> None:
+        """A second ``setup()`` replaces the prior state; useful for test isolation and reset paths."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        scheduler.setup(_problem_with_stages(["X", "Y"]))
+        assert scheduler._stage_names == ["X", "Y"]
+        assert "A" not in scheduler._stage_states
+        assert set(scheduler._stage_states) == {"X", "Y"}
+
+    def test_setup_stores_problem_and_config_by_reference(self) -> None:
+        """Scheduler holds the same objects passed in (no deep copy).
+
+        Pins the contract so a future refactor that adds an unintended
+        ``copy.deepcopy`` is caught -- runtime config patches rely on
+        the reference being shared.
+        """
+        config = SaturationAwareConfig()
+        problem = _problem_with_stages(["A"])
+        scheduler = SaturationAwareScheduler(config)
+        scheduler.setup(problem)
+        assert scheduler._config is config
+        assert scheduler._problem is problem
+
+    def test_handles_many_stages_pipeline(self) -> None:
+        """20-stage pipeline: state map size, order, and uniqueness all verified at scale."""
+        stage_names = [f"Stage-{i:02d}" for i in range(20)]
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(stage_names))
+        assert scheduler._stage_names == stage_names
+        assert len(scheduler._stage_states) == 20
+        assert all(scheduler._stage_states[name].stage_name == name for name in stage_names)
+
+
+class TestAutoscaleNoOpShape:
+    """``autoscale()`` produces a Solution that mirrors the input shape with no scaling work."""
+
+    def test_returns_one_stage_solution_per_problem_state_stage(self) -> None:
+        """Solution stage count matches ProblemState stage count -- the streaming.py contract."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B", "C"]))
+        solution = scheduler.autoscale(
+            time=100.0,
+            problem_state=_problem_state([("A", 1, 2), ("B", 2, 2), ("C", 1, 4)]),
+        )
+        assert len(solution.stages) == 3
+
+    def test_preserves_slots_per_worker_per_stage(self) -> None:
+        """Each ``StageSolution.slots_per_worker`` echoes the corresponding ProblemStageState."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B", "C"]))
+        solution = scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 1, 1), ("B", 2, 2), ("C", 1, 8)]),
+        )
+        assert [s.slots_per_worker for s in solution.stages] == [1, 2, 8]
+
+    def test_emits_no_workers_added_or_removed(self) -> None:
+        """No-op contract: every StageSolution has empty new_workers and deleted_workers lists."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+        solution = scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 4, 2), ("B", 1, 1)]),
+        )
+        for stage in solution.stages:
+            assert stage.new_workers == []
+            assert stage.deleted_workers == []
+
+    def test_returned_worker_lists_are_empty_lists_not_none(self) -> None:
+        """Worker fields are concrete empty lists, not ``None``.
+
+        ``streaming.py:apply_autoscale_result_if_ready`` does
+        ``list(result.deleted_workers)`` and iterates ``new_workers``
+        with ``for w in ...``. ``None`` would raise ``TypeError``;
+        empty list is the silent-no-op contract.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        solution = scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 2)]))
+        stage = solution.stages[0]
+        assert isinstance(stage.new_workers, list)
+        assert isinstance(stage.deleted_workers, list)
+
+
+class TestAutoscaleEdgeCases:
+    """Edge-case shapes that pin the boundary behaviour of the scheduler."""
+
+    def test_single_stage_pipeline(self) -> None:
+        """Single-stage pipeline -- the smallest valid input."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["only"]))
+        solution = scheduler.autoscale(time=0.0, problem_state=_problem_state([("only", 1, 1)]))
+        assert len(solution.stages) == 1
+        assert solution.stages[0].slots_per_worker == 1
+
+    def test_zero_stage_problem_state(self) -> None:
+        """Empty pipeline produces an empty Solution."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages([]))
+        solution = scheduler.autoscale(time=0.0, problem_state=_problem_state([]))
+        assert solution.stages == []
+
+    def test_repeated_calls_are_idempotent_for_no_op_stub(self) -> None:
+        """Calling autoscale twice with the same state produces equivalent Solutions.
+
+        The current no-op stub does not maintain state across cycles
+        (the per-stage pipeline does not run yet), so this should
+        deterministically reproduce the same Solution shape.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state([("A", 2, 4)])
+        first = scheduler.autoscale(time=0.0, problem_state=ps)
+        second = scheduler.autoscale(time=10.0, problem_state=ps)
+        assert [s.slots_per_worker for s in first.stages] == [s.slots_per_worker for s in second.stages]
+        assert all(s.new_workers == [] and s.deleted_workers == [] for s in first.stages)
+        assert all(s.new_workers == [] and s.deleted_workers == [] for s in second.stages)
+
+    def test_time_parameter_does_not_affect_no_op_output(self) -> None:
+        """Time-statelessness pin: same problem_state at any time -> same Solution shape.
+
+        The no-op stub ignores ``time``. When the per-stage pipeline
+        is wired up, growth-mode timers will care about time-derived
+        cycle counts -- this test will then need to be re-scoped, and
+        the regression on no-op-stub behaviour will fire here first.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state([("A", 1, 2)])
+        for time_value in (-1e9, 0.0, 1e-6, 1.0, 1e9):
+            sol = scheduler.autoscale(time=time_value, problem_state=ps)
+            assert [s.slots_per_worker for s in sol.stages] == [2]
+            assert sol.stages[0].new_workers == []
+            assert sol.stages[0].deleted_workers == []
+
+    def test_finished_stages_still_emit_solution(self) -> None:
+        """A stage with ``is_finished=True`` still receives a StageSolution -- no special skip.
+
+        ``streaming.py`` requires ``len(autoscale_result.stages) == len(pools)`` so the
+        stage count cannot diverge based on finished state. Pin this contract.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+        # Build ProblemState manually so we can flip is_finished on the second stage.
+        worker_a = data_structures.ProblemWorkerGroupState.make("a-w0", [])
+        worker_b = data_structures.ProblemWorkerGroupState.make("b-w0", [])
+        ps = data_structures.ProblemState(
+            [
+                data_structures.ProblemStageState(
+                    stage_name="A", workers=[worker_a], slots_per_worker=2, is_finished=False
+                ),
+                data_structures.ProblemStageState(
+                    stage_name="B", workers=[worker_b], slots_per_worker=4, is_finished=True
+                ),
+            ]
+        )
+        solution = scheduler.autoscale(time=0.0, problem_state=ps)
+        assert len(solution.stages) == 2
+        assert [s.slots_per_worker for s in solution.stages] == [2, 4]
+
+    def test_stage_state_map_persists_across_autoscale_cycles(self) -> None:
+        """``_stage_states`` dict is built once at setup and not recreated by autoscale.
+
+        Pre-paving: when the per-stage pipeline mutates state (EWMA,
+        streak counters, growth mode), autoscale MUST update the
+        existing dict entries in place rather than recreate the dict.
+        Identity preservation here protects that contract.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        original_dict = scheduler._stage_states
+        original_state_a = scheduler._stage_states["A"]
+
+        for _ in range(3):
+            scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 2)]))
+
+        assert scheduler._stage_states is original_dict
+        assert scheduler._stage_states["A"] is original_state_a
+
+
+class TestUpdateWithMeasurementsIsNoOp:
+    """``update_with_measurements`` accepts and discards measurements -- signal-driven scheduler ignores them."""
+
+    def test_does_not_raise_or_mutate_state(self) -> None:
+        """The method is a documented no-op so call sites in streaming.py can be branchless."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        snapshot_before = dict(scheduler._stage_states)
+        empty_measurements = data_structures.Measurements(time=0.0, stage_measurements=[])
+        scheduler.update_with_measurements(time=0.0, measurements=empty_measurements)
+        # Same dict, same values -- nothing was mutated.
+        assert scheduler._stage_states == snapshot_before

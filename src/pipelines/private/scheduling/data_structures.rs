@@ -157,32 +157,64 @@ impl ProblemWorkerGroupState {
 ///
 /// # Attributes
 /// * `stage_name` - Name identifier for this stage.
-/// * `workers` - List of workers currently assigned to this stage.
+/// * `worker_groups` - List of worker groups currently assigned to this stage.
 /// * `slots_per_worker` - Number of task slots available per worker.
 /// * `is_finished` - Boolean indicating if this stage has completed processing.
+/// * `num_used_slots` - Number of task slots currently occupied across all
+///   workers in the stage at sample time. Defaults to 0; consumers that do
+///   not populate this field treat the default as "no signal".
+/// * `num_empty_slots` - Number of task slots currently free across all
+///   workers in the stage at sample time. Combined with `num_used_slots`,
+///   gives the total in-stage slot capacity at sample time. Defaults to 0.
+/// * `input_queue_depth` - Number of pre-batch tasks queued upstream of this
+///   stage at sample time. Defaults to 0.
 #[pyclass(get_all, set_all)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProblemStageState {
     pub stage_name: String,
     pub worker_groups: Vec<ProblemWorkerGroupState>,
     pub slots_per_worker: usize,
     pub is_finished: bool,
+    pub num_used_slots: usize,
+    pub num_empty_slots: usize,
+    pub input_queue_depth: usize,
 }
 
 #[pymethods]
 impl ProblemStageState {
+    /// Construct a `ProblemStageState`.
+    ///
+    /// The slot-signal fields (`num_used_slots`, `num_empty_slots`,
+    /// `input_queue_depth`) are optional keyword arguments defaulting to 0
+    /// so existing call sites that built `ProblemStageState` from four
+    /// positional arguments continue to compile unchanged.
     #[new]
+    #[pyo3(signature = (
+        stage_name,
+        worker_groups,
+        slots_per_worker,
+        is_finished,
+        num_used_slots = 0,
+        num_empty_slots = 0,
+        input_queue_depth = 0,
+    ))]
     pub fn py_new(
         stage_name: String,
         worker_groups: Vec<ProblemWorkerGroupState>,
         slots_per_worker: usize,
         is_finished: bool,
+        num_used_slots: usize,
+        num_empty_slots: usize,
+        input_queue_depth: usize,
     ) -> Self {
         Self {
             stage_name,
             worker_groups,
             slots_per_worker,
             is_finished,
+            num_used_slots,
+            num_empty_slots,
+            input_queue_depth,
         }
     }
 
@@ -262,7 +294,7 @@ impl Display for ProblemState {
 /// # Attributes
 /// * `cluster_resources` - Total available resources in the cluster.
 /// * `stages` - List of all stages that need resource allocation.
-#[pyclass]
+#[pyclass(get_all, set_all)]
 #[derive(Debug, Clone)]
 pub struct Problem {
     pub cluster_resources: resources::ClusterResources,
@@ -313,6 +345,22 @@ impl StageSolution {
     }
 }
 
+#[pymethods]
+impl StageSolution {
+    /// Construct an empty StageSolution from Python.
+    ///
+    /// Used by pure-Python schedulers that need to produce
+    /// `Solution` outputs without going through the Rust autoscaler.
+    /// Callers populate `new_workers` and `deleted_workers` via the
+    /// `set_all`-exposed setters; mirrors the existing `#[new]`
+    /// constructors on `ProblemWorkerGroupState`, `ProblemStageState`,
+    /// `ProblemState`, and `Problem`.
+    #[new]
+    pub fn py_new(slots_per_worker: usize) -> Self {
+        Self::new(slots_per_worker)
+    }
+}
+
 /// Represents the complete result of the allocation problem.
 ///
 /// Contains the complete set of changes to be applied to the system.
@@ -327,6 +375,16 @@ pub struct Solution {
 
 #[pymethods]
 impl Solution {
+    /// Construct an empty Solution from Python.
+    ///
+    /// Used by pure-Python schedulers that need to assemble a
+    /// `Solution` from a list of `StageSolution`s without going
+    /// through the Rust autoscaler. Callers populate `stages` via
+    /// the `set_all`-exposed setter.
+    #[new]
+    pub fn py_new() -> Self {
+        Self::default()
+    }
     pub fn num_new_workers_per_stage(&self) -> Vec<usize> {
         self.stages.iter().map(|x| x.new_workers.len()).collect()
     }

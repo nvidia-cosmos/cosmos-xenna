@@ -15,6 +15,7 @@
 
 pub mod allocator;
 pub mod approx_utils;
+pub mod autoscale_plan_context;
 pub mod autoscaling_algorithms;
 pub mod data_structures;
 pub mod fragmentation_allocation_algorithms;
@@ -49,12 +50,20 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     data_structures::register_module(py, data_structures_module.as_module())?;
     let data_structures = data_structures_module.finish();
 
+    let autoscale_plan_context_module = ImportablePyModuleBuilder::new(
+        py,
+        &format!("{}.autoscale_plan_context", m.name().unwrap()),
+    )?;
+    autoscale_plan_context::register_module(py, autoscale_plan_context_module.as_module())?;
+    let autoscale_plan_context = autoscale_plan_context_module.finish();
+
     // Add submodules to main module
     ImportablePyModuleBuilder::from(m.clone())?
         .add_submodule(&resources)?
         .add_submodule(&allocator)?
         .add_submodule(&autoscaling_algorithms)?
         .add_submodule(&data_structures)?
+        .add_submodule(&autoscale_plan_context)?
         .finish();
     Ok(())
 }
