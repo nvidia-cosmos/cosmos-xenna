@@ -105,6 +105,7 @@ def _make_autoscaler_with_solution(solution: MagicMock, enable_backlog_guard: bo
     # (a literal ``0.0`` would yield ``time.time() - 0.0`` >> 1.0s).
     autoscaler._autoscale_start_time = time.time()
     autoscaler._enable_backlog_guard = enable_backlog_guard
+    autoscaler._scale_down_grace_after_ready_s = 0.0
     return autoscaler
 
 
