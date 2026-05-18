@@ -17,8 +17,9 @@
 //!
 //! `AutoscalePlanContext` is a `pyclass` that owns a working copy of the
 //! cluster snapshot plus per-stage staged adds and removes. Its construction
-//! path is live today; the mutation methods are Python-visible stubs until
-//! the Fragmentation Gradient Descent (FGD) planning operations land.
+//! path, worker-add path, and worker-remove path are live today; the final
+//! `into_solution` conversion remains a Python-visible stub until the staged
+//! plan can be frozen into a `Solution`.
 //!
 //! Lifecycle (one instance per autoscale cycle):
 //!
@@ -34,8 +35,9 @@
 //!      is the best candidate (cancels the pending remove instead of
 //!      adding to `pending_adds`). Returns `None` when the cluster
 //!      cannot satisfy the request.
-//!   3. `try_remove_worker(stage_index, worker_id)` - currently raises
-//!      `NotImplementedError`.
+//!   3. `try_remove_worker(stage_index, worker_id)` - removes a worker
+//!      from the working cluster by id and stages it in
+//!      `pending_removes[stage_name]`; returns `false` for unknown ids.
 //!   4. `into_solution()` - currently raises `NotImplementedError`.
 //!
 //! Callers should construct a fresh `AutoscalePlanContext` for each cycle;
@@ -60,9 +62,9 @@ const DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT: f32 = 10.0;
 /// Per-cycle autoscale planning context.
 ///
 /// Owns a working copy of the cluster snapshot seeded with current worker
-/// allocations, plus per-stage maps of pending adds and removes. The
-/// construction path is implemented now; mutation methods are exposed as
-/// stubs until the planner can stage adds and removes.
+/// allocations, plus per-stage maps of pending adds and removes. Planning
+/// methods mutate this private snapshot; callers build one context per
+/// autoscale cycle.
 ///
 /// # Fields
 /// * `cluster` - Working cluster snapshot. Cloned from the input
@@ -81,6 +83,11 @@ const DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT: f32 = 10.0;
 ///   un-staged.
 /// * `pending_removes` - Per-stage list of workers staged for removal this
 ///   cycle. Maps stage_name -> Vec of `ProblemWorkerGroupState` to remove.
+/// * `current_workers` - Per-stage current non-SPMD workers in the mutable
+///   planning snapshot. Fresh adds are inserted here and removals pop from
+///   here, so multiple planning operations compose inside one cycle.
+/// * `current_worker_groups` - Same mutable snapshot for multi-allocation
+///   SPMD worker groups.
 /// * `worker_id_factory` - Generates unique IDs for newly allocated workers.
 /// * `workload_estimate` - Per-stage workload weights consumed by FGD when
 ///   choosing among candidate placements.
@@ -92,8 +99,9 @@ pub struct AutoscalePlanContext {
     cluster: rds::ClusterResources,
     stages: Vec<ds::ProblemStage>,
     pending_adds: HashMap<String, Vec<ds::ProblemWorkerGroupState>>,
-    #[allow(dead_code)]
     pending_removes: HashMap<String, Vec<ds::ProblemWorkerGroupState>>,
+    current_workers: HashMap<String, HashMap<String, ds::ProblemWorkerGroupState>>,
+    current_worker_groups: HashMap<String, HashMap<String, ds::ProblemWorkerGroupState>>,
     worker_id_factory: WorkerIdFactory,
     workload_estimate: frag::Workload,
     worker_reuse_fragmentation_equivalent: f32,
@@ -129,6 +137,24 @@ impl AutoscalePlanContext {
             )));
         }
 
+        // Initialise per-stage staged-adds/removes and current-worker maps
+        // with one entry per pipeline stage so planning methods can index by
+        // stage name without a None-check.
+        let mut pending_adds: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
+        let mut pending_removes: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
+        let mut current_workers: HashMap<String, HashMap<String, ds::ProblemWorkerGroupState>> =
+            HashMap::new();
+        let mut current_worker_groups: HashMap<
+            String,
+            HashMap<String, ds::ProblemWorkerGroupState>,
+        > = HashMap::new();
+        for stage in &problem.stages {
+            pending_adds.insert(stage.name.clone(), Vec::new());
+            pending_removes.insert(stage.name.clone(), Vec::new());
+            current_workers.insert(stage.name.clone(), HashMap::new());
+            current_worker_groups.insert(stage.name.clone(), HashMap::new());
+        }
+
         // Clone the cluster shape and seed it with every worker currently
         // allocated to a stage. After this loop the working cluster reflects
         // the live placement, so FGD calls in subsequent iterations find
@@ -157,6 +183,16 @@ impl AutoscalePlanContext {
                                 w.id, stage.name, e
                             ))
                         })?;
+                        current_worker_groups
+                            .get_mut(&stage.name)
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "AutoscalePlanContext: current_worker_groups entry \
+                                     missing for stage {}",
+                                    stage.name
+                                ))
+                            })?
+                            .insert(w.id.clone(), w.clone());
                     }
                     _ => {
                         validate_seed_resources(&cluster, &stage.name, w, Some(1))?;
@@ -168,19 +204,19 @@ impl AutoscalePlanContext {
                                 w.id, stage.name, e
                             ))
                         })?;
+                        current_workers
+                            .get_mut(&stage.name)
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "AutoscalePlanContext: current_workers entry missing \
+                                     for stage {}",
+                                    stage.name
+                                ))
+                            })?
+                            .insert(w.id.clone(), w.clone());
                     }
                 }
             }
-        }
-
-        // Initialise per-stage staged-adds and staged-removes maps with one
-        // entry per pipeline stage so callers can index by stage name without
-        // a None-check.
-        let mut pending_adds: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
-        let mut pending_removes: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
-        for stage in &problem.stages {
-            pending_adds.insert(stage.name.clone(), Vec::new());
-            pending_removes.insert(stage.name.clone(), Vec::new());
         }
 
         // Build the workload estimate FGD consumes when ranking candidate
@@ -199,6 +235,8 @@ impl AutoscalePlanContext {
             stages,
             pending_adds,
             pending_removes,
+            current_workers,
+            current_worker_groups,
             worker_id_factory: WorkerIdFactory::default(),
             workload_estimate,
             worker_reuse_fragmentation_equivalent: DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
@@ -266,10 +304,8 @@ impl AutoscalePlanContext {
             rds::WorkerShape::SpmdNodeMultiple(spmd_shape) => {
                 // SPMD allocation does not consult the reuse map today
                 // (matches `add_worker_fn` in autoscaling_algorithms.rs).
-                let result = frag::find_best_allocation_for_spmd_node_multiple(
-                    &self.cluster,
-                    &spmd_shape,
-                );
+                let result =
+                    frag::find_best_allocation_for_spmd_node_multiple(&self.cluster, &spmd_shape);
                 if result.worker_allocations.is_empty() {
                     return Ok(None);
                 }
@@ -297,6 +333,10 @@ impl AutoscalePlanContext {
                     .entry(stage_name)
                     .or_default()
                     .push(placement.clone());
+                self.current_worker_groups
+                    .entry(worker_group.stage_name)
+                    .or_default()
+                    .insert(placement.id.clone(), placement.clone());
                 Ok(Some(placement))
             }
             _ => {
@@ -341,13 +381,16 @@ impl AutoscalePlanContext {
                             stage_name
                         ))
                     })?;
-                    let pos = removes.iter().position(|p| p.id == reused_id).ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "AutoscalePlanContext.try_add_worker: reused worker {} \
+                    let pos = removes
+                        .iter()
+                        .position(|p| p.id == reused_id)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "AutoscalePlanContext.try_add_worker: reused worker {} \
                              reported by FGD is not in pending_removes for stage {}",
-                            reused_id, stage_name
-                        ))
-                    })?;
+                                reused_id, stage_name
+                            ))
+                        })?;
                     let reused = removes.remove(pos);
                     let worker = reused.to_worker(stage_name.clone());
                     self.cluster.allocate(&worker.allocation).map_err(|e| {
@@ -358,6 +401,10 @@ impl AutoscalePlanContext {
                             reused_id, stage_name, e
                         ))
                     })?;
+                    self.current_workers
+                        .entry(stage_name)
+                        .or_default()
+                        .insert(reused.id.clone(), reused.clone());
                     Ok(Some(reused))
                 } else if let Some(allocation_resources) = allocation.resources {
                     // Fresh placement. Build a new ProblemWorkerGroupState
@@ -376,9 +423,13 @@ impl AutoscalePlanContext {
                         ))
                     })?;
                     self.pending_adds
-                        .entry(stage_name)
+                        .entry(stage_name.clone())
                         .or_default()
                         .push(placement.clone());
+                    self.current_workers
+                        .entry(stage_name)
+                        .or_default()
+                        .insert(placement.id.clone(), placement.clone());
                     Ok(Some(placement))
                 } else {
                     // FGD says did_allocate=true but neither a reused id
@@ -440,11 +491,87 @@ impl AutoscalePlanContext {
     /// True on success, False if the worker was not found in this stage's
     /// current set.
     ///
-    /// Not yet implemented.
-    pub fn try_remove_worker(&mut self, _stage_index: usize, _worker_id: &str) -> PyResult<bool> {
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "AutoscalePlanContext.try_remove_worker is not yet implemented",
-        ))
+    /// # Errors
+    /// * `PyIndexError` - `stage_index >= num_stages()`.
+    /// * `PyRuntimeError` - Releasing resources from the working cluster
+    ///   failed, which indicates a corrupted planning snapshot.
+    pub fn try_remove_worker(&mut self, stage_index: usize, worker_id: &str) -> PyResult<bool> {
+        if stage_index >= self.stages.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "AutoscalePlanContext.try_remove_worker: stage_index {} out of range \
+                 (num_stages={})",
+                stage_index,
+                self.stages.len(),
+            )));
+        }
+
+        let stage = self.stages[stage_index].clone();
+        let stage_name = stage.name;
+
+        match stage.worker_shape {
+            rds::WorkerShape::SpmdNodeMultiple(_) => {
+                let groups = self
+                    .current_worker_groups
+                    .get_mut(&stage_name)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "AutoscalePlanContext.try_remove_worker: current_worker_groups \
+                         entry missing for stage {}",
+                            stage_name
+                        ))
+                    })?;
+                let Some(removed) = groups.remove(worker_id) else {
+                    return Ok(false);
+                };
+
+                self.cluster
+                    .release_allocations(&removed.resources)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "AutoscalePlanContext.try_remove_worker: failed to release SPMD \
+                         worker group {} for stage {}: {:?}",
+                            worker_id, stage_name, e
+                        ))
+                    })?;
+                self.pending_removes
+                    .entry(stage_name)
+                    .or_default()
+                    .push(removed);
+                Ok(true)
+            }
+            _ => {
+                let workers = self.current_workers.get_mut(&stage_name).ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.try_remove_worker: current_workers entry \
+                         missing for stage {}",
+                        stage_name
+                    ))
+                })?;
+                let Some(removed) = workers.remove(worker_id) else {
+                    return Ok(false);
+                };
+
+                let Some(resource) = removed.resources.first() else {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.try_remove_worker: worker {} for stage {} \
+                         has no resource allocation",
+                        worker_id, stage_name
+                    )));
+                };
+                self.cluster.release_allocation(resource).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.try_remove_worker: failed to release worker \
+                         {} for stage {}: {:?}",
+                        worker_id, stage_name, e
+                    ))
+                })?;
+                self.pending_removes
+                    .entry(stage_name)
+                    .or_default()
+                    .push(removed);
+                Ok(true)
+            }
+        }
     }
 
     /// Build a `Solution` from the staged plan.
@@ -1443,8 +1570,8 @@ mod tests {
     fn try_add_worker_reuses_worker_from_pending_removes() {
         // Pre-seed a single worker onto node0, then manually inject it
         // into pending_removes (simulating the state after a
-        // try_remove_worker call -- which we test in 1a-iii). The next
-        // try_add_worker call must reuse that exact placement (the
+        // try_remove_worker call). The next try_add_worker call must
+        // reuse that exact placement (the
         // FGD reuse bonus dominates over any fresh fragment cost),
         // pop the entry from pending_removes, and NOT push to
         // pending_adds.
@@ -1491,6 +1618,17 @@ mod tests {
             "reused workers must NOT be pushed to pending_adds (they were never \
              structurally removed; the staged remove was simply un-staged)"
         );
+        // Verify the third invariant of the reuse path: the cluster
+        // was re-allocated for the placement. Without this assertion
+        // a regression that pops pending_removes but skips
+        // `cluster.allocate(...)` would silently double-account the
+        // resources.
+        let node0_used_cpus = ctx.cluster.nodes.get("node0").unwrap().used_cpus;
+        assert_eq!(
+            node0_used_cpus,
+            rds::FixedUtil::ONE,
+            "reuse path must re-allocate the cluster (1 cpu consumed on node0)",
+        );
     }
 
     #[test]
@@ -1504,14 +1642,20 @@ mod tests {
         let _first = ctx.try_add_worker(0).unwrap().unwrap();
         let pending_adds_before = ctx.pending_add_count(0).unwrap();
         let pending_removes_before = ctx.pending_remove_count(0).unwrap();
+        let cluster_used_before = ctx.cluster.nodes.get("node0").unwrap().used_cpus;
 
         let second = ctx.try_add_worker(0).unwrap();
 
         assert!(second.is_none());
         assert_eq!(ctx.pending_add_count(0).unwrap(), pending_adds_before);
+        assert_eq!(ctx.pending_remove_count(0).unwrap(), pending_removes_before);
+        // Cluster snapshot must not have shifted for a failed
+        // allocation: the caller depends on this to drive donor logic
+        // without rolling back side effects.
         assert_eq!(
-            ctx.pending_remove_count(0).unwrap(),
-            pending_removes_before
+            ctx.cluster.nodes.get("node0").unwrap().used_cpus,
+            cluster_used_before,
+            "failed try_add_worker must leave cluster used_cpus unchanged",
         );
     }
 
@@ -1541,12 +1685,249 @@ mod tests {
         );
     }
 
-    // ----- end Phase 1a-ii tests -----
+    #[test]
+    fn try_remove_worker_stages_seeded_cpu_worker_and_reuse_cancels_remove() {
+        // Seed one existing worker into a 1-CPU cluster. Removing it must
+        // release that CPU from the working cluster and append the original
+        // worker state to pending_removes. A subsequent add for the same
+        // shape should reuse that exact worker id and cancel the remove
+        // instead of creating a new pending add.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let worker_id = "stage_a_worker_0";
+
+        assert!(
+            ctx.try_add_worker(0).unwrap().is_none(),
+            "seeded worker consumes the only CPU before removal"
+        );
+        assert!(
+            ctx.try_remove_worker(0, worker_id).unwrap(),
+            "existing worker id must be removable"
+        );
+        assert_eq!(
+            ctx.pending_remove_count(0).unwrap(),
+            1,
+            "successful remove is staged in pending_removes"
+        );
+        assert_eq!(
+            ctx.pending_add_count(0).unwrap(),
+            0,
+            "removing an existing worker must not create a pending add"
+        );
+
+        let reused = ctx.try_add_worker(0).unwrap().unwrap();
+
+        assert_eq!(
+            reused.id, worker_id,
+            "FGD should reuse the exact worker staged for removal"
+        );
+        assert_eq!(
+            ctx.pending_remove_count(0).unwrap(),
+            0,
+            "reuse cancels the pending remove"
+        );
+        assert_eq!(
+            ctx.pending_add_count(0).unwrap(),
+            0,
+            "reused worker was already live, so no add is staged"
+        );
+    }
 
     #[test]
-    fn unimplemented_methods_still_stub_to_not_implemented() {
-        // try_add_worker is now implemented (Phase 1a-ii). The remaining
-        // mutation methods are still stubs until Phase 1a-iii / 1a-iv land.
+    fn try_remove_worker_returns_false_for_unknown_id_without_mutation() {
+        // Unknown worker ids are expected during stale-snapshot handling:
+        // callers can attempt a conservative remove and continue when it
+        // returns false. The method must not mutate any pending counts.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+
+        let removed = ctx.try_remove_worker(0, "missing_worker").unwrap();
+
+        assert!(!removed, "unknown worker id must return false");
+        assert_eq!(ctx.pending_remove_count(0).unwrap(), 0);
+        assert_eq!(ctx.pending_add_count(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn try_remove_worker_rejects_out_of_bounds_stage_index() {
+        // Mirror try_add_worker / pending count bounds checks so Python
+        // callers get IndexError instead of a Rust panic.
+        let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+
+        let result = ctx.try_remove_worker(1, "any");
+
+        assert!(
+            result.is_err(),
+            "out-of-range stage_index must return PyIndexError"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_second_remove_of_same_id_returns_false() {
+        // Once a worker is removed from the current snapshot, attempting
+        // to remove it again in the same planning cycle should be a
+        // no-op false, not a duplicate pending remove.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+
+        assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
+        assert!(!ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
+
+        assert_eq!(
+            ctx.pending_remove_count(0).unwrap(),
+            1,
+            "duplicate remove must not duplicate pending_removes"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_isolates_pending_removes_per_stage() {
+        // Two stages each have one live worker. Removing stage_a's worker
+        // must not affect stage_b's pending_remove count.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("stage_a"), make_cpu_stage("stage_b")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_cpu_stage_state_with_workers("stage_a", 1, "node0"),
+                make_cpu_stage_state_with_workers("stage_b", 1, "node0"),
+            ],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+
+        assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
+
+        assert_eq!(ctx.pending_remove_count(0).unwrap(), 1);
+        assert_eq!(
+            ctx.pending_remove_count(1).unwrap(),
+            0,
+            "stage_b must not see stage_a's pending remove"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_can_remove_freshly_added_worker_for_reuse() {
+        // The plan context treats newly added workers as part of the
+        // current working snapshot. Removing one should make its placement
+        // available to the reuse map, which lets a later add revive the
+        // same id instead of consuming another fresh id.
+        let (problem, state) = one_stage_cpu_problem_and_state(1, 2.0);
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let first = ctx.try_add_worker(0).unwrap().unwrap();
+        let second = ctx.try_add_worker(0).unwrap().unwrap();
+
+        assert!(ctx.try_remove_worker(0, &first.id).unwrap());
+        let reused = ctx
+            .try_add_worker(0)
+            .unwrap()
+            .expect("removal frees capacity even when the worker was added in this cycle");
+        let exhausted = ctx.try_add_worker(0).unwrap();
+
+        assert_eq!(
+            reused.id, first.id,
+            "FGD should reuse the freshly removed worker before considering fresh ids"
+        );
+        assert!(
+            exhausted.is_none(),
+            "cluster returns to full capacity after the freed placement is reused"
+        );
+        assert_eq!(
+            ctx.pending_add_count(0).unwrap(),
+            2,
+            "reuse of a newly removed worker does not append a third pending add"
+        );
+        assert_ne!(
+            first.id, second.id,
+            "test setup requires two distinct fresh worker ids"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_stages_spmd_group_and_readd_uses_freed_capacity() {
+        // SPMD worker groups carry multiple resource allocations. Removal
+        // must release every allocation, not just the first one, so a
+        // subsequent SPMD add can fit on the same two-node GPU cluster.
+        let problem = ds::Problem {
+            cluster_resources: make_gpu_cluster(2, 2.0),
+            stages: vec![make_spmd_stage("stage_spmd")],
+        };
+        let group = ds::ProblemWorkerGroupState {
+            id: "spmd_group_0".to_string(),
+            resources: vec![
+                rds::WorkerResources {
+                    node: "node0".to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::ONE,
+                    }],
+                },
+                rds::WorkerResources {
+                    node: "node1".to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::ONE,
+                    }],
+                },
+            ],
+        };
+        let state = ds::ProblemState {
+            stages: vec![ds::ProblemStageState {
+                stage_name: "stage_spmd".to_string(),
+                worker_groups: vec![group],
+                slots_per_worker: 1,
+                is_finished: false,
+                ..Default::default()
+            }],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+
+        assert!(
+            ctx.try_add_worker(0).unwrap().is_none(),
+            "seeded SPMD group consumes both GPU nodes before removal"
+        );
+        assert!(ctx.try_remove_worker(0, "spmd_group_0").unwrap());
+        assert_eq!(ctx.pending_remove_count(0).unwrap(), 1);
+
+        let readded = ctx.try_add_worker(0).unwrap();
+
+        assert!(
+            readded.is_some(),
+            "SPMD removal must release all group allocations for a later add"
+        );
+        assert_eq!(
+            ctx.pending_add_count(0).unwrap(),
+            1,
+            "SPMD add path does not reuse pending removes yet, so it stages a fresh add"
+        );
+    }
+
+    #[test]
+    fn into_solution_still_stubs_to_not_implemented() {
+        // Worker add/remove planning is implemented. Freezing the staged
+        // plan into a Solution remains a stub until the solution builder
+        // lands.
         let problem = ds::Problem {
             cluster_resources: make_empty_cluster(1, 1.0),
             stages: vec![make_cpu_stage("stage_a")],
@@ -1560,12 +1941,8 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
 
-        assert!(
-            ctx.try_remove_worker(0, "fake_id").is_err(),
-            "try_remove_worker is currently a NotImplementedError stub"
-        );
         assert!(
             ctx.into_solution().is_err(),
             "into_solution is currently a NotImplementedError stub"

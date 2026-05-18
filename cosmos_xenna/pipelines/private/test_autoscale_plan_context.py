@@ -20,12 +20,13 @@ Pins the construction contract: ``from_problem_state`` accepts a
 
   1. Reports the right number of stages.
   2. Exposes the underlying Rust object via ``.rust``.
-  3. Implements ``try_add_worker`` (Phase 1a-ii): one fresh placement
+  3. Implements ``try_add_worker``: one fresh placement
      per call via Fragmentation Gradient Descent, ``None`` on no-fit,
      ``IndexError`` on out-of-range stage index.
-  4. Keeps ``try_remove_worker`` / ``into_solution`` stubbed (they
-     currently raise ``NotImplementedError`` until 1a-iii / 1a-iv
-     land).
+  4. Implements ``try_remove_worker``: removes by id,
+     increments ``pending_remove_count``, returns ``False`` for unknown
+     ids, and leaves removed placements available for reuse.
+  5. Keeps ``into_solution`` stubbed until the solution builder lands.
 """
 
 import pytest
@@ -204,24 +205,10 @@ class TestAutoscalePlanContextConstruction:
 
 
 class TestAutoscalePlanContextStubs:
-    """Methods that have not yet been implemented raise ``NotImplementedError``.
-
-    Pinning the stub behaviour keeps the contract honest: callers cannot
-    accidentally rely on a default no-op output before the real
-    implementation lands. ``try_add_worker`` was a stub in 1a-i; it is
-    now implemented and is covered by ``TestTryAddWorker`` instead.
-    """
-
-    def test_try_remove_worker_is_stubbed(self) -> None:
-        """``try_remove_worker`` is currently unimplemented (lands in 1a-iii)."""
-        problem, state = _build_one_stage_problem_and_state()
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
-
-        with pytest.raises(NotImplementedError):
-            ctx.try_remove_worker(0, "fake_id")
+    """Methods that have not yet been implemented raise ``NotImplementedError``."""
 
     def test_into_solution_is_stubbed(self) -> None:
-        """``into_solution`` is currently unimplemented (lands in 1a-iv)."""
+        """``into_solution`` is currently unimplemented."""
         problem, state = _build_one_stage_problem_and_state()
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
 
@@ -229,8 +216,84 @@ class TestAutoscalePlanContextStubs:
             ctx.into_solution()
 
 
+class TestTryRemoveWorker:
+    """Contract for ``AutoscalePlanContext.try_remove_worker``."""
+
+    def test_existing_worker_increments_pending_remove_count(self) -> None:
+        """Removing a live worker stages exactly one pending remove."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        removed = ctx.try_remove_worker(0, "w0")
+
+        assert removed is True
+        assert ctx.pending_remove_count(0) == 1
+        assert ctx.pending_add_count(0) == 0
+
+    def test_unknown_worker_returns_false_without_mutating_counts(self) -> None:
+        """Unknown worker ids are no-op failures."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        removed = ctx.try_remove_worker(0, "missing")
+
+        assert removed is False
+        assert ctx.pending_remove_count(0) == 0
+        assert ctx.pending_add_count(0) == 0
+
+    def test_out_of_range_stage_index_raises_index_error(self) -> None:
+        """``stage_index >= num_stages()`` surfaces as ``IndexError``."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        with pytest.raises(IndexError):
+            ctx.try_remove_worker(99, "w0")
+
+    def test_second_remove_of_same_worker_returns_false(self) -> None:
+        """The same worker cannot be staged for removal twice."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        first = ctx.try_remove_worker(0, "w0")
+        second = ctx.try_remove_worker(0, "w0")
+
+        assert first is True
+        assert second is False
+        assert ctx.pending_remove_count(0) == 1
+
+    def test_remove_then_add_reuses_removed_worker(self) -> None:
+        """A later add revives a removed placement instead of staging a fresh add."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        assert ctx.try_remove_worker(0, "w0") is True
+        reused = ctx.try_add_worker(0)
+
+        assert reused is not None
+        assert reused.id == "w0"
+        assert ctx.pending_remove_count(0) == 0
+        assert ctx.pending_add_count(0) == 0
+
+    def test_freshly_added_worker_can_be_removed_and_reused(self) -> None:
+        """New planned workers participate in the same working snapshot."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        first = ctx.try_add_worker(0)
+        second = ctx.try_add_worker(0)
+
+        assert first is not None
+        assert second is not None
+        assert ctx.try_remove_worker(0, first.id) is True
+        reused = ctx.try_add_worker(0)
+
+        assert reused is not None
+        assert reused.id == first.id
+        assert ctx.pending_remove_count(0) == 0
+        assert ctx.pending_add_count(0) == 2
+
+
 class TestTryAddWorker:
-    """Phase 1a-ii contract for ``AutoscalePlanContext.try_add_worker``.
+    """Contract for ``AutoscalePlanContext.try_add_worker``.
 
     Pins the Python wrapper's behaviour: a fresh placement returns a
     ``ProblemWorkerGroupState`` whose resources match a real cluster
@@ -342,7 +405,7 @@ class TestTryAddWorker:
 
 
 class TestPendingCounts:
-    """Phase 1a-ii contract for ``pending_add_count`` / ``pending_remove_count``."""
+    """Contract for ``pending_add_count`` / ``pending_remove_count``."""
 
     def test_pending_counts_start_at_zero(self) -> None:
         """A fresh context has nothing staged.

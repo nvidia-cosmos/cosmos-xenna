@@ -379,8 +379,8 @@ class AutoscalePlanContext:
         ``from_problem_state``: seeded construction.
         ``try_add_worker``: stage one worker add via Fragmentation
             Gradient Descent on the working snapshot. Implemented.
-        ``try_remove_worker``: delegates to the Rust removal method.
-            Currently a stub.
+        ``try_remove_worker``: stage one worker removal by id on the
+            working snapshot.
         ``into_solution``: delegates to the Rust solution builder.
             Currently a stub.
         ``pending_add_count`` / ``pending_remove_count``: read-only
@@ -494,15 +494,24 @@ class AutoscalePlanContext:
     def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
         """Stage removal of an existing worker.
 
+        Mutates the context's working cluster snapshot to release the
+        removed worker's resources and appends the worker to the stage's
+        pending-removes list. A later ``try_add_worker`` for the same
+        shape can reuse that placement and cancel the pending remove.
+
         Args:
             stage_index: Position of the stage in the problem.
             worker_id: Stable id of the worker to remove.
 
         Returns:
-            True when the worker was found and staged for removal.
+            True when the worker was found and staged for removal;
+            False when ``worker_id`` is not present in that stage's
+            current planning snapshot.
 
         Raises:
-            NotImplementedError: Until the Rust planner method is implemented.
+            IndexError: ``stage_index >= num_stages()``.
+            RuntimeError: Underlying cluster release failed despite the
+                worker being present in the planning snapshot.
 
         """
         return bool(self._r.try_remove_worker(stage_index, worker_id))
