@@ -386,11 +386,24 @@ class AutoscalePlanContext:
             counts of staged adds / removes per stage, intended for
             planning-time invariant checks.
         ``num_stages``: number of stages this context tracks.
+        ``worker_ages`` / ``worker_age``: per-worker age tracking.
+            Workers placed mid-cycle via ``try_add_worker`` start at
+            age 0; seeded workers carry the age value supplied to the
+            constructor (default 0). Callers that need cross-cycle age
+            awareness -- e.g. for picking the youngest eligible donor
+            across stages -- read these and persist them, incremented,
+            into the next cycle.
 
     """
 
     @classmethod
-    def from_problem_state(cls, problem: Problem, state: ProblemState) -> Self:
+    def from_problem_state(
+        cls,
+        problem: Problem,
+        state: ProblemState,
+        *,
+        worker_ages: dict[str, int] | None = None,
+    ) -> Self:
         """Build a planning context seeded with the current cluster state.
 
         Clones ``problem.cluster_resources`` and pre-allocates every worker
@@ -402,6 +415,16 @@ class AutoscalePlanContext:
                 shape definitions).
             state: Runtime snapshot (per-stage current workers, slots,
                 finished flag).
+            worker_ages: Optional previous-cycle worker-age snapshot,
+                mapping worker id to age in autoscale cycles. Each
+                value should already be incremented for the new cycle
+                by the caller. Workers present in ``state`` but absent
+                from this map default to age 0 (cold-start). Workers
+                in this map but not in ``state`` are silently dropped
+                (the worker died between cycles). When ``None`` (the
+                default; the cold-start cycle, or callers that do not
+                maintain cross-cycle age state), every seeded worker
+                starts at age 0.
 
         Returns:
             A fresh ``AutoscalePlanContext`` ready to be mutated by the
@@ -415,7 +438,13 @@ class AutoscalePlanContext:
                 not have the same length.
 
         """
-        return cls(rust_apc.AutoscalePlanContext(problem.rust, state.rust))
+        return cls(
+            rust_apc.AutoscalePlanContext(
+                problem.rust,
+                state.rust,
+                worker_ages=worker_ages,
+            )
+        )
 
     def __init__(self, rust_context: rust_apc.AutoscalePlanContext) -> None:
         self._r = rust_context
@@ -554,3 +583,56 @@ class AutoscalePlanContext:
         that need to verify the seeding round-tripped the input shape.
         """
         return int(self._r.num_stages())
+
+    def worker_ages(self) -> dict[str, int]:
+        """Snapshot of the per-worker age map.
+
+        Keys are every worker id present in this cycle's planning
+        snapshot (initial seed plus mid-cycle additions); values are
+        each worker's age in autoscale cycles (0 for workers placed
+        fresh this cycle, positive integers for workers carried over
+        from previous cycles).
+
+        Workers staged for removal are still included -- they may be
+        reused via the FGD reuse path before ``into_solution`` runs --
+        so callers building an age-aware index must intersect this map
+        with the per-stage live-worker set to filter out
+        scheduled-for-removal entries. After ``into_solution`` drains
+        the per-stage pending lists, callers should further filter
+        against ``solution.deleted_workers`` before persisting the map
+        for the next cycle. Safe to call after ``into_solution()``
+        drains the plan; the read accessors deliberately bypass the
+        drained-state guard so the caller can persist the post-cycle
+        age map for the next cycle.
+
+        Returns:
+            A fresh ``dict[str, int]`` (cloned from the underlying Rust
+            map). Caller mutations on the returned dict do not affect
+            the context's internal state.
+
+        """
+        ages: dict[str, int] = self._r.worker_ages()
+        return ages
+
+    def worker_age(self, worker_id: str) -> int | None:
+        """Age in autoscale cycles for ``worker_id``.
+
+        Cheap O(1) lookup against the same map exposed in bulk by
+        :meth:`worker_ages`. Use this when you have a specific worker id
+        and want its age without cloning the whole map (for example,
+        comparing donor candidates one at a time inside a Python loop).
+        Safe to call after ``into_solution()`` for the same reason as
+        :meth:`worker_ages`.
+
+        Args:
+            worker_id: Stable id of the worker to inspect.
+
+        Returns:
+            The worker's age in autoscale cycles, or ``None`` if the
+            worker is not present in the planning snapshot (was never
+            seeded, was dropped because the seed was stale, or had its
+            age entry removed by a cancel-pending-add).
+
+        """
+        age = self._r.worker_age(worker_id)
+        return None if age is None else int(age)

@@ -1152,3 +1152,620 @@ class TestAutoscalePlanContextValidation:
 
         with pytest.raises(RuntimeError, match="failed to seed cluster"):
             data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+
+class TestAutoscalePlanContextWorkerAges:
+    """Worker-age tracking exposed for the saturation-aware donor logic.
+
+    Pins the contract that any caller (cross-stage donor logic, audit
+    tooling, age-based eviction policies) relies on: the context
+    maintains a per-worker age map that callers seed from the previous
+    cycle (already incremented), fresh placements get age 0, and
+    cancel-pending-add drops the entry so a re-staging cannot resurrect
+    stale data.
+    """
+
+    def test_no_seed_means_every_existing_worker_starts_at_age_zero(self) -> None:
+        """Cold-start path: missing seed maps every seeded worker to 0."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0"), _make_cpu_worker("w1")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        assert ctx.worker_ages() == {"w0": 0, "w1": 0}
+
+    def test_seed_round_trips_values_through_constructor(self) -> None:
+        """Caller-supplied ages survive the FFI hop intact."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0"), _make_cpu_worker("w1")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 3, "w1": 11},
+        )
+        assert ctx.worker_ages() == {"w0": 3, "w1": 11}
+
+    def test_seed_default_to_zero_for_known_worker_missing_from_seed(self) -> None:
+        """Partial seed: unknown ids default to 0 (treated as freshly observed)."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0"), _make_cpu_worker("w1")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 4},
+        )
+        ages = ctx.worker_ages()
+        assert ages["w0"] == 4
+        assert ages["w1"] == 0
+
+    def test_seed_filters_stale_ids_not_in_state(self) -> None:
+        """Seed entries for dead workers must not bleed into the new cycle."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 2, "ghost": 99},
+        )
+        ages = ctx.worker_ages()
+        assert ages == {"w0": 2}
+        assert ctx.worker_age("ghost") is None
+
+    def test_new_worker_placed_via_try_add_has_age_zero(self) -> None:
+        """Fresh placements start at age 0 (treated as the youngest possible)."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        placed = ctx.try_add_worker(0)
+        assert placed is not None
+        assert ctx.worker_age(placed.id) == 0
+
+    def test_new_spmd_worker_placed_via_try_add_has_age_zero(self) -> None:
+        """Fresh SPMD placements also start at age 0."""
+        problem, state = _make_two_node_spmd_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        placed = ctx.try_add_worker(0)
+
+        assert placed is not None
+        assert ctx.worker_age(placed.id) == 0
+
+    def test_oldest_first_sort_returns_correct_order(self) -> None:
+        """Descending-age sort returns oldest first (caller-side ordering pin)."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[
+                _make_cpu_worker("w_middle"),
+                _make_cpu_worker("w_youngest"),
+                _make_cpu_worker("w_oldest"),
+            ],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w_middle": 5, "w_youngest": 0, "w_oldest": 10},
+        )
+        ages = ctx.worker_ages()
+        ordered = sorted(ages.items(), key=lambda kv: kv[1], reverse=True)
+        assert [worker_id for worker_id, _ in ordered] == [
+            "w_oldest",
+            "w_middle",
+            "w_youngest",
+        ]
+
+    def test_youngest_first_sort_matches_donor_selection_order(self) -> None:
+        """Ascending-age sort returns youngest first (donor selection ordering)."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[
+                _make_cpu_worker("w_middle"),
+                _make_cpu_worker("w_youngest"),
+                _make_cpu_worker("w_oldest"),
+            ],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w_middle": 5, "w_youngest": 0, "w_oldest": 10},
+        )
+        ages = ctx.worker_ages()
+        ordered = sorted(ages.items(), key=lambda kv: kv[1])
+        assert [worker_id for worker_id, _ in ordered] == [
+            "w_youngest",
+            "w_middle",
+            "w_oldest",
+        ]
+
+    def test_age_increments_cycle_to_cycle(self) -> None:
+        """Caller-driven cycle-to-cycle increment: ages advance by 1 each cycle."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx_cycle_1 = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        assert ctx_cycle_1.worker_age("w0") == 0
+
+        # Caller advances every surviving worker's age by 1 between cycles.
+        next_ages = {worker_id: age + 1 for worker_id, age in ctx_cycle_1.worker_ages().items()}
+
+        # Cycle 2: same physical worker is alive; the seeded age is 1.
+        ctx_cycle_2 = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages=next_ages,
+        )
+        assert ctx_cycle_2.worker_age("w0") == 1
+
+    def test_cancel_pending_add_drops_age_entry(self) -> None:
+        """Worker added then immediately removed: the stale age 0 entry must be dropped."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        placed = ctx.try_add_worker(0)
+        assert placed is not None
+        assert ctx.worker_age(placed.id) == 0
+        assert ctx.try_remove_worker(0, placed.id) is True
+        assert ctx.worker_age(placed.id) is None
+
+    def test_stage_for_removal_keeps_age_for_potential_reuse(self) -> None:
+        """A staged-for-removal worker must keep its age so reuse preserves it."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 4},
+        )
+        assert ctx.try_remove_worker(0, "w0") is True
+        assert ctx.worker_age("w0") == 4
+
+    def test_reuse_path_preserves_original_age(self) -> None:
+        """Remove + re-add (reuse path) must NOT collapse the age to 0."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 7},
+        )
+        assert ctx.try_remove_worker(0, "w0") is True
+        reused = ctx.try_add_worker(0)
+        assert reused is not None
+        assert reused.id == "w0"
+        assert ctx.worker_age("w0") == 7
+
+    def test_spmd_reuse_path_preserves_original_age(self) -> None:
+        """SPMD remove + re-add reuse must NOT collapse age to 0."""
+        problem, state = _make_two_node_spmd_problem_and_state(seeded_worker_id="spmd_w0")
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"spmd_w0": 9},
+        )
+
+        assert ctx.try_remove_worker(0, "spmd_w0") is True
+        reused = ctx.try_add_worker(0)
+
+        assert reused is not None
+        assert reused.id == "spmd_w0"
+        assert ctx.worker_age("spmd_w0") == 9
+
+    def test_cancel_pending_spmd_add_drops_age_entry(self) -> None:
+        """Fresh SPMD add then remove retracts the age entry too."""
+        problem, state = _make_two_node_spmd_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        placed = ctx.try_add_worker(0)
+        assert placed is not None
+        assert ctx.worker_age(placed.id) == 0
+
+        assert ctx.try_remove_worker(0, placed.id) is True
+
+        assert ctx.worker_age(placed.id) is None
+
+    def test_zero_stage_pipeline_yields_empty_age_map(self) -> None:
+        """Boundary: no stages -> empty age map regardless of seed."""
+        cluster = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=1.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        problem = data_structures.Problem(cluster_resources=cluster, stages=[])
+        state = data_structures.ProblemState(stages=[])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"ghost": 99},
+        )
+        assert ctx.worker_ages() == {}
+
+    def test_try_add_worker_returning_none_does_not_mutate_age_map(self) -> None:
+        """Cluster-full add returns None and must NOT introduce a stale entry.
+
+        Mutation symmetry matters for any age-aware donor logic: a
+        failed try_add_worker (cluster full) followed by a donor swap +
+        retry must see the SAME pre-add age map -- if a None-returning
+        path leaked an entry, the retry would observe a non-existent
+        worker as age 0 and incorrectly bias donor selection.
+        """
+        # Build a 1-node, 1-cpu cluster with a single seeded worker. A
+        # second 1-cpu add cannot fit, so try_add_worker returns None.
+        cluster = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=1.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        shape = resources.Resources(cpus=1.0, gpus=0.0).to_worker_shape(cluster)
+        stage = data_structures.ProblemStage(
+            name="stage_a",
+            stage_batch_size=1,
+            worker_shape=shape,
+            requested_num_workers=None,
+            over_provision_factor=None,
+        )
+        problem = data_structures.Problem(cluster_resources=cluster, stages=[stage])
+        state = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[_make_cpu_worker("w0")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                )
+            ]
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 4},
+        )
+        ages_before = ctx.worker_ages()
+        assert ctx.try_add_worker(0) is None, "second 1-cpu add must fail on a 1-cpu cluster"
+        ages_after = ctx.worker_ages()
+        assert ages_after == ages_before
+        assert ages_after == {"w0": 4}
+
+    def test_try_remove_worker_unknown_id_does_not_mutate_age_map(self) -> None:
+        """Unknown-id remove returns False and must NOT touch worker_ages."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 6},
+        )
+        ages_before = ctx.worker_ages()
+        assert ctx.try_remove_worker(0, "nonexistent") is False
+        assert ctx.worker_ages() == ages_before
+
+    def test_cross_stage_age_isolation_across_multi_stage_pipeline(self) -> None:
+        """Per-worker ages in different stages remain independent."""
+        cluster = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=4.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        shape = resources.Resources(cpus=1.0, gpus=0.0).to_worker_shape(cluster)
+        problem = data_structures.Problem(
+            cluster_resources=cluster,
+            stages=[
+                data_structures.ProblemStage(
+                    name="stage_a",
+                    stage_batch_size=1,
+                    worker_shape=shape,
+                    requested_num_workers=None,
+                    over_provision_factor=None,
+                ),
+                data_structures.ProblemStage(
+                    name="stage_b",
+                    stage_batch_size=1,
+                    worker_shape=shape,
+                    requested_num_workers=None,
+                    over_provision_factor=None,
+                ),
+            ],
+        )
+        state = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[_make_cpu_worker("a0"), _make_cpu_worker("a1")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+                data_structures.ProblemStageState(
+                    stage_name="stage_b",
+                    workers=[_make_cpu_worker("b0")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+            ]
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"a0": 1, "a1": 9, "b0": 5},
+        )
+        # Mutate stage_a only; stage_b ages must remain untouched.
+        assert ctx.try_remove_worker(0, "a0") is True
+        new_b = ctx.try_add_worker(1)
+        assert new_b is not None
+        assert ctx.worker_age("a1") == 9
+        assert ctx.worker_age("b0") == 5
+        assert ctx.worker_age(new_b.id) == 0
+
+    def test_mixed_seeded_and_fresh_workers_have_independent_ages(self) -> None:
+        """Seeded workers keep their seed ages; mid-cycle adds get age 0 alongside them."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("seeded_old", node="node0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"seeded_old": 12},
+        )
+        fresh = ctx.try_add_worker(0)
+        assert fresh is not None
+        ages = ctx.worker_ages()
+        assert ages["seeded_old"] == 12
+        assert ages[fresh.id] == 0
+        assert len(ages) == 2
+
+    def test_caller_filter_pattern_persists_ages_correctly_across_cycles(self) -> None:
+        """End-to-end documented pattern: get ages, drop deleted, increment, re-seed.
+
+        This is the contract any age-tracking caller follows to
+        maintain age across autoscale cycles. Two stages so the FGD
+        reuse map (built per-stage from ``pending_removes[stage_name]``)
+        cannot cancel the ``stage_a`` removal with the ``stage_b`` add;
+        the Solution faithfully reflects one delete and one add and the
+        caller-side filter has work to do.
+        """
+        # Cycle 1: cold start, two stages, two seeded workers.
+        cluster_1 = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=4.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        shape_1 = resources.Resources(cpus=1.0, gpus=0.0).to_worker_shape(cluster_1)
+        problem_cycle_1 = data_structures.Problem(
+            cluster_resources=cluster_1,
+            stages=[
+                data_structures.ProblemStage(
+                    name="stage_a",
+                    stage_batch_size=1,
+                    worker_shape=shape_1,
+                    requested_num_workers=None,
+                    over_provision_factor=None,
+                ),
+                data_structures.ProblemStage(
+                    name="stage_b",
+                    stage_batch_size=1,
+                    worker_shape=shape_1,
+                    requested_num_workers=None,
+                    over_provision_factor=None,
+                ),
+            ],
+        )
+        state_cycle_1 = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[_make_cpu_worker("doomed_in_a")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+                data_structures.ProblemStageState(
+                    stage_name="stage_b",
+                    workers=[_make_cpu_worker("survivor_in_b")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+            ]
+        )
+        ctx1 = data_structures.AutoscalePlanContext.from_problem_state(
+            problem_cycle_1,
+            state_cycle_1,
+            worker_ages={"doomed_in_a": 7, "survivor_in_b": 3},
+        )
+        assert ctx1.try_remove_worker(0, "doomed_in_a") is True
+        added = ctx1.try_add_worker(1)
+        assert added is not None
+        # The reuse map is per-stage, so adding to stage_b cannot consume
+        # stage_a's pending_removes -- the new worker is genuinely fresh.
+        assert added.id != "doomed_in_a"
+
+        solution = ctx1.into_solution()
+
+        # Caller-side persistence pattern: drop deleted, increment the rest.
+        deleted_ids: set[str] = {w.id for stage in solution.stages for w in stage.deleted_workers}
+        assert deleted_ids == {"doomed_in_a"}
+        next_cycle_ages = {
+            worker_id: age + 1 for worker_id, age in ctx1.worker_ages().items() if worker_id not in deleted_ids
+        }
+        # survivor_in_b (age 3 + 1 = 4); freshly-added (age 0 + 1 = 1); doomed dropped.
+        assert next_cycle_ages == {"survivor_in_b": 4, added.id: 1}
+
+        # Cycle 2: build context with persisted ages and the post-cycle state.
+        state_cycle_2 = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+                data_structures.ProblemStageState(
+                    stage_name="stage_b",
+                    workers=[
+                        _make_cpu_worker("survivor_in_b"),
+                        _make_cpu_worker(added.id),
+                    ],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+            ]
+        )
+        ctx2 = data_structures.AutoscalePlanContext.from_problem_state(
+            problem_cycle_1,
+            state_cycle_2,
+            worker_ages=next_cycle_ages,
+        )
+        assert ctx2.worker_age("survivor_in_b") == 4
+        assert ctx2.worker_age(added.id) == 1
+        assert ctx2.worker_age("doomed_in_a") is None
+
+    def test_worker_ages_remains_readable_after_into_solution_drained(self) -> None:
+        """Read accessors stay valid after drain -- caller MUST inspect ages post-drain."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 5},
+        )
+        added = ctx.try_add_worker(0)
+        assert added is not None
+        _ = ctx.into_solution()
+
+        # The drained-state guard blocks try_add / try_remove but read
+        # accessors must keep working: the documented caller pattern
+        # reads ``worker_ages()`` AFTER ``into_solution()`` to filter
+        # against ``solution.deleted_workers`` for the next cycle.
+        ages = ctx.worker_ages()
+        assert ages["w0"] == 5
+        assert ages[added.id] == 0
+        assert ctx.worker_age("w0") == 5
+
+    def test_independent_contexts_have_independent_age_maps(self) -> None:
+        """Two contexts built from the same input do not share age state."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx_a = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 3},
+        )
+        ctx_b = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 3},
+        )
+
+        # Mutate ctx_a: remove the seeded worker (stage-for-removal keeps
+        # the age entry, but pending_removes gets the worker so a later
+        # in-stage add reuse path could cancel it). The point is to
+        # observe that NONE of these mutations bleed across to ctx_b's
+        # independent age map.
+        assert ctx_a.try_remove_worker(0, "w0") is True
+
+        # ctx_b sees its original snapshot unchanged regardless of what
+        # ctx_a did to its own internal state.
+        assert ctx_b.worker_ages() == {"w0": 3}
+        assert ctx_b.worker_age("w0") == 3
+
+    def test_worker_ages_returns_a_fresh_dict_on_each_call(self) -> None:
+        """Mutating the returned dict does not mutate the context's internal map.
+
+        The Rust implementation clones the underlying ``HashMap`` on every
+        call, but the contract is documented at the Python boundary;
+        pin it so a future refactor (e.g. exposing a Rust reference)
+        cannot silently introduce shared mutable state.
+        """
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 4},
+        )
+        snapshot_a = ctx.worker_ages()
+        snapshot_a["w0"] = 999
+        snapshot_a["bogus"] = 12345
+        snapshot_b = ctx.worker_ages()
+        assert snapshot_b == {"w0": 4}
+        assert ctx.worker_age("w0") == 4
+
+    def test_reuse_then_drain_carries_age_into_next_cycle(self) -> None:
+        """End-to-end: stage-for-removal + reuse must carry the original age into the next cycle.
+
+        The most interesting cross-cycle invariant for any age-aware
+        donor selector: a stage-for-removal followed by reuse that
+        incorrectly reset to age 0 would only surface in the donor
+        selector's behaviour, not in any individual ``worker_age()``
+        lookup unless the test specifically chains the operations.
+        """
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        ctx1 = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages={"w0": 6},
+        )
+        assert ctx1.try_remove_worker(0, "w0") is True
+        reused = ctx1.try_add_worker(0)
+        assert reused is not None
+        assert reused.id == "w0", "FGD reuse must restore the same worker id"
+        assert ctx1.worker_age("w0") == 6, "reuse path preserves original age"
+
+        solution = ctx1.into_solution()
+        deleted_ids: set[str] = {w.id for stage in solution.stages for w in stage.deleted_workers}
+        assert deleted_ids == set(), "reuse cancels the staged remove"
+
+        next_cycle_ages = {
+            worker_id: age + 1 for worker_id, age in ctx1.worker_ages().items() if worker_id not in deleted_ids
+        }
+        ctx2 = data_structures.AutoscalePlanContext.from_problem_state(
+            problem,
+            state,
+            worker_ages=next_cycle_ages,
+        )
+        assert ctx2.worker_age("w0") == 7
+
+    def test_negative_seed_value_raises_overflow_error(self) -> None:
+        """Negative ages cannot fit in u64; pyo3 raises OverflowError."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        with pytest.raises(OverflowError):
+            data_structures.AutoscalePlanContext.from_problem_state(
+                problem,
+                state,
+                worker_ages={"w0": -1},
+            )
+
+    def test_seed_value_above_u64_max_raises_overflow_error(self) -> None:
+        """Values exceeding u64::MAX cannot round-trip through the FFI."""
+        problem, state = _build_one_stage_problem_and_state(
+            workers=[_make_cpu_worker("w0")],
+        )
+        with pytest.raises(OverflowError):
+            data_structures.AutoscalePlanContext.from_problem_state(
+                problem,
+                state,
+                worker_ages={"w0": 2**64},
+            )

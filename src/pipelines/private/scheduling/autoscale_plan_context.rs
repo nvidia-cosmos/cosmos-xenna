@@ -22,10 +22,14 @@
 //!
 //! Lifecycle (one instance per autoscale cycle):
 //!
-//!   1. `from_problem_state(problem, state)` - seeds the working cluster
-//!      with all currently-allocated workers from the input snapshot;
-//!      initialises empty per-stage `pending_adds` / `pending_removes`
-//!      maps; computes the workload estimate used by FGD.
+//!   1. `from_problem_state(problem, state, *, worker_ages=None)` -
+//!      seeds the working cluster with all currently-allocated workers
+//!      from the input snapshot; initialises empty per-stage
+//!      `pending_adds` / `pending_removes` maps; computes the workload
+//!      estimate used by FGD; seeds the per-worker age map from the
+//!      optional `worker_ages` kwarg (each entry is the age in cycles
+//!      already incremented by the caller for the new cycle, defaulting
+//!      to 0 for ids the scheduler has never observed before).
 //!   2. `try_add_worker(stage_index)` - runs Fragmentation Gradient
 //!      Descent against the working cluster, mutates `cluster` to
 //!      reflect the new allocation, appends the placement to
@@ -123,6 +127,19 @@ const DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT: f32 = 10.0;
 ///   report 0 for the now-empty pending maps), and `into_solution()`
 ///   itself remains idempotent so callers can re-extract the same
 ///   empty `Solution` shape if needed for tests / introspection.
+/// * `worker_ages` - Per-worker age (in autoscale cycles) for every worker
+///   present in this cycle's planning snapshot. Seeded from the optional
+///   `worker_ages` constructor argument (the caller's previous-cycle
+///   snapshot, with each value already incremented for the new cycle);
+///   missing seed entries default to age 0. Updated by `try_add_worker`
+///   (fresh placements get age 0; reuse paths keep the existing age) and
+///   by `try_remove_worker` (only the cancel-pending-add branch drops
+///   the entry, since stage-for-removal workers may still be reused
+///   later in the same cycle via the FGD reuse path). Callers that need
+///   a youngest-first index across stages build it in O(W) by joining
+///   this map against the per-stage current-worker maps. Stale ids --
+///   workers that were in the seed but are no longer in
+///   `state.stages.worker_groups` -- are silently dropped.
 #[pyclass]
 pub struct AutoscalePlanContext {
     cluster: rds::ClusterResources,
@@ -133,6 +150,7 @@ pub struct AutoscalePlanContext {
     current_worker_groups: HashMap<String, HashMap<String, ds::ProblemWorkerGroupState>>,
     reserved_worker_ids: HashSet<String>,
     slots_per_worker_by_stage: Vec<usize>,
+    worker_ages: HashMap<String, u64>,
     worker_id_factory: WorkerIdFactory,
     workload_estimate: frag::Workload,
     worker_reuse_fragmentation_equivalent: f32,
@@ -153,13 +171,29 @@ impl AutoscalePlanContext {
     ///   shape definitions).
     /// * `state` - Runtime snapshot (per-stage current workers, slots,
     ///   finished flag).
+    /// * `worker_ages` - Optional previous-cycle worker-age snapshot.
+    ///   Each entry maps a worker id to its age in autoscale cycles.
+    ///   Workers present in `state.stages.worker_groups` but absent from
+    ///   this map default to age 0 (treated as freshly observed).
+    ///   Workers present in this map but absent from the new
+    ///   `ProblemState` are silently dropped (the worker died between
+    ///   cycles). Callers are responsible for incrementing ages by 1 for
+    ///   surviving workers between cycles before passing the map back
+    ///   in. When omitted, every seeded worker starts at age 0
+    ///   (cold-start); callers that do not maintain cross-cycle age
+    ///   state pass `None`.
     ///
     /// # Errors
     /// Returns a `PyRuntimeError` if seeding fails because a current worker
     /// cannot be allocated on the cluster (would indicate a corrupted
     /// snapshot).
     #[new]
-    pub fn from_problem_state(problem: &ds::Problem, state: &ds::ProblemState) -> PyResult<Self> {
+    #[pyo3(signature = (problem, state, *, worker_ages=None))]
+    pub fn from_problem_state(
+        problem: &ds::Problem,
+        state: &ds::ProblemState,
+        worker_ages: Option<HashMap<String, u64>>,
+    ) -> PyResult<Self> {
         if problem.stages.len() != state.stages.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "AutoscalePlanContext: stage count mismatch - \
@@ -275,6 +309,22 @@ impl AutoscalePlanContext {
             .map(|stage_state| stage_state.slots_per_worker)
             .collect();
 
+        // Seed the per-worker ages map. Iterate over the seeded workers
+        // (`reserved_worker_ids`) rather than the input map so stale ids
+        // - workers that were alive in a prior cycle but no longer
+        // appear in `state.stages.worker_groups` - are silently dropped.
+        // Missing entries in the input map default to age 0 (cold-start
+        // semantics: a worker the scheduler has never seen before is
+        // treated as freshly observed).
+        let seed_ages: HashMap<String, u64> = worker_ages.unwrap_or_default();
+        let worker_ages_map: HashMap<String, u64> = reserved_worker_ids
+            .iter()
+            .map(|id| {
+                let age = seed_ages.get(id).copied().unwrap_or(0);
+                (id.clone(), age)
+            })
+            .collect();
+
         Ok(Self {
             cluster,
             stages,
@@ -284,6 +334,7 @@ impl AutoscalePlanContext {
             current_worker_groups,
             reserved_worker_ids,
             slots_per_worker_by_stage,
+            worker_ages: worker_ages_map,
             worker_id_factory: WorkerIdFactory::default(),
             workload_estimate,
             worker_reuse_fragmentation_equivalent: DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
@@ -424,6 +475,10 @@ impl AutoscalePlanContext {
                     .entry(worker_group.stage_name)
                     .or_default()
                     .insert(placement.id.clone(), placement.clone());
+                // Fresh placement: age 0 because the worker is brand-new
+                // this cycle. The reuse path above does NOT touch
+                // worker_ages, so the original seeded age is preserved.
+                self.worker_ages.insert(placement.id.clone(), 0);
                 Ok(Some(placement))
             }
             _ => {
@@ -537,6 +592,11 @@ impl AutoscalePlanContext {
                         .entry(stage_name)
                         .or_default()
                         .insert(placement.id.clone(), placement.clone());
+                    // Fresh placement: age 0 because the worker is brand-
+                    // new this cycle. The reuse path above does NOT touch
+                    // worker_ages, so the original seeded age is
+                    // preserved when the FGD reused-worker branch fires.
+                    self.worker_ages.insert(placement.id.clone(), 0);
                     Ok(Some(placement))
                 } else {
                     // FGD says did_allocate=true but neither a reused id
@@ -656,8 +716,21 @@ impl AutoscalePlanContext {
                         ))
                     })?;
                 if self.cancel_pending_add(&stage_name, worker_id) {
+                    // Cancel-pending-add: the worker was added earlier in
+                    // this same cycle (so its worker_ages entry was age 0)
+                    // and is now being un-staged. Drop the age entry --
+                    // the worker never structurally existed before this
+                    // cycle and will not appear in any next-cycle seed.
+                    self.worker_ages.remove(worker_id);
                     return Ok(true);
                 }
+                // Stage-for-removal: KEEP the age entry. The worker is
+                // moving from current_worker_groups to pending_removes,
+                // but a subsequent try_add_worker may resurrect it via
+                // the FGD reuse path; preserving the age lets any
+                // age-aware donor selector compare candidates by their
+                // true age rather than collapsing all reused workers
+                // to age 0.
                 self.pending_removes
                     .entry(stage_name)
                     .or_default()
@@ -691,8 +764,20 @@ impl AutoscalePlanContext {
                     ))
                 })?;
                 if self.cancel_pending_add(&stage_name, worker_id) {
+                    // Cancel-pending-add: the worker was added earlier in
+                    // this same cycle (so its worker_ages entry was age 0)
+                    // and is now being un-staged. Drop the age entry --
+                    // the worker never structurally existed before this
+                    // cycle and will not appear in any next-cycle seed.
+                    self.worker_ages.remove(worker_id);
                     return Ok(true);
                 }
+                // Stage-for-removal: KEEP the age entry. The worker is
+                // moving from current_workers to pending_removes, but a
+                // subsequent try_add_worker may resurrect it via the FGD
+                // reuse path; preserving the age lets any age-aware
+                // donor selector compare candidates by their true age
+                // rather than collapsing all reused workers to age 0.
                 self.pending_removes
                     .entry(stage_name)
                     .or_default()
@@ -761,6 +846,41 @@ impl AutoscalePlanContext {
     /// the same cardinality by construction.
     pub fn num_stages(&self) -> usize {
         self.stages.len()
+    }
+
+    /// Snapshot of the per-worker age map.
+    ///
+    /// Keys are every worker id present in this cycle's planning
+    /// snapshot (initial seed plus mid-cycle additions); values are
+    /// each worker's age in autoscale cycles (0 for workers placed
+    /// fresh this cycle, positive integers for workers carried over
+    /// from previous cycles). Workers staged for removal are still
+    /// included -- they may be reused via the FGD reuse path before
+    /// `into_solution` runs -- so callers building an age-aware index
+    /// must intersect this map with the per-stage current-worker maps
+    /// to filter out scheduled-for-removal entries. After
+    /// `into_solution` drains `pending_removes`, callers should
+    /// further filter against `solution.deleted_workers` before
+    /// persisting the map for the next cycle.
+    ///
+    /// Returns a clone (`HashMap` is cheaply clonable for the small
+    /// W << 100k cardinalities we see in practice). Safe to call
+    /// after `into_solution()` drains the plan; the read accessors
+    /// deliberately bypass the drained-state guard so the caller can
+    /// persist the post-cycle age map for the next cycle.
+    pub fn worker_ages(&self) -> HashMap<String, u64> {
+        self.worker_ages.clone()
+    }
+
+    /// Age of a single worker (`None` if not present in the planning
+    /// snapshot).
+    ///
+    /// Cheap O(1) lookup against the same map exposed in bulk by
+    /// `worker_ages`. Use this when you have a specific worker id and
+    /// want its age without cloning the whole map. Safe to call after
+    /// `into_solution()` for the same reason as `worker_ages`.
+    pub fn worker_age(&self, worker_id: &str) -> Option<u64> {
+        self.worker_ages.get(worker_id).copied()
     }
 }
 
@@ -964,10 +1084,6 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-// --------------------
-// Tests (pure Rust)
-// --------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,8 +1195,6 @@ mod tests {
         rds::ClusterResources { nodes }
     }
 
-    // ----- New corner-case coverage starts here -----
-
     #[test]
     fn from_problem_state_with_zero_stages_succeeds() {
         // Boundary: a Problem with no stages is degenerate but valid;
@@ -1093,7 +1207,7 @@ mod tests {
         };
         let state = ds::ProblemState { stages: Vec::new() };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state)
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None)
             .expect("zero-stage pipeline is a valid empty input");
 
         assert_eq!(ctx.num_stages(), 0, "no stages tracked");
@@ -1120,7 +1234,7 @@ mod tests {
             ],
         };
 
-        let result = AutoscalePlanContext::from_problem_state(&problem, &state);
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
         assert!(
             result.is_err(),
             "stage count mismatch in the state>problem direction must error"
@@ -1148,7 +1262,7 @@ mod tests {
             ],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert_eq!(ctx.num_stages(), 3);
         for name in ["stage_a", "stage_b", "stage_c"] {
@@ -1184,7 +1298,7 @@ mod tests {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 2, "node0")],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let used = ctx.cluster.nodes["node0"].used_cpus.to_num::<f32>();
         assert!(
@@ -1207,7 +1321,7 @@ mod tests {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 2, "node0")],
         };
 
-        let result = AutoscalePlanContext::from_problem_state(&problem, &state);
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
         assert!(
             result.is_err(),
             "seeding two cpu workers on a 1-cpu cluster must error"
@@ -1256,7 +1370,7 @@ mod tests {
             }],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state)
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None)
             .expect("seeding an SPMD group must go through allocate_multiple cleanly");
 
         // Both nodes contributed one cpu and one whole gpu fraction.
@@ -1295,7 +1409,7 @@ mod tests {
             ],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let expected = 1.0_f32 / 3.0;
         for s in &ctx.workload_estimate.stages {
@@ -1328,7 +1442,7 @@ mod tests {
             ],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let f_a = ctx.workload_estimate.stages[0].frequency;
         let f_b = ctx.workload_estimate.stages[1].frequency;
@@ -1359,7 +1473,7 @@ mod tests {
             ],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let f_a = ctx.workload_estimate.stages[0].frequency;
         let f_b = ctx.workload_estimate.stages[1].frequency;
@@ -1392,7 +1506,7 @@ mod tests {
             ],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let f_a = ctx.workload_estimate.stages[0].frequency;
         let f_b = ctx.workload_estimate.stages[1].frequency;
@@ -1417,7 +1531,7 @@ mod tests {
         };
 
         assert!(
-            AutoscalePlanContext::from_problem_state(&problem, &state).is_err(),
+            AutoscalePlanContext::from_problem_state(&problem, &state, None).is_err(),
             "stage-name mismatch must be rejected before seeding"
         );
     }
@@ -1442,7 +1556,7 @@ mod tests {
         };
 
         assert!(
-            AutoscalePlanContext::from_problem_state(&problem, &state).is_err(),
+            AutoscalePlanContext::from_problem_state(&problem, &state, None).is_err(),
             "empty non-SPMD worker resources must not panic"
         );
     }
@@ -1478,7 +1592,7 @@ mod tests {
         };
 
         assert!(
-            AutoscalePlanContext::from_problem_state(&problem, &state).is_err(),
+            AutoscalePlanContext::from_problem_state(&problem, &state, None).is_err(),
             "multi-allocation non-SPMD worker resources must not panic"
         );
     }
@@ -1494,7 +1608,7 @@ mod tests {
         };
 
         assert!(
-            AutoscalePlanContext::from_problem_state(&problem, &state).is_err(),
+            AutoscalePlanContext::from_problem_state(&problem, &state, None).is_err(),
             "unknown node must be rejected before allocation unwraps"
         );
     }
@@ -1526,7 +1640,7 @@ mod tests {
         };
 
         assert!(
-            AutoscalePlanContext::from_problem_state(&problem, &state).is_err(),
+            AutoscalePlanContext::from_problem_state(&problem, &state, None).is_err(),
             "invalid GPU offset must be rejected before allocation unwraps"
         );
     }
@@ -1547,7 +1661,7 @@ mod tests {
             }],
         };
 
-        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state)
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None)
             .expect("from_problem_state should succeed on a valid empty snapshot");
 
         assert_eq!(
@@ -1599,7 +1713,7 @@ mod tests {
             }],
         };
 
-        let result = AutoscalePlanContext::from_problem_state(&problem, &state);
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
         assert!(
             result.is_err(),
             "stage count mismatch must produce a clear error"
@@ -1630,7 +1744,7 @@ mod tests {
         // stage must return Some, allocate the CPU, push a placement to
         // pending_adds, and the placement must reference the only node.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed = ctx.try_add_worker(0).unwrap();
         let placed = placed.expect("FGD must find a placement on an empty 1-CPU cluster");
@@ -1662,7 +1776,7 @@ mod tests {
         // The first call succeeds; the second must return Ok(None) (FGD
         // reports no feasible placement) without mutating anything.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _first = ctx.try_add_worker(0).unwrap().unwrap();
         let second = ctx.try_add_worker(0).unwrap();
@@ -1685,7 +1799,7 @@ mod tests {
         // spreads across nodes when capacity is symmetric), third
         // returns None.
         let (problem, state) = one_stage_cpu_problem_and_state(2, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed1 = ctx.try_add_worker(0).unwrap().unwrap();
         let placed2 = ctx.try_add_worker(0).unwrap().unwrap();
@@ -1711,7 +1825,7 @@ mod tests {
         // The context reserves every minted id; sequential placements
         // must therefore have distinct ids.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 4.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let p1 = ctx.try_add_worker(0).unwrap().unwrap();
         let p2 = ctx.try_add_worker(0).unwrap().unwrap();
@@ -1758,7 +1872,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed = ctx.try_add_worker(0).unwrap().unwrap();
 
@@ -1780,7 +1894,7 @@ mod tests {
         // caller cannot accidentally mutate `pending_adds` for a stage
         // that does not exist.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         // Only stage 0 exists; stage 1 must be rejected.
         let result = ctx.try_add_worker(1);
@@ -1803,7 +1917,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let p1 = ctx.try_add_worker(0).unwrap();
         let p2 = ctx.try_add_worker(0).unwrap();
@@ -1828,7 +1942,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_empty_stage_state("stage_spmd")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed = ctx.try_add_worker(0).unwrap();
         let placed = placed.expect("2-actor SPMD group fits on a 2-node GPU cluster");
@@ -1858,7 +1972,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_empty_stage_state("stage_spmd")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed = ctx.try_add_worker(0).unwrap();
         assert!(
@@ -1888,7 +2002,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_empty_stage_state("stage_a")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         // Manually stage a removal: a worker that "was removed earlier
         // this cycle" and whose placement is now free in `cluster`.
@@ -1943,7 +2057,7 @@ mod tests {
         // pending_removes / cluster untouched so the caller can fall
         // back to donor logic without rolling back side effects.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _first = ctx.try_add_worker(0).unwrap().unwrap();
         let pending_adds_before = ctx.pending_add_count(0).unwrap();
@@ -1979,7 +2093,7 @@ mod tests {
                 make_empty_stage_state("stage_b"),
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _ = ctx.try_add_worker(0).unwrap().unwrap();
 
@@ -2005,7 +2119,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
         let worker_id = "stage_a_worker_0";
 
         assert!(
@@ -2057,7 +2171,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let removed = ctx.try_remove_worker(0, "missing_worker").unwrap();
 
@@ -2071,7 +2185,7 @@ mod tests {
         // Mirror try_add_worker / pending count bounds checks so Python
         // callers get IndexError instead of a Rust panic.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let result = ctx.try_remove_worker(1, "any");
 
@@ -2093,7 +2207,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
         assert!(!ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
@@ -2119,7 +2233,7 @@ mod tests {
                 make_cpu_stage_state_with_workers("stage_b", 1, "node0"),
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
 
@@ -2138,7 +2252,7 @@ mod tests {
         // cancels the pending add instead of staging an impossible delete
         // for a worker that did not exist at cycle start.
         let (problem, state) = one_stage_cpu_problem_and_state(1, 2.0);
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
         let first = ctx.try_add_worker(0).unwrap().unwrap();
         let second = ctx.try_add_worker(0).unwrap().unwrap();
 
@@ -2217,7 +2331,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert!(
             ctx.try_add_worker(0).unwrap().is_none(),
@@ -2271,7 +2385,7 @@ mod tests {
                 },
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let solution = ctx.into_solution().unwrap();
 
@@ -2298,7 +2412,7 @@ mod tests {
                 make_empty_stage_state("stage_b"),
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let placed = ctx.try_add_worker(0).unwrap().unwrap();
         let solution = ctx.into_solution().unwrap();
@@ -2322,7 +2436,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         // Worker id matches the helper's naming convention.
         let removed = ctx.try_remove_worker(0, "stage_a_worker_0").unwrap();
@@ -2352,7 +2466,7 @@ mod tests {
                 make_empty_stage_state("stage_b"),
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
         let added = ctx.try_add_worker(1).unwrap().unwrap();
@@ -2381,7 +2495,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
         let reused = ctx.try_add_worker(0).unwrap().unwrap();
@@ -2421,7 +2535,7 @@ mod tests {
                 make_empty_stage_state("stage_c"),
             ],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _ = ctx.try_add_worker(1).unwrap().unwrap();
         let solution = ctx.into_solution().unwrap();
@@ -2446,7 +2560,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_empty_stage_state("stage_a")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
         ctx.try_add_worker(0).unwrap().unwrap();
 
         let first = ctx.into_solution().unwrap();
@@ -2473,7 +2587,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _ = ctx.try_add_worker(0).unwrap().unwrap();
         assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
@@ -2512,7 +2626,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _ = ctx.into_solution().unwrap();
 
@@ -2536,7 +2650,7 @@ mod tests {
         let state = ds::ProblemState {
             stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
         };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let _ = ctx.into_solution().unwrap();
 
@@ -2644,10 +2758,566 @@ mod tests {
             stages: Vec::new(),
         };
         let state = ds::ProblemState { stages: Vec::new() };
-        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state).unwrap();
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
         let solution = ctx.into_solution().unwrap();
 
         assert!(solution.stages.is_empty());
+    }
+
+    #[test]
+    fn worker_ages_default_to_zero_when_no_seed_supplied() {
+        // Cold start: when the constructor is called with no
+        // `worker_ages` kwarg, every seeded worker reports age 0. This
+        // is the entry path on the very first autoscale cycle, before
+        // any caller has a previous-cycle snapshot to pass back in.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 2, "node0")],
+        };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let ages = ctx.worker_ages();
+        assert_eq!(ages.len(), 2);
+        assert_eq!(ages.get("stage_a_worker_0"), Some(&0u64));
+        assert_eq!(ages.get("stage_a_worker_1"), Some(&0u64));
+    }
+
+    #[test]
+    fn worker_ages_round_trip_seed_values_through_constructor() {
+        // The caller passes the previous cycle's age map (already
+        // incremented for the new cycle) into the constructor, and the
+        // context exposes those same values back through
+        // `worker_ages()`. This is the cycle-to-cycle persistence
+        // contract the donor logic relies on.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 2, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 5);
+        seed.insert("stage_a_worker_1".to_string(), 12);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        let ages = ctx.worker_ages();
+        assert_eq!(ages.get("stage_a_worker_0"), Some(&5u64));
+        assert_eq!(ages.get("stage_a_worker_1"), Some(&12u64));
+        // Single-worker accessor must agree with the bulk map.
+        assert_eq!(ctx.worker_age("stage_a_worker_1"), Some(12));
+    }
+
+    #[test]
+    fn worker_ages_drop_stale_seed_ids_not_in_state() {
+        // Workers that died between the previous cycle and the new
+        // cycle still appear in the caller's saved age map (the caller
+        // does not necessarily know which ids survived). The
+        // constructor must silently filter them out so the in-context
+        // age map mirrors the live worker set.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 3);
+        seed.insert("worker_that_died".to_string(), 99);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        let ages = ctx.worker_ages();
+        assert_eq!(ages.len(), 1, "stale seed id must be filtered out");
+        assert_eq!(ages.get("stage_a_worker_0"), Some(&3u64));
+        assert_eq!(ctx.worker_age("worker_that_died"), None);
+    }
+
+    #[test]
+    fn worker_ages_default_to_zero_for_seed_missing_known_worker() {
+        // Mixed case: caller passes a partial seed (some workers were
+        // observed in prior cycles, others are brand-new this cycle
+        // because they were just created externally between cycles).
+        // Missing entries default to 0 -- treat unknown ids as freshly
+        // observed rather than rejecting the call.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 2, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 7);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        let ages = ctx.worker_ages();
+        assert_eq!(ages.get("stage_a_worker_0"), Some(&7u64));
+        assert_eq!(
+            ages.get("stage_a_worker_1"),
+            Some(&0u64),
+            "worker missing from seed defaults to age 0"
+        );
+    }
+
+    #[test]
+    fn try_add_worker_assigns_age_zero_to_fresh_placement() {
+        // Fresh placements register age 0 on the non-SPMD code path so
+        // any age-aware donor selector treats freshly-placed
+        // candidates as the youngest possible.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_empty_stage_state("stage_a")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let placed = ctx.try_add_worker(0).unwrap().unwrap();
+        let ages = ctx.worker_ages();
+        assert_eq!(
+            ages.get(&placed.id),
+            Some(&0u64),
+            "fresh CPU placement must register age 0"
+        );
+    }
+
+    #[test]
+    fn try_add_worker_assigns_age_zero_to_fresh_spmd_placement() {
+        // Companion to the non-SPMD test. SPMD groups go through
+        // `find_best_allocation_for_spmd_node_multiple` rather than
+        // FGD, so they exercise a different fresh-add code path that
+        // must also register age 0.
+        let problem = ds::Problem {
+            cluster_resources: make_gpu_cluster(2, 1.0),
+            stages: vec![make_spmd_stage("spmd_stage")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_empty_stage_state("spmd_stage")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let placed = ctx.try_add_worker(0).unwrap().unwrap();
+        let ages = ctx.worker_ages();
+        assert_eq!(
+            ages.get(&placed.id),
+            Some(&0u64),
+            "fresh SPMD placement must register age 0"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_cancel_pending_spmd_add_drops_age_entry() {
+        // Same cancel-pending-add invariant as the CPU path, applied to
+        // a fresh SPMD group. SPMD removals go through
+        // `current_worker_groups` and `release_allocations`, so pin
+        // that they also remove the age entry when the add is retracted
+        // before it ever becomes live.
+        let problem = ds::Problem {
+            cluster_resources: make_gpu_cluster(2, 1.0),
+            stages: vec![make_spmd_stage("spmd_stage")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_empty_stage_state("spmd_stage")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let placed = ctx.try_add_worker(0).unwrap().unwrap();
+        assert_eq!(ctx.worker_age(&placed.id), Some(0));
+
+        assert!(ctx.try_remove_worker(0, &placed.id).unwrap());
+
+        assert_eq!(
+            ctx.worker_age(&placed.id),
+            None,
+            "cancel-pending-add must drop the SPMD worker_ages entry"
+        );
+    }
+
+    #[test]
+    fn worker_ages_sort_oldest_first_returns_correct_order() {
+        // Caller-side sorting is the documented pattern (callers sort
+        // in Python on the (worker_id, age) pairs the context exposes).
+        // Pin that the exposed pairs are sufficient for a deterministic
+        // descending sort.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 3.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 3, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 5);
+        seed.insert("stage_a_worker_1".to_string(), 0);
+        seed.insert("stage_a_worker_2".to_string(), 10);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        let mut entries: Vec<(String, u64)> = ctx.worker_ages().into_iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["stage_a_worker_2", "stage_a_worker_0", "stage_a_worker_1",],
+            "descending sort must place the oldest worker first"
+        );
+    }
+
+    #[test]
+    fn worker_ages_sort_youngest_first_returns_correct_order() {
+        // Donor selection picks the youngest eligible donor across
+        // stages so that long-running workers are not preferentially
+        // evicted; pin that an ascending sort on the exposed pairs
+        // gives the right ordering.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 3.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 3, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 5);
+        seed.insert("stage_a_worker_1".to_string(), 0);
+        seed.insert("stage_a_worker_2".to_string(), 10);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        let mut entries: Vec<(String, u64)> = ctx.worker_ages().into_iter().collect();
+        entries.sort_by_key(|(_, age)| *age);
+        let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["stage_a_worker_1", "stage_a_worker_0", "stage_a_worker_2",],
+            "ascending sort must place the youngest worker first"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_cancel_pending_add_drops_age_entry() {
+        // Worker added mid-cycle (age 0) and then immediately removed:
+        // cancel_pending_add fires, the worker disappears from the
+        // plan entirely, and its age entry must be dropped so a
+        // subsequent reuse (would be impossible here, but defensively
+        // we drop) cannot resurface a stale age 0 record.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_empty_stage_state("stage_a")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let placed = ctx.try_add_worker(0).unwrap().unwrap();
+        assert!(ctx.worker_ages().contains_key(&placed.id));
+
+        assert!(ctx.try_remove_worker(0, &placed.id).unwrap());
+        assert!(
+            !ctx.worker_ages().contains_key(&placed.id),
+            "cancel-pending-add must drop the worker_ages entry"
+        );
+    }
+
+    #[test]
+    fn try_remove_worker_stage_for_removal_keeps_age_entry() {
+        // A seeded worker (age >= 1) staged for removal still occupies
+        // a slot in pending_removes; a later try_add_worker may revive
+        // it via the FGD reuse path. Keep its age entry so the donor
+        // logic compares revived workers by their true age, not 0.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 4);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
+
+        assert_eq!(
+            ctx.worker_age("stage_a_worker_0"),
+            Some(4),
+            "stage-for-removal must NOT drop the worker_ages entry; \
+             pending_removes may still be reused this cycle"
+        );
+    }
+
+    #[test]
+    fn try_add_worker_reuse_path_preserves_original_age() {
+        // Seeded worker has a non-zero age; remove it (-> pending_removes,
+        // age preserved); add another worker with the same shape on
+        // the same stage (-> FGD reuse path, age preserved). The reused
+        // worker must still report its original age, NOT 0. This is the
+        // core invariant that makes age-based donor selection meaningful
+        // when the same cycle shrinks then re-grows a stage.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 8);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        assert!(ctx.try_remove_worker(0, "stage_a_worker_0").unwrap());
+        let reused = ctx.try_add_worker(0).unwrap().unwrap();
+        assert_eq!(
+            reused.id, "stage_a_worker_0",
+            "reuse path consumed pending remove"
+        );
+        assert_eq!(
+            ctx.worker_age(&reused.id),
+            Some(8),
+            "reuse path must preserve original age, not collapse to 0"
+        );
+    }
+
+    #[test]
+    fn try_add_worker_reuse_path_preserves_age_for_spmd_groups() {
+        // Same invariant as above, applied to the SPMD reuse path
+        // (`take_pending_remove_matching_allocations`). SPMD groups go
+        // through a different reuse code path than FGD; the age
+        // contract must hold for both.
+        let problem = ds::Problem {
+            cluster_resources: make_gpu_cluster(2, 1.0),
+            stages: vec![make_spmd_stage("spmd_stage")],
+        };
+        let seeded_id = "spmd_worker".to_string();
+        let stage_state = ds::ProblemStageState {
+            stage_name: "spmd_stage".to_string(),
+            worker_groups: vec![ds::ProblemWorkerGroupState {
+                id: seeded_id.clone(),
+                resources: vec![
+                    rds::WorkerResources {
+                        node: "node0".to_string(),
+                        cpus: rds::FixedUtil::ONE,
+                        gpus: vec![rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        }],
+                    },
+                    rds::WorkerResources {
+                        node: "node1".to_string(),
+                        cpus: rds::FixedUtil::ONE,
+                        gpus: vec![rds::GpuAllocation {
+                            offset: 0,
+                            used_fraction: rds::FixedUtil::ONE,
+                        }],
+                    },
+                ],
+            }],
+            slots_per_worker: 1,
+            is_finished: false,
+            ..Default::default()
+        };
+        let state = ds::ProblemState {
+            stages: vec![stage_state],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert(seeded_id.clone(), 6);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+
+        assert!(ctx.try_remove_worker(0, &seeded_id).unwrap());
+        let reused = ctx.try_add_worker(0).unwrap().unwrap();
+        assert_eq!(
+            reused.id, seeded_id,
+            "SPMD reuse path consumed pending remove"
+        );
+        assert_eq!(
+            ctx.worker_age(&reused.id),
+            Some(6),
+            "SPMD reuse path must preserve original age"
+        );
+    }
+
+    #[test]
+    fn worker_ages_increment_cycle_to_cycle_via_caller() {
+        // Age increments cycle-to-cycle: build context for cycle 1
+        // (cold start), drain to Solution, increment all surviving
+        // ages by 1 (caller's job between cycles), build context for
+        // cycle 2 with the incremented map. The same worker now
+        // reports age 1.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state_cycle_1 = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let ctx_cycle_1 =
+            AutoscalePlanContext::from_problem_state(&problem, &state_cycle_1, None).unwrap();
+        // Cold start: every seeded worker is age 0.
+        assert_eq!(ctx_cycle_1.worker_age("stage_a_worker_0"), Some(0));
+
+        // Caller advances the clock between cycles by incrementing
+        // every surviving worker's age by 1.
+        let mut next_cycle_ages = ctx_cycle_1.worker_ages();
+        for v in next_cycle_ages.values_mut() {
+            *v += 1;
+        }
+
+        // Cycle 2: same physical worker is still alive, the seeded age
+        // map carries the incremented value, and the new context
+        // reports age 1.
+        let state_cycle_2 = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let ctx_cycle_2 = AutoscalePlanContext::from_problem_state(
+            &problem,
+            &state_cycle_2,
+            Some(next_cycle_ages),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx_cycle_2.worker_age("stage_a_worker_0"),
+            Some(1),
+            "age must increment cycle-to-cycle when the caller \
+             passes the previous cycle's incremented map"
+        );
+    }
+
+    #[test]
+    fn worker_ages_zero_stage_pipeline_yields_empty_map_without_seed() {
+        // Boundary: zero-stage pipeline reports an empty worker_ages
+        // map when the constructor is called without a seed.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: Vec::new(),
+        };
+        let state = ds::ProblemState { stages: Vec::new() };
+
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        assert!(ctx.worker_ages().is_empty());
+    }
+
+    #[test]
+    fn worker_ages_zero_stage_pipeline_drops_every_seed_entry_as_stale() {
+        // Boundary: zero-stage pipeline with a non-empty seed yields
+        // an empty map -- no stage means no workers, so every seed
+        // entry is stale and silently filtered.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: Vec::new(),
+        };
+        let state = ds::ProblemState { stages: Vec::new() };
+
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("ghost_worker".to_string(), 99);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+        assert!(ctx.worker_ages().is_empty());
+    }
+
+    #[test]
+    fn try_add_worker_returning_none_does_not_mutate_worker_ages() {
+        // Mutation guard: when try_add_worker returns None (cluster
+        // full) the worker_ages map must be byte-identical to its
+        // pre-call state. A leak here would let the donor logic
+        // observe a phantom worker as age 0 after a failed add.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 4);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+        let ages_before = ctx.worker_ages();
+
+        // 1-cpu cluster already saturated by the seeded worker; a
+        // second 1-cpu add cannot fit and the planner returns None.
+        assert!(ctx.try_add_worker(0).unwrap().is_none());
+        assert_eq!(ctx.worker_ages(), ages_before);
+    }
+
+    #[test]
+    fn try_remove_worker_returning_false_does_not_mutate_worker_ages() {
+        // Mutation guard: when try_remove_worker returns false (no
+        // such worker in the planning snapshot) the worker_ages map
+        // must be byte-identical to its pre-call state. A leak here
+        // would silently drop a live worker's age and collapse it to
+        // 0 on a future cycle.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 6);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+        let ages_before = ctx.worker_ages();
+
+        assert!(!ctx.try_remove_worker(0, "nonexistent").unwrap());
+        assert_eq!(ctx.worker_ages(), ages_before);
+    }
+
+    #[test]
+    fn worker_ages_remain_valid_after_into_solution_drained() {
+        // Read accessors stay valid after drain: the documented caller
+        // pattern reads `worker_ages()` AFTER `into_solution()` to
+        // filter against `solution.deleted_workers` for the next cycle.
+        // Mutating entrypoints are guarded; reads are not.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 5);
+        let mut ctx =
+            AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+        let added = ctx.try_add_worker(0).unwrap().unwrap();
+
+        // Drain the plan; the read accessors must keep working.
+        let _solution = ctx.into_solution().unwrap();
+        let ages_after_drain = ctx.worker_ages();
+        assert_eq!(ages_after_drain.get("stage_a_worker_0"), Some(&5u64));
+        assert_eq!(ages_after_drain.get(&added.id), Some(&0u64));
+        assert_eq!(ctx.worker_age("stage_a_worker_0"), Some(5));
+    }
+
+    #[test]
+    fn worker_ages_returns_a_clone_so_caller_mutations_do_not_leak() {
+        // The contract documented at the Python boundary requires that
+        // `worker_ages()` returns a fresh map; mutating it must not
+        // affect the underlying context state. Pin this so a future
+        // refactor that exposes a Rust reference cannot silently break
+        // the encapsulation.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert("stage_a_worker_0".to_string(), 4);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
+        let mut snapshot_a = ctx.worker_ages();
+        snapshot_a.insert("stage_a_worker_0".to_string(), 999);
+        snapshot_a.insert("phantom".to_string(), 12345);
+        let snapshot_b = ctx.worker_ages();
+        assert_eq!(snapshot_b.get("stage_a_worker_0"), Some(&4u64));
+        assert!(snapshot_b.get("phantom").is_none());
     }
 }
