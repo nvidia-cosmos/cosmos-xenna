@@ -378,14 +378,13 @@ class AutoscalePlanContext:
     Methods:
         ``from_problem_state``: seeded construction.
         ``try_add_worker``: stage one worker add via Fragmentation
-            Gradient Descent on the working snapshot. Implemented.
+            Gradient Descent on the working snapshot.
         ``try_remove_worker``: stage one worker removal by id on the
             working snapshot.
-        ``into_solution``: delegates to the Rust solution builder.
-            Currently a stub.
+        ``into_solution``: drains staged adds/removes into a ``Solution``.
         ``pending_add_count`` / ``pending_remove_count``: read-only
-            counts of staged adds / removes per stage (for invariants
-            and integration tests).
+            counts of staged adds / removes per stage, intended for
+            planning-time invariant checks.
         ``num_stages``: number of stages this context tracks.
 
     """
@@ -450,7 +449,9 @@ class AutoscalePlanContext:
             IndexError: ``stage_index >= num_stages()``.
             RuntimeError: Underlying cluster allocation failed despite
                 the planner reporting a feasible placement (would
-                indicate a corrupted snapshot or planner bug).
+                indicate a corrupted snapshot or planner bug), OR the
+                context has already been drained by ``into_solution``
+                (any further staging is a caller bug).
 
         """
         worker = self._r.try_add_worker(stage_index)
@@ -462,8 +463,9 @@ class AutoscalePlanContext:
         """Number of workers staged for addition on ``stage_index`` so far.
 
         Returns 0 for stages that have not been touched in this cycle.
-        Used by integration tests and invariant checks to verify that
-        ``try_add_worker`` mutated the right per-stage list.
+        After ``into_solution`` drains the staged plan, returns 0 even
+        for stages that previously had pending adds. Use this as a
+        planning-time invariant check, not a post-finalization audit.
 
         Args:
             stage_index: Position of the stage in the problem.
@@ -478,9 +480,9 @@ class AutoscalePlanContext:
         """Number of workers staged for removal on ``stage_index`` so far.
 
         Returns 0 for stages that have not been touched in this cycle.
-        Used by integration tests and invariant checks to verify that
-        ``try_remove_worker`` (or the reuse path of ``try_add_worker``)
-        mutated the right per-stage list.
+        After ``into_solution`` drains the staged plan, returns 0 even
+        for stages that previously had pending removes. Use this as a
+        planning-time invariant check, not a post-finalization audit.
 
         Args:
             stage_index: Position of the stage in the problem.
@@ -511,7 +513,9 @@ class AutoscalePlanContext:
         Raises:
             IndexError: ``stage_index >= num_stages()``.
             RuntimeError: Underlying cluster release failed despite the
-                worker being present in the planning snapshot.
+                worker being present in the planning snapshot, OR the
+                context has already been drained by ``into_solution``
+                (any further staging is a caller bug).
 
         """
         return bool(self._r.try_remove_worker(stage_index, worker_id))
@@ -519,8 +523,25 @@ class AutoscalePlanContext:
     def into_solution(self) -> Solution:
         """Build a ``Solution`` from the staged plan.
 
-        Raises:
-            NotImplementedError: Until the Rust solution builder is implemented.
+        Produces one ``StageSolution`` per stage, ordered by stage
+        position. ``new_workers`` is the list of placements staged via
+        ``try_add_worker``; ``deleted_workers`` is the list of removals
+        staged via ``try_remove_worker``. Workers reused inside the same
+        cycle (a remove cancelled by a later add, or an add cancelled
+        by a later remove) appear in NEITHER list, mirroring the
+        live-set semantics: they were never structurally swapped.
+
+        ``slots_per_worker`` is preserved from the input
+        ``ProblemState`` - the planner does not change it.
+
+        Drains the per-stage pending lists in place and marks the
+        context as terminal. A second call on the same context returns
+        a ``Solution`` whose per-stage lists are all empty (the drain
+        is idempotent), but any further ``try_add_worker`` /
+        ``try_remove_worker`` call on a drained context raises
+        ``RuntimeError``. Callers must construct a fresh
+        ``AutoscalePlanContext`` for each autoscale cycle rather than
+        re-using one.
 
         """
         return Solution(self._r.into_solution())
