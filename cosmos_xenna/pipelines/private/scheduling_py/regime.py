@@ -32,9 +32,9 @@ empty-slot fraction against ``threshold = 1 / sqrt(total_workers)``::
 
 Hysteresis: enter super-HW only after ``streak_cycles`` consecutive
 cycles below ``threshold``. Exit super-HW only after the same streak
-above ``threshold * exit_band_multiplier`` (default 1.5) - a wider
-exit band so noisy oscillation around the boundary cannot flap the
-regime. ``RegimeDetectorState`` carries the cross-cycle streak; the
+above ``threshold * EXIT_BAND_MULTIPLIER`` - a wider exit band so
+noisy oscillation around the boundary cannot flap the regime.
+``RegimeDetectorState`` carries the cross-cycle streak; the
 scheduler holds one instance for the lifetime of the run.
 
 Defined as pure functions so they are testable in isolation without
@@ -43,8 +43,15 @@ a scheduler context.
 
 import enum
 import math
+from typing import Final
 
 import attrs
+
+# Asymmetric hysteresis exit band. The exit threshold is
+# ``threshold * EXIT_BAND_MULTIPLIER`` so a regime that has just
+# entered super-Halfin-Whitt requires a sustained signal noticeably
+# above the entry threshold to revert.
+EXIT_BAND_MULTIPLIER: Final[float] = 1.5
 
 
 class Regime(str, enum.Enum):
@@ -65,24 +72,21 @@ class Regime(str, enum.Enum):
 
 @attrs.frozen
 class RegimeSignal:
-    """Per-cycle regime-detection inputs and the raw (un-hysteresized) verdict.
+    """Per-cycle regime-detection inputs.
 
     Attributes:
-        detected_regime: What the raw signal says this cycle, ignoring
-            hysteresis.
         total_workers: Sum of worker counts across all stages.
-        cluster_idle_fraction: Mean of per-stage empty-slot ratios.
+        cluster_idle_fraction: Empty-slot fraction across the cluster.
         threshold: ``1 / sqrt(total_workers)``. Equals ``1.0`` when
             ``total_workers <= 1`` (degenerate; the cluster is
             considered sub-HW for any non-empty signal).
         signal_available: ``False`` when no stage in the input had any
             slot signal populated (sum of used + empty slots is zero
-            across the cluster). Callers ignore the ``detected_regime``
-            in that case and leave their hysteresis state unchanged.
+            across the cluster). Callers leave hysteresis state
+            unchanged when the signal is unavailable.
 
     """
 
-    detected_regime: Regime
     total_workers: int
     cluster_idle_fraction: float
     threshold: float
@@ -114,7 +118,7 @@ def compute_regime_signal(
     total_used_slots: int,
     total_empty_slots: int,
 ) -> RegimeSignal:
-    """Compute the cluster's raw (un-hysteresized) regime for one cycle.
+    """Compute the cluster's regime-detection signal for one cycle.
 
     Args:
         total_workers: Sum of worker counts across all stages.
@@ -122,12 +126,10 @@ def compute_regime_signal(
         total_empty_slots: Sum of free slots across all stages.
 
     Returns:
-        A ``RegimeSignal`` whose ``detected_regime`` reflects the raw
-        per-cycle verdict, plus enough context to drive logging and the
-        downstream hysteresis update. ``signal_available`` is ``False``
-        when ``total_used_slots + total_empty_slots == 0`` (no stage
-        populates slot signals); the caller leaves hysteresis state
-        unchanged in that case.
+        A ``RegimeSignal`` carrying the inputs the downstream
+        hysteresis update needs. ``signal_available`` is ``False``
+        when ``total_used_slots + total_empty_slots == 0``; callers
+        leave hysteresis state unchanged in that case.
 
     """
     total_slots = total_used_slots + total_empty_slots
@@ -139,15 +141,7 @@ def compute_regime_signal(
     else:
         threshold = 1.0 / math.sqrt(total_workers)
 
-    if not signal_available:
-        detected = Regime.SUB_HALFIN_WHITT
-    elif cluster_idle_fraction < threshold:
-        detected = Regime.SUPER_HALFIN_WHITT
-    else:
-        detected = Regime.SUB_HALFIN_WHITT
-
     return RegimeSignal(
-        detected_regime=detected,
         total_workers=total_workers,
         cluster_idle_fraction=cluster_idle_fraction,
         threshold=threshold,
@@ -160,7 +154,7 @@ def update_regime_state(
     signal: RegimeSignal,
     *,
     streak_cycles: int,
-    exit_band_multiplier: float = 1.5,
+    exit_band_multiplier: float = EXIT_BAND_MULTIPLIER,
 ) -> bool:
     """Apply hysteresis to ``state`` in place; return whether the regime transitioned.
 

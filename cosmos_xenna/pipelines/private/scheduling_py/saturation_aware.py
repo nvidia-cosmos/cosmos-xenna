@@ -42,6 +42,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     _resolve_auto_thresholds,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
+    EXIT_BAND_MULTIPLIER,
     Regime,
     RegimeDetectorState,
     RegimeSignal,
@@ -170,13 +171,14 @@ class SaturationAwareScheduler:
         return base
 
     @staticmethod
-    def _log_regime_transition(new_regime: Regime, signal: RegimeSignal) -> None:
+    def _log_regime_transition(new_regime: Regime, signal: RegimeSignal, effective_aggressiveness: float) -> None:
         """Emit one INFO line per regime transition."""
         logger.info(
             f"scheduler regime transition: -> {new_regime.value} "
             f"(total_workers={signal.total_workers}, "
             f"cluster_idle_fraction={signal.cluster_idle_fraction:.4f}, "
-            f"threshold={signal.threshold:.4f})"
+            f"threshold={signal.threshold:.4f}, "
+            f"effective_aggressiveness={effective_aggressiveness:.4f})"
         )
 
     @staticmethod
@@ -274,12 +276,13 @@ class SaturationAwareScheduler:
             self._regime_state,
             signal,
             streak_cycles=self._config.regime_transition_streak_cycles,
-            exit_band_multiplier=1.5,
+            exit_band_multiplier=EXIT_BAND_MULTIPLIER,
         )
         if not transitioned:
             return
 
-        self._log_regime_transition(self._regime_state.current_regime, signal)
+        effective = self._effective_aggressiveness(self._config.stage_defaults.saturation_aggressiveness)
+        self._log_regime_transition(self._regime_state.current_regime, signal, effective)
         for runtime in self._stage_states.values():
             runtime.resolved_thresholds = None
 
@@ -289,11 +292,9 @@ def _aggregate_cluster_regime_signal(problem_state: data_structures.ProblemState
 
     Sums worker counts, used slots, and empty slots across every stage
     in ``problem_state``, then delegates to ``compute_regime_signal``.
-    Production wiring of ``num_used_slots`` / ``num_empty_slots`` on
-    ``ProblemStageState`` is the trigger that flips
-    ``signal_available`` from ``False`` to ``True``; until that wiring
-    lands the regime detector observes the no-signal default and
-    leaves the regime state untouched.
+    The returned signal is unavailable when no stage reports any slot
+    occupancy (``total_used_slots + total_empty_slots == 0``); callers
+    treat unavailable signals as a no-op.
     """
     total_workers = 0
     total_used = 0

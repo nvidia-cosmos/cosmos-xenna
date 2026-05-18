@@ -88,6 +88,43 @@ class TestFormulaCorrectness:
         assert resolved.slots_per_actor == 16
 
 
+class TestAggressivenessOverride:
+    """``aggressiveness_override`` substitutes a runtime-adjusted ``K`` without mutating the config."""
+
+    def test_override_replaces_config_aggressiveness_in_formula(self) -> None:
+        """Override flows into the K/sqrt(c) numerator instead of cfg.saturation_aggressiveness."""
+        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.30)
+        resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4, aggressiveness_override=0.45)
+        # 0.45 / sqrt(4) = 0.225, comfortably inside [0.02, 0.45].
+        assert resolved.saturation_threshold == pytest.approx(0.225)
+
+    def test_override_recorded_on_resolved_thresholds(self) -> None:
+        """The override value, not the config value, is recorded as provenance."""
+        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.30)
+        resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4, aggressiveness_override=0.45)
+        assert resolved.saturation_aggressiveness == pytest.approx(0.45)
+
+    def test_override_none_falls_back_to_config(self) -> None:
+        """Default ``aggressiveness_override=None`` reads ``cfg.saturation_aggressiveness``."""
+        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.45)
+        resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4)
+        assert resolved.saturation_aggressiveness == pytest.approx(0.45)
+        assert resolved.saturation_threshold == pytest.approx(0.225)
+
+    def test_override_clamps_at_auto_threshold_max(self) -> None:
+        """A high override value is still clamped by ``auto_threshold_max``."""
+        cfg = SaturationAwareStageConfig()  # auto_threshold_max=0.45
+        resolved = _resolve_auto_thresholds(cfg, slots_per_actor=1, aggressiveness_override=0.60)
+        assert resolved.saturation_threshold == pytest.approx(cfg.auto_threshold_max)
+
+    def test_override_does_not_affect_pinned_saturation_threshold(self) -> None:
+        """When ``saturation_threshold`` is pinned the override is unused for that field."""
+        cfg = SaturationAwareStageConfig(saturation_threshold=0.10)
+        resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4, aggressiveness_override=0.45)
+        assert resolved.saturation_threshold == pytest.approx(0.10)
+        assert resolved.saturation_threshold_was_overridden is True
+
+
 class TestClamps:
     """``auto_threshold_min`` and ``auto_threshold_max`` bound the auto-derived saturation threshold."""
 
@@ -185,26 +222,24 @@ class TestOverrideHierarchy:
 
 
 class TestOverProvisionedOrderingGuard:
-    """Resolver enforces ``saturation < over_provisioned_threshold`` on the auto path.
+    """Cross-field validator forbids ``auto_threshold_max >= over_provisioned_threshold``.
 
-    ``__attrs_post_init__`` only validates this chain when
-    ``saturation_threshold`` is explicitly pinned. The auto-derived
-    saturation can still collide with or exceed the (un-auto-derived)
-    over-provisioned threshold, which would silently collapse the
-    classifier's NORMAL zone or invert SATURATED vs OVER_PROVISIONED.
+    The auto-derived saturation can clamp at ``auto_threshold_max``;
+    if that ceiling is at or above ``over_provisioned_threshold`` the
+    SATURATED zone would touch or invert with OVER_PROVISIONED.
+    Catching it at construction is fail-fast vs surfacing as a
+    resolver runtime error on the first cycle that hits the clamp.
     """
 
-    def test_aggressiveness_high_at_c_one_collides_with_default_over_provisioned(self) -> None:
-        """aggressiveness=0.60 + c=1 -> saturation clamps at 0.50 = default over_provisioned."""
-        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.60)
-        with pytest.raises(ValueError, match="resolved thresholds violate zone ordering"):
-            _resolve_auto_thresholds(cfg, slots_per_actor=1)
+    def test_low_over_provisioned_below_auto_threshold_max_rejected_at_construction(self) -> None:
+        """over_provisioned=0.20 + default auto_threshold_max=0.45 -> construction raises."""
+        with pytest.raises(ValueError, match="auto_threshold_max .* must be < over_provisioned_threshold"):
+            SaturationAwareStageConfig(over_provisioned_threshold=0.20)
 
-    def test_pinned_low_over_provisioned_below_auto_saturation_raises(self) -> None:
-        """over_provisioned=0.20 + default aggressiveness + c=1 -> auto saturation 0.30 > 0.20."""
-        cfg = SaturationAwareStageConfig(over_provisioned_threshold=0.20)
-        with pytest.raises(ValueError, match="resolved thresholds violate zone ordering"):
-            _resolve_auto_thresholds(cfg, slots_per_actor=1)
+    def test_equal_auto_threshold_max_and_over_provisioned_rejected(self) -> None:
+        """``auto_threshold_max == over_provisioned_threshold`` rejected (strict inequality)."""
+        with pytest.raises(ValueError, match="auto_threshold_max .* must be < over_provisioned_threshold"):
+            SaturationAwareStageConfig(auto_threshold_max=0.50, over_provisioned_threshold=0.50)
 
 
 class TestInvalidInputs:

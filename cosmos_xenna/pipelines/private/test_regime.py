@@ -45,43 +45,40 @@ class TestComputeRegimeSignal:
         signal = compute_regime_signal(total_workers=10, total_used_slots=80, total_empty_slots=20)
         assert signal.cluster_idle_fraction == pytest.approx(0.20)
 
-    def test_idle_below_threshold_classifies_super_hw(self) -> None:
-        """Sustained busy cluster -> raw verdict is super-Halfin-Whitt."""
+    def test_idle_below_threshold_marks_signal_available(self) -> None:
+        """Sustained busy cluster -> idle fraction < threshold; signal available."""
         signal = compute_regime_signal(total_workers=100, total_used_slots=99, total_empty_slots=1)
-        assert signal.detected_regime is Regime.SUPER_HALFIN_WHITT
+        assert signal.cluster_idle_fraction < signal.threshold
         assert signal.signal_available is True
 
-    def test_idle_at_or_above_threshold_classifies_sub_hw(self) -> None:
-        """Comfortable headroom -> raw verdict is sub-Halfin-Whitt."""
+    def test_idle_at_or_above_threshold_marks_signal_available(self) -> None:
+        """Comfortable headroom -> idle fraction >= threshold; signal available."""
         signal = compute_regime_signal(total_workers=100, total_used_slots=50, total_empty_slots=50)
-        assert signal.detected_regime is Regime.SUB_HALFIN_WHITT
+        assert signal.cluster_idle_fraction >= signal.threshold
+        assert signal.signal_available is True
 
-    def test_zero_workers_defaults_threshold_to_one_and_classifies_sub_hw(self) -> None:
-        """Edge case: no workers means no Halfin-Whitt regime; default to sub-HW."""
+    def test_zero_workers_defaults_threshold_to_one(self) -> None:
+        """Edge case: no workers degenerates the threshold to 1.0."""
         signal = compute_regime_signal(total_workers=0, total_used_slots=0, total_empty_slots=0)
         assert signal.threshold == 1.0
-        assert signal.detected_regime is Regime.SUB_HALFIN_WHITT
         assert signal.signal_available is False
 
-    def test_one_worker_defaults_threshold_to_one_and_classifies_sub_hw(self) -> None:
+    def test_one_worker_defaults_threshold_to_one(self) -> None:
         """``total_workers=1`` is degenerate: threshold = 1 / sqrt(1) = 1.0."""
         signal = compute_regime_signal(total_workers=1, total_used_slots=1, total_empty_slots=0)
         assert signal.threshold == 1.0
-        # idle fraction = 0 < 1 -> raw super-HW even at degenerate threshold.
-        assert signal.detected_regime is Regime.SUPER_HALFIN_WHITT
 
     def test_no_slot_signals_marks_signal_unavailable(self) -> None:
-        """Used + empty == 0 -> signal_available False; default sub-HW verdict."""
+        """Used + empty == 0 -> signal_available False."""
         signal = compute_regime_signal(total_workers=64, total_used_slots=0, total_empty_slots=0)
         assert signal.signal_available is False
-        assert signal.detected_regime is Regime.SUB_HALFIN_WHITT
         assert signal.cluster_idle_fraction == 0.0
 
-    def test_signal_available_with_only_empty_slots_classifies_sub_hw(self) -> None:
-        """All slots empty -> idle fraction = 1.0 >= threshold -> sub-HW."""
+    def test_signal_available_with_only_empty_slots(self) -> None:
+        """All slots empty -> idle fraction = 1.0 >= threshold."""
         signal = compute_regime_signal(total_workers=100, total_used_slots=0, total_empty_slots=200)
         assert signal.signal_available is True
-        assert signal.detected_regime is Regime.SUB_HALFIN_WHITT
+        assert signal.cluster_idle_fraction == 1.0
 
 
 class TestUpdateRegimeStateValidation:

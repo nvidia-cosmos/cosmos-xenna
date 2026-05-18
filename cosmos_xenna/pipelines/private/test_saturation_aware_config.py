@@ -202,6 +202,38 @@ class TestSaturationAwareConfigClusterValidators:
             SaturationAwareConfig(memory_pressure_critical_threshold=1.5)
 
 
+class TestRegimeAwareFields:
+    """Single-field validators for the regime-aware aggressiveness lift."""
+
+    def test_enable_regime_aware_aggressiveness_default_is_true(self) -> None:
+        """The lift is enabled by default."""
+        assert SaturationAwareConfig().enable_regime_aware_aggressiveness is True
+
+    def test_super_halfin_whitt_aggressiveness_lift_default(self) -> None:
+        """Default lift value matches the documented Halfin-Whitt-derived recommendation."""
+        assert SaturationAwareConfig().super_halfin_whitt_aggressiveness_lift == pytest.approx(0.15)
+
+    def test_super_halfin_whitt_aggressiveness_lift_negative_is_rejected(self) -> None:
+        """The lift must be non-negative; setting to 0 is the same as disabling."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(super_halfin_whitt_aggressiveness_lift=-0.01)
+
+    def test_super_halfin_whitt_aggressiveness_lift_above_max_is_rejected(self) -> None:
+        """The lift is bounded at 0.5 to prevent runaway aggressiveness."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(super_halfin_whitt_aggressiveness_lift=0.51)
+
+    def test_regime_transition_streak_cycles_zero_is_rejected(self) -> None:
+        """A streak of 0 cycles would commit a transition on the first cycle (no hysteresis)."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(regime_transition_streak_cycles=0)
+
+    def test_regime_transition_streak_cycles_negative_is_rejected(self) -> None:
+        """A negative streak length is meaningless."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(regime_transition_streak_cycles=-1)
+
+
 class TestThreeTierResolver:
     """``get_effective_stage_config`` resolves overrides by precedence.
 

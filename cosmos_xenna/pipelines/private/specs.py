@@ -472,8 +472,11 @@ class SaturationAwareStageConfig:
     )
     # Upper clamp on the auto-derived ``saturation_threshold``. Acts as a
     # safety ceiling: even at ``c=1`` the formula cannot exceed this value.
+    # Must be strictly less than ``over_provisioned_threshold`` so the
+    # auto-derived saturation never collides with the over-provisioned
+    # zone (cross-field validator below).
     auto_threshold_max: float = attrs.field(
-        default=0.50,
+        default=0.45,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
     # Fraction of the resolved saturation threshold at which the
@@ -649,6 +652,20 @@ class SaturationAwareStageConfig:
             msg = (
                 f"auto_threshold_min ({self.auto_threshold_min}) must be < "
                 f"auto_threshold_max ({self.auto_threshold_max})"
+            )
+            raise ValueError(msg)
+
+        # Auto-threshold ceiling vs over-provisioned floor - any auto-derived
+        # saturation that hits the upper clamp must still be strictly below
+        # the over-provisioned threshold; otherwise the resolver's zone
+        # ordering fails when a regime-aware lift pushes the formula output
+        # into the clamp at small slots_per_actor.
+        if not (self.auto_threshold_max < self.over_provisioned_threshold):
+            msg = (
+                f"auto_threshold_max ({self.auto_threshold_max}) must be < "
+                f"over_provisioned_threshold ({self.over_provisioned_threshold}) "
+                "so the auto-derived saturation never collides with the "
+                "over-provisioned zone."
             )
             raise ValueError(msg)
 
