@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Python wrappers around the Rust autoscaling data structures."""
 
-from __future__ import annotations
+from typing import Self
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     autoscale_plan_context as rust_apc,
+)
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     data_structures as rust,
 )
 from cosmos_xenna.pipelines.private import resources
@@ -45,7 +48,8 @@ class ProblemStage:
         )
 
     @property
-    def rust(self) -> rust.Problem:
+    def rust(self) -> rust.ProblemStage:
+        """Underlying Rust ``ProblemStage`` object."""
         return self._r
 
 
@@ -77,25 +81,45 @@ class ProblemWorkerGroupState:
     """
 
     @classmethod
-    def make(cls, id: str, resources: list[resources.WorkerResourcesInternal]) -> ProblemWorkerGroupState:
-        return cls(rust.ProblemWorkerGroupState(id, [x.to_rust() for x in resources]))
+    def make(cls, id: str, worker_resources: list[resources.WorkerResourcesInternal]) -> Self:
+        """Build a worker-group snapshot from Python primitives.
+
+        Args:
+            id: Stable identifier for the worker group.
+            worker_resources: One entry per resource allocation owned by
+                this worker group (typically one for CPU/GPU workers,
+                multiple for SPMD groups). The parameter is named
+                ``worker_resources`` rather than ``resources`` so it does
+                not shadow the module-level ``resources`` import inside
+                the method body.
+
+        Returns:
+            A ``ProblemWorkerGroupState`` wrapping a freshly-constructed
+            Rust ``rust.ProblemWorkerGroupState``.
+
+        """
+        return cls(rust.ProblemWorkerGroupState(id, [x.to_rust() for x in worker_resources]))
 
     def __init__(self, rust_problem_worker_state: rust.ProblemWorkerGroupState) -> None:
         self._r = rust_problem_worker_state
 
-    @property
-    def id(self) -> str:
-        return self._r.id
-
-    @property
-    def resources(self) -> list[resources.WorkerResourcesInternal]:
-        return [resources.WorkerResourcesInternal.from_rust(x) for x in self._r.resources]
-
     def to_worker_group(self, stage_name: str) -> resources.WorkerGroup:
+        """Convert this snapshot into a concrete ``WorkerGroup`` for ``stage_name``."""
         return resources.WorkerGroup(self._r.to_worker_group(stage_name))
 
     @property
+    def id(self) -> str:
+        """Stable identifier for this worker group."""
+        return str(self._r.id)
+
+    @property
+    def resources(self) -> list[resources.WorkerResourcesInternal]:
+        """Resource allocations owned by this worker group."""
+        return [resources.WorkerResourcesInternal.from_rust(x) for x in self._r.resources]
+
+    @property
     def rust(self) -> rust.ProblemWorkerGroupState:
+        """Underlying Rust ``ProblemWorkerGroupState`` object."""
         return self._r
 
 
@@ -250,7 +274,7 @@ class StageSolution:
         slots_per_worker: int,
         new_workers: list[ProblemWorkerGroupState] | None = None,
         deleted_workers: list[ProblemWorkerGroupState] | None = None,
-    ) -> StageSolution:
+    ) -> Self:
         """Build a StageSolution from Python primitives.
 
         Pure-Python schedulers use this factory to assemble per-stage
@@ -285,7 +309,8 @@ class StageSolution:
 
     @property
     def slots_per_worker(self) -> int:
-        return self._r.slots_per_worker
+        """Task slots configured on each worker for this stage."""
+        return int(self._r.slots_per_worker)
 
     @property
     def rust(self) -> rust.StageSolution:
@@ -309,7 +334,7 @@ class Solution:
         self._r = rust_solution
 
     @classmethod
-    def make(cls, stages: list[StageSolution] | None = None) -> Solution:
+    def make(cls, stages: list[StageSolution] | None = None) -> Self:
         """Build a Solution from a list of StageSolutions.
 
         Pure-Python schedulers use this factory to assemble the final
@@ -341,33 +366,28 @@ class Solution:
 
 
 class AutoscalePlanContext:
-    """Per-cycle planning context for pure-Python schedulers.
+    """Per-cycle autoscale planning context.
 
     Owns a working copy of the cluster snapshot seeded with the current
     worker placements from ``ProblemState``, plus per-stage maps of
-    pending adds and pending removes that the scheduler stages during
-    one autoscale cycle. Construct one instance per cycle via
-    ``from_problem_state``; subsequent cycles MUST construct a fresh
+    pending adds and pending removes that the caller stages during one
+    autoscale cycle. Construct one instance per cycle via
+    ``from_problem_state``; subsequent cycles must construct a fresh
     context.
 
-    Method coverage tracks the granular sub-iterations:
+    Methods:
+        ``from_problem_state``: seeded construction.
+        ``try_add_worker``: delegates to the Rust planning method.
+        ``try_remove_worker``: delegates to the Rust removal method.
+        ``into_solution``: delegates to the Rust solution builder.
 
-    * ``from_problem_state`` (1a-i, this iteration) - seeded
-      construction.
-    * ``try_add_worker`` (1a-ii, future) - runs FGD on the working
-      cluster and stages an add.
-    * ``try_remove_worker`` (1a-iii, future) - frees a placement and
-      stages a remove.
-    * ``into_solution`` (1a-iv, future) - consumes self, drains the
-      staged adds/removes into a ``Solution``.
-
-    See plan section 4f.J for the full lifecycle and the design rule
-    that motivates this class.
+    The delegated Rust planning methods currently raise
+    ``NotImplementedError`` until the add/remove planner is implemented.
 
     """
 
     @classmethod
-    def from_problem_state(cls, problem: Problem, state: ProblemState) -> AutoscalePlanContext:
+    def from_problem_state(cls, problem: Problem, state: ProblemState) -> Self:
         """Build a planning context seeded with the current cluster state.
 
         Clones ``problem.cluster_resources`` and pre-allocates every worker
@@ -381,8 +401,8 @@ class AutoscalePlanContext:
                 finished flag).
 
         Returns:
-            A fresh ``AutoscalePlanContext`` ready for the planning
-            sub-iterations to mutate.
+            A fresh ``AutoscalePlanContext`` ready to be mutated by the
+            planning methods.
 
         Raises:
             RuntimeError: If seeding fails because a current worker
@@ -402,6 +422,49 @@ class AutoscalePlanContext:
         """Underlying Rust planning-context object."""
         return self._r
 
+    def try_add_worker(self, stage_index: int) -> ProblemWorkerGroupState | None:
+        """Stage a worker add for a stage.
+
+        Args:
+            stage_index: Position of the stage in the problem.
+
+        Returns:
+            The newly placed worker, or ``None`` when no placement exists.
+
+        Raises:
+            NotImplementedError: Until the Rust planner method is implemented.
+
+        """
+        worker = self._r.try_add_worker(stage_index)
+        if worker is None:
+            return None
+        return ProblemWorkerGroupState(worker)
+
+    def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
+        """Stage removal of an existing worker.
+
+        Args:
+            stage_index: Position of the stage in the problem.
+            worker_id: Stable id of the worker to remove.
+
+        Returns:
+            True when the worker was found and staged for removal.
+
+        Raises:
+            NotImplementedError: Until the Rust planner method is implemented.
+
+        """
+        return bool(self._r.try_remove_worker(stage_index, worker_id))
+
+    def into_solution(self) -> Solution:
+        """Build a ``Solution`` from the staged plan.
+
+        Raises:
+            NotImplementedError: Until the Rust solution builder is implemented.
+
+        """
+        return Solution(self._r.into_solution())
+
     def num_stages(self) -> int:
         """Number of stages this context tracks.
 
@@ -409,4 +472,4 @@ class AutoscalePlanContext:
         ``len(stage_solutions) == ctx.num_stages()``) and for tests
         that need to verify the seeding round-tripped the input shape.
         """
-        return self._r.num_stages()
+        return int(self._r.num_stages())
