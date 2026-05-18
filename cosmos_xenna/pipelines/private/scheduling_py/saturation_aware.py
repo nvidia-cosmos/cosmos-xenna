@@ -26,9 +26,11 @@ Classifier thresholds are resolved lazily on the first
 supplies the M/M/c concurrency the resolver needs, and the
 formula's ``K/sqrt(c)`` derivation is unstable until that value is
 present. Once resolved, the values live on
-``_StageRuntimeState.resolved_thresholds`` for the lifetime of the
-run and are never re-derived (re-derivation would invalidate the
-EWMA / streak history tuned to the original threshold band).
+``_StageRuntimeState.resolved_thresholds`` across ordinary cycles and
+runtime ``slots_per_worker`` changes. A Halfin-Whitt regime transition
+is the only re-resolution path: it clears the resolved thresholds and
+threshold-relative classifier history before deriving the new band from
+the updated effective aggressiveness.
 
 ``autoscale()`` constructs an ``AutoscalePlanContext`` per cycle so
 per-stage decision logic can stage worker adds and removes against
@@ -264,17 +266,10 @@ class SaturationAwareScheduler:
     ) -> None:
         """Shrink manual stages whose ``requested_num_workers`` is below current.
 
-        Iterates the problem's stages and, for any manual stage
-        (``requested_num_workers is not None``) that is not finished
-        and is currently larger than its request, calls
-        ``select_workers_to_delete_youngest_first`` to pick the
-        surplus and removes them via ``ctx.try_remove_worker``.
-        Youngest-first preserves the warm state of long-lived
-        workers (vLLM engine, GPU memory pools, primed caches),
-        matching the rationale of Phase B's cross-stage donor
-        selection. Worker-rotation hygiene is the responsibility of
-        ``worker_max_lifetime_m`` / ``worker_restart_interval_m`` on
-        ``StageSpec``, not of this manual-shrink path.
+        Manual stages are those with ``requested_num_workers`` set.
+        For unfinished manual stages whose current worker count exceeds
+        the request, surplus workers are staged for deletion through
+        ``ctx.try_remove_worker``.
 
         Raises:
             RuntimeError: ``try_remove_worker`` returned ``False`` for
@@ -283,7 +278,9 @@ class SaturationAwareScheduler:
                 immediately.
 
         """
-        assert self._problem is not None  # autoscale() guards this
+        if self._problem is None:
+            msg = "_run_phase_a_delete called before setup()"
+            raise RuntimeError(msg)
         worker_ages = ctx.worker_ages()
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
             requested = problem_stage.requested_num_workers
@@ -297,7 +294,8 @@ class SaturationAwareScheduler:
                 continue
             delete_count = current - requested
             worker_ids = [w.id for w in runtime_stage.worker_groups]
-            victims = select_workers_to_delete_youngest_first(
+            # Delete youngest workers first so long-lived warmed workers survive manual shrink.
+            victims = _select_workers_to_delete_youngest_first(
                 worker_ids=worker_ids,
                 worker_ages=worker_ages,
                 delete_count=delete_count,
@@ -305,7 +303,7 @@ class SaturationAwareScheduler:
             for worker_id in victims:
                 if not ctx.try_remove_worker(stage_index, worker_id):
                     msg = (
-                        f"Phase A delete: try_remove_worker(stage_index={stage_index}, "
+                        f"Manual-shrink: try_remove_worker(stage_index={stage_index}, "
                         f"worker_id={worker_id!r}) returned False on stage "
                         f"{problem_stage.name!r}; the worker was present in problem_state "
                         "but unknown to the planner - snapshot inconsistency."
@@ -348,7 +346,7 @@ class SaturationAwareScheduler:
             runtime.classifier_streak = 0
 
 
-def select_workers_to_delete_youngest_first(
+def _select_workers_to_delete_youngest_first(
     *,
     worker_ids: list[str],
     worker_ages: dict[str, int],
@@ -359,8 +357,7 @@ def select_workers_to_delete_youngest_first(
     Sort key: ``(age ASC, worker_id ASC)``. Workers missing from
     ``worker_ages`` are treated as age 0 (newly observed). The
     ``worker_id`` tiebreaker keeps the choice deterministic when
-    every worker has the same age (e.g. before cross-cycle age
-    persistence is wired).
+    every worker has the same age.
 
     Args:
         worker_ids: Worker ids in the stage's current snapshot.

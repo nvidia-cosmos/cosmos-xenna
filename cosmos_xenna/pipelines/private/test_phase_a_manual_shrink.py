@@ -13,28 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behaviour tests for Phase A delete (manual-stage shrink).
+"""Behaviour tests for the manual-stage shrink path.
 
 Pin the contract:
 
-  1. Manual stage with ``requested_num_workers < current`` shrinks
-     to exactly ``requested`` (no further, no overshoot).
+  1. A manual stage (``requested_num_workers is not None``) with
+     ``requested < current`` shrinks to exactly ``requested``.
   2. Among the surplus workers, the youngest-first sort selects
      victims; ties are broken by ``worker_id`` ascending so the
      decision is deterministic with uniform ages.
   3. Finished stages, non-manual stages, and stages already at or
      below the request are not touched.
-  4. ``ProblemStageState`` worker ids that the planner does not
-     recognise produce a ``RuntimeError`` (snapshot inconsistency).
 
 The pure sort helper is tested here directly so regressions surface
 on a focused failure rather than through scheduler-integration noise.
 """
 
+from typing import cast
+
+import pytest
+
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import (
     SaturationAwareScheduler,
-    select_workers_to_delete_youngest_first,
+    _select_workers_to_delete_youngest_first,
 )
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
 
@@ -93,12 +95,29 @@ def _problem_state(
     return data_structures.ProblemState(states)
 
 
+class _RejectingRemoveContext:
+    """AutoscalePlanContext-shaped fake that rejects every staged removal."""
+
+    def __init__(self) -> None:
+        """Create an empty call recorder."""
+        self.calls: list[tuple[int, str]] = []
+
+    def worker_ages(self) -> dict[str, int]:
+        """Return no age history so victim selection falls back to worker id."""
+        return {}
+
+    def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
+        """Record the attempted removal and reject it."""
+        self.calls.append((stage_index, worker_id))
+        return False
+
+
 class TestSelectWorkersToDeleteYoungestFirst:
     """Pure sort helper: ``(age ASC, worker_id ASC)``."""
 
     def test_uniform_ages_returns_smallest_worker_ids(self) -> None:
         """Default age 0 for every worker -> deterministic worker_id ascending."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w2", "A-w0", "A-w1"],
             worker_ages={},
             delete_count=2,
@@ -107,7 +126,7 @@ class TestSelectWorkersToDeleteYoungestFirst:
 
     def test_youngest_age_wins_over_lex_smaller_worker_id(self) -> None:
         """A-w0 has age 5, A-w1 has age 0 -> A-w1 selected first."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w0", "A-w1", "A-w2"],
             worker_ages={"A-w0": 5, "A-w1": 0, "A-w2": 3},
             delete_count=1,
@@ -116,7 +135,7 @@ class TestSelectWorkersToDeleteYoungestFirst:
 
     def test_age_tie_falls_back_to_worker_id_order(self) -> None:
         """Two workers with age 1 and one with age 5 -> the tied workers selected first."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w0", "A-w1", "A-w2"],
             worker_ages={"A-w0": 1, "A-w1": 5, "A-w2": 1},
             delete_count=2,
@@ -125,7 +144,7 @@ class TestSelectWorkersToDeleteYoungestFirst:
 
     def test_delete_count_zero_returns_empty(self) -> None:
         """A request to delete zero workers returns no victims."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w0"],
             worker_ages={"A-w0": 0},
             delete_count=0,
@@ -134,7 +153,7 @@ class TestSelectWorkersToDeleteYoungestFirst:
 
     def test_delete_count_above_population_clamps_to_population(self) -> None:
         """A request to delete more workers than exist returns every worker."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w0", "A-w1"],
             worker_ages={},
             delete_count=10,
@@ -143,7 +162,7 @@ class TestSelectWorkersToDeleteYoungestFirst:
 
     def test_missing_worker_age_treated_as_zero(self) -> None:
         """A worker with no entry in the ages map is treated as freshly observed."""
-        victims = select_workers_to_delete_youngest_first(
+        victims = _select_workers_to_delete_youngest_first(
             worker_ids=["A-w0", "A-w1"],
             worker_ages={"A-w0": 7},  # A-w1 missing -> treated as age 0
             delete_count=1,
@@ -151,8 +170,8 @@ class TestSelectWorkersToDeleteYoungestFirst:
         assert victims == ["A-w1"]
 
 
-class TestPhaseADeleteScheduler:
-    """End-to-end Phase A delete via ``SaturationAwareScheduler.autoscale``."""
+class TestManualShrinkScheduler:
+    """End-to-end manual shrink via ``SaturationAwareScheduler.autoscale``."""
 
     def test_manual_shrink_emits_delete_workers_for_excess(self) -> None:
         """4-worker manual stage with ``requested=2`` shrinks to 2."""
@@ -190,7 +209,7 @@ class TestPhaseADeleteScheduler:
         assert solution.stages[0].deleted_workers == []
 
     def test_non_manual_stages_are_skipped(self) -> None:
-        """``requested_num_workers=None`` makes the stage non-manual; Phase A skips."""
+        """``requested_num_workers=None`` makes the stage non-manual; the path skips it."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_requested([("A", None)]))
         solution = scheduler.autoscale(
@@ -211,7 +230,7 @@ class TestPhaseADeleteScheduler:
         assert solution.stages[0].new_workers == []
 
     def test_no_op_when_current_below_requested(self) -> None:
-        """``current < requested`` is a Phase A grow case; this iteration is no-op."""
+        """``current < requested`` is a manual-grow case; the shrink path is a no-op."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_requested([("A", 4)]))
         solution = scheduler.autoscale(
@@ -246,3 +265,18 @@ class TestPhaseADeleteScheduler:
         auto_deleted = {w.id for w in solution.stages[1].deleted_workers}
         assert len(manual_deleted) == 2
         assert auto_deleted == set()
+
+    def test_planner_rejecting_selected_worker_raises_runtime_error(self) -> None:
+        """A selected runtime worker missing from the planner snapshot raises."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_requested([("A", 1)]))
+        ctx = _RejectingRemoveContext()
+        problem_state = _problem_state([("A", 2, 1, False)])
+
+        with pytest.raises(RuntimeError, match="snapshot inconsistency"):
+            scheduler._run_phase_a_delete(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                problem_state,
+            )
+
+        assert ctx.calls == [(0, "A-w0")]

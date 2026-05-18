@@ -107,7 +107,8 @@ class RegimeDetectorState:
             for a transition.
         streak: Consecutive cycles whose raw signal disagrees with
             ``current_regime``. Resets to zero on any cycle that agrees
-            with ``current_regime`` or whose signal is unavailable.
+            with ``current_regime``; unavailable signals leave the
+            streak unchanged.
 
     """
 
