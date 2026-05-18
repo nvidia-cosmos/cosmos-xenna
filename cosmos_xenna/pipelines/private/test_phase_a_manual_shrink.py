@@ -237,8 +237,9 @@ class TestManualShrinkScheduler:
             time=0.0,
             problem_state=_problem_state([("A", 1, 1, False)]),
         )
+        # Shrink-path contract only: delete list must stay empty when no surplus exists.
+        # Grow-path adds are exercised in test_phase_a_manual_grow.
         assert solution.stages[0].deleted_workers == []
-        assert solution.stages[0].new_workers == []
 
     def test_requested_zero_removes_every_worker(self) -> None:
         """``requested=0`` shrinks the stage to empty."""

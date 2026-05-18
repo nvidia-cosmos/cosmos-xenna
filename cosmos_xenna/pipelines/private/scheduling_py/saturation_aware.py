@@ -257,6 +257,7 @@ class SaturationAwareScheduler:
         self._ensure_thresholds_resolved(problem_state)
         ctx = data_structures.AutoscalePlanContext.from_problem_state(self._problem, problem_state)
         self._run_phase_a_delete(ctx, problem_state)
+        self._run_phase_a_grow(ctx, problem_state)
         return ctx.into_solution()
 
     def _run_phase_a_delete(
@@ -309,6 +310,48 @@ class SaturationAwareScheduler:
                         "but unknown to the planner - snapshot inconsistency."
                     )
                     raise RuntimeError(msg)
+
+    def _run_phase_a_grow(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> None:
+        """Grow manual stages whose ``requested_num_workers`` is above current.
+
+        Manual stages are those with ``requested_num_workers`` set.
+        For unfinished manual stages whose current worker count is
+        below the request, fresh workers are staged through
+        ``ctx.try_add_worker`` until the request is met. When the
+        working cluster has no remaining placement (returns ``None``),
+        growth stops for that stage in this cycle without raising;
+        the deficit is left for the cross-stage donor fallback to
+        cover by donating from over-supplied peers, and a single
+        WARNING per affected stage is emitted so operators retain
+        visibility into partially-satisfied manual requests.
+
+        """
+        if self._problem is None:
+            msg = "_run_phase_a_grow called before setup()"
+            raise RuntimeError(msg)
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            requested = problem_stage.requested_num_workers
+            if requested is None:
+                continue
+            runtime_stage = problem_state.rust.stages[stage_index]
+            if runtime_stage.is_finished:
+                continue
+            current = len(runtime_stage.worker_groups)
+            while current < requested:
+                if ctx.try_add_worker(stage_index) is None:
+                    deficit = requested - current
+                    logger.warning(
+                        f"manual grow: stage {problem_stage.name!r} requested "
+                        f"{requested} workers; cluster placement exhausted at "
+                        f"{current} (deficit={deficit}); deficit handed to the "
+                        "cross-stage donor fallback."
+                    )
+                    break
+                current += 1
 
     def _update_regime_aware_aggressiveness(self, problem_state: data_structures.ProblemState) -> None:
         """Detect the cluster's Halfin-Whitt regime and re-resolve thresholds on transition.
