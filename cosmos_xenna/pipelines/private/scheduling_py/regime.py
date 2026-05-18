@@ -24,8 +24,9 @@ cost-of-mistake characteristics differ materially:
   likely claimed by another stage's growth before the original owner
   recovers, costing up to ``log(N)`` cycles of throughput loss.
 
-The regime is detected per cycle by comparing the cluster's mean
-empty-slot fraction against ``threshold = 1 / sqrt(total_workers)``::
+The regime is detected per cycle by comparing the cluster-wide
+aggregate empty-slot fraction against
+``threshold = 1 / sqrt(total_workers)``::
 
     cluster_idle < threshold       -> super-Halfin-Whitt (near full)
     cluster_idle >= threshold      -> sub-Halfin-Whitt (slack)
@@ -35,7 +36,8 @@ cycles below ``threshold``. Exit super-HW only after the same streak
 above ``threshold * EXIT_BAND_MULTIPLIER`` - a wider exit band so
 noisy oscillation around the boundary cannot flap the regime.
 ``RegimeDetectorState`` carries the cross-cycle streak; the
-scheduler holds one instance for the lifetime of the run.
+scheduler resets it on each ``setup()`` call so a new run starts from
+base aggressiveness.
 
 Defined as pure functions so they are testable in isolation without
 a scheduler context.
@@ -54,7 +56,7 @@ import attrs
 EXIT_BAND_MULTIPLIER: Final[float] = 1.5
 
 
-class Regime(str, enum.Enum):
+class Regime(enum.StrEnum):
     """Heavy-traffic operating regime of the cluster.
 
     Attributes:
@@ -76,10 +78,11 @@ class RegimeSignal:
 
     Attributes:
         total_workers: Sum of worker counts across all stages.
-        cluster_idle_fraction: Empty-slot fraction across the cluster.
+        cluster_idle_fraction: Aggregate empty-slot fraction across
+            the cluster: ``total_empty_slots / (total_used_slots +
+            total_empty_slots)``.
         threshold: ``1 / sqrt(total_workers)``. Equals ``1.0`` when
-            ``total_workers <= 1`` (degenerate; the cluster is
-            considered sub-HW for any non-empty signal).
+            ``total_workers <= 1``.
         signal_available: ``False`` when no stage in the input had any
             slot signal populated (sum of used + empty slots is zero
             across the cluster). Callers leave hysteresis state

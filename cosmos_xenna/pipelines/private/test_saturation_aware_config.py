@@ -22,6 +22,8 @@ three-tier resolver behaviour is also pinned because downstream phases
 rely on its precedence semantics.
 """
 
+from typing import cast
+
 import attrs
 import pytest
 
@@ -209,12 +211,17 @@ class TestRegimeAwareFields:
         """The lift is enabled by default."""
         assert SaturationAwareConfig().enable_regime_aware_aggressiveness is True
 
+    def test_enable_regime_aware_aggressiveness_must_be_bool(self) -> None:
+        """String values are rejected instead of being treated as truthy."""
+        with pytest.raises(TypeError):
+            SaturationAwareConfig(enable_regime_aware_aggressiveness=cast(bool, "false"))
+
     def test_super_halfin_whitt_aggressiveness_lift_default(self) -> None:
         """Default lift value matches the documented Halfin-Whitt-derived recommendation."""
         assert SaturationAwareConfig().super_halfin_whitt_aggressiveness_lift == pytest.approx(0.15)
 
     def test_super_halfin_whitt_aggressiveness_lift_negative_is_rejected(self) -> None:
-        """The lift must be non-negative; setting to 0 is the same as disabling."""
+        """The lift must be non-negative."""
         with pytest.raises(ValueError):
             SaturationAwareConfig(super_halfin_whitt_aggressiveness_lift=-0.01)
 

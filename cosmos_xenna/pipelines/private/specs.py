@@ -729,16 +729,20 @@ class SaturationAwareConfig:
     # When True, detect the cluster's Halfin-Whitt regime per cycle and lift
     # ``saturation_aggressiveness`` by ``super_halfin_whitt_aggressiveness_lift``
     # whenever the cluster sits in the super-Halfin-Whitt regime.
-    #  The lift makes scale-up faster without changing scale-down.
-    # Set False to pin the aggressiveness at its base value -
+    # The lift makes scale-up faster without changing scale-down.
+    # Set False to pin the aggressiveness at its base value and skip
+    # regime tracking entirely -
     # useful for diagnosis or queueing-theory-purity A/B comparisons.
-    enable_regime_aware_aggressiveness: bool = True
+    enable_regime_aware_aggressiveness: bool = attrs.field(
+        default=True,
+        validator=attrs.validators.instance_of(bool),
+    )
     # Additive lift applied to ``saturation_aggressiveness`` when the
     # cluster is in super-Halfin-Whitt. Default 0.15 shifts the canonical
     # 0.30 base to 0.45 (the auto-derived ``saturation_threshold``
     # increases proportionally, so the classifier fires SATURATED earlier
-    # in the empty-slot ratio band). Range ``[0.0, 0.5]``; setting to 0.0
-    # has the same effect as ``enable_regime_aware_aggressiveness=False``.
+    # in the empty-slot ratio band). Range ``[0.0, 0.5]``; setting to
+    # 0.0 disables the numeric lift but still runs regime tracking.
     super_halfin_whitt_aggressiveness_lift: float = attrs.field(
         default=0.15,
         validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(0.5)),

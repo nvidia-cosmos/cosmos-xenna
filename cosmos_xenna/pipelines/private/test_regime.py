@@ -33,7 +33,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.regime import (
 
 
 class TestComputeRegimeSignal:
-    """Per-cycle signal computation: threshold, fraction, raw verdict."""
+    """Per-cycle signal computation: threshold, fraction, availability."""
 
     def test_threshold_matches_one_over_sqrt_workers(self) -> None:
         """``threshold = 1 / sqrt(total_workers)`` per Halfin-Whitt."""

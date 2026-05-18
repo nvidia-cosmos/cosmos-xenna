@@ -49,7 +49,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     compute_regime_signal,
     update_regime_state,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
 
@@ -110,6 +110,7 @@ class SaturationAwareScheduler:
         self._problem = problem
         self._stage_names = [stage.name for stage in problem.rust.stages]
         self._stage_states = {name: _StageRuntimeState(stage_name=name) for name in self._stage_names}
+        self._regime_state = RegimeDetectorState()
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -122,8 +123,9 @@ class SaturationAwareScheduler:
         populated short-circuit; mid-run ``slots_per_worker`` changes
         do not re-resolve. A regime transition (handled by
         ``_update_regime_aware_aggressiveness``) drops every stage's
-        resolved thresholds so this method re-derives them with the
-        new effective aggressiveness on the same cycle.
+        resolved thresholds and threshold-relative classifier history
+        so this method re-derives them with the new effective
+        aggressiveness on the same cycle.
 
         Raises:
             ValueError: If ``problem_state`` carries a stage name not
@@ -252,19 +254,76 @@ class SaturationAwareScheduler:
         self._update_regime_aware_aggressiveness(problem_state)
         self._ensure_thresholds_resolved(problem_state)
         ctx = data_structures.AutoscalePlanContext.from_problem_state(self._problem, problem_state)
+        self._run_phase_a_delete(ctx, problem_state)
         return ctx.into_solution()
+
+    def _run_phase_a_delete(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> None:
+        """Shrink manual stages whose ``requested_num_workers`` is below current.
+
+        Iterates the problem's stages and, for any manual stage
+        (``requested_num_workers is not None``) that is not finished
+        and is currently larger than its request, calls
+        ``select_workers_to_delete_youngest_first`` to pick the
+        surplus and removes them via ``ctx.try_remove_worker``.
+        Youngest-first preserves the warm state of long-lived
+        workers (vLLM engine, GPU memory pools, primed caches),
+        matching the rationale of Phase B's cross-stage donor
+        selection. Worker-rotation hygiene is the responsibility of
+        ``worker_max_lifetime_m`` / ``worker_restart_interval_m`` on
+        ``StageSpec``, not of this manual-shrink path.
+
+        Raises:
+            RuntimeError: ``try_remove_worker`` returned ``False`` for
+                a worker that was present in ``problem_state`` -- a
+                planner-state inconsistency that must surface
+                immediately.
+
+        """
+        assert self._problem is not None  # autoscale() guards this
+        worker_ages = ctx.worker_ages()
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            requested = problem_stage.requested_num_workers
+            if requested is None:
+                continue
+            runtime_stage = problem_state.rust.stages[stage_index]
+            if runtime_stage.is_finished:
+                continue
+            current = len(runtime_stage.worker_groups)
+            if current <= requested:
+                continue
+            delete_count = current - requested
+            worker_ids = [w.id for w in runtime_stage.worker_groups]
+            victims = select_workers_to_delete_youngest_first(
+                worker_ids=worker_ids,
+                worker_ages=worker_ages,
+                delete_count=delete_count,
+            )
+            for worker_id in victims:
+                if not ctx.try_remove_worker(stage_index, worker_id):
+                    msg = (
+                        f"Phase A delete: try_remove_worker(stage_index={stage_index}, "
+                        f"worker_id={worker_id!r}) returned False on stage "
+                        f"{problem_stage.name!r}; the worker was present in problem_state "
+                        "but unknown to the planner - snapshot inconsistency."
+                    )
+                    raise RuntimeError(msg)
 
     def _update_regime_aware_aggressiveness(self, problem_state: data_structures.ProblemState) -> None:
         """Detect the cluster's Halfin-Whitt regime and re-resolve thresholds on transition.
 
         Computes the per-cycle regime signal, applies hysteresis via
         ``update_regime_state``, and -- on a regime transition -- drops
-        every stage's ``resolved_thresholds`` so the next call to
-        ``_ensure_thresholds_resolved`` re-derives them with the
+        every stage's ``resolved_thresholds`` and threshold-relative
+        classifier history so the next call to
+        ``_ensure_thresholds_resolved`` re-derives thresholds with the
         appropriate effective aggressiveness. Cycles whose signal is
-        unavailable (no stage populates ``num_used_slots`` /
-        ``num_empty_slots`` yet) leave the regime state and resolved
-        thresholds untouched. Respects the
+        unavailable (some active stage has not populated
+        ``num_used_slots`` / ``num_empty_slots`` yet) leave the regime
+        state and resolved thresholds untouched. Respects the
         ``enable_regime_aware_aggressiveness`` flag.
 
         """
@@ -285,6 +344,40 @@ class SaturationAwareScheduler:
         self._log_regime_transition(self._regime_state.current_regime, signal, effective)
         for runtime in self._stage_states.values():
             runtime.resolved_thresholds = None
+            runtime.classifier_state = StageState.NORMAL
+            runtime.classifier_streak = 0
+
+
+def select_workers_to_delete_youngest_first(
+    *,
+    worker_ids: list[str],
+    worker_ages: dict[str, int],
+    delete_count: int,
+) -> list[str]:
+    """Pick ``delete_count`` workers to delete, youngest first.
+
+    Sort key: ``(age ASC, worker_id ASC)``. Workers missing from
+    ``worker_ages`` are treated as age 0 (newly observed). The
+    ``worker_id`` tiebreaker keeps the choice deterministic when
+    every worker has the same age (e.g. before cross-cycle age
+    persistence is wired).
+
+    Args:
+        worker_ids: Worker ids in the stage's current snapshot.
+        worker_ages: Cluster-wide worker ages.
+        delete_count: Number of workers to return. Clamped to
+            ``len(worker_ids)``.
+
+    Returns:
+        The first ``delete_count`` worker ids of the youngest-first
+        ordering.
+
+    """
+    ranked = sorted(
+        ((worker_ages.get(wid, 0), wid) for wid in worker_ids),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    return [wid for _, wid in ranked[:delete_count]]
 
 
 def _aggregate_cluster_regime_signal(problem_state: data_structures.ProblemState) -> RegimeSignal:
@@ -292,15 +385,23 @@ def _aggregate_cluster_regime_signal(problem_state: data_structures.ProblemState
 
     Sums worker counts, used slots, and empty slots across every stage
     in ``problem_state``, then delegates to ``compute_regime_signal``.
-    The returned signal is unavailable when no stage reports any slot
-    occupancy (``total_used_slots + total_empty_slots == 0``); callers
-    treat unavailable signals as a no-op.
+    The returned signal is unavailable when any active worker stage
+    still carries the ``0/0`` no-signal sentinel, or when no stage
+    reports any slot occupancy at all.
     """
     total_workers = 0
     total_used = 0
     total_empty = 0
     for stage in problem_state.rust.stages:
-        total_workers += len(stage.worker_groups)
+        stage_workers = len(stage.worker_groups)
+        stage_slots = stage.num_used_slots + stage.num_empty_slots
+        if stage_workers > 0 and not stage.is_finished and stage_slots == 0:
+            return compute_regime_signal(
+                total_workers=total_workers + stage_workers,
+                total_used_slots=0,
+                total_empty_slots=0,
+            )
+        total_workers += stage_workers
         total_used += stage.num_used_slots
         total_empty += stage.num_empty_slots
     return compute_regime_signal(
