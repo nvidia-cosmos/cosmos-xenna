@@ -67,9 +67,14 @@ impl WorkerIdFactory {
 
     /// Generate a new unique worker ID.
     ///
+    /// Marked `pub` so sibling modules (e.g. `autoscale_plan_context`)
+    /// can drive the factory directly when planning fresh allocations
+    /// outside of `run_fragmentation_autoscaler`. Already exposed to
+    /// Python via `#[pymethods]`.
+    ///
     /// # Returns
     /// A unique string ID representing the worker
-    fn make_new_id(&mut self) -> String {
+    pub fn make_new_id(&mut self) -> String {
         let id = self.count.to_string();
         self.count += 1;
         id

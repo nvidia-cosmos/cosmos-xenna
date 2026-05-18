@@ -20,8 +20,12 @@ Pins the construction contract: ``from_problem_state`` accepts a
 
   1. Reports the right number of stages.
   2. Exposes the underlying Rust object via ``.rust``.
-  3. Keeps the ``try_add_worker`` / ``try_remove_worker`` / ``into_solution``
-     methods stubbed (they currently raise ``NotImplementedError``).
+  3. Implements ``try_add_worker`` (Phase 1a-ii): one fresh placement
+     per call via Fragmentation Gradient Descent, ``None`` on no-fit,
+     ``IndexError`` on out-of-range stage index.
+  4. Keeps ``try_remove_worker`` / ``into_solution`` stubbed (they
+     currently raise ``NotImplementedError`` until 1a-iii / 1a-iv
+     land).
 """
 
 import pytest
@@ -200,23 +204,16 @@ class TestAutoscalePlanContextConstruction:
 
 
 class TestAutoscalePlanContextStubs:
-    """Stubbed methods raise ``NotImplementedError``.
+    """Methods that have not yet been implemented raise ``NotImplementedError``.
 
     Pinning the stub behaviour keeps the contract honest: callers cannot
     accidentally rely on a default no-op output before the real
-    implementation lands.
+    implementation lands. ``try_add_worker`` was a stub in 1a-i; it is
+    now implemented and is covered by ``TestTryAddWorker`` instead.
     """
 
-    def test_try_add_worker_is_stubbed(self) -> None:
-        """``try_add_worker`` is currently unimplemented."""
-        problem, state = _build_one_stage_problem_and_state()
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
-
-        with pytest.raises(NotImplementedError):
-            ctx.try_add_worker(0)
-
     def test_try_remove_worker_is_stubbed(self) -> None:
-        """``try_remove_worker`` is currently unimplemented."""
+        """``try_remove_worker`` is currently unimplemented (lands in 1a-iii)."""
         problem, state = _build_one_stage_problem_and_state()
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
 
@@ -224,12 +221,157 @@ class TestAutoscalePlanContextStubs:
             ctx.try_remove_worker(0, "fake_id")
 
     def test_into_solution_is_stubbed(self) -> None:
-        """``into_solution`` is currently unimplemented."""
+        """``into_solution`` is currently unimplemented (lands in 1a-iv)."""
         problem, state = _build_one_stage_problem_and_state()
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
 
         with pytest.raises(NotImplementedError):
             ctx.into_solution()
+
+
+class TestTryAddWorker:
+    """Phase 1a-ii contract for ``AutoscalePlanContext.try_add_worker``.
+
+    Pins the Python wrapper's behaviour: a fresh placement returns a
+    ``ProblemWorkerGroupState`` whose resources match a real cluster
+    node, sequential calls deplete capacity, and out-of-range stage
+    indices surface as ``IndexError``.
+    """
+
+    def test_fresh_add_returns_a_placement_with_one_allocation(self) -> None:
+        """First add on an empty cluster returns a one-allocation worker.
+
+        Verifies the wrapper materialises the Rust placement back into
+        a Python ``ProblemWorkerGroupState`` with the expected shape
+        (one resource entry for a CPU-only stage).
+        """
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        placed = ctx.try_add_worker(0)
+
+        assert placed is not None
+        assert len(placed.resources) == 1, "CPU stages have one allocation per worker"
+
+    def test_fresh_add_increments_pending_add_count(self) -> None:
+        """A successful add must be visible via ``pending_add_count``."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        assert ctx.pending_add_count(0) == 0
+        ctx.try_add_worker(0)
+        assert ctx.pending_add_count(0) == 1
+
+    def test_returns_none_when_cluster_is_full(self) -> None:
+        """Once capacity is exhausted, subsequent adds return ``None``.
+
+        Build a 1-node 1-cpu pipeline so the second add cannot fit.
+        Verifies the wrapper passes through the Rust ``Ok(None)``
+        signal as Python ``None`` rather than raising.
+        """
+        cluster = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=1.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        shape = resources.Resources(cpus=1.0, gpus=0.0).to_worker_shape(cluster)
+        problem = data_structures.Problem(
+            cluster_resources=cluster,
+            stages=[
+                data_structures.ProblemStage(
+                    name="stage_a",
+                    stage_batch_size=1,
+                    worker_shape=shape,
+                    requested_num_workers=None,
+                    over_provision_factor=None,
+                )
+            ],
+        )
+        state = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[],
+                    slots_per_worker=1,
+                    is_finished=False,
+                )
+            ]
+        )
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        first = ctx.try_add_worker(0)
+        second = ctx.try_add_worker(0)
+
+        assert first is not None
+        assert second is None, "second add must fail with None on a 1-cpu cluster"
+        assert ctx.pending_add_count(0) == 1, "only the successful add was committed"
+
+    def test_out_of_range_stage_index_raises_index_error(self) -> None:
+        """``stage_index >= num_stages()`` surfaces as ``IndexError``.
+
+        Catches caller bugs (off-by-one) before they can mutate the
+        plan. The Rust side returns ``PyIndexError`` which PyO3
+        converts to Python's built-in ``IndexError``.
+        """
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        with pytest.raises(IndexError):
+            ctx.try_add_worker(99)
+
+    def test_independent_contexts_do_not_share_pending_state(self) -> None:
+        """Two contexts built from the same inputs plan independently.
+
+        Adds in ``ctx_a`` must not appear in ``ctx_b``'s pending counts.
+        Catches accidental cross-cycle state leakage via shared Rust
+        objects or mutable globals.
+        """
+        problem, state = _build_one_stage_problem_and_state()
+        ctx_a = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        ctx_b = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        ctx_a.try_add_worker(0)
+
+        assert ctx_a.pending_add_count(0) == 1
+        assert ctx_b.pending_add_count(0) == 0
+
+
+class TestPendingCounts:
+    """Phase 1a-ii contract for ``pending_add_count`` / ``pending_remove_count``."""
+
+    def test_pending_counts_start_at_zero(self) -> None:
+        """A fresh context has nothing staged.
+
+        Pins the construction contract: a context with no planning
+        calls must report 0 staged adds and 0 staged removes for every
+        stage. Future cluster-wide invariants depend on this.
+        """
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        assert ctx.pending_add_count(0) == 0
+        assert ctx.pending_remove_count(0) == 0
+
+    def test_pending_add_count_rejects_out_of_range_index(self) -> None:
+        """Out-of-range stage index raises ``IndexError``."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        with pytest.raises(IndexError):
+            ctx.pending_add_count(99)
+
+    def test_pending_remove_count_rejects_out_of_range_index(self) -> None:
+        """Out-of-range stage index raises ``IndexError``."""
+        problem, state = _build_one_stage_problem_and_state()
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        with pytest.raises(IndexError):
+            ctx.pending_remove_count(99)
 
 
 class TestAutoscalePlanContextValidation:

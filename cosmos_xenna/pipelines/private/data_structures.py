@@ -377,12 +377,16 @@ class AutoscalePlanContext:
 
     Methods:
         ``from_problem_state``: seeded construction.
-        ``try_add_worker``: delegates to the Rust planning method.
+        ``try_add_worker``: stage one worker add via Fragmentation
+            Gradient Descent on the working snapshot. Implemented.
         ``try_remove_worker``: delegates to the Rust removal method.
+            Currently a stub.
         ``into_solution``: delegates to the Rust solution builder.
-
-    The delegated Rust planning methods currently raise
-    ``NotImplementedError`` until the add/remove planner is implemented.
+            Currently a stub.
+        ``pending_add_count`` / ``pending_remove_count``: read-only
+            counts of staged adds / removes per stage (for invariants
+            and integration tests).
+        ``num_stages``: number of stages this context tracks.
 
     """
 
@@ -423,22 +427,69 @@ class AutoscalePlanContext:
         return self._r
 
     def try_add_worker(self, stage_index: int) -> ProblemWorkerGroupState | None:
-        """Stage a worker add for a stage.
+        """Stage one worker add for a stage via Fragmentation Gradient Descent.
+
+        Mutates the context's working cluster snapshot to reflect the new
+        allocation. On a fresh placement, the new worker is appended to
+        the stage's ``pending_adds`` list. On a reuse (the FGD search
+        chose to revive a pending-remove worker rather than place a
+        fresh one), the matching entry is popped from the stage's
+        ``pending_removes`` list and ``pending_adds`` is left untouched
+        (the worker was never structurally removed; the staged remove
+        is simply un-staged).
 
         Args:
-            stage_index: Position of the stage in the problem.
+            stage_index: Position of the stage in the problem (and in
+                the context's stages list).
 
         Returns:
-            The newly placed worker, or ``None`` when no placement exists.
+            The placed (or reused) worker, or ``None`` when no
+            placement exists on the working cluster.
 
         Raises:
-            NotImplementedError: Until the Rust planner method is implemented.
+            IndexError: ``stage_index >= num_stages()``.
+            RuntimeError: Underlying cluster allocation failed despite
+                the planner reporting a feasible placement (would
+                indicate a corrupted snapshot or planner bug).
 
         """
         worker = self._r.try_add_worker(stage_index)
         if worker is None:
             return None
         return ProblemWorkerGroupState(worker)
+
+    def pending_add_count(self, stage_index: int) -> int:
+        """Number of workers staged for addition on ``stage_index`` so far.
+
+        Returns 0 for stages that have not been touched in this cycle.
+        Used by integration tests and invariant checks to verify that
+        ``try_add_worker`` mutated the right per-stage list.
+
+        Args:
+            stage_index: Position of the stage in the problem.
+
+        Raises:
+            IndexError: ``stage_index >= num_stages()``.
+
+        """
+        return int(self._r.pending_add_count(stage_index))
+
+    def pending_remove_count(self, stage_index: int) -> int:
+        """Number of workers staged for removal on ``stage_index`` so far.
+
+        Returns 0 for stages that have not been touched in this cycle.
+        Used by integration tests and invariant checks to verify that
+        ``try_remove_worker`` (or the reuse path of ``try_add_worker``)
+        mutated the right per-stage list.
+
+        Args:
+            stage_index: Position of the stage in the problem.
+
+        Raises:
+            IndexError: ``stage_index >= num_stages()``.
+
+        """
+        return int(self._r.pending_remove_count(stage_index))
 
     def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
         """Stage removal of an existing worker.
