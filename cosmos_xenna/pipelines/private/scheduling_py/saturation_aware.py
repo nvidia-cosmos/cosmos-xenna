@@ -23,17 +23,19 @@ swapped at ``Autoscaler.__init__`` based on
 
 The pure-function primitives (classifier, decisions, growth-mode
 state machine, per-stage pipeline) are wired into the per-stage
-state map built at ``setup()`` time. ``autoscale()`` returns valid
-``Solution`` objects with one ``StageSolution`` per pipeline stage.
+state map built at ``setup()`` time. ``autoscale()`` constructs a
+fresh ``AutoscalePlanContext`` per cycle, allowing per-stage
+decision logic to stage worker adds and removes against the
+context's working cluster snapshot, and freezes the staged plan
+into a ``Solution`` via ``ctx.into_solution()``.
 
-The per-cycle pipeline integration with real slot signals (used /
-empty slots from ``ActorPool``, input queue depth from upstream
-queue) requires injecting that data through the ``ProblemState``
-boundary; today ``ProblemState`` carries only stage names, worker
-groups, slot counts, and the ``is_finished`` flag. Until the signal
-injection lands, ``autoscale()`` returns a no-op ``Solution`` per
-stage (no worker adds, no removals; existing slot counts preserved)
-so the dispatcher works end-to-end without crashing.
+The current implementation stages no decisions: the resulting
+``Solution`` carries one ``StageSolution`` per stage with the
+existing ``slots_per_worker`` and empty add / delete lists -- a
+no-op plan that preserves the cluster shape end-to-end through
+the full Rust planner lifecycle. Per-stage decision logic
+(manual scale up / down, floor enforcement, saturation-driven
+scale up, scale-down) is added in subsequent iterations.
 """
 
 from cosmos_xenna.pipelines.private import data_structures
@@ -123,12 +125,14 @@ class SaturationAwareScheduler:
     ) -> data_structures.Solution:
         """Compute the autoscale plan for the current cycle.
 
-        Walks each stage in ``problem_state`` and emits one
-        ``StageSolution`` per stage carrying the existing
-        ``slots_per_worker`` and empty add / delete lists. The result
-        is a no-op ``Solution`` that preserves the current cluster
-        shape; callers (``Autoscaler.apply_autoscale_result_if_ready``)
-        see no scaling work to apply.
+        Builds a fresh ``AutoscalePlanContext`` from ``self._problem``
+        and ``problem_state``, then freezes the staged plan into a
+        ``Solution`` via ``ctx.into_solution()``. The current
+        implementation stages no worker adds or removes, so the
+        resulting ``Solution`` is a no-op that preserves the cluster
+        shape -- one ``StageSolution`` per stage with the existing
+        ``slots_per_worker`` and empty ``new_workers`` /
+        ``deleted_workers`` lists.
 
         Args:
             time: Current wall-clock time in seconds.
@@ -142,10 +146,25 @@ class SaturationAwareScheduler:
             ``deleted_workers`` lists and the existing
             ``slots_per_worker``.
 
+        Raises:
+            RuntimeError: If ``setup()`` was not called before
+                ``autoscale()`` -- the dispatcher in ``streaming.py``
+                always calls ``setup()`` first; this guard catches
+                misuse from tests or future call sites that bypass
+                the dispatcher. Also propagated from
+                ``AutoscalePlanContext.from_problem_state`` if the
+                seeded planner cannot allocate an existing worker
+                against the cluster snapshot (corrupted state).
+            ValueError: Propagated from
+                ``AutoscalePlanContext.from_problem_state`` if
+                ``problem`` and ``problem_state`` disagree on the
+                stage count or stage names.
+
         """
         del time
-        stages = [
-            data_structures.StageSolution.make(slots_per_worker=stage.slots_per_worker)
-            for stage in problem_state.rust.stages
-        ]
-        return data_structures.Solution.make(stages=stages)
+        if self._problem is None:
+            msg = "SaturationAwareScheduler.autoscale() called before setup()"
+            raise RuntimeError(msg)
+
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(self._problem, problem_state)
+        return ctx.into_solution()

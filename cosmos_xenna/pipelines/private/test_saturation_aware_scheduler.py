@@ -30,6 +30,8 @@ Tests use real ``Problem`` and ``ProblemState`` objects (not mocks)
 so the Python -> Rust round-trips are exercised end-to-end.
 """
 
+import pytest
+
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
@@ -65,15 +67,27 @@ def _problem_with_stages(stage_names: list[str]) -> data_structures.Problem:
 def _problem_state(stage_specs: list[tuple[str, int, int]]) -> data_structures.ProblemState:
     """Build a real ``ProblemState``.
 
+    Each worker carries a single 1-CPU allocation on ``node-0`` so the
+    snapshot is consistent with the 8-CPU cluster from
+    :func:`_cluster` and ``AutoscalePlanContext.from_problem_state``
+    can seed the per-worker allocations without failing the
+    consistency check that rejects empty-resource workers.
+
     Args:
         stage_specs: list of (stage_name, num_workers, slots_per_worker).
             For each entry, constructs a ``ProblemStageState`` carrying
-            the requested number of empty worker groups (one
-            ``ProblemWorkerGroupState`` per worker, no resources).
+            ``num_workers`` worker groups each consuming 1 CPU on
+            ``node-0``.
     """
     states = []
     for name, num_workers, slots in stage_specs:
-        worker_groups = [data_structures.ProblemWorkerGroupState.make(f"{name}-w{i}", []) for i in range(num_workers)]
+        worker_groups = [
+            data_structures.ProblemWorkerGroupState.make(
+                f"{name}-w{i}",
+                [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+            )
+            for i in range(num_workers)
+        ]
         states.append(
             data_structures.ProblemStageState(
                 stage_name=name,
@@ -265,8 +279,9 @@ class TestAutoscaleEdgeCases:
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A", "B"]))
         # Build ProblemState manually so we can flip is_finished on the second stage.
-        worker_a = data_structures.ProblemWorkerGroupState.make("a-w0", [])
-        worker_b = data_structures.ProblemWorkerGroupState.make("b-w0", [])
+        cpu = [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])]
+        worker_a = data_structures.ProblemWorkerGroupState.make("a-w0", cpu)
+        worker_b = data_structures.ProblemWorkerGroupState.make("b-w0", cpu)
         ps = data_structures.ProblemState(
             [
                 data_structures.ProblemStageState(
@@ -313,3 +328,61 @@ class TestUpdateWithMeasurementsIsNoOp:
         scheduler.update_with_measurements(time=0.0, measurements=empty_measurements)
         # Same dict, same values -- nothing was mutated.
         assert scheduler._stage_states == snapshot_before
+
+
+class TestAutoscalePlanContextLifecycle:
+    """``autoscale()`` builds and drains an ``AutoscalePlanContext`` per cycle.
+
+    Pins the contract that the no-op ``Solution`` flows through the
+    full Rust planner lifecycle (``from_problem_state`` ->
+    ``into_solution``) instead of being constructed directly from
+    per-stage ``slots_per_worker`` values. Subsequent decision logic
+    will stage worker adds and removes against this context; this
+    test class pins the boundary behaviour that logic will build on.
+    """
+
+    def test_autoscale_seeds_existing_workers_into_the_context_cluster(self) -> None:
+        """Existing workers must be allocated against the context's cluster.
+
+        The 8-CPU cluster from :func:`_cluster` plus 5 1-CPU workers
+        across two stages is well below capacity. If the context's
+        seed step did not actually consume cluster capacity, a future
+        phase that called ``ctx.try_add_worker`` could over-commit
+        the cluster. This test exercises seeding for several worker
+        counts to pin that the constructor accepts the snapshot.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+        solution = scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 4, 2), ("B", 1, 1)]),
+        )
+        # Sanity: 5 1-CPU workers fit in the 8-CPU cluster; the
+        # constructor would have raised if the seed allocations did
+        # not match the cluster shape.
+        assert [s.slots_per_worker for s in solution.stages] == [2, 1]
+
+    def test_autoscale_raises_when_called_before_setup(self) -> None:
+        """Defensive guard: ``autoscale()`` requires a prior ``setup()`` call."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        with pytest.raises(RuntimeError, match="setup"):
+            scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 1)]))
+
+    def test_autoscale_constructs_a_fresh_context_per_cycle(self) -> None:
+        """Each cycle owns its own context; no state bleeds between calls.
+
+        ``AutoscalePlanContext`` is single-shot: ``into_solution`` drains
+        it and the read-only accessors stay valid afterwards. Three
+        consecutive cycles with the same ``problem_state`` must
+        produce three Solutions whose shape matches the input -- if
+        a stale context were reused, the second cycle's seeding would
+        attempt to re-allocate cluster capacity that the first call
+        already consumed and the constructor would raise.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+        ps = _problem_state([("A", 2, 4), ("B", 1, 1)])
+        for _ in range(3):
+            solution = scheduler.autoscale(time=0.0, problem_state=ps)
+            assert [s.slots_per_worker for s in solution.stages] == [4, 1]
+            assert all(s.new_workers == [] and s.deleted_workers == [] for s in solution.stages)
