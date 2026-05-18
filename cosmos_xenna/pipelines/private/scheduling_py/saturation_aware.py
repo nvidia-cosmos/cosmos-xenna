@@ -41,6 +41,13 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.regime import (
+    Regime,
+    RegimeDetectorState,
+    RegimeSignal,
+    compute_regime_signal,
+    update_regime_state,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
@@ -66,6 +73,11 @@ class SaturationAwareScheduler:
             per-stage pipeline.
         _stage_names: Stage names in pipeline (DAG) order, captured at
             ``setup()``. Used to iterate stages deterministically.
+        _regime_state: Cross-cycle hysteresis state for the
+            Halfin-Whitt regime detector. Used to lift the effective
+            ``saturation_aggressiveness`` when the cluster is packed
+            close to capacity. Defaults to ``SUB_HALFIN_WHITT`` so
+            cold-start cycles use the base aggressiveness.
 
     """
 
@@ -82,6 +94,7 @@ class SaturationAwareScheduler:
         self._problem: data_structures.Problem | None = None
         self._stage_states: dict[str, _StageRuntimeState] = {}
         self._stage_names: list[str] = []
+        self._regime_state: RegimeDetectorState = RegimeDetectorState()
 
     def setup(self, problem: data_structures.Problem) -> None:
         """Capture the pipeline shape and seed empty per-stage state.
@@ -102,10 +115,14 @@ class SaturationAwareScheduler:
 
         Reads ``slots_per_worker`` from each stage's runtime
         ``ProblemStageState`` (the M/M/c concurrency), feeds it to the
-        resolver, stores the result on ``_StageRuntimeState``, and
-        emits one INFO log line per stage. Stages whose
-        ``resolved_thresholds`` is already populated short-circuit;
-        mid-run ``slots_per_worker`` changes do not re-resolve.
+        resolver with the regime-aware effective aggressiveness, stores
+        the result on ``_StageRuntimeState``, and emits one INFO log
+        line per stage. Stages whose ``resolved_thresholds`` is already
+        populated short-circuit; mid-run ``slots_per_worker`` changes
+        do not re-resolve. A regime transition (handled by
+        ``_update_regime_aware_aggressiveness``) drops every stage's
+        resolved thresholds so this method re-derives them with the
+        new effective aggressiveness on the same cycle.
 
         Raises:
             ValueError: If ``problem_state`` carries a stage name not
@@ -127,9 +144,40 @@ class SaturationAwareScheduler:
                 stage_name=stage.stage_name,
                 spec_override=None,
             )
-            resolved = _resolve_auto_thresholds(stage_cfg, slots_per_actor=stage.slots_per_worker)
+            effective_aggressiveness = self._effective_aggressiveness(stage_cfg.saturation_aggressiveness)
+            resolved = _resolve_auto_thresholds(
+                stage_cfg,
+                slots_per_actor=stage.slots_per_worker,
+                aggressiveness_override=effective_aggressiveness,
+            )
             runtime.resolved_thresholds = resolved
             self._log_resolved_thresholds(stage.stage_name, stage_cfg, resolved)
+
+    def _effective_aggressiveness(self, base: float) -> float:
+        """Apply the super-Halfin-Whitt lift to the base aggressiveness if active.
+
+        Returns ``base`` unchanged when the cluster is in the
+        sub-Halfin-Whitt regime or when the regime-aware lift is
+        disabled. Returns ``base + super_halfin_whitt_aggressiveness_lift``
+        when the cluster is in super-Halfin-Whitt and the lift is
+        enabled.
+
+        """
+        if not self._config.enable_regime_aware_aggressiveness:
+            return base
+        if self._regime_state.current_regime is Regime.SUPER_HALFIN_WHITT:
+            return base + self._config.super_halfin_whitt_aggressiveness_lift
+        return base
+
+    @staticmethod
+    def _log_regime_transition(new_regime: Regime, signal: RegimeSignal) -> None:
+        """Emit one INFO line per regime transition."""
+        logger.info(
+            f"scheduler regime transition: -> {new_regime.value} "
+            f"(total_workers={signal.total_workers}, "
+            f"cluster_idle_fraction={signal.cluster_idle_fraction:.4f}, "
+            f"threshold={signal.threshold:.4f})"
+        )
 
     @staticmethod
     def _log_resolved_thresholds(
@@ -199,6 +247,63 @@ class SaturationAwareScheduler:
             msg = "SaturationAwareScheduler.autoscale() called before setup()"
             raise RuntimeError(msg)
 
+        self._update_regime_aware_aggressiveness(problem_state)
         self._ensure_thresholds_resolved(problem_state)
         ctx = data_structures.AutoscalePlanContext.from_problem_state(self._problem, problem_state)
         return ctx.into_solution()
+
+    def _update_regime_aware_aggressiveness(self, problem_state: data_structures.ProblemState) -> None:
+        """Detect the cluster's Halfin-Whitt regime and re-resolve thresholds on transition.
+
+        Computes the per-cycle regime signal, applies hysteresis via
+        ``update_regime_state``, and -- on a regime transition -- drops
+        every stage's ``resolved_thresholds`` so the next call to
+        ``_ensure_thresholds_resolved`` re-derives them with the
+        appropriate effective aggressiveness. Cycles whose signal is
+        unavailable (no stage populates ``num_used_slots`` /
+        ``num_empty_slots`` yet) leave the regime state and resolved
+        thresholds untouched. Respects the
+        ``enable_regime_aware_aggressiveness`` flag.
+
+        """
+        if not self._config.enable_regime_aware_aggressiveness:
+            return
+
+        signal = _aggregate_cluster_regime_signal(problem_state)
+        transitioned = update_regime_state(
+            self._regime_state,
+            signal,
+            streak_cycles=self._config.regime_transition_streak_cycles,
+            exit_band_multiplier=1.5,
+        )
+        if not transitioned:
+            return
+
+        self._log_regime_transition(self._regime_state.current_regime, signal)
+        for runtime in self._stage_states.values():
+            runtime.resolved_thresholds = None
+
+
+def _aggregate_cluster_regime_signal(problem_state: data_structures.ProblemState) -> RegimeSignal:
+    """Aggregate the cluster's regime-detection inputs from per-stage state.
+
+    Sums worker counts, used slots, and empty slots across every stage
+    in ``problem_state``, then delegates to ``compute_regime_signal``.
+    Production wiring of ``num_used_slots`` / ``num_empty_slots`` on
+    ``ProblemStageState`` is the trigger that flips
+    ``signal_available`` from ``False`` to ``True``; until that wiring
+    lands the regime detector observes the no-signal default and
+    leaves the regime state untouched.
+    """
+    total_workers = 0
+    total_used = 0
+    total_empty = 0
+    for stage in problem_state.rust.stages:
+        total_workers += len(stage.worker_groups)
+        total_used += stage.num_used_slots
+        total_empty += stage.num_empty_slots
+    return compute_regime_signal(
+        total_workers=total_workers,
+        total_used_slots=total_used,
+        total_empty_slots=total_empty,
+    )

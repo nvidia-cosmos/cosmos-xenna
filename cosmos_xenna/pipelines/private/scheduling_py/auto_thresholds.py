@@ -89,6 +89,8 @@ class ResolvedThresholds:
 def _resolve_auto_thresholds(
     stage_cfg: SaturationAwareStageConfig,
     slots_per_actor: int,
+    *,
+    aggressiveness_override: float | None = None,
 ) -> ResolvedThresholds:
     """Resolve the classifier thresholds for one stage.
 
@@ -100,6 +102,11 @@ def _resolve_auto_thresholds(
         stage_cfg: Per-stage configuration.
         slots_per_actor: M/M/c slot count for the stage. Must be
             ``>= 1``.
+        aggressiveness_override: Effective ``K`` to use in place of
+            ``stage_cfg.saturation_aggressiveness`` for the formula.
+            ``None`` (the default) uses the config value. Callers that
+            apply runtime adjustments (e.g. a regime-aware lift) pass
+            the adjusted value here without mutating the config.
 
     Returns:
         Resolved thresholds plus the provenance needed to log them.
@@ -114,12 +121,16 @@ def _resolve_auto_thresholds(
         msg = f"slots_per_actor must be >= 1, got {slots_per_actor}"
         raise ValueError(msg)
 
+    aggressiveness = (
+        aggressiveness_override if aggressiveness_override is not None else stage_cfg.saturation_aggressiveness
+    )
+
     pinned_saturation = stage_cfg.saturation_threshold
     if pinned_saturation is not None:
         saturation = pinned_saturation
         saturation_was_overridden = True
     else:
-        raw = stage_cfg.saturation_aggressiveness / math.sqrt(slots_per_actor)
+        raw = aggressiveness / math.sqrt(slots_per_actor)
         saturation = max(stage_cfg.auto_threshold_min, min(raw, stage_cfg.auto_threshold_max))
         saturation_was_overridden = False
 
@@ -146,7 +157,7 @@ def _resolve_auto_thresholds(
     return ResolvedThresholds(
         saturation_threshold=saturation,
         activation_threshold=activation,
-        saturation_aggressiveness=stage_cfg.saturation_aggressiveness,
+        saturation_aggressiveness=aggressiveness,
         slots_per_actor=slots_per_actor,
         saturation_threshold_was_overridden=saturation_was_overridden,
         activation_threshold_was_overridden=activation_was_overridden,

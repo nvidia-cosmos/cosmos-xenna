@@ -705,10 +705,32 @@ class SaturationAwareConfig:
     ``docs/curator/scheduler-tuning.md``.
     """
 
-    # --- Cycle (cluster-wide) ---
     # Cycle period for the autoscaler control loop, in seconds. Effective
     # response time is ``interval_s * streak_min_cycles``.
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
+
+    # When True, detect the cluster's Halfin-Whitt regime per cycle and lift
+    # ``saturation_aggressiveness`` by ``super_halfin_whitt_aggressiveness_lift``
+    # whenever the cluster sits in the super-Halfin-Whitt regime.
+    #  The lift makes scale-up faster without changing scale-down.
+    # Set False to pin the aggressiveness at its base value -
+    # useful for diagnosis or queueing-theory-purity A/B comparisons.
+    enable_regime_aware_aggressiveness: bool = True
+    # Additive lift applied to ``saturation_aggressiveness`` when the
+    # cluster is in super-Halfin-Whitt. Default 0.15 shifts the canonical
+    # 0.30 base to 0.45 (the auto-derived ``saturation_threshold``
+    # increases proportionally, so the classifier fires SATURATED earlier
+    # in the empty-slot ratio band). Range ``[0.0, 0.5]``; setting to 0.0
+    # has the same effect as ``enable_regime_aware_aggressiveness=False``.
+    super_halfin_whitt_aggressiveness_lift: float = attrs.field(
+        default=0.15,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(0.5)),
+    )
+    # Consecutive cycles required to commit a regime transition (in either
+    # direction). Hysteresis prevents a noisy ``cluster_idle_fraction``
+    # oscillating around the regime threshold from flapping the effective
+    # aggressiveness.
+    regime_transition_streak_cycles: int = attrs.field(default=3, validator=attrs_utils.validate_positive_int)
 
     # --- DAG priority + cross-stage donor (cluster-wide) ---
     # When True, growth attempts are sorted by DAG depth descending

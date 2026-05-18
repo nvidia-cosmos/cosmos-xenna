@@ -33,6 +33,7 @@ so the Python -> Rust round-trips are exercised end-to-end.
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
+from cosmos_xenna.pipelines.private.scheduling_py.regime import Regime
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
@@ -65,7 +66,7 @@ def _problem_with_stages(stage_names: list[str]) -> data_structures.Problem:
 
 
 def _problem_state(stage_specs: list[tuple[str, int, int]]) -> data_structures.ProblemState:
-    """Build a real ``ProblemState``.
+    """Build a real ``ProblemState`` with no slot-signal population.
 
     Each worker carries a single 1-CPU allocation on ``node-0`` so the
     snapshot is consistent with the 8-CPU cluster from
@@ -75,9 +76,6 @@ def _problem_state(stage_specs: list[tuple[str, int, int]]) -> data_structures.P
 
     Args:
         stage_specs: list of (stage_name, num_workers, slots_per_worker).
-            For each entry, constructs a ``ProblemStageState`` carrying
-            ``num_workers`` worker groups each consuming 1 CPU on
-            ``node-0``.
     """
     states = []
     for name, num_workers, slots in stage_specs:
@@ -94,6 +92,39 @@ def _problem_state(stage_specs: list[tuple[str, int, int]]) -> data_structures.P
                 workers=worker_groups,
                 slots_per_worker=slots,
                 is_finished=False,
+            )
+        )
+    return data_structures.ProblemState(states)
+
+
+def _problem_state_with_slot_signals(
+    stage_specs: list[tuple[str, int, int, int, int]],
+) -> data_structures.ProblemState:
+    """Build a ``ProblemState`` whose stages populate ``num_used_slots`` / ``num_empty_slots``.
+
+    Args:
+        stage_specs: list of (stage_name, num_workers, slots_per_worker,
+            num_used_slots, num_empty_slots). Used by the regime-aware
+            integration tests; the regime detector reads the slot
+            signals to compute the cluster-wide idle fraction.
+    """
+    states = []
+    for name, num_workers, slots, used, empty in stage_specs:
+        worker_groups = [
+            data_structures.ProblemWorkerGroupState.make(
+                f"{name}-w{i}",
+                [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+            )
+            for i in range(num_workers)
+        ]
+        states.append(
+            data_structures.ProblemStageState(
+                stage_name=name,
+                workers=worker_groups,
+                slots_per_worker=slots,
+                is_finished=False,
+                num_used_slots=used,
+                num_empty_slots=empty,
             )
         )
     return data_structures.ProblemState(states)
@@ -448,3 +479,92 @@ class TestThresholdResolutionTiming:
         second_resolved = scheduler._stage_states["A"].resolved_thresholds
         assert second_resolved is first_resolved
         assert second_resolved.slots_per_actor == 8
+
+
+class TestRegimeAwareAggressiveness:
+    """Cluster-wide Halfin-Whitt regime detection drives the per-cycle aggressiveness lift.
+
+    Pin the per-cycle regime evaluation, the asymmetric hysteresis on
+    transitions, the lifted-aggressiveness re-resolve on a transition,
+    the disable flag, and the no-signal defensive guard so a future
+    tweak surfaces as a precise failure.
+    """
+
+    def test_no_slot_signals_keeps_state_in_sub_hw(self) -> None:
+        """Production cycles without slot signals leave the regime in sub-HW."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # `_problem_state` does NOT populate num_used_slots / num_empty_slots.
+        for _ in range(5):
+            scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 4, 8)]))
+        assert scheduler._regime_state.current_regime is Regime.SUB_HALFIN_WHITT
+        # Stage thresholds resolved with base aggressiveness 0.30.
+        resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert resolved is not None
+        assert resolved.saturation_aggressiveness == pytest.approx(0.30)
+
+    def test_sustained_busy_signal_transitions_to_super_hw_after_streak(self) -> None:
+        """Three consecutive busy cycles commit the regime transition."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # 4 workers, each carrying 8 slots, 31 used / 1 empty -> idle ~ 0.031.
+        # threshold = 1/sqrt(4) = 0.50 -> 0.031 < 0.50 -> super-HW raw verdict.
+        ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
+        for _ in range(3):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+        assert scheduler._regime_state.current_regime is Regime.SUPER_HALFIN_WHITT
+
+    def test_super_hw_transition_relifts_aggressiveness(self) -> None:
+        """A transition into super-HW re-resolves thresholds with base + lift."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
+        for _ in range(3):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+        resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert resolved is not None
+        # Base 0.30 + lift 0.15 = 0.45.
+        assert resolved.saturation_aggressiveness == pytest.approx(0.45)
+
+    def test_oscillation_around_threshold_does_not_flap_regime(self) -> None:
+        """Cluster idle oscillating across the boundary holds sub-HW (streak resets)."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # 4 workers, 8 slots/worker -> 32 total slots; threshold = 1/sqrt(4) = 0.50.
+        below = _problem_state_with_slot_signals([("A", 4, 8, 19, 13)])  # idle ~ 0.41 < 0.50
+        above = _problem_state_with_slot_signals([("A", 4, 8, 14, 18)])  # idle ~ 0.56 >= 0.50
+        # Two busy cycles, one idle, repeat: streak never reaches 3.
+        for ps in (below, below, above, below, below, above):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+        assert scheduler._regime_state.current_regime is Regime.SUB_HALFIN_WHITT
+
+    def test_disabled_flag_pins_aggressiveness_at_base(self) -> None:
+        """``enable_regime_aware_aggressiveness=False`` skips regime tracking entirely."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig(enable_regime_aware_aggressiveness=False))
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
+        for _ in range(10):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+        # Regime state stays at default (sub-HW); thresholds resolved at base.
+        assert scheduler._regime_state.current_regime is Regime.SUB_HALFIN_WHITT
+        resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert resolved is not None
+        assert resolved.saturation_aggressiveness == pytest.approx(0.30)
+
+    def test_super_hw_exit_re_resolves_with_base_aggressiveness(self) -> None:
+        """Transitioning back to sub-HW re-resolves with the base aggressiveness."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # Enter super-HW.
+        busy = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
+        for _ in range(3):
+            scheduler.autoscale(time=0.0, problem_state=busy)
+        assert scheduler._regime_state.current_regime is Regime.SUPER_HALFIN_WHITT
+        # threshold = 1/sqrt(4) = 0.50; exit band = 0.75. Use idle = 0.84.
+        idle = _problem_state_with_slot_signals([("A", 4, 8, 5, 27)])
+        for _ in range(3):
+            scheduler.autoscale(time=0.0, problem_state=idle)
+        assert scheduler._regime_state.current_regime is Regime.SUB_HALFIN_WHITT
+        resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert resolved is not None
+        assert resolved.saturation_aggressiveness == pytest.approx(0.30)
