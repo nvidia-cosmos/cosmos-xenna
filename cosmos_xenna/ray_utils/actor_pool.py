@@ -509,6 +509,12 @@ class _WorkerGroup:
     actors: set[str]
     state: _WorkerGroupState
     rendevous_params: resources.NcclRendevousParams | None
+    # Wall-clock time (``time.time()``) when the worker group most recently
+    # transitioned into ``_WorkerGroupState.READY``. ``None`` while still in
+    # setup. Consumed by ``ActorPool.is_worker_group_ready`` to implement the
+    # post-Ready scale-down grace period (see
+    # ``StreamingSpecificSpec.scale_down_grace_after_ready_s``).
+    ready_at: float | None = None
 
     @property
     def id_(self) -> str:
@@ -843,6 +849,39 @@ class ActorPool(Generic[T, V]):
 
     def add_actor_to_create(self, worker: resources.WorkerGroup) -> None:
         self._worker_groups_to_create.append(worker)
+
+    def is_worker_group_ready(self, worker_group_id: str, min_age_s: float = 0.0) -> bool:
+        """Return True iff the group is Ready *and* has been Ready for ``min_age_s``.
+
+        Used by the autoscaler-application path to defer scale-down of
+        worker groups that are still in setup or that just finished setup.
+        Killing a pending actor aborts an in-progress, expensive setup
+        (e.g. vLLM model load and ``torch.compile``) and risks leaking
+        GPU memory because ``EngineCore`` subprocesses get SIGKILLed
+        mid-init when their SIGTERM grace expires.
+
+        The ``min_age_s`` parameter extends that protection for a short
+        window after the group transitions to Ready, preventing the
+        "spin up, finish setup, get torn down next tick" thrash pattern.
+        A value of ``0.0`` requests no post-Ready grace; the predicate
+        then degenerates to "is the group Ready?".
+
+        Returns ``False`` for unknown worker group ids so callers can
+        treat "not ready" and "not present" identically -- both mean
+        "not safe to scale down right now".
+        """
+        wg = self._worker_groups.get(worker_group_id)
+        if wg is None or wg.state != _WorkerGroupState.READY:
+            return False
+        if min_age_s <= 0.0:
+            return True
+        # ``ready_at`` is set atomically with the state transition in
+        # ``_move_worker_group_to_ready_if_all_actors_ready``; guard against
+        # ``None`` defensively in case a future code path mutates state
+        # without updating the timestamp.
+        if wg.ready_at is None:
+            return True
+        return (time.time() - wg.ready_at) >= min_age_s
 
     def set_num_slots_per_actor(self, target: int) -> None:
         if target < self._slots_per_actor:
@@ -1182,6 +1221,7 @@ class ActorPool(Generic[T, V]):
         if all(actor_id in self._ready_actors for actor_id in worker_group.actors):
             logger.debug(f"Moving worker group {worker_group_id} to ready state.")
             worker_group.state = _WorkerGroupState.READY
+            worker_group.ready_at = time.time()
 
     def _move_pending_actors_to_ready(self) -> None:
         """Checks for completed setup calls and transitions actors from pending to ready."""

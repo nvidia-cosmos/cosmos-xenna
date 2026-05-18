@@ -405,6 +405,22 @@ class StreamingSpecificSpec:
     # starvation pattern where source completion triggers aggressive CPU-stage scale-down before
     # queued work has drained.
     enable_backlog_aware_scaledown: bool = False
+    # Grace period applied to *newly Ready* worker groups before the autoscaler is
+    # allowed to delete them. Worker groups still in setup are always protected
+    # (independent of this value); the grace extends that protection for a short
+    # window after they reach Ready.
+    #
+    # The motivation is preventing the "thrash" pattern where the Rust autoscaler
+    # spins up a worker, the worker finishes an expensive setup (e.g. vLLM model
+    # load + ``torch.compile`` for a large LLM, ~60-90 s), and the *very next*
+    # autoscaler tick decides the queue is momentarily empty and tears the worker
+    # down. The setup cost is then wasted and, for GPU stages, the SIGKILL-on-
+    # destroy fallback raises the risk of orphaned CUDA contexts.
+    #
+    # Set to ``0.0`` to disable the post-Ready grace (pending-actor protection
+    # still applies). End-of-stage teardown bypasses the grace via the
+    # ``stages_is_dones`` flag so final drain is never delayed.
+    scale_down_grace_after_ready_s: float = 60.0
 
 
 @attrs.define
