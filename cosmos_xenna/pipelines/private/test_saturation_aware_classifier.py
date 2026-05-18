@@ -17,10 +17,10 @@
 
 Each test pins exactly one zone or one hysteresis edge so a future
 threshold tweak surfaces as a precise test failure instead of a
-vague regression. Default-configured ``SaturationAwareStageConfig``
-is used unless the test explicitly varies a knob.
+vague regression. Tests use explicit threshold overrides on the
+config so test math stays anchored to fixed numerical bounds.
 
-Default thresholds at the time of writing:
+Pinned thresholds for the test suite:
   activation_threshold = 0.05
   saturation_threshold = 0.15
   saturation_deadband_pct = 0.15  -> exit-up boundary 0.1725
@@ -37,8 +37,30 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 @pytest.fixture
 def cfg() -> SaturationAwareStageConfig:
-    """Default per-stage config; thresholds and deadbands documented above."""
-    return SaturationAwareStageConfig()
+    """Per-stage config with explicit threshold overrides for stable test math."""
+    return SaturationAwareStageConfig(saturation_threshold=0.15, activation_threshold=0.05)
+
+
+def _classify(cfg: SaturationAwareStageConfig, **kwargs: object) -> StageState:
+    """Forward to ``classify`` with thresholds taken from ``cfg`` overrides.
+
+    The fixture pins ``saturation_threshold`` and ``activation_threshold``
+    to numeric values so the type-narrowing checks here cannot fail.
+    """
+    assert cfg.saturation_threshold is not None, (
+        "_classify() requires cfg.saturation_threshold to be pinned to a numeric override; "
+        "the test fixture must use SaturationAwareStageConfig(saturation_threshold=..., "
+        "activation_threshold=...) so the helper does not have to resolve auto-derived values."
+    )
+    assert cfg.activation_threshold is not None, (
+        "_classify() requires cfg.activation_threshold to be pinned; see the suite fixture."
+    )
+    return classify(
+        saturation_threshold=cfg.saturation_threshold,
+        activation_threshold=cfg.activation_threshold,
+        config=cfg,
+        **kwargs,  # type: ignore[arg-type]
+    )
 
 
 class TestSaturatedCriticalZone:
@@ -51,11 +73,11 @@ class TestSaturatedCriticalZone:
 
     def test_zero_ratio_classifies_as_critical(self, cfg: SaturationAwareStageConfig) -> None:
         """All slots full -> ratio 0.0 -> CRITICAL."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.0,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED_CRITICAL
 
@@ -64,11 +86,11 @@ class TestSaturatedCriticalZone:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """activation_threshold is the upper bound of the CRITICAL zone."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.activation_threshold - 1e-6,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED_CRITICAL
 
@@ -77,11 +99,11 @@ class TestSaturatedCriticalZone:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """A drop straight from OVER_PROVISIONED to CRITICAL fires immediately, no deadband."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.0,
             input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
-            config=cfg,
         )
         assert result is StageState.SATURATED_CRITICAL
 
@@ -90,11 +112,11 @@ class TestSaturatedCriticalZone:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """A SATURATED stage that drops further into CRITICAL fires immediately, not held by deadband."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.0,
             input_queue_depth=10,
             prev_state=StageState.SATURATED,
-            config=cfg,
         )
         assert result is StageState.SATURATED_CRITICAL
 
@@ -104,11 +126,11 @@ class TestSaturatedZone:
 
     def test_at_activation_classifies_as_saturated(self, cfg: SaturationAwareStageConfig) -> None:
         """Exact equality with activation_threshold puts the stage in SATURATED, not CRITICAL."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.activation_threshold,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED
 
@@ -117,11 +139,11 @@ class TestSaturatedZone:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """saturation_threshold is the upper bound of the SATURATED zone."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.saturation_threshold - 1e-6,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED
 
@@ -130,11 +152,11 @@ class TestSaturatedZone:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """Exact equality with saturation_threshold -- no hysteresis -> NORMAL."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.saturation_threshold,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -146,11 +168,11 @@ class TestSaturatedHysteresis:
         """A previously SATURATED stage stays SATURATED inside the upper deadband."""
         # Threshold is 0.15; deadband 0.15 -> exit-up boundary 0.1725.
         ratio_inside_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct / 2.0)
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
             input_queue_depth=10,
             prev_state=StageState.SATURATED,
-            config=cfg,
         )
         assert result is StageState.SATURATED
 
@@ -158,11 +180,11 @@ class TestSaturatedHysteresis:
         """Once ratio exceeds the deadband, the stage transitions out of SATURATED."""
         # Threshold is 0.15; deadband 0.15 -> exit-up boundary 0.1725.
         ratio_above_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct) + 1e-6
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_above_deadband,
             input_queue_depth=10,
             prev_state=StageState.SATURATED,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -172,11 +194,11 @@ class TestSaturatedHysteresis:
     ) -> None:
         """SATURATED_CRITICAL prev_state shares the hysteresis exit-up boundary with SATURATED."""
         ratio_inside_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct / 2.0)
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
             input_queue_depth=10,
             prev_state=StageState.SATURATED_CRITICAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED
 
@@ -191,11 +213,11 @@ class TestSaturatedHysteresis:
         result to STARVED. STARVED only fires from the upper zone.
         """
         ratio_above_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct) + 1e-6
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_above_deadband,
             input_queue_depth=0,
             prev_state=StageState.SATURATED,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -206,11 +228,11 @@ class TestNormalZone:
     def test_midband_ratio_classifies_as_normal(self, cfg: SaturationAwareStageConfig) -> None:
         """A ratio half-way between the two thresholds is unambiguously NORMAL."""
         midband = (cfg.saturation_threshold + cfg.over_provisioned_threshold) / 2.0
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=midband,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -223,11 +245,11 @@ class TestOverProvisionedAndStarvedZones:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """Free slots + work upstream pending -> can shed actors."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
 
@@ -236,11 +258,11 @@ class TestOverProvisionedAndStarvedZones:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """Free slots + empty queue -> upstream is the bottleneck (no local action)."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.STARVED
 
@@ -249,11 +271,11 @@ class TestOverProvisionedAndStarvedZones:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """ratio == 1.0 with queue -> OVER_PROVISIONED (every slot free)."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=1.0,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
 
@@ -262,11 +284,11 @@ class TestOverProvisionedAndStarvedZones:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """Boundary equality: ratio == op_threshold (no hysteresis) + queue > 0 -> OVER_PROVISIONED."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold,
             input_queue_depth=10,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
 
@@ -279,11 +301,11 @@ class TestOverProvisionedAndStarvedZones:
         Confirms the queue-disambiguation branch fires at the boundary,
         not just strictly above it.
         """
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.STARVED
 
@@ -298,22 +320,22 @@ class TestOverProvisionedHysteresis:
         """Previously OVER_PROVISIONED stage stays OVER_PROVISIONED inside the lower deadband."""
         # Threshold 0.50; deadband 0.30 -> exit-down boundary 0.35.
         ratio_inside_deadband = cfg.over_provisioned_threshold * (1.0 - cfg.over_provisioned_deadband_pct / 2.0)
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
             input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
-            config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
 
     def test_below_deadband_escapes_to_normal(self, cfg: SaturationAwareStageConfig) -> None:
         """Once ratio drops below the deadband, the stage transitions out of OVER_PROVISIONED."""
         ratio_below_deadband = cfg.over_provisioned_threshold * (1.0 - cfg.over_provisioned_deadband_pct) - 1e-6
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_below_deadband,
             input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -329,11 +351,11 @@ class TestOverProvisionedHysteresis:
         OVER_PROVISIONED.
         """
         ratio_inside_deadband = cfg.over_provisioned_threshold * (1.0 - cfg.over_provisioned_deadband_pct / 2.0)
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
             input_queue_depth=0,
             prev_state=StageState.OVER_PROVISIONED,
-            config=cfg,
         )
         assert result is StageState.STARVED
 
@@ -346,11 +368,11 @@ class TestStarvedDoesNotApplyToBusyStages:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """A stage saturated on already-pulled work shows CRITICAL, not STARVED."""
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.0,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.SATURATED_CRITICAL
 
@@ -360,11 +382,11 @@ class TestStarvedDoesNotApplyToBusyStages:
     ) -> None:
         """A NORMAL-zone stage with empty queue stays NORMAL until ratio crosses op_threshold."""
         midband = (cfg.saturation_threshold + cfg.over_provisioned_threshold) / 2.0
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=midband,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -387,11 +409,11 @@ class TestCrossZoneTransitions:
         not gate the OVER_PROVISIONED check; the upper zone is reached
         as soon as ratio crosses op_threshold from below.
         """
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.80,
             input_queue_depth=10,
             prev_state=StageState.SATURATED,
-            config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
 
@@ -405,11 +427,11 @@ class TestCrossZoneTransitions:
         gate the SATURATED check; the lower zone is reached as soon as
         ratio crosses saturation_threshold from above.
         """
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.10,
             input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
-            config=cfg,
         )
         assert result is StageState.SATURATED
 
@@ -423,11 +445,11 @@ class TestCrossZoneTransitions:
         op_boundary on exit because STARVED is a transient
         upstream-bottleneck state, not a scaled-out state.
         """
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold - 1e-6,
             input_queue_depth=10,
             prev_state=StageState.STARVED,
-            config=cfg,
         )
         assert result is StageState.NORMAL
 
@@ -440,10 +462,10 @@ class TestCrossZoneTransitions:
         Ensures the STARVED -> SATURATED edge does not get held by
         any spurious hysteresis path.
         """
-        result = classify(
+        result = _classify(
+            cfg,
             slots_empty_ratio_ewma=0.10,
             input_queue_depth=10,
             prev_state=StageState.STARVED,
-            config=cfg,
         )
         assert result is StageState.SATURATED

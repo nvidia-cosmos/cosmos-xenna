@@ -15,58 +15,17 @@
 
 """Per-stage decision pipeline -- composes every primitive each cycle.
 
-``run_per_stage_pipeline`` is the single entry point the scheduler's
-main loop invokes for each stage. It consumes raw signals from the
-stage's ``ProblemStageState`` snapshot, mutates the stage's
-``_StageRuntimeState`` in place to reflect the cycle's outcome, and
-returns the unclamped per-cycle delta.
+Per-cycle flow::
 
-Pipeline order::
-
-    raw stage snapshot
-    (used_slots, empty_slots, input_queue_depth, current_workers)
-          |
-          v
-    +------------------------------------------------------------+
-    | resolve classifier signal                                  |
-    |                                                            |
-    |   live slots:              compute ratio -> update EWMA     |
-    |   zero actors + old EWMA:  carry forward last valid EWMA    |
-    |   zero actors + no EWMA:   no classifier input this cycle   |
-    +------------------------------------------------------------+
-          |                                      |
-          | classifier input                     | no classifier input
-          v                                      v
-    +-------------------------+          +----------------------------+
-    | classify                |          | tick growth mode with       |
-    | update classifier_streak|          | delta=0, return 0           |
-    | should_fire_action      |          +----------------------------+
-    +-------------------------+
-          |
-          v
-    +------------------------------------------------------------+
-    | compute intent delta                                       |
-    |                                                            |
-    |   fire gate closed -> 0                                    |
-    |   SATURATED / CRITICAL -> scale-up intent                  |
-    |   OVER_PROVISIONED -> scale-down intent                    |
-    |   NORMAL / STARVED -> 0                                    |
-    +------------------------------------------------------------+
-          |
-          v
-    +------------------------------------------------------------+
-    | update growth mode using the returned intent delta          |
-    | ACQUIRING / TRACKING / HOLD state is mutated in place       |
-    +------------------------------------------------------------+
-          |
-          v
-    return intent delta
+    snapshot -> resolve classifier signal -> classify -> update streak
+             -> fire-gate -> compute intent delta -> update growth mode
+             -> return delta
 
 The returned delta is the algorithm's intent. Cluster-wide
 feasibility (per-stage min/max, per-node caps, capacity, memory
 pressure gate) is applied by the scheduler's main loop after this
-function returns, so the growth-mode transition observes the intent
-delta produced here.
+function returns, so the growth-mode transition observes the
+unclamped intent delta produced here.
 """
 
 from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
@@ -95,27 +54,37 @@ def run_per_stage_pipeline(
 ) -> int:
     """Run the per-cycle decision pipeline for one stage.
 
-    Composes ratio -> EWMA -> classify -> streak -> fire-gate ->
-    delta -> growth-mode-transition. Mutates ``stage_state`` in
-    place; returns the unclamped per-cycle delta.
+    Mutates ``stage_state`` in place; returns the unclamped delta.
 
     Args:
-        stage_state: Per-stage runtime state. Mutated in place to
-            reflect this cycle's outcome.
-        num_used_slots: Slots currently occupied by in-flight tasks.
+        stage_state: Per-stage runtime state. Mutated in place.
+        num_used_slots: Slots currently occupied.
         num_empty_slots: Slots currently free.
         input_queue_depth: Tasks waiting upstream of this stage.
-        current_workers: Worker count for the stage at the start of
-            this cycle. Used as the base for multiplicative growth
-            and for the scale-down fraction.
+        current_workers: Worker count at cycle start.
         config: Per-stage configuration.
 
     Returns:
-        Signed integer: positive to add workers, negative to remove,
-        zero for no action (NORMAL/STARVED, fire-gate not reached,
-        or zero-actor cold-start with no carry-forward).
+        Signed delta: positive to add, negative to remove, zero for
+        no action.
+
+    Raises:
+        RuntimeError: If ``stage_state.resolved_thresholds`` is
+            ``None`` (the scheduler's first ``autoscale()`` cycle
+            populates it; tests that build state directly must call
+            ``_resolve_auto_thresholds`` first).
 
     """
+    if stage_state.resolved_thresholds is None:
+        msg = (
+            f"_StageRuntimeState for stage {stage_state.stage_name!r} has no "
+            "resolved_thresholds; SaturationAwareScheduler._ensure_thresholds_resolved "
+            "(invoked at the top of autoscale()) is the only legitimate populator. "
+            "Tests that construct _StageRuntimeState directly must populate "
+            "resolved_thresholds via _resolve_auto_thresholds(...) at fixture time."
+        )
+        raise RuntimeError(msg)
+
     classifier_input = _resolve_classifier_signal(
         stage_state=stage_state,
         num_used_slots=num_used_slots,
@@ -139,6 +108,8 @@ def run_per_stage_pipeline(
         slots_empty_ratio_ewma=classifier_input,
         input_queue_depth=input_queue_depth,
         prev_state=stage_state.classifier_state,
+        saturation_threshold=stage_state.resolved_thresholds.saturation_threshold,
+        activation_threshold=stage_state.resolved_thresholds.activation_threshold,
         config=config,
     )
     stage_state.classifier_streak = update_streak(
@@ -177,21 +148,11 @@ def _resolve_classifier_signal(
 ) -> float | None:
     """Determine the EWMA value the classifier reads this cycle.
 
-    Three cases:
-
-      1. Live signal (``num_used_slots + num_empty_slots > 0``):
-         compute the raw ratio, update the EWMA, refresh the
-         carry-forward field.
-      2. Zero ready actors with a prior valid EWMA: hold the EWMA
-         steady (no new sample) and reuse the carry-forward value
-         for the classifier so a transient zero-actor moment does
-         not flip the classification.
-      3. Zero ready actors with no prior signal (cold start):
-         return ``None`` to signal the caller that the classifier
-         must be skipped this cycle.
-
     Returns:
-        The classifier-input EWMA value, or ``None`` for case 3.
+        Live signal -> updated EWMA. Zero ready actors with a prior
+        valid EWMA -> the carry-forward value (no new sample).
+        Cold-start with no prior signal -> ``None`` (caller skips
+        the classifier this cycle).
 
     """
     total_slots = num_used_slots + num_empty_slots

@@ -28,6 +28,7 @@ multi-cycle traces produce the expected sequence of decisions.
 import attrs
 import pytest
 
+from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
@@ -35,13 +36,22 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 @pytest.fixture
 def cfg() -> SaturationAwareStageConfig:
-    """Default per-stage config; thresholds and counts as documented in the module."""
-    return SaturationAwareStageConfig()
+    """Per-stage config with explicit threshold overrides anchoring test math."""
+    return SaturationAwareStageConfig(saturation_threshold=0.15, activation_threshold=0.05)
 
 
-def _fresh_state(name: str = "TestStage") -> _StageRuntimeState:
-    """Build a freshly-constructed runtime state matching ``setup()`` initial values."""
-    return _StageRuntimeState(stage_name=name)
+def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> _StageRuntimeState:
+    """Build a runtime state with classifier thresholds pre-resolved.
+
+    Production resolves thresholds on the first ``autoscale()`` cycle;
+    tests build the state directly so they must populate
+    ``resolved_thresholds`` themselves before invoking
+    ``run_per_stage_pipeline``. The fixture pins explicit overrides
+    so the resolved pair is always 0.15 / 0.05 regardless of
+    ``slots_per_actor``.
+    """
+    resolved = _resolve_auto_thresholds(cfg, slots_per_actor=8)
+    return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
 
 
 class TestNoActionPath:
@@ -50,7 +60,7 @@ class TestNoActionPath:
     def test_normal_signal_returns_zero_and_advances_state(self, cfg: SaturationAwareStageConfig) -> None:
         """Mid-band ratio (strictly between sat=0.15 and op=0.50) -> NORMAL -> delta=0."""
         # ratio = 2 / (3 + 2) = 0.4 -- in the NORMAL band (sat 0.15 < 0.4 < op 0.50).
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
             num_used_slots=3,
@@ -77,7 +87,7 @@ class TestCriticalScaleUpPath:
 
         ACQUIRING + CRITICAL: ceil(0.5 * 4) = 2; cap=4 doesn't bite.
         """
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
             num_used_slots=4,
@@ -97,7 +107,7 @@ class TestSaturatedScaleUpPath:
 
     def test_first_cycle_saturated_does_not_fire(self, cfg: SaturationAwareStageConfig) -> None:
         """SATURATED at streak=1 < min=2 -> fire-gate fails -> delta=0."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
             num_used_slots=10,
@@ -115,7 +125,7 @@ class TestSaturatedScaleUpPath:
 
         ACQUIRING + SATURATED: ceil(0.25 * 4) = 1.
         """
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         run_per_stage_pipeline(  # cycle 1: streak goes to 1
             stage_state=state,
             num_used_slots=10,
@@ -142,7 +152,7 @@ class TestOverProvisionedShrinkPath:
 
     def test_shrink_fires_after_window_and_transitions_mode(self, cfg: SaturationAwareStageConfig) -> None:
         """30 consecutive OVER_PROVISIONED cycles -> shrink fires -> ACQUIRING flips to TRACKING."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         # Walk through 29 OVER_PROVISIONED cycles -> no fire yet.
         for _ in range(29):
             delta = run_per_stage_pipeline(
@@ -176,7 +186,7 @@ class TestStarvedPath:
 
     def test_starved_signal_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
         """Free slots + empty queue -> STARVED -> delta=0 (upstream is the bottleneck)."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
             num_used_slots=1,
@@ -194,7 +204,7 @@ class TestZeroActorsColdStart:
 
     def test_cold_start_with_zero_actors_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
         """First cycle with zero actors -> no signal -> hold; the worker-floor step bootstraps elsewhere."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
             num_used_slots=0,
@@ -222,7 +232,7 @@ class TestZeroActorsCarryForward:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """Saturated, then zero actors transient -> classifier still sees SATURATED via carry-forward."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         run_per_stage_pipeline(  # cycle 1: SATURATED, EWMA caches a low value.
             stage_state=state,
             num_used_slots=10,
@@ -254,7 +264,7 @@ class TestEwmaSmoothing:
 
     def test_ewma_converges_toward_steady_state(self, cfg: SaturationAwareStageConfig) -> None:
         """Same raw ratio fed every cycle -> EWMA monotonically approaches it."""
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         target = 0.50
         for _ in range(20):
             run_per_stage_pipeline(
@@ -288,7 +298,7 @@ class TestFullLifecycleTrace:
         warmup tax), so 30 consecutive cycles cleanly accumulate the
         streak and fire on the 30th.
         """
-        state = _fresh_state()
+        state = _fresh_state(cfg)
         # 29 cycles of OVER_PROVISIONED with streak < 30 -- no shrink yet.
         for _ in range(29):
             delta = run_per_stage_pipeline(
@@ -328,7 +338,7 @@ class TestColdStartZeroActorsDoesNotResetGrowthMode:
         """A stage parked in HOLD with zero actors must still exit to TRACKING after the window expires."""
         # Construct a state already in HOLD via attrs.evolve to skip the lifecycle.
         state = attrs.evolve(
-            _fresh_state(),
+            _fresh_state(cfg),
             growth_mode=GrowthMode.HOLD,
             growth_streak=cfg.stabilization_window_cycles_down,
             last_valid_slots_empty_ratio_ewma=None,

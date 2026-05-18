@@ -254,12 +254,10 @@ class TestAutoscaleEdgeCases:
         assert all(s.new_workers == [] and s.deleted_workers == [] for s in second.stages)
 
     def test_time_parameter_does_not_affect_no_op_output(self) -> None:
-        """Time-statelessness pin: same problem_state at any time -> same Solution shape.
+        """``autoscale()`` output is independent of the ``time`` argument today.
 
-        The no-op stub ignores ``time``. When the per-stage pipeline
-        is wired up, growth-mode timers will care about time-derived
-        cycle counts -- this test will then need to be re-scoped, and
-        the regression on no-op-stub behaviour will fire here first.
+        Same ``problem_state`` at any time produces the same Solution
+        shape because the current decision body stages no decisions.
         """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
@@ -297,12 +295,11 @@ class TestAutoscaleEdgeCases:
         assert [s.slots_per_worker for s in solution.stages] == [2, 4]
 
     def test_stage_state_map_persists_across_autoscale_cycles(self) -> None:
-        """``_stage_states`` dict is built once at setup and not recreated by autoscale.
+        """``_stage_states`` dict identity is preserved across cycles.
 
-        Pre-paving: when the per-stage pipeline mutates state (EWMA,
-        streak counters, growth mode), autoscale MUST update the
-        existing dict entries in place rather than recreate the dict.
-        Identity preservation here protects that contract.
+        ``autoscale()`` mutates the existing dict's values in place
+        rather than recreating the dict. Identity preservation is the
+        contract any per-stage state mutation depends on.
         """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
@@ -386,3 +383,68 @@ class TestAutoscalePlanContextLifecycle:
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
             assert [s.slots_per_worker for s in solution.stages] == [4, 1]
             assert all(s.new_workers == [] and s.deleted_workers == [] for s in solution.stages)
+
+
+class TestThresholdResolutionTiming:
+    """Per-stage classifier thresholds resolve lazily from runtime ``slots_per_worker``.
+
+    The formula's ``c`` is the actor concurrency
+    (``ProblemStageState.slots_per_worker``), NOT the per-call batch
+    size (``ProblemStage.stage_batch_size``, default 1). The
+    distinction matters: using the per-call batch would yield a
+    uniform ``saturation_aggressiveness/sqrt(1) = 0.30`` for every
+    default stage, defeating the auto-derivation premise. These
+    tests pin the wiring contract.
+    """
+
+    def test_setup_does_not_resolve_thresholds(self) -> None:
+        """``setup()`` cannot resolve -- ``slots_per_worker`` only arrives in ``autoscale()``."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        assert scheduler._stage_states["A"].resolved_thresholds is None
+
+    def test_first_autoscale_resolves_thresholds_from_runtime_slots_per_worker(self) -> None:
+        """First cycle reads ``ProblemStageState.slots_per_worker`` and auto-derives.
+
+        Two stages share the same default config (no per-stage override)
+        but differ in runtime ``slots_per_worker`` -- 1 vs 64. The
+        resolver must produce different thresholds for them
+        (``0.30 / sqrt(1) = 0.30`` vs ``0.30 / sqrt(64) = 0.0375``).
+        A regression that read ``stage_batch_size`` instead would
+        produce identical thresholds for both stages.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["small_c", "large_c"]))
+        ps = _problem_state([("small_c", 1, 1), ("large_c", 1, 64)])
+        scheduler.autoscale(time=0.0, problem_state=ps)
+
+        small_resolved = scheduler._stage_states["small_c"].resolved_thresholds
+        large_resolved = scheduler._stage_states["large_c"].resolved_thresholds
+        assert small_resolved is not None
+        assert large_resolved is not None
+        assert small_resolved.slots_per_actor == 1
+        assert large_resolved.slots_per_actor == 64
+        assert small_resolved.saturation_threshold == pytest.approx(0.30, rel=1e-3)
+        assert large_resolved.saturation_threshold == pytest.approx(0.30 / 8.0, rel=1e-3)
+
+    def test_resolution_is_idempotent_across_cycles(self) -> None:
+        """Once resolved, the runtime state is reused across cycles.
+
+        Mid-run changes to a stage's ``slots_per_worker`` (operator
+        adjusts via ``Solution.slots_per_worker``) do NOT trigger
+        re-resolution by design -- the operator who reshapes a stage
+        is responsible for restarting if they also want
+        threshold re-derivation.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # First cycle: resolve at slots=8.
+        scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 8)]))
+        first_resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert first_resolved is not None
+        assert first_resolved.slots_per_actor == 8
+        # Second cycle: same stage, different slots_per_worker -- resolution is sticky.
+        scheduler.autoscale(time=10.0, problem_state=_problem_state([("A", 1, 64)]))
+        second_resolved = scheduler._stage_states["A"].resolved_thresholds
+        assert second_resolved is first_resolved
+        assert second_resolved.slots_per_actor == 8

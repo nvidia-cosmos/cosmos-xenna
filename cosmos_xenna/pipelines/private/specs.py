@@ -412,32 +412,89 @@ class SaturationAwareStageConfig:
     ``docs/curator/scheduler-tuning.md``.
     """
 
-    # --- Sampling sufficiency ---
     # Minimum cycles with at least one ready actor before the classifier is
     # trusted for that stage. Acts as a count-based data-sufficiency gate.
     min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
 
-    # --- Classifier thresholds ---
+    # Operator-facing aggressiveness knob. The Halfin-Whitt parameter (beta)
+    # in the K/sqrt(c) Erlang-C M/M/c knee formula. Higher values make every
+    # stage's saturation threshold trigger sooner; the default 0.30 is the
+    # canonical balanced QED value. Power users tune this single primary knob;
+    # the explicit threshold overrides below stay available for stage-level
+    # pinning. Range: [0.10, 0.60]. Tuning guidance lives in
+    # ``docs/curator/scheduler-tuning.md``.
+    saturation_aggressiveness: float = attrs.field(
+        default=0.30,
+        validator=attrs.validators.and_(attrs.validators.ge(0.10), attrs.validators.le(0.60)),
+    )
     # Slots-empty fraction below which a stage is classified SATURATED
-    # (sustained -> ordinary scale-up). Cross-field: must be > activation_threshold.
-    saturation_threshold: float = attrs.field(
-        default=0.15,
-        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    # (sustained -> ordinary scale-up). ``None`` (the default) auto-derives
+    # on the first ``autoscale()`` cycle from ``saturation_aggressiveness``
+    # and the stage's runtime ``slots_per_worker`` via the K/sqrt(c) formula
+    # clamped to ``[auto_threshold_min, auto_threshold_max]``. An explicit
+    # numeric value pins the threshold for this stage and bypasses the
+    # formula. Cross-field: the resolved triple must satisfy
+    # activation < saturation < over_provisioned_threshold (enforced at
+    # resolution time).
+    #
+    # Migration note: prior to the K/sqrt(c) auto-derivation the field
+    # defaulted to 0.15 (and ``activation_threshold`` to 0.05). The new
+    # ``None`` / auto default produces different values per
+    # ``slots_per_actor``; e.g. at the project default ``slots_per_actor=2``
+    # the auto value is ~0.21 (saturation) / ~0.07 (activation), ~40% more
+    # aggressive than the legacy default. Pin both fields to ``0.15`` and
+    # ``0.05`` to preserve the legacy behaviour exactly.
+    saturation_threshold: float | None = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))),
     )
     # Slots-empty fraction below which a stage is classified SATURATED_CRITICAL
-    # (burst response). Cross-field: must be < saturation_threshold.
-    activation_threshold: float = attrs.field(
-        default=0.05,
-        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    # (burst response). ``None`` (the default) auto-derives on the first
+    # ``autoscale()`` cycle as ``saturation * activation_to_saturation_ratio``.
+    # An explicit numeric value pins the threshold for this stage. Cross-field:
+    # the resolved value must be strictly less than the resolved
+    # ``saturation_threshold`` (enforced at resolution time).
+    #
+    # Migration note: see ``saturation_threshold`` above. Pin both
+    # ``saturation_threshold`` and this field to the legacy 0.15 / 0.05 to
+    # preserve pre-auto-derivation behaviour exactly.
+    activation_threshold: float | None = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))),
+    )
+    # Lower clamp on the auto-derived ``saturation_threshold``. Acts as a
+    # safety floor: even at very large ``c`` the formula cannot pin the
+    # threshold below this value, preventing the classifier from firing on
+    # single-slot transients in 100+ slot stages.
+    auto_threshold_min: float = attrs.field(
+        default=0.02,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(0.10)),
+    )
+    # Upper clamp on the auto-derived ``saturation_threshold``. Acts as a
+    # safety ceiling: even at ``c=1`` the formula cannot exceed this value.
+    auto_threshold_max: float = attrs.field(
+        default=0.50,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Fraction of the resolved saturation threshold at which the
+    # SATURATED_CRITICAL zone begins; consumed only when
+    # ``activation_threshold`` is auto-derived. Default 0.33 reproduces the
+    # legacy ``0.05 / 0.15 = 0.33`` ratio.
+    activation_to_saturation_ratio: float = attrs.field(
+        default=0.33,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.lt(1.0)),
     )
     # Slots-empty fraction above which a stage is classified OVER_PROVISIONED
-    # (sustained -> scale-down). Cross-field: must be > saturation_threshold.
+    # (sustained -> scale-down). Not auto-derived: the over-provisioned zone
+    # sits in the flat tail of the M/M/c response-time curve and is largely
+    # c-insensitive, so a fixed default works for almost any c. Cross-field:
+    # must be > the resolved saturation threshold (validated at resolution
+    # time).
     over_provisioned_threshold: float = attrs.field(
         default=0.50,
         validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
     )
 
-    # --- Classifier deadbands ---
     # Fractional band around saturation_threshold within which the classifier
     # holds the previous state to prevent edge oscillation.
     saturation_deadband_pct: float = attrs.field(
@@ -451,7 +508,6 @@ class SaturationAwareStageConfig:
         validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
     )
 
-    # --- Streak counters (in cycles) ---
     # Cycles a stage must remain SATURATED before scale-up is applied.
     saturated_streak_min_cycles: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
     # Cycles in SATURATED_CRITICAL before burst delta is applied.
@@ -462,7 +518,6 @@ class SaturationAwareStageConfig:
     # Cycles a stage must remain STARVED before logging the upstream-bottleneck warning.
     starved_streak_min_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
 
-    # --- Growth mode (slow-start state machine) ---
     # When True, per-stage growth mode (ACQUIRING / TRACKING / HOLD) shapes
     # the per-cycle delta. When False, growth uses fixed TRACKING values.
     enable_growth_mode_state_machine: bool = True
@@ -483,26 +538,23 @@ class SaturationAwareStageConfig:
     # Hard cap on the per-cycle additions any growth decision may produce.
     aggressive_growth_max_per_cycle: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
 
-    # --- EWMA smoothing on slots_empty_ratio ---
     # Weight on the NEW sample in the EWMA recursion:
     #   smoothed = level * new + (1 - level) * prior
-    # Higher values are more responsive (less smoothing); 
-    # lower values smooth more heavily. 
-    # Default 0.20 gives ~3-cycle half-life. 
+    # Higher values are more responsive (less smoothing);
+    # lower values smooth more heavily.
+    # Default 0.20 gives ~3-cycle half-life.
     # 0.0 is rejected (would freeze the smoothed value forever).
     slots_empty_ratio_smoothing_level: float = attrs.field(
         default=0.20,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
-    # --- Stabilization windows (recommendation history depth, in cycles) ---
     # Recommendation history depth for the scale-up direction.
     stabilization_window_cycles_up: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
     # Recommendation history depth for the scale-down direction.
     # Cross-field: must be > stabilization_window_cycles_up for asymmetric stabilization.
     stabilization_window_cycles_down: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
 
-    # --- Rate limit on shrink ---
     # Maximum fraction of a stage's current actors that may be deleted in a
     # single cycle. Prevents cliff scale-downs that starve downstream stages.
     max_scale_down_fraction_per_cycle: float = attrs.field(
@@ -510,7 +562,6 @@ class SaturationAwareStageConfig:
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
-    # --- Slow-start mechanisms (orthogonal to cycle period) ---
     # When True, suspend all decisions for a stage that has pending actors but
     # no ready actors (initial setup phase).
     setup_phase_quiescence_enabled: bool = True
@@ -522,7 +573,6 @@ class SaturationAwareStageConfig:
     # worker_warmup_measurement_grace_s.
     donor_warmup_grace_s: float = attrs.field(default=180.0, validator=attrs.validators.ge(0.0))
 
-    # --- Per-stage hard caps and floors ---
     # Optional cluster-wide minimum workers for this stage. ``None`` means the
     # implicit one-worker floor (1) applies. Useful for pre-warming stages with
     # long model load. When the cluster cannot satisfy the floor during the
@@ -541,7 +591,6 @@ class SaturationAwareStageConfig:
     # unbounded by this knob. Cross-field: must be >= min_workers_per_node.
     max_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
 
-    # --- Stage-local robustness toggle ---
     # When True, lower the ``max_queued`` cap while the stage is in initial
     # setup (pending actors > 0 and ready actors == 0) to prevent Ray
     # object-store pressure during long warmups.
@@ -558,17 +607,52 @@ class SaturationAwareStageConfig:
             ValueError: When two or more fields are set to mutually
                 inconsistent values.
         """
-        # Threshold ordering -- classifier zones must not overlap.
-        if not (self.activation_threshold < self.saturation_threshold < self.over_provisioned_threshold):
+        # Threshold ordering - classifier zones must not overlap. Only
+        # validated here when both auto-derivable thresholds are explicit
+        # (the resolver enforces the same invariant on the resolved values
+        # when one or both are auto).
+        if self.saturation_threshold is not None and self.activation_threshold is not None:
+            if not (self.activation_threshold < self.saturation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"activation_threshold={self.activation_threshold} must be < "
+                    f"saturation_threshold={self.saturation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+        elif self.saturation_threshold is not None:
+            # Saturation pinned, activation auto. The pinned saturation must
+            # at least leave room for the over-provisioned ordering.
+            if not (self.saturation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"saturation_threshold={self.saturation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+        elif self.activation_threshold is not None:
+            # Activation pinned, saturation auto. The pinned activation must
+            # not already exceed the over-provisioned threshold (defensive --
+            # the resolver also re-checks this against the resolved saturation).
+            if not (self.activation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"activation_threshold={self.activation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+
+        # Auto-threshold clamps - the auto-derived saturation threshold
+        # must be drawn from a non-empty interval; the upper clamp must
+        # leave room for the lower one.
+        if not (self.auto_threshold_min < self.auto_threshold_max):
             msg = (
-                f"Threshold ordering violated: "
-                f"activation_threshold={self.activation_threshold} must be < "
-                f"saturation_threshold={self.saturation_threshold} must be < "
-                f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                f"auto_threshold_min ({self.auto_threshold_min}) must be < "
+                f"auto_threshold_max ({self.auto_threshold_max})"
             )
             raise ValueError(msg)
 
-        # Slow-start grace ordering -- donor grace must cover worker grace.
+        # Slow-start grace ordering - donor grace must cover worker grace.
         if self.donor_warmup_grace_s < self.worker_warmup_measurement_grace_s:
             msg = (
                 f"donor_warmup_grace_s ({self.donor_warmup_grace_s}) must be >= "
@@ -576,7 +660,7 @@ class SaturationAwareStageConfig:
             )
             raise ValueError(msg)
 
-        # Streak ordering -- shrink streak must dominate growth streak.
+        # Streak ordering - shrink streak must dominate growth streak.
         if self.over_provisioned_streak_min_cycles <= self.saturated_streak_min_cycles:
             msg = (
                 f"over_provisioned_streak_min_cycles ({self.over_provisioned_streak_min_cycles}) must be "
@@ -585,7 +669,7 @@ class SaturationAwareStageConfig:
             )
             raise ValueError(msg)
 
-        # Stabilization windows -- down dominates up.
+        # Stabilization windows - down dominates up.
         if self.stabilization_window_cycles_down <= self.stabilization_window_cycles_up:
             msg = (
                 f"stabilization_window_cycles_down ({self.stabilization_window_cycles_down}) must be > "

@@ -55,10 +55,18 @@ class TestSaturationAwareStageConfigFieldValidators:
     """
 
     def test_default_construction_succeeds(self) -> None:
-        """All defaults are mutually consistent."""
+        """All defaults are mutually consistent.
+
+        ``saturation_threshold`` and ``activation_threshold`` default to
+        ``None`` - the resolver derives them lazily on the first
+        ``autoscale()`` cycle from ``saturation_aggressiveness`` and
+        the stage's runtime ``slots_per_worker``.
+        """
         cfg = SaturationAwareStageConfig()
         assert cfg.min_data_points == 5
-        assert cfg.saturation_threshold == 0.15
+        assert cfg.saturation_aggressiveness == 0.30
+        assert cfg.saturation_threshold is None
+        assert cfg.activation_threshold is None
 
     def test_min_data_points_zero_is_rejected(self) -> None:
         """``validate_positive_int`` rejects values below 1."""
@@ -198,7 +206,7 @@ class TestThreeTierResolver:
     """``get_effective_stage_config`` resolves overrides by precedence.
 
     Precedence (highest first):
-      1. ``StageSpec.saturation_aware`` -- passed in as ``spec_override``
+      1. ``StageSpec.saturation_aware`` - passed in as ``spec_override``
       2. ``SaturationAwareConfig.per_stage_overrides[stage_name]``
       3. ``SaturationAwareConfig.stage_defaults``
     """

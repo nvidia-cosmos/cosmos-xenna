@@ -22,7 +22,8 @@ Three concerns live in this module:
      used directly as Prometheus label values.
   2. The per-stage runtime container (``_StageRuntimeState``) the
      scheduler keeps across cycles - streak counters, EWMA value,
-     classifier output, growth-mode state.
+     classifier output, growth-mode state, resolved classifier
+     thresholds.
   3. Two pure-function helpers used by the scheduler each cycle:
      ``compute_slots_empty_ratio`` (raw signal) and ``update_ewma``
      (smoothing). They are isolated so they can be unit-tested in
@@ -33,32 +34,23 @@ import enum
 
 import attrs
 
+from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import ResolvedThresholds
+
 
 class StageState(str, enum.Enum):
     """Five-zone saturation classifier output for a single stage.
 
-    The classifier maps the (smoothed slots-empty ratio, input queue
-    depth) pair onto one of these five zones each cycle. A per-stage
-    streak counter then converts a sustained zone into an actionable
-    signal once the configured number of consecutive cycles is reached.
-
-    Members
-    -------
-
-    NORMAL
-        Operating within bounds; no scale action warranted.
-    STARVED
-        Free slots remain but the input queue is empty; upstream is
-        the bottleneck, no local scale action would help.
-    SATURATED
-        Few free slots (below ``saturation_threshold``); ordinary
-        scale-up signal once sustained.
-    SATURATED_CRITICAL
-        Effectively zero free slots (below ``activation_threshold``);
-        burst signal that bypasses hysteresis.
-    OVER_PROVISIONED
-        Many free slots with input pending; sustained scale-down
-        signal.
+    Attributes:
+        NORMAL: Operating within bounds; no scale action warranted.
+        STARVED: Free slots remain but the input queue is empty;
+            upstream is the bottleneck, no local scale action helps.
+        SATURATED: Few free slots (below ``saturation_threshold``);
+            ordinary scale-up signal once sustained.
+        SATURATED_CRITICAL: Effectively zero free slots (below
+            ``activation_threshold``); burst signal that bypasses
+            hysteresis.
+        OVER_PROVISIONED: Many free slots with input pending;
+            sustained scale-down signal.
 
     """
 
@@ -70,24 +62,15 @@ class StageState(str, enum.Enum):
 
 
 class GrowthMode(str, enum.Enum):
-    """Slow-start growth controller mode for a stage.
+    """Slow-start growth-controller mode for a stage.
 
-    Three-regime state machine that biases scale-up aggressiveness
-    based on history. The scheduler cycles a stage between these
-    modes as it observes saturation, ceiling, and shrink edges.
-
-    Members
-    -------
-
-    ACQUIRING
-        New stage or recently shrank below the previous ceiling -
-        grow multiplicatively on saturation signals (slow-start).
-    TRACKING
-        Operating near the previous saturated ceiling - grow
-        additively (congestion-avoidance).
-    HOLD
-        Just shrank from over-provisioned; suppress non-critical
-        growth for one or more cycles to stabilize.
+    Attributes:
+        ACQUIRING: New stage or recently shrank below the previous
+            ceiling; grow multiplicatively on saturation signals.
+        TRACKING: Operating near the previous saturated ceiling;
+            grow additively (congestion-avoidance).
+        HOLD: Just shrank from over-provisioned; suppress
+            non-critical growth for one or more cycles to stabilize.
 
     """
 
@@ -125,6 +108,12 @@ class _StageRuntimeState:
         prev_workers: Worker count observed at the end of the
             previous cycle. Used by growth-mode transitions to
             detect grow / shrink edges.
+        resolved_thresholds: Classifier thresholds resolved on the
+            first ``autoscale()`` cycle, when each stage's runtime
+            ``slots_per_worker`` becomes available. ``None`` between
+            ``setup()`` and the first ``autoscale()``; the per-stage
+            decision pipeline raises ``RuntimeError`` if it observes
+            an unresolved state at run time.
 
     """
 
@@ -136,22 +125,19 @@ class _StageRuntimeState:
     growth_mode: GrowthMode = GrowthMode.ACQUIRING
     growth_streak: int = 0
     prev_workers: int = 0
+    resolved_thresholds: ResolvedThresholds | None = None
 
 
 def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> float:
     """Compute slots-empty / total-slots for a stage.
 
     Args:
-        num_used_slots: Slots currently occupied by in-flight tasks.
-            Must be ``>= 0``.
+        num_used_slots: Slots currently occupied. Must be ``>= 0``.
         num_empty_slots: Slots currently free. Must be ``>= 0``.
 
     Returns:
-        The empty-slot fraction in ``[0.0, 1.0]``. Returns ``0.0``
-        when both inputs are zero (stage has no actors); the
-        classifier treats this as "no capacity" which maps to
-        SATURATED_CRITICAL, matching the behaviour the worker-floor
-        step independently grows out of.
+        Empty-slot fraction in ``[0.0, 1.0]``; ``0.0`` when both
+        inputs are zero (stage has no actors).
 
     Raises:
         ValueError: If either input is negative.
@@ -172,16 +158,13 @@ def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> floa
 def update_ewma(prev_ewma: float | None, sample: float, alpha: float) -> float:
     """Update the exponential moving average with a new sample.
 
-    Standard EWMA: ``new = alpha * sample + (1 - alpha) * prev``.
-    On cold start (``prev_ewma is None``) the result is the sample
-    itself, so the first cycle's classifier sees the live signal
-    rather than a zero-anchored half-step.
+    ``new = alpha * sample + (1 - alpha) * prev``; on cold start
+    (``prev_ewma is None``) the result is the sample itself.
 
     Args:
         prev_ewma: Previous EWMA value, or ``None`` on cold start.
         sample: New raw observation.
-        alpha: Smoothing factor in ``(0.0, 1.0]``. Higher = less
-            smoothing.
+        alpha: Smoothing factor in ``(0.0, 1.0]``.
 
     Returns:
         Updated EWMA value.

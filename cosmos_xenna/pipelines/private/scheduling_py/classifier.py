@@ -15,62 +15,25 @@
 
 """Pure-function 5-state classifier for the saturation-aware scheduler.
 
-The classifier reads empty capacity: ``0.0`` means every slot is busy,
-``1.0`` means every slot is free. It maps the smoothed empty-slot
-ratio, input queue depth, and previous state to a ``StageState``.
-Hysteresis keeps noisy samples near the saturation and over-provisioned
-thresholds from flapping; the critical zone bypasses hysteresis so
-severe saturation is detected immediately.
+Maps ``(slots_empty_ratio_ewma, input_queue_depth, prev_state)``
+plus thresholds + deadband config to a ``StageState`` zone with
+hysteresis. ``0.0`` means every slot busy; ``1.0`` means every slot
+free. Defined as a pure function so it is testable in isolation
+and reusable by simulators / replay harnesses.
 
-Default thresholds shown below are configurable via
-``SaturationAwareStageConfig``:
+Zones (for ``ratio = slots_empty_ratio_ewma``)::
 
-::
+    ratio < activation                  -> SATURATED_CRITICAL  (no hysteresis)
+    ratio < saturation_boundary         -> SATURATED
+    ratio >= over_provisioned_boundary  -> OVER_PROVISIONED if queue > 0 else STARVED
+    otherwise                           -> NORMAL
 
-    slots_empty_ratio_ewma
-    0.0 = all slots busy                                1.0 = all slots free
-
-      1.00  +--------------------------------------------------------------+
-            | UPPER IDLE ZONE                                              |
-            |                                                              |
-            | ratio >= over_provisioned_boundary                           |
-            |   queue > 0  : OVER_PROVISIONED  -> sustained: shed actors   |
-            |   queue == 0 : STARVED           -> upstream bottleneck      |
-      0.50  +--------------------------------------------------------------+  enter upper zone
-            | OVER_PROVISIONED EXIT BAND                                   |
-            |   prev OVER_PROVISIONED holds zone until ratio < 0.35        |
-      0.35  +--------------------------------------------------------------+  exit upper zone
-            | NORMAL                                                       |
-            |   capacity and demand are roughly balanced                   |
-      0.1725+--------------------------------------------------------------+  exit saturated zone
-            | SATURATION EXIT BAND                                         |
-            |   prev SATURATED/CRITICAL holds zone until ratio >= 0.1725   |
-      0.15  +--------------------------------------------------------------+  enter saturated zone
-            | SATURATED                                                    |
-            |   sustained signal -> additive scale-up                      |
-      0.05  +--------------------------------------------------------------+  enter critical zone
-            | SATURATED_CRITICAL                                           |
-            |   immediate signal -> multiplicative scale-up path           |
-      0.00  +--------------------------------------------------------------+
-
-Boundary rules:
-
-  - ``ratio < activation_threshold`` -> ``SATURATED_CRITICAL``.
-  - ``ratio < saturation_boundary`` -> ``SATURATED``.
-  - ``ratio >= over_provisioned_boundary`` -> upper idle zone.
-  - Everything between saturation and upper idle -> ``NORMAL``.
-
-Hysteresis only changes the boundary for the state being exited:
-
-  - ``SATURATED`` / ``SATURATED_CRITICAL``:
-    ``saturation_boundary *= 1 + saturation_deadband_pct``.
-  - ``OVER_PROVISIONED``:
-    ``over_provisioned_boundary *= 1 - over_provisioned_deadband_pct``.
-  - ``STARVED``: no hysteresis; queue state can change immediately.
-
-Defined as a pure function so it can be tested in isolation,
-exercised on synthetic samples, and reused by future operators
-(simulator, replay harness) without coupling to scheduler state.
+Hysteresis applies only to the state being exited: from
+``SATURATED`` / ``SATURATED_CRITICAL`` the saturation boundary is
+inflated by ``saturation_deadband_pct``; from ``OVER_PROVISIONED``
+the over-provisioned boundary is deflated by
+``over_provisioned_deadband_pct``. ``STARVED`` has no hysteresis
+because the queue-empty signal can flip immediately.
 """
 
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
@@ -82,32 +45,34 @@ def classify(
     slots_empty_ratio_ewma: float,
     input_queue_depth: int,
     prev_state: StageState,
+    saturation_threshold: float,
+    activation_threshold: float,
     config: SaturationAwareStageConfig,
 ) -> StageState:
     """Classify a stage's current cycle by its saturation signals.
 
     Args:
-        slots_empty_ratio_ewma: Smoothed empty-slot fraction in
-            ``[0.0, 1.0]``. ``0.0`` means every slot is busy;
-            ``1.0`` means every slot is free.
-        input_queue_depth: Number of tasks waiting upstream of this
-            stage. Used to disambiguate ``OVER_PROVISIONED`` (free
-            slots, work pending elsewhere) from ``STARVED`` (free
-            slots, nothing to do).
-        prev_state: The classifier output from the previous cycle.
-            Drives the hysteresis bands so the result is stable
-            against noisy samples on either side of a threshold.
-        config: Per-stage configuration carrying the threshold and
-            deadband values.
+        slots_empty_ratio_ewma: Smoothed empty-slot fraction in ``[0, 1]``.
+        input_queue_depth: Tasks waiting upstream of this stage;
+            disambiguates ``OVER_PROVISIONED`` from ``STARVED``.
+        prev_state: The previous cycle's zone (drives hysteresis).
+        saturation_threshold: Empty-slot fraction below which the
+            stage is classified ``SATURATED``. Strictly positive and
+            strictly less than ``config.over_provisioned_threshold``.
+        activation_threshold: Empty-slot fraction below which the
+            stage is classified ``SATURATED_CRITICAL``. Strictly less
+            than ``saturation_threshold``.
+        config: Per-stage configuration carrying the deadbands and
+            the over-provisioned threshold.
 
     Returns:
         The current cycle's classifier zone.
 
     """
-    if slots_empty_ratio_ewma < config.activation_threshold:
+    if slots_empty_ratio_ewma < activation_threshold:
         return StageState.SATURATED_CRITICAL
 
-    saturation_boundary = config.saturation_threshold
+    saturation_boundary = saturation_threshold
     if prev_state in (StageState.SATURATED, StageState.SATURATED_CRITICAL):
         saturation_boundary *= 1.0 + config.saturation_deadband_pct
     if slots_empty_ratio_ewma < saturation_boundary:
