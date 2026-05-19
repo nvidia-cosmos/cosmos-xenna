@@ -59,7 +59,6 @@ class TestSelectWorkersToRemoveOldestFirst:
         selected = select_workers_to_remove_oldest_first(
             worker_ids=["young", "old", "middle"],
             worker_ages={"young": 0, "old": 9, "middle": 4},
-            worker_used_slots=None,
             delete_count=3,
         )
 

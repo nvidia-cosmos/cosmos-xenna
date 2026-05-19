@@ -15,22 +15,34 @@
 
 """Cross-stage donor selection.
 
-Picks the youngest worker from a non-receiver stage that can spare
-one without violating its own minimum-worker floor. Upstream stages
-(lower index in the problem's stage order) are preferred when any
-are eligible; otherwise any non-receiver stage may donate. The
-selector is mode-agnostic: callers control behaviour purely through
-the ``stage_floors`` argument.
+Two modes ship from this module.
 
-The non-negotiable constraint is donor-floor preservation: a stage
-whose live worker count minus one would drop below its floor is
-filtered out, preventing a single donation from cascading into
-another stage's bootstrap.
+Floor mode (``select_youngest_eligible_donor``) is used by Phase B
+floor enforcement when the cluster is full and the receiver cannot
+reach its minimum-worker floor through fresh placement. It picks the
+youngest worker from any non-receiver stage that can spare one
+without violating its own floor; upstream donors are preferred when
+any are eligible.
+
+Saturation mode (``find_saturation_donor``) is used by Phase C
+saturation-driven scale-up when the cluster is full and the receiver
+wants to grow because its classifier signals SATURATED. Selection is
+more conservative because operator pressure is weaker than in the
+floor case; five anti-flap layers reject donors that would
+oscillate.
+
+The non-negotiable donor-floor preservation rule applies in both
+modes: a stage whose live worker count minus one would drop below
+its floor is filtered out, preventing a single donation from
+cascading into another stage's bootstrap.
 """
 
 import operator
 
 import attrs
+
+from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
 @attrs.frozen
@@ -102,6 +114,149 @@ def select_youngest_eligible_donor(
         )
         for stage_index in pool
         for wid in worker_ids_by_stage[stage_index]
+    ]
+    if not candidates:
+        return None
+
+    return min(candidates, key=operator.attrgetter("age", "worker_id"))
+
+
+def find_saturation_donor(
+    *,
+    receiver_stage_index: int,
+    receiver_stage_name: str,
+    stage_names: list[str],
+    stage_floors: dict[int, int],
+    worker_ids_by_stage: list[list[str]],
+    worker_ages: dict[str, int],
+    stage_states: dict[str, _StageRuntimeState],
+    config: SaturationAwareConfig,
+    stage_configs: dict[str, SaturationAwareStageConfig],
+    cycle: int,
+    last_donation_cycle: dict[str, int],
+    donations_received_this_cycle: dict[str, int],
+) -> DonorCandidate | None:
+    """Pick a donor for saturation-driven Phase C growth, with five anti-flap layers.
+
+    The non-negotiable donor-floor rule from
+    :func:`select_youngest_eligible_donor` applies unchanged. On top
+    of it, five layers reject donors that would oscillate:
+
+      1. Donor classifier must be ``OVER_PROVISIONED`` with at least
+         ``stage_cfg.over_provisioned_streak_min_cycles`` full
+         streak (gated by
+         ``config.cross_stage_donor_require_over_provisioned``).
+      2. Donor growth mode must not be ``HOLD`` (gated by
+         ``config.cross_stage_donor_exclude_hold_state``).
+      3. Receiver must not have donated within the last
+         ``config.cross_stage_donor_anti_flap_cycles`` (prevents
+         donate-then-receive ping-pong).
+      4. Receiver must not have already absorbed
+         ``config.cross_stage_donor_max_per_cycle`` donations this
+         cycle.
+      5. Donor must not have donated within the last
+         ``config.cross_stage_donor_min_donation_interval_cycles``
+         (donor-side cooldown between consecutive donations).
+
+    The master toggle ``config.enable_cross_stage_donor`` short-
+    circuits the whole helper to ``None`` when disabled. The
+    ``config.donor_must_be_strictly_upstream`` flag (separate from
+    the five anti-flap layers, but applied here) restricts donors to
+    stages with strictly smaller DAG depth when True.
+
+    Args:
+        receiver_stage_index: Index of the stage that needs the
+            extra worker.
+        receiver_stage_name: Name of the receiver stage. Used for
+            the layer 3 / 4 lookups against the per-stage cycle
+            dicts.
+        stage_names: Stage names in problem order; the i-th entry
+            is the name of the stage at index ``i``.
+        stage_floors: Per-stage donor floors. A missing entry
+            defaults to ``1``.
+        worker_ids_by_stage: Per-stage live worker ids in problem
+            order. Each inner list is the snapshot the planner
+            currently holds for that stage.
+        worker_ages: Cluster-wide worker ages keyed by worker id.
+            Missing entries default to ``0``.
+        stage_states: Per-stage runtime state keyed by stage name.
+            Drives the layer 1 / 2 classifier and growth-mode
+            checks.
+        config: Cluster-wide configuration. Carries the master
+            toggle, the upstream-only flag, and all five anti-flap
+            cycle counts.
+        stage_configs: Per-stage effective configs keyed by stage
+            name. Drives the layer 1 streak threshold.
+        cycle: Current monotonic cycle number, against which
+            cross-cycle cooldowns are evaluated.
+        last_donation_cycle: Per-stage record of the cycle at which
+            each stage most recently donated.
+        donations_received_this_cycle: Per-stage receiver counter,
+            reset at the top of every autoscale cycle.
+
+    Returns:
+        The selected ``DonorCandidate`` or ``None`` when the master
+        toggle is disabled, the receiver is itself in cooldown, the
+        receiver has hit its per-cycle absorption cap, or no donor
+        stage passes every filter.
+
+    """
+    if not config.enable_cross_stage_donor:
+        return None
+
+    receiver_anti_flap_cycle = last_donation_cycle.get(receiver_stage_name)
+    if (
+        receiver_anti_flap_cycle is not None
+        and cycle - receiver_anti_flap_cycle < config.cross_stage_donor_anti_flap_cycles
+    ):
+        return None
+
+    if donations_received_this_cycle.get(receiver_stage_name, 0) >= config.cross_stage_donor_max_per_cycle:
+        return None
+
+    eligible_stages: list[int] = []
+    for donor_index, donor_workers in enumerate(worker_ids_by_stage):
+        if donor_index == receiver_stage_index:
+            continue
+        if config.donor_must_be_strictly_upstream and donor_index >= receiver_stage_index:
+            continue
+        if len(donor_workers) - 1 < stage_floors.get(donor_index, 1):
+            continue
+
+        donor_name = stage_names[donor_index]
+        donor_state = stage_states.get(donor_name)
+        if donor_state is None:
+            continue
+        if config.cross_stage_donor_require_over_provisioned:
+            donor_cfg = stage_configs.get(donor_name)
+            if donor_cfg is None:
+                continue
+            if donor_state.classifier_state is not StageState.OVER_PROVISIONED:
+                continue
+            if donor_state.classifier_streak < donor_cfg.over_provisioned_streak_min_cycles:
+                continue
+        if config.cross_stage_donor_exclude_hold_state and donor_state.growth_mode is GrowthMode.HOLD:
+            continue
+        donor_last_donation = last_donation_cycle.get(donor_name)
+        if (
+            donor_last_donation is not None
+            and cycle - donor_last_donation < config.cross_stage_donor_min_donation_interval_cycles
+        ):
+            continue
+
+        eligible_stages.append(donor_index)
+
+    if not eligible_stages:
+        return None
+
+    candidates = [
+        DonorCandidate(
+            stage_index=donor_index,
+            worker_id=wid,
+            age=worker_ages.get(wid, 0),
+        )
+        for donor_index in eligible_stages
+        for wid in worker_ids_by_stage[donor_index]
     ]
     if not candidates:
         return None

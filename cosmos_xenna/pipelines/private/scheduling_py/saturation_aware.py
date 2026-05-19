@@ -46,7 +46,11 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     _resolve_auto_thresholds,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_dag_depth_order
-from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, select_youngest_eligible_donor
+from cosmos_xenna.pipelines.private.scheduling_py.donor import (
+    DonorCandidate,
+    find_saturation_donor,
+    select_youngest_eligible_donor,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     PhaseBoundary,
     check_invariants_after_phase,
@@ -114,6 +118,19 @@ class SaturationAwareScheduler:
             no positive intent. The counter is the input the
             pipeline-level ``stuck_plan_detection_cycles`` watchdog
             (Phase 4) will read.
+        _cycle_counter: Monotonic count of completed ``autoscale()``
+            calls since ``setup()``. Used as the time index for the
+            saturation-mode cross-stage donor anti-flap layers.
+        _last_donation_cycle: Per-stage record of the cycle at which
+            each stage most recently donated a worker through the
+            saturation-mode cross-stage path. Drives both the
+            ``cross_stage_donor_min_donation_interval_cycles`` donor
+            cooldown and the ``cross_stage_donor_anti_flap_cycles``
+            receiver-was-recent-donor block.
+        _donations_received_this_cycle: Per-cycle bound on how many
+            cross-stage donations a single receiver may absorb.
+            Resets at the top of every ``autoscale()`` and is
+            consulted against ``cross_stage_donor_max_per_cycle``.
 
     """
 
@@ -134,12 +151,17 @@ class SaturationAwareScheduler:
         self._worker_ages: dict[str, int] = {}
         self._last_intent_deltas: dict[str, int] = {}
         self._stuck_plan_counters: dict[str, int] = {}
-        # Per-stage counter of consecutive cycles where floor enforcement
-        # could not be satisfied because the cluster was full and no eligible
-        # donor existed. Reset on any cycle where the receiver makes forward
-        # progress; post-donation retry misses raise immediately because the
-        # donor removal cannot be rolled back safely.
         self._floor_stuck_counters: dict[str, int] = {}
+        # Saturation-mode cross-stage donor anti-flap state.
+        # ``_cycle_counter`` is monotonic and increments at the top of every
+        # ``autoscale()`` call. ``_last_donation_cycle`` records the cycle at
+        # which each stage most recently donated; missing entries mean the
+        # stage has never donated. ``_donations_received_this_cycle`` resets
+        # on each ``autoscale()`` and bounds receiver donations under
+        # ``cross_stage_donor_max_per_cycle``.
+        self._cycle_counter: int = 0
+        self._last_donation_cycle: dict[str, int] = {}
+        self._donations_received_this_cycle: dict[str, int] = {}
 
     def setup(self, problem: data_structures.Problem) -> None:
         """Capture the pipeline shape and seed empty per-stage state.
@@ -159,6 +181,9 @@ class SaturationAwareScheduler:
         self._floor_stuck_counters = {}
         self._last_intent_deltas = {}
         self._stuck_plan_counters = {}
+        self._cycle_counter = 0
+        self._last_donation_cycle = {}
+        self._donations_received_this_cycle = {}
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -307,6 +332,8 @@ class SaturationAwareScheduler:
             msg = "SaturationAwareScheduler.autoscale() called before setup()"
             raise RuntimeError(msg)
 
+        self._cycle_counter += 1
+        self._donations_received_this_cycle = {}
         self._update_regime_aware_aggressiveness(problem_state)
         self._ensure_thresholds_resolved(problem_state)
         ctx = data_structures.AutoscalePlanContext.from_problem_state(
@@ -371,9 +398,9 @@ class SaturationAwareScheduler:
 
         The intent values are exposed via :attr:`_last_intent_deltas`
         for tests and observability. Saturation-driven scale-up
-        (Phase C) and scale-down (Phase D) -- not yet implemented --
-        will consume these intents and stage worker adds / removes on
-        the planner context. Finished stages are absent from the
+        (Phase C) and scale-down (Phase D) consume these intents and
+        stage worker adds / removes on the planner context.
+        Finished stages are absent from the
         returned map: their classifier short-circuits upstream of
         ``run_per_stage_pipeline`` and any drain-state slot signal
         would only mutate per-stage EWMA state without affecting the
@@ -486,11 +513,37 @@ class SaturationAwareScheduler:
                 continue
             added = 0
             while added < intent:
-                if ctx.try_add_worker(stage_index) is None:
+                if ctx.try_add_worker(stage_index) is not None:
+                    added += 1
+                    continue
+                # Cluster placement exhausted. Try the saturation-mode
+                # cross-stage donor fallback before giving up. On donor
+                # success the planner has freed exactly one placement,
+                # so the very next ``try_add_worker`` for this receiver
+                # should succeed; if it does not (donor's freed slot
+                # does not match the receiver's shape), give up for the
+                # cycle without raising. The donor cooldown and
+                # receiver-per-cycle counters are updated only on a
+                # successfully completed donation+retry.
+                if not self._attempt_cross_stage_donation(
+                    ctx=ctx,
+                    receiver_stage_index=stage_index,
+                    receiver_stage_name=stage_name,
+                ):
                     deficit = intent - added
                     logger.warning(
                         f"saturation-aware scale-up: stage {stage_name!r} intent "
                         f"{intent} workers; cluster placement exhausted after "
+                        f"{added} (deficit={deficit}); request remains partially "
+                        "satisfied this cycle."
+                    )
+                    break
+                if ctx.try_add_worker(stage_index) is None:
+                    deficit = intent - added
+                    logger.warning(
+                        f"saturation-aware scale-up: stage {stage_name!r} intent "
+                        f"{intent} workers; cross-stage donation freed a slot but "
+                        f"the post-donation retry returned no placement after "
                         f"{added} (deficit={deficit}); request remains partially "
                         "satisfied this cycle."
                     )
@@ -500,6 +553,82 @@ class SaturationAwareScheduler:
                 self._stuck_plan_counters[stage_name] = self._stuck_plan_counters.get(stage_name, 0) + 1
             else:
                 self._stuck_plan_counters[stage_name] = 0
+
+    def _attempt_cross_stage_donation(
+        self,
+        *,
+        ctx: data_structures.AutoscalePlanContext,
+        receiver_stage_index: int,
+        receiver_stage_name: str,
+    ) -> bool:
+        """Try to free a placement for a saturation-driven receiver.
+
+        Selects an eligible donor via
+        :func:`find_saturation_donor` (five anti-flap layers + strict
+        upstream + master toggle), removes it from the planner, and
+        updates the donor cooldown + receiver per-cycle counter. The
+        caller is responsible for the immediate ``try_add_worker``
+        retry after this method returns ``True``.
+
+        Returns:
+            True when a donor was selected, removed, and the donor /
+            receiver counters were advanced. False when the master
+            toggle is off, when no eligible donor exists, or when the
+            planner refuses the selected donor (defensive guard).
+
+        Raises:
+            RuntimeError: The scheduler has not been set up.
+
+        """
+        if self._problem is None:
+            msg = "_attempt_cross_stage_donation called before setup()"
+            raise RuntimeError(msg)
+
+        num_nodes = len(self._problem.rust.cluster_resources.nodes)
+        stage_floors = self._compute_stage_floors(num_nodes)
+        worker_ids_by_stage = ctx.worker_ids_by_stage()
+        worker_ages = ctx.worker_ages()
+        stage_configs = {
+            name: self._config.get_effective_stage_config(stage_name=name, spec_override=None)
+            for name in self._stage_names
+        }
+
+        donor = find_saturation_donor(
+            receiver_stage_index=receiver_stage_index,
+            receiver_stage_name=receiver_stage_name,
+            stage_names=self._stage_names,
+            stage_floors=stage_floors,
+            worker_ids_by_stage=worker_ids_by_stage,
+            worker_ages=worker_ages,
+            stage_states=self._stage_states,
+            config=self._config,
+            stage_configs=stage_configs,
+            cycle=self._cycle_counter,
+            last_donation_cycle=self._last_donation_cycle,
+            donations_received_this_cycle=self._donations_received_this_cycle,
+        )
+        if donor is None:
+            return False
+
+        donor_stage_name = self._stage_names[donor.stage_index]
+        if not ctx.try_remove_worker(donor.stage_index, donor.worker_id):
+            logger.warning(
+                f"[scheduler] saturation-mode donor: stage {donor_stage_name!r} "
+                f"worker {donor.worker_id!r} selected by donor helper but planner "
+                "refused removal; donation cancelled and receiver retry skipped."
+            )
+            return False
+
+        self._last_donation_cycle[donor_stage_name] = self._cycle_counter
+        self._donations_received_this_cycle[receiver_stage_name] = (
+            self._donations_received_this_cycle.get(receiver_stage_name, 0) + 1
+        )
+        logger.info(
+            f"[scheduler] saturation-mode donation: donor stage {donor_stage_name!r} "
+            f"worker {donor.worker_id!r} (age={donor.age}) -> receiver stage "
+            f"{receiver_stage_name!r} at cycle {self._cycle_counter}."
+        )
+        return True
 
     def _run_phase_d_shrink(
         self,
@@ -518,7 +647,7 @@ class SaturationAwareScheduler:
 
           * The configured per-stage / per-node floor (a stage is
             never reduced below ``min_workers`` or
-            ``min_workers_per_node * num_nodes`` -- the same target
+            ``min_workers_per_node * num_nodes``; the same target
             Phase B enforces).
           * The intent magnitude itself (already capped by
             ``compute_delta._shrink_delta`` to the same fraction).
@@ -636,9 +765,9 @@ class SaturationAwareScheduler:
 
         Raises:
             RuntimeError: ``try_remove_worker`` returned ``False`` for
-                a worker that was present in ``problem_state`` -- a
-                planner-state inconsistency that must surface
-                immediately.
+                a worker that was present in ``problem_state``. This
+                signals a planner-state inconsistency that must
+                surface immediately.
 
         """
         if self._problem is None:
@@ -896,7 +1025,7 @@ class SaturationAwareScheduler:
         remaining = grace - counter
         logger.warning(
             f"[scheduler] {stage_name!r}: minimum-worker floor stuck "
-            f"({counter}/{grace} grace cycles) -- target_min={target_min}, "
+            f"({counter}/{grace} grace cycles); target_min={target_min}, "
             f"achieved={current}, no eligible cross-stage donor; will raise after "
             f"{remaining} more consecutive failed cycles."
         )
@@ -947,8 +1076,8 @@ class SaturationAwareScheduler:
         """Build the operator-actionable message for an unmet minimum-worker floor.
 
         Distinguishes the two failure modes (no eligible donor vs.
-        donor selected but retry still failed) and -- when a donor was
-        selected -- names that donor so operators can correlate the
+        donor selected but retry still failed) and, when a donor was
+        selected, names that donor so operators can correlate the
         failure with the donation log line.
         """
         if donor_attempted:
@@ -959,7 +1088,7 @@ class SaturationAwareScheduler:
             )
             donor_clause = (
                 "donor fallback attempted but post-donation retry returned no placement"
-                f"{donor_label} -- the donor's freed slot does not match the receiver's shape"
+                f"{donor_label}; the donor's freed slot does not match the receiver's shape"
             )
         else:
             donor_clause = "no eligible cross-stage donor (every other stage at its own floor)"
@@ -977,7 +1106,7 @@ class SaturationAwareScheduler:
         """Detect the cluster's Halfin-Whitt regime and re-resolve thresholds on transition.
 
         Computes the per-cycle regime signal, applies hysteresis via
-        ``update_regime_state``, and -- on a regime transition -- drops
+        ``update_regime_state``, and on a regime transition drops
         every stage's ``resolved_thresholds`` and threshold-relative
         classifier history so the next call to
         ``_ensure_thresholds_resolved`` re-derives thresholds with the
