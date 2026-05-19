@@ -59,7 +59,7 @@ class TestNumUsedSlotsField:
     """Pin the new per-worker ``num_used_slots`` field's contract."""
 
     def test_defaults_to_zero_when_omitted(self) -> None:
-        """Backward-compat: the existing two-positional ``make`` call defaults to 0."""
+        """Omitting the keyword keeps the existing two-positional ``make`` call at 0."""
         worker = data_structures.ProblemWorkerGroupState.make("w0", _allocs())
 
         assert worker.num_used_slots == 0

@@ -6,12 +6,16 @@
 The streaming layer must populate the per-stage saturation signals
 (``num_used_slots``, ``num_empty_slots``, ``input_queue_depth``) on
 ``ProblemStageState`` from the live ``ActorPool`` snapshot so that the
-saturation-aware scheduler can read them each autoscale cycle.
+saturation-aware scheduler can read them each autoscale cycle. It also
+copies per-worker ``num_used_slots`` onto each
+``ProblemWorkerGroupState`` so Phase D can prefer idle worker groups.
 
 This module pins the wiring contract:
 
     * Active stages: signals match the ``ActorPool`` accessors
       (``num_used_slots``, ``num_empty_slots``, ``num_queued_tasks``).
+    * Active workers: ``worker_group_num_used_slots()`` entries land on
+      matching worker snapshots.
     * Finished stages: signals are zeroed even if the pool reports
       transient drain-state slot or queue counts.
     * Multi-stage problems preserve per-stage signal isolation.
@@ -680,6 +684,49 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
 
         assert self._per_worker_used_slots(state) == {"ingest-w0": 2, "ingest-w1": 0}
 
+    def test_negative_worker_group_signal_overflows_at_rust_boundary(self) -> None:
+        """A negative per-worker map value surfaces before reaching Phase D."""
+        allocator = _FakeAllocator(
+            workers_by_stage={"active": [_worker_group("active", "active-w0")]},
+        )
+        pool = _FakeActorPool(
+            name="active",
+            slots_per_actor=4,
+            num_used_slots=0,
+            num_empty_slots=4,
+            num_queued_tasks=0,
+            worker_group_used_slots={"active-w0": -1},
+        )
+
+        with pytest.raises(OverflowError):
+            _make_problem_state([pool], [False], allocator=allocator)
+
+    def test_repeated_calls_read_fresh_per_worker_signals(self) -> None:
+        """Per-worker map values are sampled fresh each cycle."""
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "active": [
+                    _worker_group("active", "active-w0"),
+                    _worker_group("active", "active-w1"),
+                ],
+            },
+        )
+        pool = _FakeActorPool(
+            name="active",
+            slots_per_actor=4,
+            num_used_slots=1,
+            num_empty_slots=7,
+            num_queued_tasks=0,
+            worker_group_used_slots={"active-w0": 1, "active-w1": 0},
+        )
+
+        first = _make_problem_state([pool], [False], allocator=allocator)
+        pool.worker_group_used_slots = {"active-w0": 0, "active-w1": 3}
+        second = _make_problem_state([pool], [False], allocator=allocator)
+
+        assert self._per_worker_used_slots(first) == {"active-w0": 1, "active-w1": 0}
+        assert self._per_worker_used_slots(second) == {"active-w0": 0, "active-w1": 3}
+
     def test_pool_worker_group_num_used_slots_exception_propagates(self) -> None:
         """An exception from ``worker_group_num_used_slots()`` propagates uncaught.
 
@@ -704,6 +751,29 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
         with pytest.raises(RuntimeError, match="transient pool failure"):
             _make_problem_state([_RaisingMethodPool()], [False])  # type: ignore[list-item]
 
+    def test_finished_stage_zeroes_workers_without_reading_nonempty_map(self) -> None:
+        """Finished workers get 0 used slots even if the pool has stale map entries."""
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "done": [
+                    _worker_group("done", "done-w0"),
+                    _worker_group("done", "done-w1"),
+                ],
+            },
+        )
+        pool = _FakeActorPool(
+            name="done",
+            slots_per_actor=4,
+            num_used_slots=8,
+            num_empty_slots=0,
+            num_queued_tasks=99,
+            worker_group_used_slots={"done-w0": 4, "done-w1": 4},
+        )
+
+        state = _make_problem_state([pool], [True], allocator=allocator)
+
+        assert self._per_worker_used_slots(state) == {"done-w0": 0, "done-w1": 0}
+
     def test_finished_stage_does_not_call_worker_group_num_used_slots(self) -> None:
         """Finished stages must not read the per-worker accessor (matches stage-signal skip)."""
 
@@ -718,8 +788,10 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
                 msg = "should not be called on a finished stage"
                 raise RuntimeError(msg)
 
-        state = _make_problem_state([_RaisingMethodPool()], [True])  # type: ignore[list-item]
+        allocator = _FakeAllocator(workers_by_stage={"done": [_worker_group("done", "done-w0")]})
+
+        state = _make_problem_state([_RaisingMethodPool()], [True], allocator=allocator)  # type: ignore[list-item]
 
         stage = state.rust.stages[0]
         assert stage.is_finished is True
-        assert [w.num_used_slots for w in stage.worker_groups] == []
+        assert self._per_worker_used_slots(state) == {"done-w0": 0}

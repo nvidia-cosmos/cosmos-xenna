@@ -504,7 +504,7 @@ class SaturationAwareScheduler:
         ctx: data_structures.AutoscalePlanContext,
         problem_state: data_structures.ProblemState,
     ) -> None:
-        """Apply negative intent deltas as planner removes, oldest-first.
+        """Apply negative intent deltas as planner removes, idle-first then oldest-first.
 
         For each non-finished stage whose
         :attr:`_last_intent_deltas` entry is negative, removes
@@ -518,20 +518,20 @@ class SaturationAwareScheduler:
         (``_run_phase_a_delete``) remains the single source of
         truth for those.
 
-        Selection key is currently ``(age DESC, worker_id ASC)``. The
-        full STORY-33 sort key ``(host_gpu_used_fraction ASC,
-        idle_status DESC, age DESC)`` requires per-worker idle and
-        host-loading signals that are not yet exposed on
-        ``ProblemWorkerGroupState``; that data-layer extension is a
-        separate iteration. When it lands, only the helper module
-        ``scheduling_py/scale_down.py`` and the floor-aware shrink
-        cap need to change -- the orchestration here stays the same.
+        Selection key is ``(idle DESC, age DESC, worker_id ASC)``
+        where ``idle = (num_used_slots == 0)``: workers with no
+        in-flight tasks are removed before busy workers, oldest first
+        within each bucket. Per-worker ``num_used_slots`` is sourced
+        from ``runtime_stage.worker_groups[*].num_used_slots`` (the
+        streaming layer populates this from
+        ``ActorPool.worker_group_num_used_slots()`` each cycle).
 
         Args:
             ctx: The cycle's mutable planner context. Mutated in
                 place by ``try_remove_worker``.
             problem_state: The cycle's runtime snapshot. Used to skip
-                finished and manual stages.
+                finished and manual stages, and to source per-worker
+                idle signals for the selection helper.
 
         Raises:
             RuntimeError: The scheduler has not been set up, or the

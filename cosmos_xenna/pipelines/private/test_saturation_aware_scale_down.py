@@ -54,6 +54,17 @@ class TestSelectWorkersToRemoveOldestFirst:
 
         assert selected == ["missing-signal"]
 
+    def test_omitted_used_slot_map_falls_back_to_age_only_selection(self) -> None:
+        """Without per-worker signals, ordering collapses to age-DESC."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["young", "old", "middle"],
+            worker_ages={"young": 0, "old": 9, "middle": 4},
+            worker_used_slots=None,
+            delete_count=3,
+        )
+
+        assert selected == ["old", "middle", "young"]
+
     def test_missing_age_defaults_to_new_worker(self) -> None:
         """Workers missing from the age map sort as newly observed."""
         selected = select_workers_to_remove_oldest_first(

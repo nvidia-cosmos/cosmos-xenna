@@ -18,17 +18,20 @@ then ``worker_id`` ASC, using per-worker ``num_used_slots`` from
 
 import logging
 import sys
+import collections
 from collections.abc import Iterator
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
+from cosmos_xenna.pipelines.private.streaming import Autoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import PhaseBoundary
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+from cosmos_xenna.ray_utils import actor_pool
 
 
 @pytest.fixture
@@ -48,11 +51,17 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
         loguru_logger.remove(handler_id)
 
 
-def _cluster(*, total_cpus: int = 16) -> resources.ClusterResources:
-    """Build a single-node CPU cluster for Phase D fixtures."""
+def _cluster(*, total_cpus: int = 16, num_nodes: int = 1) -> resources.ClusterResources:
+    """Build a CPU cluster for Phase D fixtures."""
     return resources.ClusterResources(
         nodes={
-            "node-0": resources.NodeResources(used_cpus=0, total_cpus=total_cpus, gpus=[], name="node-0"),
+            f"node-{index}": resources.NodeResources(
+                used_cpus=0,
+                total_cpus=total_cpus,
+                gpus=[],
+                name=f"node-{index}",
+            )
+            for index in range(num_nodes)
         },
     )
 
@@ -61,6 +70,7 @@ def _problem(
     stage_specs: list[tuple[str, int | None]],
     *,
     cfg: SaturationAwareConfig | None = None,
+    num_nodes: int = 1,
 ) -> tuple[SaturationAwareScheduler, data_structures.Problem]:
     """Build a setup-completed scheduler and its matching problem."""
     if cfg is None:
@@ -68,9 +78,10 @@ def _problem(
             floor_stuck_grace_cycles=0,
             stage_defaults=SaturationAwareStageConfig(min_workers=1),
         )
-    cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(_cluster())
+    cluster = _cluster(num_nodes=num_nodes)
+    cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(cluster)
     problem = data_structures.Problem(
-        _cluster(),
+        cluster,
         [
             data_structures.ProblemStage(
                 name=name,
@@ -131,6 +142,83 @@ def _autoscale_with_intents(
         return scheduler.autoscale(time=0.0, problem_state=state)
 
 
+def _worker_group(worker_id: str) -> resources.WorkerGroup:
+    """Build a one-CPU worker group snapshot for streaming fixtures."""
+    return resources.WorkerGroup.make(
+        worker_id,
+        "A",
+        [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+    )
+
+
+def _slot(*, used: bool) -> actor_pool._Slot[object]:
+    """Build a ready-actor slot with or without an assigned task."""
+    task = cast(actor_pool._SlotData[object], object()) if used else None
+    return actor_pool._Slot(task=task)
+
+
+def _ready_actor(*, used_slots: int, empty_slots: int) -> actor_pool._ReadyActor[object]:
+    """Build a ready actor with the requested used/empty slot counts."""
+    slots = [_slot(used=True) for _ in range(used_slots)]
+    slots.extend(_slot(used=False) for _ in range(empty_slots))
+    return actor_pool._ReadyActor(
+        metadata=resources.WorkerMetadata.make_dummy(),
+        actor_ref=cast(Any, object()),
+        start_time=0.0,
+        slots=collections.deque(slots),
+    )
+
+
+class _FakeAllocator:
+    """Worker allocator shell for end-to-end Phase D tests."""
+
+    def get_workers_in_stage(self, _stage_name: str) -> list[resources.WorkerGroup]:
+        """Return the stage's current worker groups."""
+        return [_worker_group("busy-A"), _worker_group("idle-B"), _worker_group("idle-C")]
+
+
+def _real_actor_pool_for_phase_d() -> actor_pool.ActorPool[object, object]:
+    """Build an ``ActorPool`` shell whose per-worker signal differentiates workers."""
+    pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
+    pool._name = "A"
+    pool._slots_per_actor = 1
+    pool._ready_actors = {
+        "actor-busy": _ready_actor(used_slots=1, empty_slots=0),
+        "actor-idle-b": _ready_actor(used_slots=0, empty_slots=1),
+        "actor-idle-c": _ready_actor(used_slots=0, empty_slots=1),
+    }
+    pool._pending_actors = cast(Any, collections.OrderedDict())
+    pool._task_queue = cast(Any, collections.deque())
+    pool._worker_groups = {
+        "busy-A": actor_pool._WorkerGroup(
+            worker_group=_worker_group("busy-A"),
+            actors={"actor-busy"},
+            state=actor_pool._WorkerGroupState.READY,
+            rendevous_params=None,
+        ),
+        "idle-B": actor_pool._WorkerGroup(
+            worker_group=_worker_group("idle-B"),
+            actors={"actor-idle-b"},
+            state=actor_pool._WorkerGroupState.READY,
+            rendevous_params=None,
+        ),
+        "idle-C": actor_pool._WorkerGroup(
+            worker_group=_worker_group("idle-C"),
+            actors={"actor-idle-c"},
+            state=actor_pool._WorkerGroupState.READY,
+            rendevous_params=None,
+        ),
+    }
+    return cast(actor_pool.ActorPool[object, object], pool)
+
+
+def _make_problem_state_from_actor_pool(pool: actor_pool.ActorPool[object, object]) -> data_structures.ProblemState:
+    """Build ``ProblemState`` through the production streaming snapshot method."""
+    autoscaler = Autoscaler.__new__(Autoscaler)
+    autoscaler._allocator = _FakeAllocator()  # type: ignore[attr-defined, assignment]
+    return autoscaler._make_problem_state([pool], [False])
+
+
 class TestPhaseDScaleDownContract:
     """Pin the Phase D scale-down contract."""
 
@@ -176,6 +264,19 @@ class TestPhaseDScaleDownContract:
         solution = _autoscale_with_intents(scheduler, state, {"A": -10})
 
         assert len(solution.stages[0].deleted_workers) == 2
+
+    def test_per_node_floor_prevents_over_deletion(self) -> None:
+        """Scale-down respects ``min_workers_per_node * num_nodes``."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(min_workers=1, min_workers_per_node=2),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg, num_nodes=2)
+        state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -10})
+
+        assert len(solution.stages[0].deleted_workers) == 1
 
     def test_finished_stage_is_not_scaled_down(self) -> None:
         """A finished stage ignores negative intent just as it ignores positive intent."""
@@ -237,6 +338,29 @@ class TestPhaseDScaleDownContract:
         deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
         assert "busy-A" not in deleted_ids, "busy worker must not be removed when idle alternatives exist"
         assert deleted_ids == ["idle-B"]
+
+    def test_actor_pool_idle_signal_survives_to_phase_d_selection(self) -> None:
+        """Real actor-pool slot data shields the busy worker through Phase D."""
+        scheduler, _ = _problem([("A", None)])
+        state = _make_problem_state_from_actor_pool(_real_actor_pool_for_phase_d())
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert deleted_ids == ["idle-B"]
+
+    def test_unready_zero_signal_is_eligible_for_idle_first_shrink(self) -> None:
+        """Current policy treats a not-yet-ready worker-group signal as idle."""
+        scheduler, _ = _problem([("A", None)])
+        scheduler._worker_ages = {"busy-old": 100, "unready-new": 0}
+        state = _problem_state(
+            [("A", ["busy-old", "unready-new"], False)],
+            worker_used_slots={"busy-old": 1, "unready-new": 0},
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        assert [worker.id for worker in solution.stages[0].deleted_workers] == ["unready-new"]
 
     def test_all_busy_workers_falls_back_to_age_only_selection(self) -> None:
         """When every worker is busy, the helper falls back to age-DESC ordering.
