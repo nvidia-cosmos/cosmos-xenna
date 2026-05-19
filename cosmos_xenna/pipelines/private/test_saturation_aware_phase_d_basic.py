@@ -16,9 +16,9 @@ then ``worker_id`` ASC, using per-worker ``num_used_slots`` from
     * The Phase D invariant gate runs after the shrink.
 """
 
+import collections
 import logging
 import sys
-import collections
 from collections.abc import Iterator
 from typing import Any, cast
 from unittest.mock import patch
@@ -27,10 +27,10 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.streaming import Autoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import PhaseBoundary
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+from cosmos_xenna.pipelines.private.streaming import Autoscaler
 from cosmos_xenna.ray_utils import actor_pool
 
 
@@ -71,14 +71,25 @@ def _problem(
     *,
     cfg: SaturationAwareConfig | None = None,
     num_nodes: int = 1,
+    total_cpus: int = 16,
 ) -> tuple[SaturationAwareScheduler, data_structures.Problem]:
-    """Build a setup-completed scheduler and its matching problem."""
+    """Build a setup-completed scheduler and its matching problem.
+
+    The default fixture sets ``max_scale_down_fraction_per_cycle=1.0``
+    so the orchestrator-level fraction cap is effectively a no-op for
+    tests that pin floor / intent-magnitude / selection-order
+    behaviour. Tests targeting the fraction cap itself construct
+    their own ``cfg`` with a smaller fraction.
+    """
     if cfg is None:
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=1),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
-    cluster = _cluster(num_nodes=num_nodes)
+    cluster = _cluster(num_nodes=num_nodes, total_cpus=total_cpus)
     cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(cluster)
     problem = data_structures.Problem(
         cluster,
@@ -144,10 +155,16 @@ def _autoscale_with_intents(
 
 def _worker_group(worker_id: str) -> resources.WorkerGroup:
     """Build a one-CPU worker group snapshot for streaming fixtures."""
-    return resources.WorkerGroup.make(
-        worker_id,
-        "A",
-        [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+    return cast(
+        resources.WorkerGroup,
+        type(
+            "_FakeWorkerGroup",
+            (),
+            {
+                "id": worker_id,
+                "allocations": [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+            },
+        )(),
     )
 
 
@@ -256,7 +273,10 @@ class TestPhaseDScaleDownContract:
         """Scale-down never deletes below the configured stage floor."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=3),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=3,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
@@ -269,7 +289,11 @@ class TestPhaseDScaleDownContract:
         """Scale-down respects ``min_workers_per_node * num_nodes``."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=1, min_workers_per_node=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                min_workers_per_node=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg, num_nodes=2)
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
@@ -457,7 +481,10 @@ class TestPhaseDScaleDownContract:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
@@ -473,7 +500,10 @@ class TestPhaseDScaleDownContract:
         """Boundary: one above floor clamps and surfaces ``deficit=1`` in the INFO log."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
@@ -490,7 +520,10 @@ class TestPhaseDScaleDownContract:
         """Shrink is a no-op when ``current == floor`` regardless of intent magnitude."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         state = _problem_state([("A", ["A-w0", "A-w1"], False)])
@@ -530,8 +563,16 @@ class TestPhaseDScaleDownContract:
         """One stage's floor clamp must not stop the loop from processing the other."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            per_stage_overrides={"A": SaturationAwareStageConfig(min_workers=2)},
-            stage_defaults=SaturationAwareStageConfig(min_workers=1),
+            per_stage_overrides={
+                "A": SaturationAwareStageConfig(
+                    min_workers=2,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            },
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None), ("B", None)], cfg=cfg)
         state = _problem_state(
@@ -550,7 +591,10 @@ class TestPhaseDScaleDownContract:
         """A negative intent of ``-sys.maxsize`` floor-clamps without infinite loop."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3"], False)])
@@ -582,6 +626,117 @@ class TestPhaseDScaleDownContract:
         assert not any("saturation-aware scale-down" in m for m in infos)
 
 
+class TestPhaseDPerCycleFractionClamp:
+    """The orchestrator-level ``max_scale_down_fraction_per_cycle`` clamp.
+
+    Defense-in-depth on top of the per-stage / per-node floor cap and
+    the existing ``compute_delta._shrink_delta`` magnitude cap. The
+    clamp protects against externally-injected intents that bypass
+    ``compute_delta`` (e.g. test fixtures, future schedulers that
+    compute intent differently), preventing cliff scale-downs on a
+    100-actor stage when the floor alone would let the stage drop by
+    a large delta in a single cycle.
+    """
+
+    def test_fraction_cap_limits_per_cycle_deletions(self) -> None:
+        """100-worker stage with ``fraction=0.05`` and ``intent=-50`` deletes only 5."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=0.05,
+            ),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg, total_cpus=128)
+        worker_ids = [f"A-w{i:03d}" for i in range(100)]
+        state = _problem_state([("A", worker_ids, False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -50})
+
+        assert len(solution.stages[0].deleted_workers) == 5
+
+    def test_fraction_cap_floor_one_when_fraction_floors_to_zero(self) -> None:
+        """``max(1, floor(current * fraction))`` ensures progress on tiny fractions.
+
+        With ``current=5`` and ``fraction=0.05``, the bare floor would
+        be ``floor(0.25) = 0``. The ``max(1, ...)`` guard ensures the
+        stage still shrinks by 1 per cycle rather than getting stuck.
+        """
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=0.05,
+            ),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg)
+        state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -3})
+
+        assert len(solution.stages[0].deleted_workers) == 1
+
+    def test_floor_cap_dominates_when_smaller_than_fraction_cap(self) -> None:
+        """When the floor cap is the tighter constraint, it binds; fraction cap is non-binding."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=4,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg)
+        state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -10})
+
+        assert len(solution.stages[0].deleted_workers) == 1, (
+            "floor=4 with current=5 allows only 1 deletion regardless of fraction cap"
+        )
+
+    def test_fraction_cap_logs_dedicated_info_when_binding(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Operators see a fraction-specific INFO log when the fraction cap binds, not the floor log."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=0.10,
+            ),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg, total_cpus=64)
+        worker_ids = [f"A-w{i:03d}" for i in range(50)]
+        state = _problem_state([("A", worker_ids, False)])
+
+        _autoscale_with_intents(scheduler, state, {"A": -30})
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        scale_down = [m for m in infos if "saturation-aware scale-down" in m]
+        assert len(scale_down) == 1, f"expected one fraction-clamp INFO; got: {scale_down}"
+        msg = scale_down[0]
+        assert "per-cycle fraction cap" in msg, "fraction-cap log must use distinct text"
+        assert "max_scale_down_fraction_per_cycle=0.1" in msg
+        assert "deficit=25" in msg
+
+    def test_intent_magnitude_dominates_when_smallest(self) -> None:
+        """When ``|intent|`` is smaller than both caps, no clamp binds; intent passes through."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
+        )
+        scheduler, _ = _problem([("A", None)], cfg=cfg)
+        state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        assert len(solution.stages[0].deleted_workers) == 2
+
+
 class TestPhaseDMultiCycleStability:
     """Multi-cycle scale-down stability: floor holds without spurious side effects."""
 
@@ -592,7 +747,10 @@ class TestPhaseDMultiCycleStability:
         """After a stage hits its floor, repeated negative intent is a clean no-op."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(min_workers=2),
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
         )
         scheduler, _ = _problem([("A", None)], cfg=cfg)
         cycle1_state = _problem_state([("A", ["A-w0", "A-w1", "A-w2", "A-w3", "A-w4"], False)])

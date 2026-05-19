@@ -38,6 +38,8 @@ a working cluster snapshot; the staged plan is frozen into a
 ``Solution`` via ``ctx.into_solution()``.
 """
 
+import math
+
 from cosmos_xenna.pipelines.private import data_structures
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
@@ -508,13 +510,24 @@ class SaturationAwareScheduler:
 
         For each non-finished stage whose
         :attr:`_last_intent_deltas` entry is negative, removes
-        ``min(|intent|, current_workers - floor)`` workers via
-        :func:`select_workers_to_remove_oldest_first`. The shrink is
-        floor-aware: a stage is never reduced below its configured
-        minimum (``min_workers``, ``min_workers_per_node *
-        num_nodes``) -- the same target Phase B enforces. Manual
-        stages (``requested_num_workers is not None``) are excluded
-        so the operator-driven shrink path
+        ``min(|intent|, current_workers - floor, fraction_cap)``
+        workers via :func:`select_workers_to_remove_oldest_first`,
+        where ``fraction_cap = max(1, floor(current_workers *
+        stage_cfg.max_scale_down_fraction_per_cycle))``. Three
+        independent clamps bound the per-cycle shrink magnitude:
+
+          * The configured per-stage / per-node floor (a stage is
+            never reduced below ``min_workers`` or
+            ``min_workers_per_node * num_nodes`` -- the same target
+            Phase B enforces).
+          * The intent magnitude itself (already capped by
+            ``compute_delta._shrink_delta`` to the same fraction).
+          * The orchestrator-level fraction cap (defense-in-depth
+            against externally-injected intents that bypass
+            ``compute_delta``).
+
+        Manual stages (``requested_num_workers is not None``) are
+        excluded so the operator-driven shrink path
         (``_run_phase_a_delete``) remains the single source of
         truth for those.
 
@@ -562,9 +575,13 @@ class SaturationAwareScheduler:
 
             current = len(worker_ids_by_stage[stage_index])
             floor = stage_floors[stage_index]
+            stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
             requested_remove = -intent
             allowed_by_floor = max(0, current - floor)
-            actual_remove = min(requested_remove, allowed_by_floor)
+            fraction_cap = (
+                max(1, math.floor(current * stage_cfg.max_scale_down_fraction_per_cycle)) if current > 0 else 0
+            )
+            actual_remove = min(requested_remove, allowed_by_floor, fraction_cap)
             if actual_remove == 0:
                 continue
 
@@ -586,11 +603,24 @@ class SaturationAwareScheduler:
 
             if actual_remove < requested_remove:
                 deficit = requested_remove - actual_remove
-                logger.info(
-                    f"saturation-aware scale-down: stage {stage_name!r} intent "
-                    f"-{requested_remove} workers; floor cap left {actual_remove} "
-                    f"removed (deficit={deficit}, current={current}, floor={floor})."
-                )
+                # Distinguish which clamp bound the deletion. Both can apply; the
+                # operator-actionable clamp is the smaller of the two, and ties
+                # are reported as floor-bound for backward compatibility with the
+                # pre-2-vi log format.
+                fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
+                if fraction_bound:
+                    logger.info(
+                        f"saturation-aware scale-down: stage {stage_name!r} intent "
+                        f"-{requested_remove} workers; per-cycle fraction cap left "
+                        f"{actual_remove} removed (deficit={deficit}, current={current}, "
+                        f"max_scale_down_fraction_per_cycle={stage_cfg.max_scale_down_fraction_per_cycle})."
+                    )
+                else:
+                    logger.info(
+                        f"saturation-aware scale-down: stage {stage_name!r} intent "
+                        f"-{requested_remove} workers; floor cap left {actual_remove} "
+                        f"removed (deficit={deficit}, current={current}, floor={floor})."
+                    )
 
     def _run_phase_a_delete(
         self,
