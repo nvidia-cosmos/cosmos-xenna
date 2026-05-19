@@ -4,20 +4,16 @@
 """Tests for ``SaturationAwareScheduler._run_phase_d_shrink``.
 
 Phase D applies negative intent deltas as planner removes via
-``ctx.try_remove_worker``. Selection is currently age-DESC with a
-``worker_id`` tiebreaker; the full idle-first sort requires
-per-worker idle data on ``ProblemWorkerGroupState`` and is deferred to
-a separate iteration. The contract under test:
+``ctx.try_remove_worker``. Selection is idle-first, then age-DESC,
+then ``worker_id`` ASC, using per-worker ``num_used_slots`` from
+``ProblemWorkerGroupState``. The contract under test:
 
     * Negative intent removes ``min(|intent|, current - floor)``
-      workers, oldest first.
+      workers, idle-first and oldest within each idle/busy bucket.
     * The configured stage floor (``min_workers``,
       ``min_workers_per_node * num_nodes``) is never crossed.
     * Manual stages and finished stages are skipped.
     * The Phase D invariant gate runs after the shrink.
-
-The idle-first test stays as a strict xfail to capture the deferred
-contract.
 """
 
 import logging
@@ -33,11 +29,6 @@ from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import PhaseBoundary
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
-
-_IDLE_FIRST_NOT_YET_WIRED = pytest.mark.xfail(
-    reason="Per-worker idle-first sort awaits a per-worker idle-state data layer",
-    strict=True,
-)
 
 
 @pytest.fixture
@@ -96,8 +87,20 @@ def _problem(
     return scheduler, problem
 
 
-def _problem_state(stage_specs: list[tuple[str, list[str], bool]]) -> data_structures.ProblemState:
-    """Build a ``ProblemState`` from ``(stage_name, worker_ids, is_finished)`` rows."""
+def _problem_state(
+    stage_specs: list[tuple[str, list[str], bool]],
+    *,
+    worker_used_slots: dict[str, int] | None = None,
+) -> data_structures.ProblemState:
+    """Build a ``ProblemState`` from ``(stage_name, worker_ids, is_finished)`` rows.
+
+    Args:
+        stage_specs: Per-stage rows of ``(name, worker_ids, is_finished)``.
+        worker_used_slots: Optional ``{worker_id: used_slots}`` mapping.
+            Workers absent from the mapping default to 0 used slots
+            (idle), matching the production default for Phase D.
+    """
+    used = worker_used_slots or {}
     return data_structures.ProblemState(
         [
             data_structures.ProblemStageState(
@@ -106,6 +109,7 @@ def _problem_state(stage_specs: list[tuple[str, list[str], bool]]) -> data_struc
                     data_structures.ProblemWorkerGroupState.make(
                         worker_id,
                         [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+                        num_used_slots=used.get(worker_id, 0),
                     )
                     for worker_id in worker_ids
                 ],
@@ -213,15 +217,86 @@ class TestPhaseDScaleDownContract:
         assert PhaseBoundary.PHASE_D in call_order
         assert call_order.index(PhaseBoundary.PHASE_D) < call_order.index("solution_shape")
 
-    @_IDLE_FIRST_NOT_YET_WIRED
     def test_idle_worker_is_selected_before_busy_worker(self) -> None:
-        """Idle workers are removed before busy workers once idle metadata is wired."""
+        """Idle workers are removed before busy workers regardless of age.
+
+        Pins the per-worker idle-first contract: ``busy-A`` carries
+        ``num_used_slots > 0`` so it is shielded from removal even
+        though it is the lexicographically-first id (the worst case
+        for the age-DESC, worker_id-ASC tiebreaker fallback). Only the
+        two idle workers are eligible.
+        """
         scheduler, _ = _problem([("A", None)])
-        state = _problem_state([("A", ["busy-old", "idle-young", "idle-old"], False)])
+        state = _problem_state(
+            [("A", ["busy-A", "idle-B", "idle-C"], False)],
+            worker_used_slots={"busy-A": 1, "idle-B": 0, "idle-C": 0},
+        )
 
         solution = _autoscale_with_intents(scheduler, state, {"A": -1})
 
-        assert [worker.id for worker in solution.stages[0].deleted_workers] == ["idle-old"]
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert "busy-A" not in deleted_ids, "busy worker must not be removed when idle alternatives exist"
+        assert deleted_ids == ["idle-B"]
+
+    def test_all_busy_workers_falls_back_to_age_only_selection(self) -> None:
+        """When every worker is busy, the helper falls back to age-DESC ordering.
+
+        Pins the degenerate case: the idle key collapses to a single
+        bucket of busy workers, so the sort reduces to
+        ``(age DESC, worker_id ASC)``. Without this contract, an
+        OVER_PROVISIONED stage with no idle workers would refuse to
+        shrink even when the floor allows it -- a hang under sustained
+        load. Lex-first ``A-w0`` wins on age ties.
+        """
+        scheduler, _ = _problem([("A", None)])
+        state = _problem_state(
+            [("A", ["A-w0", "A-w1", "A-w2"], False)],
+            worker_used_slots={"A-w0": 1, "A-w1": 1, "A-w2": 1},
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert deleted_ids == ["A-w0"]
+
+    def test_two_idle_one_busy_intent_minus_two_takes_only_idle(self) -> None:
+        """With intent=-2 and one busy worker, both idle workers are removed.
+
+        Pins that the idle bucket is fully consumed before the busy
+        bucket: ``busy-mid`` is shielded even when the deletion count
+        would reach into the busy bucket if idle-first did not hold.
+        """
+        scheduler, _ = _problem([("A", None)])
+        state = _problem_state(
+            [("A", ["idle-A", "busy-mid", "idle-Z"], False)],
+            worker_used_slots={"idle-A": 0, "busy-mid": 5, "idle-Z": 0},
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        deleted_ids = sorted(worker.id for worker in solution.stages[0].deleted_workers)
+        assert deleted_ids == ["idle-A", "idle-Z"]
+
+    def test_intent_exceeds_idle_bucket_extends_into_busy_bucket(self) -> None:
+        """When intent > idle-bucket size, the helper falls through to busy workers.
+
+        Pins that the idle-first key is a sort priority, not a hard
+        gate: scale-down does not stall just because the idle bucket
+        is exhausted. With one idle worker and intent=-2, both ``idle``
+        and the busiest-age-eligible ``busy`` are removed (subject to
+        the floor cap, which is 1 here so 2 deletions are allowed).
+        """
+        scheduler, _ = _problem([("A", None)])
+        state = _problem_state(
+            [("A", ["A-w0", "A-w1", "A-w2"], False)],
+            worker_used_slots={"A-w0": 1, "A-w1": 0, "A-w2": 1},
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        deleted_ids = sorted(worker.id for worker in solution.stages[0].deleted_workers)
+        assert "A-w1" in deleted_ids, "the idle worker must be removed first"
+        assert len(deleted_ids) == 2
 
     def test_planner_refusal_raises_runtime_error(self) -> None:
         """Planner refusing a victim from its own snapshot raises ``RuntimeError``.

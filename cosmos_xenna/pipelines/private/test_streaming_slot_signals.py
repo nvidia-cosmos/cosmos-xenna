@@ -43,6 +43,11 @@ class _FakeActorPool:
     num_used_slots: int
     num_empty_slots: int
     num_queued_tasks: int
+    worker_group_used_slots: dict[str, int] = attrs.Factory(dict)
+
+    def worker_group_num_used_slots(self) -> dict[str, int]:
+        """Stand-in for ``ActorPool.worker_group_num_used_slots``; defaults to no signal."""
+        return dict(self.worker_group_used_slots)
 
 
 @attrs.define
@@ -108,6 +113,7 @@ def _real_actor_pool(
     slots_per_actor: int,
     ready_slots: list[tuple[str, int, int]],
     queued_tasks: int = 0,
+    worker_groups: dict[str, set[str]] | None = None,
 ) -> actor_pool.ActorPool[object, object]:
     """Build an ``ActorPool`` shell with real slot-count properties."""
     pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
@@ -119,6 +125,15 @@ def _real_actor_pool(
     }
     pool._pending_actors = cast(Any, collections.OrderedDict({"pending": object()}))
     pool._task_queue = cast(Any, collections.deque(object() for _ in range(queued_tasks)))
+    pool._worker_groups = {
+        worker_group_id: actor_pool._WorkerGroup(
+            worker_group=_worker_group(name, worker_group_id),
+            actors=set(actor_ids),
+            state=actor_pool._WorkerGroupState.READY,
+            rendevous_params=None,
+        )
+        for worker_group_id, actor_ids in (worker_groups or {}).items()
+    }
     return cast(actor_pool.ActorPool[object, object], pool)
 
 
@@ -164,6 +179,38 @@ class TestMakeProblemStateSlotSignals:
         assert pool.num_used_slots == 1
         assert pool.num_empty_slots == 2
         assert pool.num_queued_tasks == 7
+
+    def test_worker_group_num_used_slots_sums_ready_actors_by_group(self) -> None:
+        """Real ``ActorPool`` reports per-worker-group used slots from ready actors."""
+        pool = _real_actor_pool(
+            name="pool",
+            slots_per_actor=4,
+            ready_slots=[
+                ("actor-a", 2, 1),
+                ("actor-b", 1, 2),
+                ("actor-c", 0, 3),
+            ],
+            worker_groups={
+                "wg-hot": {"actor-a", "actor-b"},
+                "wg-idle": {"actor-c"},
+            },
+        )
+
+        assert pool.worker_group_num_used_slots() == {"wg-hot": 3, "wg-idle": 0}
+
+    def test_worker_group_num_used_slots_defaults_unready_group_to_zero(self) -> None:
+        """A worker group with no ready actors reports 0 used slots."""
+        pool = _real_actor_pool(
+            name="pool",
+            slots_per_actor=4,
+            ready_slots=[("ready", 1, 2)],
+            worker_groups={
+                "wg-ready": {"ready"},
+                "wg-pending": {"pending-actor"},
+            },
+        )
+
+        assert pool.worker_group_num_used_slots() == {"wg-ready": 1, "wg-pending": 0}
 
     def test_make_problem_state_uses_real_actor_pool_slot_properties(self) -> None:
         """``_make_problem_state`` consumes real ``ActorPool`` slot-property values."""
@@ -231,6 +278,33 @@ class TestMakeProblemStateSlotSignals:
         assert stage.num_used_slots == 13
         assert stage.num_empty_slots == 3
         assert stage.input_queue_depth == 21
+
+    def test_active_stage_populates_per_worker_used_slots(self) -> None:
+        """Active stages copy per-worker slot signals onto worker snapshots."""
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "active": [
+                    _worker_group("active", "active-w0"),
+                    _worker_group("active", "active-w1"),
+                ],
+            },
+        )
+        pool = _FakeActorPool(
+            name="active",
+            slots_per_actor=4,
+            num_used_slots=3,
+            num_empty_slots=5,
+            num_queued_tasks=0,
+            worker_group_used_slots={"active-w0": 3, "stale-w9": 99},
+        )
+
+        state = _make_problem_state([pool], [False], allocator=allocator)
+
+        workers = state.rust.stages[0].worker_groups
+        assert [(worker.id, worker.num_used_slots) for worker in workers] == [
+            ("active-w0", 3),
+            ("active-w1", 0),
+        ]
 
     def test_finished_stage_carries_zero_signals(self) -> None:
         """A finished stage zeroes all three signals regardless of live pool counts."""
@@ -532,3 +606,120 @@ class TestMakeProblemStateSlotSignals:
 
         with pytest.raises(ValueError):
             _make_problem_state(pools, [False])
+
+
+class TestMakeProblemStatePerWorkerNumUsedSlots:
+    """Pin per-worker ``num_used_slots`` propagation through ``_make_problem_state``."""
+
+    @staticmethod
+    def _per_worker_used_slots(
+        state: data_structures.ProblemState,
+        *,
+        stage_index: int = 0,
+    ) -> dict[str, int]:
+        """Read back ``{worker_id: num_used_slots}`` from a ``ProblemState`` snapshot."""
+        stage = state.rust.stages[stage_index]
+        return {worker.id: worker.num_used_slots for worker in stage.worker_groups}
+
+    def test_non_empty_pool_map_propagates_to_per_worker(self) -> None:
+        """``pool.worker_group_num_used_slots()`` lands on the matching worker's field.
+
+        Regression target: if the wiring keyed off ``pool.name`` instead
+        of ``w.id``, or hard-coded ``num_used_slots=pool.num_used_slots``,
+        the per-worker fields would not match the per-worker truth.
+        """
+
+        class _MapPool:
+            """Pool returning a non-trivial per-worker idle map."""
+
+            name = "active"
+            slots_per_actor = 4
+            num_used_slots = 99
+            num_empty_slots = 1
+            num_queued_tasks = 0
+
+            def worker_group_num_used_slots(self) -> dict[str, int]:
+                return {"active-w0": 3, "active-w1": 0}
+
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "active": [
+                    _worker_group("active", "active-w0"),
+                    _worker_group("active", "active-w1"),
+                ],
+            },
+        )
+
+        state = _make_problem_state([_MapPool()], [False], allocator=allocator)  # type: ignore[list-item]
+
+        assert self._per_worker_used_slots(state) == {"active-w0": 3, "active-w1": 0}
+
+    def test_worker_missing_from_idle_map_defaults_to_zero(self) -> None:
+        """A worker absent from the pool's map defaults to 0 (idle) per ``.get(w.id, 0)``."""
+
+        class _PartialMapPool:
+            name = "ingest"
+            slots_per_actor = 2
+            num_used_slots = 5
+            num_empty_slots = 3
+            num_queued_tasks = 0
+
+            def worker_group_num_used_slots(self) -> dict[str, int]:
+                return {"ingest-w0": 2}
+
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "ingest": [
+                    _worker_group("ingest", "ingest-w0"),
+                    _worker_group("ingest", "ingest-w1"),
+                ],
+            },
+        )
+
+        state = _make_problem_state([_PartialMapPool()], [False], allocator=allocator)  # type: ignore[list-item]
+
+        assert self._per_worker_used_slots(state) == {"ingest-w0": 2, "ingest-w1": 0}
+
+    def test_pool_worker_group_num_used_slots_exception_propagates(self) -> None:
+        """An exception from ``worker_group_num_used_slots()`` propagates uncaught.
+
+        Pins the same contract as ``test_pool_property_exception_propagates``
+        but for the per-worker accessor: a future ``try/except Exception:
+        return {}`` wrapper would silently substitute all-idle signals
+        for a real pool failure, and Phase D would happily shrink an
+        all-busy stage.
+        """
+
+        class _RaisingMethodPool:
+            name = "broken"
+            slots_per_actor = 1
+            num_used_slots = 0
+            num_empty_slots = 1
+            num_queued_tasks = 0
+
+            def worker_group_num_used_slots(self) -> dict[str, int]:
+                msg = "transient pool failure"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="transient pool failure"):
+            _make_problem_state([_RaisingMethodPool()], [False])  # type: ignore[list-item]
+
+    def test_finished_stage_does_not_call_worker_group_num_used_slots(self) -> None:
+        """Finished stages must not read the per-worker accessor (matches stage-signal skip)."""
+
+        class _RaisingMethodPool:
+            name = "done"
+            slots_per_actor = 1
+            num_used_slots = 0
+            num_empty_slots = 1
+            num_queued_tasks = 0
+
+            def worker_group_num_used_slots(self) -> dict[str, int]:
+                msg = "should not be called on a finished stage"
+                raise RuntimeError(msg)
+
+        state = _make_problem_state([_RaisingMethodPool()], [True])  # type: ignore[list-item]
+
+        stage = state.rust.stages[0]
+        assert stage.is_finished is True
+        assert [w.num_used_slots for w in stage.worker_groups] == []

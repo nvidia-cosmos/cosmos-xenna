@@ -568,10 +568,12 @@ class SaturationAwareScheduler:
             if actual_remove == 0:
                 continue
 
+            worker_used_slots = {wg.id: wg.num_used_slots for wg in runtime_stage.worker_groups}
             victims = select_workers_to_remove_oldest_first(
                 worker_ids=worker_ids_by_stage[stage_index],
                 worker_ages=worker_ages,
                 delete_count=actual_remove,
+                worker_used_slots=worker_used_slots,
             )
             for victim_id in victims:
                 if not ctx.try_remove_worker(stage_index, victim_id):

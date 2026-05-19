@@ -16,21 +16,29 @@
 """Worker selection helpers for the saturation-aware Phase D scale-down.
 
 Phase D removes workers from stages whose per-stage classifier
-output is OVER_PROVISIONED (negative intent from
-``compute_delta``). Selection priority is age-descending: the
-oldest worker is removed first. Older workers have had the most
-opportunity to accumulate stale state (model weights drift,
-allocator fragmentation), so removing them first is a low-risk
-shrink ordering when no per-worker idle signal is yet available.
+output is over-provisioned. Selection priority is
+**idle-first, oldest-first**: workers with zero used slots are
+preferred over busy workers, and within the same idle bucket the
+oldest workers are removed first. The ``worker_id`` tiebreaker keeps
+the choice deterministic across cycles.
 
-The full STORY-33 contract sorts by ``(host_gpu_used_fraction
-ASC, idle_status DESC, age DESC)``: a per-worker idle signal
-plus a host-GPU-loading signal are both required. Today
-``ProblemWorkerGroupState`` exposes neither -- the shrink
-ordering therefore degrades to age-only with the worker_id
-tiebreaker for determinism. Adding the missing signals is a
-separate iteration; until then the helper here is the canonical
-shrink-selection contract for Phase D.
+The age key is intentionally inverted relative to the operator-driven
+shrink paths (manual delete and donor fallback both pick the
+**youngest** eligible worker first):
+
+  - Operator-driven removal targets workers the operator just added,
+    so reversing the most recent intent is the cheapest correction.
+  - Saturation-driven removal targets a stage that has been
+    over-provisioned for many cycles, so retiring the **oldest**
+    worker is the higher-value decision: long-running actors
+    accumulate stale state (model-cache drift, allocator
+    fragmentation, leaked references) and rotating them off improves
+    cluster hygiene over time.
+
+Independent worker-lifetime knobs (``worker_max_lifetime_m``,
+``worker_restart_interval_m``) handle scheduled rotation regardless
+of saturation; this helper only governs the order in which Phase D
+selects victims among the workers eligible for removal this cycle.
 """
 
 from operator import itemgetter
@@ -41,14 +49,16 @@ def select_workers_to_remove_oldest_first(
     worker_ids: list[str],
     worker_ages: dict[str, int],
     delete_count: int,
+    worker_used_slots: dict[str, int] | None = None,
 ) -> list[str]:
-    """Pick ``delete_count`` workers to delete, oldest first.
+    """Pick ``delete_count`` workers to delete, idle-first then oldest-first.
 
-    Sort key: ``(age DESC, worker_id ASC)``. Workers missing from
-    ``worker_ages`` are treated as age 0 (newly observed). The
-    ``worker_id`` tiebreaker keeps the choice deterministic when
-    every worker has the same age. Mirrors the Phase A
-    youngest-first helper but inverts the age key.
+    Sort key: ``(idle DESC, age DESC, worker_id ASC)`` where
+    ``idle = (used_slots == 0)``. Workers missing from
+    ``worker_ages`` are treated as age 0 (newly observed); workers
+    missing from ``worker_used_slots`` are treated as 0 used slots
+    (i.e. idle). When ``worker_used_slots`` is omitted entirely, every
+    worker is idle and the sort collapses to ``(age DESC, worker_id ASC)``.
 
     Args:
         worker_ids: Worker ids in the stage's current snapshot.
@@ -56,16 +66,19 @@ def select_workers_to_remove_oldest_first(
             placement).
         delete_count: Number of workers to return. Clamped to
             ``len(worker_ids)``; non-positive values return ``[]``.
+        worker_used_slots: Optional mapping ``{worker_id: used_slots}``.
+            Idle workers (``used_slots == 0``) sort before busy ones.
 
     Returns:
-        The first ``delete_count`` worker ids of the oldest-first
-        ordering.
+        The first ``delete_count`` worker ids of the
+        idle-first oldest-first ordering.
 
     """
     if delete_count <= 0:
         return []
+    used_slots = worker_used_slots or {}
     ranked = sorted(
-        ((worker_ages.get(wid, 0), wid) for wid in worker_ids),
-        key=lambda pair: (-pair[0], pair[1]),
+        ((used_slots.get(wid, 0) > 0, worker_ages.get(wid, 0), wid) for wid in worker_ids),
+        key=lambda triple: (triple[0], -triple[1], triple[2]),
     )
-    return list(map(itemgetter(1), ranked[:delete_count]))
+    return list(map(itemgetter(2), ranked[:delete_count]))

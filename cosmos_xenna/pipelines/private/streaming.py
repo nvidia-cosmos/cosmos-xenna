@@ -219,16 +219,26 @@ def make_task_measurement_from_task_metadata(
 
 def make_problem_worker_state_from_worker_state(
     state: resources.WorkerGroup,
+    *,
+    num_used_slots: int = 0,
 ) -> data_structures.ProblemWorkerGroupState:
-    """Creates a ProblemWorkerState from a Worker instance.
+    """Creates a ``ProblemWorkerGroupState`` snapshot for a worker group.
 
     Args:
-        state: Worker instance containing worker state information.
+        state: ``WorkerGroup`` instance from the allocator (carries
+            id and resource allocations).
+        num_used_slots: Live task-slot occupancy summed across every
+            ready actor in this group. Defaults to 0 for callers that
+            do not yet plumb the per-worker idle signal.
 
     Returns:
-        A new ProblemWorkerState instance.
+        A new ``ProblemWorkerGroupState`` instance.
     """
-    return data_structures.ProblemWorkerGroupState.make(state.id, state.allocations)
+    return data_structures.ProblemWorkerGroupState.make(
+        state.id,
+        state.allocations,
+        num_used_slots=num_used_slots,
+    )
 
 
 def _required_workers_for_stage(
@@ -497,14 +507,22 @@ class Autoscaler:
                 num_used_slots = 0
                 num_empty_slots = 0
                 input_queue_depth = 0
+                worker_group_idle: dict[str, int] = {}
             else:
                 num_used_slots = pool.num_used_slots
                 num_empty_slots = pool.num_empty_slots
                 input_queue_depth = pool.num_queued_tasks
+                worker_group_idle = pool.worker_group_num_used_slots()
             stages.append(
                 data_structures.ProblemStageState(
                     pool.name,
-                    [make_problem_worker_state_from_worker_state(w) for w in workers],
+                    [
+                        make_problem_worker_state_from_worker_state(
+                            w,
+                            num_used_slots=worker_group_idle.get(w.id, 0),
+                        )
+                        for w in workers
+                    ],
                     pool.slots_per_actor,
                     is_done,
                     num_used_slots=num_used_slots,

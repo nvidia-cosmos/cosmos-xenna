@@ -74,14 +74,20 @@ class Problem:
 class ProblemWorkerGroupState:
     """Runtime snapshot of one worker group assigned to a stage.
 
-    Holds the worker group's stable id and resource allocations. The
-    stage name is supplied later when converting this snapshot back into
-    a concrete ``WorkerGroup`` for actor-pool operations.
-
+    Holds the worker group's stable id, resource allocations, and the
+    optional ``num_used_slots`` saturation signal. The stage name is
+    supplied later when converting this snapshot back into a concrete
+    ``WorkerGroup`` for actor-pool operations.
     """
 
     @classmethod
-    def make(cls, id: str, worker_resources: list[resources.WorkerResourcesInternal]) -> Self:
+    def make(
+        cls,
+        id: str,
+        worker_resources: list[resources.WorkerResourcesInternal],
+        *,
+        num_used_slots: int = 0,
+    ) -> Self:
         """Build a worker-group snapshot from Python primitives.
 
         Args:
@@ -92,13 +98,22 @@ class ProblemWorkerGroupState:
                 ``worker_resources`` rather than ``resources`` so it does
                 not shadow the module-level ``resources`` import inside
                 the method body.
+            num_used_slots: Optional task-slot occupancy signal. Defaults
+                to 0 (no signal); populated by ``streaming.py`` from the
+                live ``ActorPool`` per-actor data.
 
         Returns:
             A ``ProblemWorkerGroupState`` wrapping a freshly-constructed
             Rust ``rust.ProblemWorkerGroupState``.
 
         """
-        return cls(rust.ProblemWorkerGroupState(id, [x.to_rust() for x in worker_resources]))
+        return cls(
+            rust.ProblemWorkerGroupState(
+                id,
+                [x.to_rust() for x in worker_resources],
+                num_used_slots,
+            )
+        )
 
     def __init__(self, rust_problem_worker_state: rust.ProblemWorkerGroupState) -> None:
         self._r = rust_problem_worker_state
@@ -116,6 +131,11 @@ class ProblemWorkerGroupState:
     def resources(self) -> list[resources.WorkerResourcesInternal]:
         """Resource allocations owned by this worker group."""
         return [resources.WorkerResourcesInternal.from_rust(x) for x in self._r.resources]
+
+    @property
+    def num_used_slots(self) -> int:
+        """Number of task slots currently occupied on this worker."""
+        return int(self._r.num_used_slots)
 
     @property
     def rust(self) -> rust.ProblemWorkerGroupState:
