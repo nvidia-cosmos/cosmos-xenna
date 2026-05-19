@@ -636,3 +636,27 @@ class AutoscalePlanContext:
         """
         age = self._r.worker_age(worker_id)
         return None if age is None else int(age)
+
+    def worker_ids_by_stage(self) -> list[list[str]]:
+        """Snapshot of the live worker ids per stage.
+
+        Returns one entry per stage in problem order; each entry is the
+        list of worker ids currently held by that stage in the planner's
+        working snapshot. Reflects every successful ``try_add_worker``
+        and ``try_remove_worker`` issued so far in this cycle. Workers
+        staged for removal are excluded (they have moved to
+        ``pending_removes``); freshly added workers are included.
+
+        Per-stage ids are sorted lexicographically so the output is
+        deterministic across calls. Safe to call after
+        ``into_solution()`` for the same reason as :meth:`worker_ages`;
+        the returned list is freshly allocated and caller mutations do
+        not leak into the planner.
+
+        Returns:
+            A list of ``len(problem.stages)`` lists; entry ``i`` is the
+            ids of the live workers in stage ``i``.
+
+        """
+        rows: list[list[str]] = self._r.worker_ids_by_stage()
+        return rows

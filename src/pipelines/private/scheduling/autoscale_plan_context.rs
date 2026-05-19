@@ -882,6 +882,46 @@ impl AutoscalePlanContext {
     pub fn worker_age(&self, worker_id: &str) -> Option<u64> {
         self.worker_ages.get(worker_id).copied()
     }
+
+    /// Live worker ids per stage in the current planning snapshot.
+    ///
+    /// Returns a vector indexed by stage position (matching the order
+    /// of `stages` in the constructor); each entry is the list of
+    /// worker ids currently held by that stage in the planner's
+    /// working snapshot. Includes both non-SPMD workers (from
+    /// `current_workers`) and SPMD groups (from
+    /// `current_worker_groups`); reflects every `try_add_worker`
+    /// success and every `try_remove_worker` success applied so far
+    /// in this cycle.
+    ///
+    /// Workers staged for removal are NOT present here -- they have
+    /// been moved to `pending_removes`. Workers staged as fresh
+    /// adds ARE present (the planner inserts them into
+    /// `current_workers` / `current_worker_groups` on success).
+    /// Per-stage ids are sorted lexicographically so the output is
+    /// deterministic across calls; ordering aids reproducibility in
+    /// callers that drive donor-style selection.
+    ///
+    /// Safe to call after `into_solution()` for the same reason as
+    /// `worker_ages`: read accessors deliberately bypass the
+    /// drained-state guard. The returned vector clones the live
+    /// state; mutating it does not affect the planner.
+    pub fn worker_ids_by_stage(&self) -> Vec<Vec<String>> {
+        self.stages
+            .iter()
+            .map(|stage| {
+                let mut ids: Vec<String> = Vec::new();
+                if let Some(non_spmd) = self.current_workers.get(&stage.name) {
+                    ids.extend(non_spmd.keys().cloned());
+                }
+                if let Some(spmd) = self.current_worker_groups.get(&stage.name) {
+                    ids.extend(spmd.keys().cloned());
+                }
+                ids.sort();
+                ids
+            })
+            .collect()
+    }
 }
 
 impl AutoscalePlanContext {
@@ -3319,5 +3359,149 @@ mod tests {
         let snapshot_b = ctx.worker_ages();
         assert_eq!(snapshot_b.get("stage_a_worker_0"), Some(&4u64));
         assert!(snapshot_b.get("phantom").is_none());
+    }
+
+    #[test]
+    fn worker_ids_by_stage_returns_seeded_workers_in_stage_order() {
+        // Two stages with 2 and 3 seeded workers respectively; the
+        // accessor returns one entry per stage in the same order as
+        // `Problem.stages`, with per-stage ids sorted lexicographically.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 8.0),
+            stages: vec![make_cpu_stage("stage_a"), make_cpu_stage("stage_b")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_cpu_stage_state_with_workers("stage_a", 2, "node0"),
+                make_cpu_stage_state_with_workers("stage_b", 3, "node0"),
+            ],
+        };
+
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        let by_stage = ctx.worker_ids_by_stage();
+        assert_eq!(
+            by_stage,
+            vec![
+                vec!["stage_a_worker_0".to_string(), "stage_a_worker_1".to_string()],
+                vec![
+                    "stage_b_worker_0".to_string(),
+                    "stage_b_worker_1".to_string(),
+                    "stage_b_worker_2".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_ids_by_stage_reflects_try_add_and_try_remove_within_cycle() {
+        // The accessor must return the LIVE state, not the seed: a
+        // successful add appears in the entry; a successful remove
+        // disappears from it.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        let added = ctx.try_add_worker(0).unwrap().expect("cluster has 4 cpus, add succeeds");
+        let added_id = added.id.clone();
+        let after_add = ctx.worker_ids_by_stage();
+        assert_eq!(after_add.len(), 1);
+        let mut expected_after_add = vec!["stage_a_worker_0".to_string(), added_id.clone()];
+        expected_after_add.sort();
+        assert_eq!(after_add[0], expected_after_add);
+
+        let removed = ctx.try_remove_worker(0, "stage_a_worker_0").unwrap();
+        assert!(removed);
+        let after_remove = ctx.worker_ids_by_stage();
+        assert_eq!(after_remove[0], vec![added_id]);
+    }
+
+    #[test]
+    fn worker_ids_by_stage_remains_valid_after_into_solution() {
+        // Read accessors deliberately bypass the drained-state guard so
+        // callers can persist the post-cycle state for the next cycle.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        let _ = ctx.into_solution();
+
+        let by_stage = ctx.worker_ids_by_stage();
+        assert_eq!(by_stage, vec![vec!["stage_a_worker_0".to_string()]]);
+    }
+
+    #[test]
+    fn worker_ids_by_stage_zero_stage_pipeline_returns_empty_outer_vec() {
+        // Boundary: zero-stage pipeline yields an empty outer vector
+        // (no per-stage entries, not a one-element vector with an
+        // empty inner list).
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: Vec::new(),
+        };
+        let state = ds::ProblemState { stages: Vec::new() };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        assert!(ctx.worker_ids_by_stage().is_empty());
+    }
+
+    #[test]
+    fn worker_ids_by_stage_unions_spmd_and_non_spmd_workers() {
+        // SPMD workers live in `current_worker_groups`; non-SPMD live in
+        // `current_workers`. The accessor must surface both and merge them
+        // into one per-stage list.
+        let problem = ds::Problem {
+            cluster_resources: make_gpu_cluster(2, 2.0),
+            stages: vec![make_spmd_stage("stage_spmd"), make_cpu_stage("stage_cpu")],
+        };
+        let spmd_group = ds::ProblemWorkerGroupState {
+            id: "spmd_group_0".to_string(),
+            resources: vec![
+                rds::WorkerResources {
+                    node: "node0".to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::ONE,
+                    }],
+                },
+                rds::WorkerResources {
+                    node: "node1".to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: vec![rds::GpuAllocation {
+                        offset: 0,
+                        used_fraction: rds::FixedUtil::ONE,
+                    }],
+                },
+            ],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                ds::ProblemStageState {
+                    stage_name: "stage_spmd".to_string(),
+                    worker_groups: vec![spmd_group],
+                    slots_per_worker: 1,
+                    is_finished: false,
+                    ..Default::default()
+                },
+                make_cpu_stage_state_with_workers("stage_cpu", 1, "node0"),
+            ],
+        };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        let by_stage = ctx.worker_ids_by_stage();
+        assert_eq!(
+            by_stage,
+            vec![
+                vec!["spmd_group_0".to_string()],
+                vec!["stage_cpu_worker_0".to_string()],
+            ]
+        );
     }
 }

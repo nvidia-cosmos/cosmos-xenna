@@ -781,6 +781,16 @@ class SaturationAwareConfig:
     cross_stage_donor_min_donation_interval_cycles: int = attrs.field(
         default=30, validator=attrs_utils.validate_positive_int
     )
+    # Number of consecutive cycles the minimum-worker floor enforcement may
+    # fail without receiver progress (cluster placement exhausted AND no
+    # eligible cross-stage donor) before raising ``RuntimeError`` and failing
+    # the pipeline. Default 6 autoscale cycles; wall-clock duration depends on
+    # the scheduler loop cadence.
+    # Set to 0 to disable the grace window: floor enforcement raises on the
+    # first failed no-donor allocation. Counter resets on any successful add
+    # or donation for the receiver stage. Post-donation retry failures raise
+    # immediately because the donor removal cannot be rolled back safely.
+    floor_stuck_grace_cycles: int = attrs.field(default=6, validator=attrs.validators.ge(0))
 
     # --- Loop watchdog (cluster-wide) ---
     # Fraction of ``interval_s`` above which a cycle's wall-clock duration

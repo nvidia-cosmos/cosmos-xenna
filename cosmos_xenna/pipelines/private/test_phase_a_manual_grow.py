@@ -21,12 +21,16 @@ Pin the contract:
      ``current < requested`` grows to exactly ``requested`` when the
      cluster has room.
   2. When the working cluster has no remaining placement, growth
-     stops for that stage in this cycle without raising; the deficit
-     is left for the cross-stage donor fallback to cover in a later
-     iteration.
+     stops for that stage in this cycle without raising, leaving the
+     request partially satisfied.
   3. Finished stages, non-manual stages, and stages already at or
      above the request are not touched.
 """
+
+from typing import cast
+from unittest.mock import patch
+
+import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
@@ -90,6 +94,19 @@ def _problem_state(
     return data_structures.ProblemState(states)
 
 
+class _RaisingAddContext:
+    """Fake planner that surfaces a hard placement-context failure."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.calls: list[int] = []
+        self._exc = exc or RuntimeError("planner context is drained")
+
+    def try_add_worker(self, stage_index: int) -> data_structures.ProblemWorkerGroupState | None:
+        """Raise the same exception type a corrupted planner context would raise."""
+        self.calls.append(stage_index)
+        raise self._exc
+
+
 class TestManualGrowScheduler:
     """End-to-end manual grow via ``SaturationAwareScheduler.autoscale``."""
 
@@ -125,12 +142,17 @@ class TestManualGrowScheduler:
         assert solution.stages[0].new_workers == []
 
     def test_non_manual_stages_are_skipped(self) -> None:
-        """``requested_num_workers=None`` makes the stage non-manual; the path skips it."""
+        """``requested_num_workers=None`` makes the stage non-manual; manual grow skips it.
+
+        Start at ``current=2`` so the stage is already above the implicit
+        Phase B floor; this isolates the manual-grow contract from the
+        floor enforcement that runs later in the same cycle.
+        """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_requested([("A", None)]))
         solution = scheduler.autoscale(
             time=0.0,
-            problem_state=_problem_state([("A", 0, 1, False)]),
+            problem_state=_problem_state([("A", 2, 1, False)]),
         )
         assert solution.stages[0].new_workers == []
 
@@ -162,12 +184,17 @@ class TestManualGrowScheduler:
         # Growth should add at most (4 - 1) = 3 new workers, then stop.
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_requested([("A", 10)], total_cpus=4))
-        solution = scheduler.autoscale(
-            time=0.0,
-            problem_state=_problem_state([("A", 1, 1, False)]),
-        )
+        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.warning") as warning:
+            solution = scheduler.autoscale(
+                time=0.0,
+                problem_state=_problem_state([("A", 1, 1, False)]),
+            )
         assert len(solution.stages[0].new_workers) == 3
         assert solution.stages[0].deleted_workers == []
+        warning.assert_called_once_with(
+            "manual grow: stage 'A' requested 10 workers; cluster placement exhausted at 4 "
+            "(deficit=6); manual request remains partially satisfied this cycle."
+        )
 
     def test_partial_grow_when_other_stages_consume_capacity(self) -> None:
         """Two manual stages compete for capacity; first stage fully grows, second partially."""
@@ -224,3 +251,41 @@ class TestManualGrowScheduler:
         )
         assert len(solution.stages[0].deleted_workers) == 3
         assert len(solution.stages[1].new_workers) == 3
+
+    def test_grow_called_before_setup_raises_runtime_error(self) -> None:
+        """Calling the grow phase before ``setup`` fails with a clear scheduler error."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+
+        with pytest.raises(RuntimeError, match="_run_phase_a_grow called before setup"):
+            scheduler._run_phase_a_grow(
+                cast(data_structures.AutoscalePlanContext, _RaisingAddContext()),
+                _problem_state([("A", 0, 1, False)]),
+            )
+
+    def test_planner_exception_propagates(self) -> None:
+        """Hard planner failures are not downgraded to best-effort capacity exhaustion."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_requested([("A", 2)]))
+        ctx = _RaisingAddContext()
+
+        with pytest.raises(RuntimeError, match="planner context is drained"):
+            scheduler._run_phase_a_grow(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                _problem_state([("A", 0, 1, False)]),
+            )
+
+        assert ctx.calls == [0]
+
+    def test_planner_index_error_propagates(self) -> None:
+        """Planner index errors are not downgraded to capacity exhaustion."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_requested([("A", 2)]))
+        ctx = _RaisingAddContext(IndexError("stage_index 0 out of range"))
+
+        with pytest.raises(IndexError, match="stage_index 0 out of range"):
+            scheduler._run_phase_a_grow(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                _problem_state([("A", 0, 1, False)]),
+            )
+
+        assert ctx.calls == [0]

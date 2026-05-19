@@ -43,6 +43,12 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, select_youngest_eligible_donor
+from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
+    PhaseBoundary,
+    check_invariants_after_phase,
+    check_solution_shape,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     EXIT_BAND_MULTIPLIER,
     Regime,
@@ -81,6 +87,9 @@ class SaturationAwareScheduler:
             ``saturation_aggressiveness`` when the cluster is packed
             close to capacity. Defaults to ``SUB_HALFIN_WHITT`` so
             cold-start cycles use the base aggressiveness.
+        _worker_ages: Cross-cycle worker age snapshot keyed by worker
+            id. Seeded into each planner context so manual shrink and
+            floor donor fallback can prefer younger workers.
 
     """
 
@@ -98,6 +107,13 @@ class SaturationAwareScheduler:
         self._stage_states: dict[str, _StageRuntimeState] = {}
         self._stage_names: list[str] = []
         self._regime_state: RegimeDetectorState = RegimeDetectorState()
+        self._worker_ages: dict[str, int] = {}
+        # Per-stage counter of consecutive cycles where floor enforcement
+        # could not be satisfied because the cluster was full and no eligible
+        # donor existed. Reset on any cycle where the receiver makes forward
+        # progress; post-donation retry misses raise immediately because the
+        # donor removal cannot be rolled back safely.
+        self._floor_stuck_counters: dict[str, int] = {}
 
     def setup(self, problem: data_structures.Problem) -> None:
         """Capture the pipeline shape and seed empty per-stage state.
@@ -113,6 +129,8 @@ class SaturationAwareScheduler:
         self._stage_names = [stage.name for stage in problem.rust.stages]
         self._stage_states = {name: _StageRuntimeState(stage_name=name) for name in self._stage_names}
         self._regime_state = RegimeDetectorState()
+        self._worker_ages = {}
+        self._floor_stuck_counters = {}
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -243,7 +261,15 @@ class SaturationAwareScheduler:
             on the cycle's ``AutoscalePlanContext``.
 
         Raises:
-            RuntimeError: ``setup()`` was not called.
+            RuntimeError: ``setup()`` was not called, planner context
+                construction failed, or the non-manual worker floor
+                cannot be satisfied by the current cluster.
+            SchedulerInvariantError: A planner-context or
+                Solution-shape invariant failed between phases; the
+                plan is corrupted and must not be applied. Caller
+                should treat as a must-fail signal: log, surface,
+                and refuse to apply the plan. See
+                ``scheduling_py/invariants.py``.
             ValueError: ``problem`` and ``problem_state`` disagree on
                 stage names or count.
 
@@ -255,10 +281,45 @@ class SaturationAwareScheduler:
 
         self._update_regime_aware_aggressiveness(problem_state)
         self._ensure_thresholds_resolved(problem_state)
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(self._problem, problem_state)
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            self._problem,
+            problem_state,
+            worker_ages=self._next_cycle_worker_ages(),
+        )
         self._run_phase_a_delete(ctx, problem_state)
         self._run_phase_a_grow(ctx, problem_state)
-        return ctx.into_solution()
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
+
+        self._run_phase_b_floor(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
+
+        solution = ctx.into_solution()
+        check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
+        self._persist_worker_ages(ctx)
+        return solution
+
+    def _next_cycle_worker_ages(self) -> dict[str, int]:
+        """Build the planner's age seed for the next autoscale cycle.
+
+        Ages count completed autoscale cycles. Surviving workers age by
+        one when a new planning context is created; the Rust planner
+        drops ids that are absent from the current ``ProblemState`` and
+        assigns age 0 to newly observed workers.
+        """
+        return {worker_id: age + 1 for worker_id, age in self._worker_ages.items()}
+
+    def _persist_worker_ages(self, ctx: data_structures.AutoscalePlanContext) -> None:
+        """Persist live worker ages from a finalized planning context.
+
+        Defensive against the Rust contract that worker ids returned by
+        ``worker_ids_by_stage`` are also present in ``worker_ages``: a
+        missing entry defaults to age 0 (treated as freshly observed)
+        rather than raising ``KeyError`` mid-cycle. The fallback matches
+        :func:`select_youngest_eligible_donor`'s missing-age semantics.
+        """
+        live_worker_ids = {worker_id for stage_ids in ctx.worker_ids_by_stage() for worker_id in stage_ids}
+        worker_ages = ctx.worker_ages()
+        self._worker_ages = {worker_id: worker_ages.get(worker_id, 0) for worker_id in live_worker_ids}
 
     def _run_phase_a_delete(
         self,
@@ -323,11 +384,14 @@ class SaturationAwareScheduler:
         below the request, fresh workers are staged through
         ``ctx.try_add_worker`` until the request is met. When the
         working cluster has no remaining placement (returns ``None``),
-        growth stops for that stage in this cycle without raising;
-        the deficit is left for the cross-stage donor fallback to
-        cover by donating from over-supplied peers, and a single
-        WARNING per affected stage is emitted so operators retain
-        visibility into partially-satisfied manual requests.
+        growth stops for that stage in this cycle without raising, and
+        a single WARNING per affected stage is emitted so operators
+        retain visibility into partially-satisfied manual requests.
+
+        Raises:
+            RuntimeError: The scheduler has not been set up, or the
+                planner reports a corrupted/drained planning context.
+            IndexError: The planner rejects the stage index.
 
         """
         if self._problem is None:
@@ -347,11 +411,266 @@ class SaturationAwareScheduler:
                     logger.warning(
                         f"manual grow: stage {problem_stage.name!r} requested "
                         f"{requested} workers; cluster placement exhausted at "
-                        f"{current} (deficit={deficit}); deficit handed to the "
-                        "cross-stage donor fallback."
+                        f"{current} (deficit={deficit}); manual request remains "
+                        "partially satisfied this cycle."
                     )
                     break
                 current += 1
+
+    def _run_phase_b_floor(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> None:
+        """Enforce the per-stage minimum-worker floor on non-manual stages.
+
+        For each non-manual, non-finished stage, brings the current
+        worker count up to ``_compute_stage_floors``'s ``target_min``.
+        Each shortfall is filled by ``ctx.try_add_worker``; on
+        capacity exhaustion the cross-stage donor fallback
+        (:func:`select_youngest_eligible_donor`) reallocates one
+        worker from another stage and the add is retried. A no-donor
+        floor miss accumulates a per-stage stuck-cycle counter;
+        ``RuntimeError`` is raised only when the counter exceeds
+        ``floor_stuck_grace_cycles``. The counter resets on any cycle
+        where the receiver makes forward progress. A post-donation
+        retry miss raises immediately because the planner state already
+        removed the donor and cannot be rolled back safely.
+
+        Raises:
+            RuntimeError: ``setup()`` was not called; OR the floor
+                has stayed unsatisfied without progress for more than
+                ``floor_stuck_grace_cycles`` consecutive cycles; OR a
+                post-donation retry misses; OR the planner rejects a
+                staged remove of a worker that is live in the snapshot
+                (scheduler defect).
+            IndexError: The planner rejects the stage index.
+
+        """
+        if self._problem is None:
+            msg = "_run_phase_b_floor called before setup()"
+            raise RuntimeError(msg)
+        num_nodes = self._problem.rust.cluster_resources.num_nodes()
+        stage_floors = self._compute_stage_floors(num_nodes)
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            if problem_stage.requested_num_workers is not None:
+                # Manual stages have their worker count owned by the manual-shrink/grow path.
+                continue
+            runtime_stage = problem_state.rust.stages[stage_index]
+            if runtime_stage.is_finished:
+                continue
+            target_min = stage_floors[stage_index]
+            # Read the receiver's count from the planner's live snapshot so any
+            # mutation by an earlier-iteration donation is observed correctly.
+            current = len(ctx.worker_ids_by_stage()[stage_index])
+            stage_cfg = self._config.get_effective_stage_config(
+                stage_name=problem_stage.name,
+                spec_override=None,
+            )
+            made_progress = False
+            stuck = False
+            while current < target_min:
+                if ctx.try_add_worker(stage_index) is not None:
+                    current += 1
+                    made_progress = True
+                    continue
+                # Cluster is full for the receiver's shape; attempt the
+                # cross-stage donor fallback before deciding whether to raise.
+                donor = select_youngest_eligible_donor(
+                    receiver_stage_index=stage_index,
+                    stage_floors=stage_floors,
+                    worker_ids_by_stage=ctx.worker_ids_by_stage(),
+                    worker_ages=ctx.worker_ages(),
+                )
+                if donor is None:
+                    if made_progress and self._config.floor_stuck_grace_cycles > 0:
+                        self._warn_floor_partial_progress(
+                            stage_name=problem_stage.name,
+                            target_min=target_min,
+                            current=current,
+                        )
+                    else:
+                        self._on_floor_stuck(
+                            stage_name=problem_stage.name,
+                            target_min=target_min,
+                            current=current,
+                            stage_cfg=stage_cfg,
+                            num_nodes=num_nodes,
+                        )
+                        stuck = True
+                    break
+                if not ctx.try_remove_worker(donor.stage_index, donor.worker_id):
+                    msg = (
+                        f"Cross-stage floor donor: planner snapshot inconsistency - "
+                        f"try_remove_worker(stage_index={donor.stage_index}, "
+                        f"worker_id={donor.worker_id!r}) returned False even though the "
+                        "worker is present in the live snapshot. This is a scheduler "
+                        "defect; report it with the autoscale cycle's problem_state."
+                    )
+                    raise RuntimeError(msg)
+                if ctx.try_add_worker(stage_index) is None:
+                    msg = self._format_floor_unmet_message(
+                        stage_name=problem_stage.name,
+                        target_min=target_min,
+                        current=current,
+                        stage_cfg=stage_cfg,
+                        num_nodes=num_nodes,
+                        donor_attempted=True,
+                        donor=donor,
+                    )
+                    raise RuntimeError(msg)
+                logger.info(
+                    f"[scheduler] {problem_stage.name!r}: cross-stage minimum-floor donor "
+                    f"accepted (donor_stage_index={donor.stage_index}, "
+                    f"donor_worker_id={donor.worker_id!r}, donor_age={donor.age})"
+                )
+                current += 1
+                made_progress = True
+            if made_progress or not stuck:
+                # Floor satisfied this cycle (either by direct add, by donation, or
+                # because target_min was already met at entry), or the receiver made
+                # partial progress; reset the stuck counter.
+                self._floor_stuck_counters.pop(problem_stage.name, None)
+
+    @staticmethod
+    def _warn_floor_partial_progress(
+        *,
+        stage_name: str,
+        target_min: int,
+        current: int,
+    ) -> None:
+        """Warn when a floor is still short but the receiver grew this cycle."""
+        logger.warning(
+            f"[scheduler] {stage_name!r}: minimum-worker floor partially satisfied "
+            f"(target_min={target_min}, achieved={current}, no eligible cross-stage donor); "
+            "stuck counter reset because the receiver made forward progress."
+        )
+
+    def _on_floor_stuck(
+        self,
+        *,
+        stage_name: str,
+        target_min: int,
+        current: int,
+        stage_cfg: SaturationAwareStageConfig,
+        num_nodes: int,
+    ) -> None:
+        """Account for a single stuck-cycle and either raise or warn.
+
+        Increments the per-stage stuck counter, raises ``RuntimeError``
+        when the counter exceeds ``floor_stuck_grace_cycles``, and
+        otherwise emits a single WARNING per stuck cycle so operators
+        can correlate transient pressure with eventual escalation.
+
+        Args:
+            stage_name: Receiver stage that did not reach its floor.
+            target_min: Configured minimum for the stage.
+            current: Worker count achieved before the failure.
+            stage_cfg: Effective per-stage config (used for the
+                operator-actionable error message).
+            num_nodes: Cluster node count at this cycle.
+
+        Raises:
+            RuntimeError: The per-stage stuck counter has exceeded
+                ``floor_stuck_grace_cycles``. Message identifies the
+                stage, target floor, both source values, and tells
+                the operator to reduce the floor or scale up the
+                cluster.
+
+        """
+        counter = self._floor_stuck_counters.get(stage_name, 0) + 1
+        grace = self._config.floor_stuck_grace_cycles
+        if counter > grace:
+            msg = self._format_floor_unmet_message(
+                stage_name=stage_name,
+                target_min=target_min,
+                current=current,
+                stage_cfg=stage_cfg,
+                num_nodes=num_nodes,
+                donor_attempted=False,
+                donor=None,
+            )
+            raise RuntimeError(msg)
+        self._floor_stuck_counters[stage_name] = counter
+        remaining = grace - counter
+        logger.warning(
+            f"[scheduler] {stage_name!r}: minimum-worker floor stuck "
+            f"({counter}/{grace} grace cycles) -- target_min={target_min}, "
+            f"achieved={current}, no eligible cross-stage donor; will raise after "
+            f"{remaining} more consecutive failed cycles."
+        )
+
+    def _compute_stage_floors(self, num_nodes: int) -> dict[int, int]:
+        """Compute the donor / receiver floor for every stage in the problem.
+
+        Returns ``target_min`` per stage (problem-stage index → floor)::
+
+            target_min = max(
+                stage_cfg.min_workers if stage_cfg.min_workers is not None else 1,
+                (stage_cfg.min_workers_per_node * num_nodes) if stage_cfg.min_workers_per_node is not None else 0,
+            )
+
+        Applied uniformly to manual and non-manual stages. A manual
+        stage may donate down to its configured ``min_workers`` floor;
+        ``requested_num_workers`` is a target, not a hard lower bound.
+        Operators who need a hard floor must set ``min_workers`` to the
+        desired minimum.
+
+        """
+        if self._problem is None:
+            msg = "_compute_stage_floors called before setup()"
+            raise RuntimeError(msg)
+        floors: dict[int, int] = {}
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            stage_cfg = self._config.get_effective_stage_config(
+                stage_name=problem_stage.name,
+                spec_override=None,
+            )
+            floors[stage_index] = max(
+                stage_cfg.min_workers if stage_cfg.min_workers is not None else 1,
+                stage_cfg.min_workers_per_node * num_nodes if stage_cfg.min_workers_per_node is not None else 0,
+            )
+        return floors
+
+    @staticmethod
+    def _format_floor_unmet_message(
+        *,
+        stage_name: str,
+        target_min: int,
+        current: int,
+        stage_cfg: SaturationAwareStageConfig,
+        num_nodes: int,
+        donor_attempted: bool,
+        donor: DonorCandidate | None,
+    ) -> str:
+        """Build the operator-actionable message for an unmet minimum-worker floor.
+
+        Distinguishes the two failure modes (no eligible donor vs.
+        donor selected but retry still failed) and -- when a donor was
+        selected -- names that donor so operators can correlate the
+        failure with the donation log line.
+        """
+        if donor_attempted:
+            donor_label = (
+                f" (donor_stage_index={donor.stage_index}, donor_worker_id={donor.worker_id!r})"
+                if donor is not None
+                else ""
+            )
+            donor_clause = (
+                "donor fallback attempted but post-donation retry returned no placement"
+                f"{donor_label} -- the donor's freed slot does not match the receiver's shape"
+            )
+        else:
+            donor_clause = "no eligible cross-stage donor (every other stage at its own floor)"
+        return (
+            f"Minimum-worker floor for stage {stage_name!r} cannot be satisfied: "
+            f"target_min={target_min} (achieved={current}; from "
+            f"min_workers={stage_cfg.min_workers}, "
+            f"min_workers_per_node={stage_cfg.min_workers_per_node}, "
+            f"num_nodes={num_nodes}). Cluster placement exhausted and "
+            f"{donor_clause}. Reduce min_workers / min_workers_per_node, "
+            "or scale up the cluster."
+        )
 
     def _update_regime_aware_aggressiveness(self, problem_state: data_structures.ProblemState) -> None:
         """Detect the cluster's Halfin-Whitt regime and re-resolve thresholds on transition.

@@ -726,6 +726,97 @@ class TestIntoSolution:
         assert solution.stages[1].deleted_workers == []
 
 
+class TestWorkerIdsByStage:
+    """Contract for ``AutoscalePlanContext.worker_ids_by_stage``."""
+
+    def test_returns_seeded_worker_ids_in_stage_order(self) -> None:
+        """Seeded worker ids are grouped by stage and sorted deterministically."""
+        cluster = resources.ClusterResources(
+            nodes={
+                "node0": resources.NodeResources(
+                    used_cpus=0.0,
+                    total_cpus=8.0,
+                    gpus=[],
+                    name="node0",
+                )
+            }
+        )
+        shape = resources.Resources(cpus=1.0, gpus=0.0).to_worker_shape(cluster)
+        stages = [
+            data_structures.ProblemStage(
+                name="stage_a",
+                stage_batch_size=1,
+                worker_shape=shape,
+                requested_num_workers=None,
+                over_provision_factor=None,
+            ),
+            data_structures.ProblemStage(
+                name="stage_b",
+                stage_batch_size=1,
+                worker_shape=shape,
+                requested_num_workers=None,
+                over_provision_factor=None,
+            ),
+        ]
+        problem = data_structures.Problem(cluster_resources=cluster, stages=stages)
+        state = data_structures.ProblemState(
+            stages=[
+                data_structures.ProblemStageState(
+                    stage_name="stage_a",
+                    workers=[_make_cpu_worker("stage_a_w1"), _make_cpu_worker("stage_a_w0")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+                data_structures.ProblemStageState(
+                    stage_name="stage_b",
+                    workers=[_make_cpu_worker("stage_b_w0")],
+                    slots_per_worker=1,
+                    is_finished=False,
+                ),
+            ]
+        )
+
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        assert ctx.worker_ids_by_stage() == [["stage_a_w0", "stage_a_w1"], ["stage_b_w0"]]
+
+    def test_reflects_add_and_remove_in_current_cycle(self) -> None:
+        """Successful adds appear and successful removes disappear immediately."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        added = ctx.try_add_worker(0)
+        assert added is not None
+        assert ctx.try_remove_worker(0, "w0") is True
+
+        assert ctx.worker_ids_by_stage() == [[added.id]]
+
+    def test_spmd_worker_groups_are_reported(self) -> None:
+        """SPMD worker groups come from the SPMD live-worker map."""
+        problem, state = _make_two_node_spmd_problem_and_state(seeded_worker_id="spmd_w0")
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        assert ctx.worker_ids_by_stage() == [["spmd_w0"]]
+
+    def test_returns_fresh_lists(self) -> None:
+        """Caller mutations to returned lists do not leak into the planner."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+
+        snapshot = ctx.worker_ids_by_stage()
+        snapshot[0].append("phantom")
+
+        assert ctx.worker_ids_by_stage() == [["w0"]]
+
+    def test_remains_valid_after_into_solution(self) -> None:
+        """Read access stays available after the plan is drained."""
+        problem, state = _build_one_stage_problem_and_state(workers=[_make_cpu_worker("w0")])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, state)
+        ctx.into_solution()
+
+        assert ctx.worker_ids_by_stage() == [["w0"]]
+
+
 class TestTryRemoveWorker:
     """Contract for ``AutoscalePlanContext.try_remove_worker``."""
 

@@ -198,6 +198,11 @@ class TestSaturationAwareConfigClusterValidators:
         with pytest.raises(ValueError):
             SaturationAwareConfig(interval_s=0.0)
 
+    def test_floor_stuck_grace_cycles_negative_is_rejected(self) -> None:
+        """Floor stuck grace is a non-negative cycle count."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(floor_stuck_grace_cycles=-1)
+
     def test_memory_pressure_threshold_above_one_is_rejected(self) -> None:
         """Threshold is a fraction in (0, 1]."""
         with pytest.raises(ValueError):
