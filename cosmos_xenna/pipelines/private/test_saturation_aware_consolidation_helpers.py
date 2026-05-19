@@ -243,6 +243,53 @@ class TestComputeHostGpuUsedFractions:
 
         assert first == second
 
+    def test_cpu_only_stage_alongside_gpu_stage_only_gpu_contributes(self) -> None:
+        """A CPU-only stage in the same pipeline contributes nothing to the GPU map."""
+        state = _make_problem_state(
+            [
+                ("CPU", [("CPU-w0", []), ("CPU-w1", [])], False),
+                ("GPU", [("GPU-w0", [("node-0", 0, 0.40)])], False),
+            ],
+        )
+
+        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+
+        assert set(result.keys()) == {("node-0", 0)}
+        assert result[("node-0", 0)] == pytest.approx(0.40, abs=_F32_TOL)
+
+    def test_high_concurrency_aggregation_produces_correct_sum_above_one(self) -> None:
+        """100 stages each contributing 0.01 to the same GPU sum to 1.0 (boundary)."""
+        worker_rows = [(f"w{i}", [("node-0", 0, 0.01)]) for i in range(100)]
+        # Each stage has one worker contributing 0.01; total 100 * 0.01 = 1.00.
+        state = _make_problem_state(
+            [(f"S{i}", [worker_rows[i]], False) for i in range(100)],
+        )
+
+        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+
+        assert set(result.keys()) == {("node-0", 0)}
+        # f32 quantization on each of 100 0.01 contributions accumulates to a wider
+        # absolute tolerance than the single-allocation _F32_TOL.
+        assert result[("node-0", 0)] == pytest.approx(1.0, abs=1e-3)
+
+    def test_thousand_workers_in_single_stage_aggregates_correctly(self) -> None:
+        """1000 workers distributed across 8 GPUs aggregate without performance pathology."""
+        worker_rows = []
+        per_gpu_count = [0] * 8
+        for index in range(1000):
+            offset = index % 8
+            per_gpu_count[offset] += 1
+            # Each worker contributes a small slice (0.001) of its GPU.
+            worker_rows.append((f"w{index:04d}", [("node-0", offset, 0.001)]))
+        state = _make_problem_state([("S", worker_rows, False)])
+
+        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+
+        assert set(result.keys()) == {("node-0", offset) for offset in range(8)}
+        for offset, count in enumerate(per_gpu_count):
+            # f32 accumulation tolerance scales with the number of contributions.
+            assert result[("node-0", offset)] == pytest.approx(0.001 * count, abs=1e-3)
+
 
 class TestExtractWorkerHostGpuUsedFractions:
     """Pin the per-stage projection contract using the cluster-wide map."""
@@ -370,6 +417,65 @@ class TestExtractWorkerHostGpuUsedFractions:
         )
 
         assert result == {"A-w0": 0.0}
+
+    def test_workers_sharing_one_gpu_get_identical_projected_fraction(self) -> None:
+        """Two workers on the same ``(node, offset)`` both see the full aggregate fraction."""
+        state = _make_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-w0", [("node-0", 0, 0.25)]),
+                        ("A-w1", [("node-0", 0, 0.25)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+        # Cluster-wide map sees both: 0.25 + 0.25 = 0.50.
+        host_gpu_used_fractions = {("node-0", 0): 0.50}
+
+        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+            runtime_stage=state.rust.stages[0],
+            host_gpu_used_fractions=host_gpu_used_fractions,
+        )
+
+        assert set(result.keys()) == {"A-w0", "A-w1"}
+        assert result["A-w0"] == pytest.approx(0.50, abs=_F32_TOL)
+        assert result["A-w1"] == pytest.approx(0.50, abs=_F32_TOL)
+        # The MAX rule means workers tied for the same GPU sort identically on the
+        # consolidation key; secondary keys (idle/age/id) decide which is deleted.
+
+    def test_aggregate_above_one_propagates_to_worker_projection(self) -> None:
+        """Worker projection passes through over-allocated aggregate values verbatim."""
+        state = _make_problem_state([("A", [("A-w0", [("node-0", 0, 0.50)])], False)])
+        host_gpu_used_fractions = {("node-0", 0): 1.50}
+
+        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+            runtime_stage=state.rust.stages[0],
+            host_gpu_used_fractions=host_gpu_used_fractions,
+        )
+
+        assert result["A-w0"] == pytest.approx(1.50, abs=_F32_TOL)
+
+    def test_max_rule_picks_the_largest_when_one_gpu_is_zero(self) -> None:
+        """A multi-GPU worker on (heavy, zero) GPUs projects to the heavy fraction."""
+        state = _make_problem_state(
+            [("A", [("A-w0", [("node-0", 0, 0.50), ("node-0", 1, 0.50)])], False)],
+        )
+        host_gpu_used_fractions = {
+            ("node-0", 0): 0.95,
+            ("node-0", 1): 0.0,
+        }
+
+        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+            runtime_stage=state.rust.stages[0],
+            host_gpu_used_fractions=host_gpu_used_fractions,
+        )
+
+        # MAX(0.95, 0.0) = 0.95 — the lightly-loaded GPU does NOT pull the worker's
+        # consolidation key down.
+        assert result["A-w0"] == pytest.approx(0.95, abs=_F32_TOL)
 
 
 class TestDefensiveNumericInputs:

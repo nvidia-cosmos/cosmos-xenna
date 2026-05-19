@@ -262,3 +262,100 @@ class TestConsolidationTiebreak:
         # Every selected worker must have a fraction <= every unselected worker (the consolidation
         # bucket boundary), otherwise the primary sort key was violated.
         assert max_selected_fraction <= min_unselected_fraction
+
+
+class TestConsolidationTiebreakEdgeCases:
+    """Pin adversarial edge cases of the consolidation primary sort key.
+
+    These extend ``TestConsolidationTiebreak`` with input shapes that
+    are pathological at the algorithm boundary: zero workers, single
+    worker, ``delete_count`` overflow, all-equal fractions, and
+    non-ASCII worker ids. Failures here pinpoint sort-stability
+    regressions that the canonical happy-path tests would miss.
+    """
+
+    def test_empty_worker_list_returns_empty_selection(self) -> None:
+        """No workers means nothing to delete; the selector returns an empty list."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=[],
+            worker_ages={},
+            worker_used_slots={},
+            worker_host_gpu_used_fractions={},
+            delete_count=5,
+        )
+
+        assert selected == []
+
+    def test_single_worker_stage_with_consolidation_returns_that_worker(self) -> None:
+        """A 1-worker stage shrinking by 1 returns the only worker regardless of fraction."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["solo"],
+            worker_ages={"solo": 42},
+            worker_used_slots={"solo": 0},
+            worker_host_gpu_used_fractions={"solo": 0.99},
+            delete_count=1,
+        )
+
+        assert selected == ["solo"]
+
+    def test_delete_count_exceeds_worker_count_returns_all_in_consolidation_order(self) -> None:
+        """When asked to delete more than exist, return every worker sorted consolidation-first."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["w-light", "w-heavy", "w-medium"],
+            worker_ages={"w-light": 1, "w-heavy": 1, "w-medium": 1},
+            worker_used_slots={"w-light": 0, "w-heavy": 0, "w-medium": 0},
+            worker_host_gpu_used_fractions={"w-light": 0.10, "w-heavy": 0.90, "w-medium": 0.50},
+            delete_count=99,
+        )
+
+        assert selected == ["w-light", "w-medium", "w-heavy"]
+
+    def test_all_workers_on_identical_fraction_collapses_to_secondary_keys(self) -> None:
+        """If every worker maps to the same fraction, the primary key is constant; (idle, age, id) decides."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["young-busy", "old-idle", "young-idle", "old-busy"],
+            worker_ages={"young-busy": 1, "old-idle": 100, "young-idle": 1, "old-busy": 100},
+            worker_used_slots={"young-busy": 5, "old-idle": 0, "young-idle": 0, "old-busy": 5},
+            worker_host_gpu_used_fractions={
+                "young-busy": 0.5,
+                "old-idle": 0.5,
+                "young-idle": 0.5,
+                "old-busy": 0.5,
+            },
+            delete_count=4,
+        )
+
+        # Same selection order as the existing equal-fraction test, but verifying the
+        # invariant holds for the FIRST element (idle/oldest wins) and LAST element
+        # (busy/youngest loses).
+        assert selected[0] == "old-idle"
+        assert selected[-1] == "young-busy"
+
+    def test_unicode_worker_ids_sort_deterministically(self) -> None:
+        """Non-ASCII worker ids participate in the sort without breaking determinism.
+
+        Pins that the worker-id tiebreaker uses Python's standard string comparison,
+        which is deterministic across runs for any UTF-8 content.
+        """
+        worker_ids = ["w-\u00e9", "w-\u4e2d", "w-\U0001f680", "w-z"]
+        worker_ages = {wid: 0 for wid in worker_ids}
+        worker_used_slots = {wid: 0 for wid in worker_ids}
+        worker_host_gpu_used_fractions = {wid: 0.50 for wid in worker_ids}
+
+        first = select_workers_to_remove_oldest_first(
+            worker_ids=worker_ids,
+            worker_ages=worker_ages,
+            worker_used_slots=worker_used_slots,
+            worker_host_gpu_used_fractions=worker_host_gpu_used_fractions,
+            delete_count=4,
+        )
+        second = select_workers_to_remove_oldest_first(
+            worker_ids=list(reversed(worker_ids)),
+            worker_ages=worker_ages,
+            worker_used_slots=worker_used_slots,
+            worker_host_gpu_used_fractions=worker_host_gpu_used_fractions,
+            delete_count=4,
+        )
+
+        assert first == second
+        assert sorted(first) == sorted(worker_ids)

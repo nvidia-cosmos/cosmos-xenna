@@ -1232,3 +1232,185 @@ class TestPhaseDConsolidationTiebreak:
         b_deleted = [worker.id for worker in solution.stages[1].deleted_workers]
         assert a_deleted == ["A-on-private"]
         assert b_deleted == [], "finished stages must never be selected for Phase D shrink"
+
+
+class TestPhaseDConsolidationEdgeCases:
+    """Adversarial edge cases for Phase D consolidation.
+
+    These extend ``TestPhaseDConsolidationTiebreak`` with input shapes
+    that surface failure modes outside the canonical 3->1 contract:
+    floor-bound stages with strong consolidation signals, manual
+    stages with GPU resources, multi-stage reciprocal independence,
+    idempotency across repeated cycles, and intent oscillation
+    stability. Failures here pinpoint orchestrator-layer regressions
+    that the canonical tests would miss.
+    """
+
+    def test_stage_at_floor_does_not_delete_despite_strong_consolidation_signal(self) -> None:
+        """When ``current == min_workers``, consolidation never deletes; floor wins.
+
+        The consolidation primary key is irrelevant if the floor cap is 0; the
+        sort never runs because the deletion count is clamped to zero.
+        """
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=2,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
+        )
+        scheduler, _ = _gpu_problem([("A", None)], cfg=cfg)
+        # current=2, floor=2 -> no shrink possible. A heavy intent (-10) and a clear
+        # consolidation signal (one actor on a near-empty GPU) are both ignored.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-light", [("node-0", 0, 0.05)]),
+                        ("A-heavy", [("node-0", 1, 0.95)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -10})
+
+        assert solution.stages[0].deleted_workers == []
+
+    def test_manual_stage_with_gpu_resources_is_immune_to_consolidation_shrink(self) -> None:
+        """Manual stages (``requested_num_workers != None``) are skipped by Phase D.
+
+        Even though a manual stage has GPU resources contributing to the cluster-wide
+        fraction map, its own workers are never selected by the consolidation sort
+        because Phase D filters manual stages out before the sort runs.
+        """
+        scheduler, _ = _gpu_problem([("A", 3)])  # manual: requested_num_workers=3.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-light", [("node-0", 0, 0.05)]),
+                        ("A-medium", [("node-0", 1, 0.50)]),
+                        ("A-heavy", [("node-0", 2, 0.95)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        assert solution.stages[0].deleted_workers == []
+
+    def test_two_gpu_stages_independently_consolidate_without_interference(self) -> None:
+        """Two GPU stages each shrink to their own consolidation winner; no greedy-break.
+
+        Pins the anti-greedy-break invariant from Phase 2-iv extended to Phase D:
+        an over-provisioned stage's consolidation never blocks another stage's
+        consolidation, even if both are shrinking in the same cycle.
+        """
+        scheduler, _ = _gpu_problem([("A", None), ("B", None)])
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-light", [("node-0", 0, 0.10)]),
+                        ("A-heavy", [("node-0", 1, 0.90)]),
+                    ],
+                    False,
+                ),
+                (
+                    "B",
+                    [
+                        ("B-light", [("node-0", 2, 0.10)]),
+                        ("B-heavy", [("node-0", 3, 0.90)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1, "B": -1})
+
+        a_deleted = [worker.id for worker in solution.stages[0].deleted_workers]
+        b_deleted = [worker.id for worker in solution.stages[1].deleted_workers]
+        # Each stage independently picks the lowest-fraction worker; neither shrink
+        # interferes with the other's bucket boundary.
+        assert a_deleted == ["A-light"]
+        assert b_deleted == ["B-light"]
+
+    def test_idempotent_autoscale_two_calls_same_input_same_deletions(self) -> None:
+        """Calling autoscale twice with the same input produces the same deletion set.
+
+        This is a weaker form of multi-cycle convergence: it pins that the helpers
+        are deterministic given identical inputs even when scheduler state advances
+        (e.g., ``_cycle_counter`` increments). The deletions returned in the
+        Solution must match exactly across the two calls.
+        """
+        scheduler, _ = _gpu_problem([("A", None)])
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-w0", [("node-0", 0, 0.15)]),
+                        ("A-w1", [("node-0", 1, 0.45)]),
+                        ("A-w2", [("node-0", 2, 0.75)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        sol1 = _autoscale_with_intents(scheduler, state, {"A": -2})
+        sol2 = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        first_set = sorted(worker.id for worker in sol1.stages[0].deleted_workers)
+        second_set = sorted(worker.id for worker in sol2.stages[0].deleted_workers)
+        assert first_set == second_set
+        assert first_set == ["A-w0", "A-w1"]
+
+    def test_intent_sign_flips_across_cycles_without_thrashing_consolidation(self) -> None:
+        """Negative intent (cycle 1) deletes; non-negative intent (cycle 2) is a no-op for Phase D.
+
+        Pins that a sign flip on the intent does not retroactively re-delete the
+        consolidation winners; once Phase D commits, the deletions are durable. This
+        prevents an oscillating-intent operator from accidentally pumping deletions
+        cycle after cycle.
+        """
+        scheduler, _ = _gpu_problem([("A", None)])
+        cycle1_state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-light", [("node-0", 0, 0.20)]),
+                        ("A-heavy", [("node-0", 1, 0.80)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+        cycle2_state = _gpu_problem_state(
+            [
+                ("A", [("A-heavy", [("node-0", 1, 0.80)])], False),
+            ],
+        )
+
+        sol1 = _autoscale_with_intents(scheduler, cycle1_state, {"A": -1})
+        sol2 = _autoscale_with_intents(scheduler, cycle2_state, {"A": +1})
+        sol3 = _autoscale_with_intents(scheduler, cycle2_state, {"A": -1})
+
+        cycle1_deleted = [worker.id for worker in sol1.stages[0].deleted_workers]
+        cycle2_deleted = [worker.id for worker in sol2.stages[0].deleted_workers]
+        cycle3_deleted = [worker.id for worker in sol3.stages[0].deleted_workers]
+        # Cycle 1: consolidation wins, A-light deleted.
+        assert cycle1_deleted == ["A-light"]
+        # Cycle 2: positive intent; Phase D is a no-op (Phase C handles the grow).
+        assert cycle2_deleted == []
+        # Cycle 3: negative intent again, but floor=1 prevents any further deletion.
+        assert cycle3_deleted == []
