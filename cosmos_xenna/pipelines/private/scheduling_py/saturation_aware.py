@@ -40,6 +40,7 @@ a working cluster snapshot; the staged plan is frozen into a
 
 import math
 
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import data_structures as rust_data_structures  # type: ignore[import-not-found]
 from cosmos_xenna.pipelines.private import data_structures
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
@@ -660,13 +661,24 @@ class SaturationAwareScheduler:
         (``_run_phase_a_delete``) remains the single source of
         truth for those.
 
-        Selection key is ``(idle DESC, age DESC, worker_id ASC)``
-        where ``idle = (num_used_slots == 0)``: workers with no
-        in-flight tasks are removed before busy workers, oldest first
-        within each bucket. Per-worker ``num_used_slots`` is sourced
-        from ``runtime_stage.worker_groups[*].num_used_slots`` (the
-        streaming layer populates this from
-        ``ActorPool.worker_group_num_used_slots()`` each cycle).
+        Selection key is
+        ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
+        where ``host_gpu_used_fraction`` is the total used fraction
+        of the GPU each worker is placed on (summed across every
+        stage that holds an allocation on that GPU) and ``idle =
+        (num_used_slots == 0)``. The consolidation key is the
+        primary sort: workers on the GPUs with the lowest total
+        fraction are removed first, because those GPUs are most
+        likely to become fully unallocated and recoverable for
+        downstream whole-GPU stages. Per-worker ``num_used_slots``
+        is sourced from
+        ``runtime_stage.worker_groups[*].num_used_slots``; per-GPU
+        used fractions are derived from
+        ``runtime_stage.worker_groups[*].resources`` aggregated
+        across all stages of ``problem_state``. For multi-GPU
+        workers the per-worker fraction is the maximum across the
+        worker's GPU allocations (the most-loaded GPU is the
+        binding constraint for whole-GPU recovery).
 
         Args:
             ctx: The cycle's mutable planner context. Mutated in
@@ -690,6 +702,7 @@ class SaturationAwareScheduler:
         stage_floors = self._compute_stage_floors(num_nodes)
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
+        host_gpu_used_fractions = self._compute_host_gpu_used_fractions(problem_state)
 
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
             if problem_stage.requested_num_workers is not None:
@@ -715,11 +728,16 @@ class SaturationAwareScheduler:
                 continue
 
             worker_used_slots = {wg.id: wg.num_used_slots for wg in runtime_stage.worker_groups}
+            worker_host_gpu_used_fractions = self._extract_worker_host_gpu_used_fractions(
+                runtime_stage=runtime_stage,
+                host_gpu_used_fractions=host_gpu_used_fractions,
+            )
             victims = select_workers_to_remove_oldest_first(
                 worker_ids=worker_ids_by_stage[stage_index],
                 worker_ages=worker_ages,
                 delete_count=actual_remove,
                 worker_used_slots=worker_used_slots,
+                worker_host_gpu_used_fractions=worker_host_gpu_used_fractions,
             )
             for victim_id in victims:
                 if not ctx.try_remove_worker(stage_index, victim_id):
@@ -750,6 +768,94 @@ class SaturationAwareScheduler:
                         f"-{requested_remove} workers; floor cap left {actual_remove} "
                         f"removed (deficit={deficit}, current={current}, floor={floor})."
                     )
+
+    def _compute_host_gpu_used_fractions(
+        self,
+        problem_state: data_structures.ProblemState,
+    ) -> dict[tuple[str, int], float]:
+        """Aggregate the cycle-start used fraction of every GPU in the cluster.
+
+        Iterates the cycle-start snapshot of every worker group in
+        every stage and sums each allocation's ``used_fraction`` by
+        ``(node_name, gpu_offset)`` key. The result is the total
+        used fraction of each GPU at cycle start, used by Phase D
+        scale-down to prefer removing workers from GPUs whose total
+        usage is lowest (most likely to become fully unallocated
+        after deletion).
+
+        This is a cycle-start approximation. Mutations from Phase
+        A, Phase B, and Phase C may have shifted the live cluster
+        fractions by the time Phase D runs. The consolidation key
+        is a soft heuristic that converges over multiple cycles, so
+        a per-cycle approximation is acceptable; a live-cluster
+        accessor would tighten the signal at the cost of an
+        additional Rust FFI hop.
+
+        Args:
+            problem_state: The cycle's runtime snapshot. Every
+                stage's ``worker_groups[*].resources`` contributes
+                to the aggregate.
+
+        Returns:
+            Mapping ``{(node_name, gpu_offset): total_used_fraction}``
+            covering every GPU that has at least one worker group
+            allocation at cycle start. GPUs with no allocations are
+            absent from the map; callers must default to 0.0 for
+            missing keys.
+
+        """
+        fraction_map: dict[tuple[str, int], float] = {}
+        for stage_state in problem_state.rust.stages:
+            for worker_group in stage_state.worker_groups:
+                for resource in worker_group.resources:
+                    node = resource.node
+                    for gpu_alloc in resource.gpus:
+                        key = (node, gpu_alloc.offset)
+                        fraction_map[key] = fraction_map.get(key, 0.0) + float(gpu_alloc.used_fraction)
+        return fraction_map
+
+    @staticmethod
+    def _extract_worker_host_gpu_used_fractions(
+        *,
+        runtime_stage: rust_data_structures.ProblemStageState,
+        host_gpu_used_fractions: dict[tuple[str, int], float],
+    ) -> dict[str, float]:
+        """Project the cluster-wide GPU fraction map onto a single stage's workers.
+
+        For each worker group in ``runtime_stage``, looks up the
+        cycle-start used fraction of every GPU the worker is placed
+        on and returns the maximum across those GPUs. The maximum
+        captures the most-loaded GPU that the worker contributes
+        to: that GPU is the binding constraint for whole-GPU
+        recovery, since deleting the worker only frees the
+        worker's contribution and the GPU stays loaded if other
+        stages also occupy it.
+
+        CPU-only workers (no GPU allocations) and workers whose
+        GPUs have no aggregate fraction in
+        ``host_gpu_used_fractions`` (allocations only on this
+        worker but with ``used_fraction == 0``) map to 0.0.
+
+        Args:
+            runtime_stage: One stage's cycle-start snapshot. Only
+                ``worker_groups[*].resources`` is read.
+            host_gpu_used_fractions: Cluster-wide map produced by
+                :meth:`_compute_host_gpu_used_fractions`.
+
+        Returns:
+            Mapping ``{worker_id: per_worker_max_host_gpu_used_fraction}``
+            covering every worker group in ``runtime_stage``.
+
+        """
+        out: dict[str, float] = {}
+        for worker_group in runtime_stage.worker_groups:
+            fractions = [
+                host_gpu_used_fractions.get((resource.node, gpu_alloc.offset), 0.0)
+                for resource in worker_group.resources
+                for gpu_alloc in resource.gpus
+            ]
+            out[worker_group.id] = max(fractions, default=0.0)
+        return out
 
     def _run_phase_a_delete(
         self,
