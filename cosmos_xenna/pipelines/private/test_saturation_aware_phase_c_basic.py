@@ -177,12 +177,15 @@ class TestNonPositiveIntentIsNoOp:
         assert solution.stages[0].new_workers == []
 
     def test_negative_intent_does_not_grow(self) -> None:
-        """OVER_PROVISIONED produces negative intent; Phase D handles it, Phase C must not.
+        """OVER_PROVISIONED produces negative intent; Phase C must not grow.
 
         Pins the asymmetric responsibility split: scale-up is Phase
         C; scale-down is Phase D. A regression flipping ``intent <= 0``
         to ``intent != 0`` would silently grow over-provisioned
-        stages in Phase C and is caught here.
+        stages in Phase C and is caught here. Phase D's scale-down
+        side effect on the same Solution is asserted in
+        ``test_saturation_aware_phase_d_basic.py``; this test is
+        scoped to the Phase C contract only.
         """
         scheduler = _scheduler([("A", None)])
         state = _problem_state([("A", 4, 1, False)])
@@ -190,7 +193,6 @@ class TestNonPositiveIntentIsNoOp:
         solution = _autoscale_with_intents(scheduler, state, {"A": -2})
 
         assert solution.stages[0].new_workers == []
-        assert solution.stages[0].deleted_workers == []
 
 
 class TestFinishedStageSkipped:

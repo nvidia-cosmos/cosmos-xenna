@@ -369,13 +369,18 @@ class TestSchedulerWiringDoesNotRaise:
                 time=0.0,
                 problem_state=_problem_state([("A", 1, 1, False)]),
             )
-        # Three phase boundaries: after Phase A, Phase B, and Phase C.
-        assert phase_check.call_count == 3
+        # Four phase boundaries: after Phase A, Phase B, Phase C, and Phase D.
+        assert phase_check.call_count == 4
         # One Solution-shape check (after into_solution).
         assert shape_check.call_count == 1
         # The phase boundaries are tagged so operators can locate the violating phase.
         phase_names = {call.kwargs["phase_name"] for call in phase_check.call_args_list}
-        assert phase_names == {PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B, PhaseBoundary.PHASE_C}
+        assert phase_names == {
+            PhaseBoundary.PHASE_A,
+            PhaseBoundary.PHASE_B,
+            PhaseBoundary.PHASE_C,
+            PhaseBoundary.PHASE_D,
+        }
 
     def test_phase_a_invariant_failure_stops_before_phase_b(self) -> None:
         """A Phase A invariant failure propagates and prevents later plan mutation."""

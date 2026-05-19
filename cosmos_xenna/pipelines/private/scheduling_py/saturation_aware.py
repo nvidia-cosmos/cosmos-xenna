@@ -59,6 +59,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     compute_regime_signal,
     update_regime_state,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
@@ -322,6 +323,9 @@ class SaturationAwareScheduler:
         self._run_phase_c_grow(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
 
+        self._run_phase_d_shrink(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
+
         solution = ctx.into_solution()
         check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
         self._persist_worker_ages(ctx)
@@ -424,14 +428,15 @@ class SaturationAwareScheduler:
 
         Walks stages in downstream-first order (greatest DAG depth
         first) so any free cluster capacity is spent on the stage
-        most likely to bound pipeline throughput, and unwinds Phase
-        3's "stop on first failure" trap (see KG entity
-        ``stuck-bottleneck-phase3-greedy-break``): every stage with
-        positive intent is attempted independently. For each
+        most likely to bound pipeline throughput, and avoids the
+        fragmentation-based scheduler behavior where one blocked
+        bottleneck can stop growth attempts for other saturated
+        stages: every stage with positive intent is attempted
+        independently. For each
         non-finished stage whose :attr:`_last_intent_deltas` entry is
         positive, calls ``ctx.try_add_worker(stage_index)`` up to
         ``intent`` times. Cluster placement exhaustion (planner
-        returns ``None``) is non-fatal -- growth stops for that
+        returns ``None``) is non-fatal: growth stops for that
         stage in the current cycle and a single WARNING per affected
         stage is emitted so operators retain visibility into
         partially-satisfied saturation-driven growth. Negative or
@@ -493,6 +498,97 @@ class SaturationAwareScheduler:
                 self._stuck_plan_counters[stage_name] = self._stuck_plan_counters.get(stage_name, 0) + 1
             else:
                 self._stuck_plan_counters[stage_name] = 0
+
+    def _run_phase_d_shrink(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> None:
+        """Apply negative intent deltas as planner removes, oldest-first.
+
+        For each non-finished stage whose
+        :attr:`_last_intent_deltas` entry is negative, removes
+        ``min(|intent|, current_workers - floor)`` workers via
+        :func:`select_workers_to_remove_oldest_first`. The shrink is
+        floor-aware: a stage is never reduced below its configured
+        minimum (``min_workers``, ``min_workers_per_node *
+        num_nodes``) -- the same target Phase B enforces. Manual
+        stages (``requested_num_workers is not None``) are excluded
+        so the operator-driven shrink path
+        (``_run_phase_a_delete``) remains the single source of
+        truth for those.
+
+        Selection key is currently ``(age DESC, worker_id ASC)``. The
+        full STORY-33 sort key ``(host_gpu_used_fraction ASC,
+        idle_status DESC, age DESC)`` requires per-worker idle and
+        host-loading signals that are not yet exposed on
+        ``ProblemWorkerGroupState``; that data-layer extension is a
+        separate iteration. When it lands, only the helper module
+        ``scheduling_py/scale_down.py`` and the floor-aware shrink
+        cap need to change -- the orchestration here stays the same.
+
+        Args:
+            ctx: The cycle's mutable planner context. Mutated in
+                place by ``try_remove_worker``.
+            problem_state: The cycle's runtime snapshot. Used to skip
+                finished and manual stages.
+
+        Raises:
+            RuntimeError: The scheduler has not been set up, or the
+                planner refuses a worker id selected from its own
+                snapshot (defensive: the snapshot inconsistency is a
+                scheduler defect, not an operator-config issue).
+
+        """
+        if self._problem is None:
+            msg = "_run_phase_d_shrink called before setup()"
+            raise RuntimeError(msg)
+
+        num_nodes = len(self._problem.rust.cluster_resources.nodes)
+        stage_floors = self._compute_stage_floors(num_nodes)
+        worker_ids_by_stage = ctx.worker_ids_by_stage()
+        worker_ages = ctx.worker_ages()
+
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            if problem_stage.requested_num_workers is not None:
+                continue
+            runtime_stage = problem_state.rust.stages[stage_index]
+            if runtime_stage.is_finished:
+                continue
+            stage_name = problem_stage.name
+            intent = self._last_intent_deltas.get(stage_name, 0)
+            if intent >= 0:
+                continue
+
+            current = len(worker_ids_by_stage[stage_index])
+            floor = stage_floors[stage_index]
+            requested_remove = -intent
+            allowed_by_floor = max(0, current - floor)
+            actual_remove = min(requested_remove, allowed_by_floor)
+            if actual_remove == 0:
+                continue
+
+            victims = select_workers_to_remove_oldest_first(
+                worker_ids=worker_ids_by_stage[stage_index],
+                worker_ages=worker_ages,
+                delete_count=actual_remove,
+            )
+            for victim_id in victims:
+                if not ctx.try_remove_worker(stage_index, victim_id):
+                    msg = (
+                        f"Phase D shrink: stage {stage_name!r} planner refused removal of "
+                        f"worker {victim_id!r} selected from its own snapshot. This is a "
+                        "scheduler defect; the planner state and the runtime snapshot disagree."
+                    )
+                    raise RuntimeError(msg)
+
+            if actual_remove < requested_remove:
+                deficit = requested_remove - actual_remove
+                logger.info(
+                    f"saturation-aware scale-down: stage {stage_name!r} intent "
+                    f"-{requested_remove} workers; floor cap left {actual_remove} "
+                    f"removed (deficit={deficit}, current={current}, floor={floor})."
+                )
 
     def _run_phase_a_delete(
         self,

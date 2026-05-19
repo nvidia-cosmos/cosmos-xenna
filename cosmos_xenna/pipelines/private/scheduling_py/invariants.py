@@ -51,6 +51,7 @@ class PhaseBoundary(enum.StrEnum):
     PHASE_A = "phase_a"
     PHASE_B = "phase_b"
     PHASE_C = "phase_c"
+    PHASE_D = "phase_d"
     INTO_SOLUTION = "into_solution"
 
 
