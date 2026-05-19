@@ -49,6 +49,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     check_invariants_after_phase,
     check_solution_shape,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     EXIT_BAND_MULTIPLIER,
     Regime,
@@ -90,6 +91,15 @@ class SaturationAwareScheduler:
         _worker_ages: Cross-cycle worker age snapshot keyed by worker
             id. Seeded into each planner context so manual shrink and
             floor donor fallback can prefer younger workers.
+        _last_intent_deltas: Per-stage signed worker-count intent
+            produced by the per-stage decision pipeline on the most
+            recent ``autoscale()`` call. Saturation-driven scale-up
+            (Phase C) and scale-down (Phase D) consume this map; the
+            current iteration computes intent only and does not act
+            on the values, so they are exposed for tests and
+            observability. Reset on every ``autoscale()`` cycle.
+            Finished stages are absent (skipped by
+            ``_compute_intent_deltas``).
 
     """
 
@@ -108,6 +118,7 @@ class SaturationAwareScheduler:
         self._stage_names: list[str] = []
         self._regime_state: RegimeDetectorState = RegimeDetectorState()
         self._worker_ages: dict[str, int] = {}
+        self._last_intent_deltas: dict[str, int] = {}
         # Per-stage counter of consecutive cycles where floor enforcement
         # could not be satisfied because the cluster was full and no eligible
         # donor existed. Reset on any cycle where the receiver makes forward
@@ -131,6 +142,7 @@ class SaturationAwareScheduler:
         self._regime_state = RegimeDetectorState()
         self._worker_ages = {}
         self._floor_stuck_counters = {}
+        self._last_intent_deltas = {}
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -293,6 +305,8 @@ class SaturationAwareScheduler:
         self._run_phase_b_floor(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
+        self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state)
+
         solution = ctx.into_solution()
         check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
         self._persist_worker_ages(ctx)
@@ -320,6 +334,64 @@ class SaturationAwareScheduler:
         live_worker_ids = {worker_id for stage_ids in ctx.worker_ids_by_stage() for worker_id in stage_ids}
         worker_ages = ctx.worker_ages()
         self._worker_ages = {worker_id: worker_ages.get(worker_id, 0) for worker_id in live_worker_ids}
+
+    def _compute_intent_deltas(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> dict[str, int]:
+        """Compute the per-stage signed worker-count intent for this cycle.
+
+        For each non-finished stage, calls
+        :func:`run_per_stage_pipeline` with the live slot signals
+        sourced from ``ProblemStageState`` and the post-Phase-B worker
+        count read from the planner context. The returned delta is the
+        algorithm's intent before any cluster-wide feasibility clamps.
+
+        The intent values are exposed via :attr:`_last_intent_deltas`
+        for tests and observability. Saturation-driven scale-up
+        (Phase C) and scale-down (Phase D) -- not yet implemented --
+        will consume these intents and stage worker adds / removes on
+        the planner context. Finished stages are absent from the
+        returned map: their classifier short-circuits upstream of
+        ``run_per_stage_pipeline`` and any drain-state slot signal
+        would only mutate per-stage EWMA state without affecting the
+        plan.
+
+        Args:
+            ctx: The cycle's mutable planner context after Phase B.
+                Read-only here (intent only); ``current_workers`` is
+                sourced from ``ctx.worker_ids_by_stage()`` so the
+                pipeline observes the post-Phase-B worker count.
+            problem_state: The cycle's runtime snapshot. Provides the
+                three slot signals (``num_used_slots``,
+                ``num_empty_slots``, ``input_queue_depth``) populated
+                in the streaming layer.
+
+        Returns:
+            Mapping of stage name -> signed intent. Positive values
+            indicate scale-up intent, negative values scale-down,
+            zero a no-op. Finished stages are absent.
+        """
+        intents: dict[str, int] = {}
+        worker_ids_by_stage = ctx.worker_ids_by_stage()
+        for stage_index, runtime_stage in enumerate(problem_state.rust.stages):
+            if runtime_stage.is_finished:
+                continue
+            stage_name = runtime_stage.stage_name
+            stage_state = self._stage_states[stage_name]
+            stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
+            current_workers = len(worker_ids_by_stage[stage_index])
+            delta = run_per_stage_pipeline(
+                stage_state=stage_state,
+                num_used_slots=runtime_stage.num_used_slots,
+                num_empty_slots=runtime_stage.num_empty_slots,
+                input_queue_depth=runtime_stage.input_queue_depth,
+                current_workers=current_workers,
+                config=stage_cfg,
+            )
+            intents[stage_name] = delta
+        return intents
 
     def _run_phase_a_delete(
         self,

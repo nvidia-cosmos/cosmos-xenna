@@ -476,6 +476,13 @@ class Autoscaler:
     ) -> data_structures.ProblemState:
         """Creates a `ProblemState` instance from the current pipeline state.
 
+        Populates the per-stage slot signals (``num_used_slots``,
+        ``num_empty_slots``, ``input_queue_depth``) from the live
+        ``ActorPool`` snapshot. Finished stages carry zero signals
+        because their autoscaling decisions are short-circuited
+        upstream and any drain-state slot / queue counts would be
+        misleading saturation signal.
+
         Args:
             actor_pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
@@ -486,12 +493,23 @@ class Autoscaler:
         stages = []
         for pool, is_done in zip(actor_pools, stages_is_dones, strict=True):
             workers = self._allocator.get_workers_in_stage(pool.name)
+            if is_done:
+                num_used_slots = 0
+                num_empty_slots = 0
+                input_queue_depth = 0
+            else:
+                num_used_slots = pool.num_used_slots
+                num_empty_slots = pool.num_empty_slots
+                input_queue_depth = pool.num_queued_tasks
             stages.append(
                 data_structures.ProblemStageState(
                     pool.name,
                     [make_problem_worker_state_from_worker_state(w) for w in workers],
                     pool.slots_per_actor,
                     is_done,
+                    num_used_slots=num_used_slots,
+                    num_empty_slots=num_empty_slots,
+                    input_queue_depth=input_queue_depth,
                 )
             )
         return data_structures.ProblemState(stages)
