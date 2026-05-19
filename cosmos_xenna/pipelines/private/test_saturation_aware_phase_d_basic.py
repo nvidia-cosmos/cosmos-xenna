@@ -19,6 +19,7 @@ then ``worker_id`` ASC, using per-worker ``num_used_slots`` from
 import collections
 import logging
 import sys
+import uuid
 from collections.abc import Iterator
 from typing import Any, cast
 from unittest.mock import patch
@@ -59,6 +60,40 @@ def _cluster(*, total_cpus: int = 16, num_nodes: int = 1) -> resources.ClusterRe
                 used_cpus=0,
                 total_cpus=total_cpus,
                 gpus=[],
+                name=f"node-{index}",
+            )
+            for index in range(num_nodes)
+        },
+    )
+
+
+def _gpu_cluster(
+    *,
+    total_cpus: int = 16,
+    num_nodes: int = 1,
+    num_gpus_per_node: int = 4,
+) -> resources.ClusterResources:
+    """Build a GPU cluster used by the consolidation tiebreak fixtures.
+
+    Each node carries ``num_gpus_per_node`` GPU slots, all initially
+    unallocated (``used_fraction=0``). The Rust planner seeds
+    per-worker fractions during ``AutoscalePlanContext.from_problem_state``,
+    so the cluster only needs the GPU slot structure to satisfy the
+    "GPU offset exists on this node" validation.
+    """
+    return resources.ClusterResources(
+        nodes={
+            f"node-{index}": resources.NodeResources(
+                used_cpus=0,
+                total_cpus=total_cpus,
+                gpus=[
+                    resources.GpuResources(
+                        index=g,
+                        uuid_=uuid.uuid4(),
+                        used_fraction=0.0,
+                    )
+                    for g in range(num_gpus_per_node)
+                ],
                 name=f"node-{index}",
             )
             for index in range(num_nodes)
@@ -109,6 +144,61 @@ def _problem(
     return scheduler, problem
 
 
+def _gpu_problem(
+    stage_specs: list[tuple[str, int | None]],
+    *,
+    cfg: SaturationAwareConfig | None = None,
+    num_nodes: int = 1,
+    num_gpus_per_node: int = 4,
+    total_cpus: int = 16,
+    gpu_per_worker: float = 0.5,
+) -> tuple[SaturationAwareScheduler, data_structures.Problem]:
+    """Build a setup-completed scheduler with GPU-shaped worker stages.
+
+    Used by tests that need a cluster with GPU slots so the planner
+    accepts pre-seeded worker allocations on specific GPU offsets.
+
+    Args:
+        stage_specs: Per-stage rows of ``(name, requested_num_workers)``.
+        cfg: Optional override config. When ``None``, uses the default
+            ``max_scale_down_fraction_per_cycle=1.0`` so the
+            orchestrator-level fraction cap is a no-op.
+        num_nodes: Cluster node count.
+        num_gpus_per_node: GPU slots per node.
+        total_cpus: CPU count per node.
+        gpu_per_worker: Fractional GPU per worker for the stage shape.
+            Only matters for ``try_add_worker``; pre-seeded workers
+            carry their own ``WorkerResources`` allocations directly.
+
+    """
+    if cfg is None:
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                min_workers=1,
+                max_scale_down_fraction_per_cycle=1.0,
+            ),
+        )
+    cluster = _gpu_cluster(num_nodes=num_nodes, total_cpus=total_cpus, num_gpus_per_node=num_gpus_per_node)
+    gpu_shape = resources.Resources(cpus=1.0, gpus=gpu_per_worker).to_worker_shape(cluster)
+    problem = data_structures.Problem(
+        cluster,
+        [
+            data_structures.ProblemStage(
+                name=name,
+                stage_batch_size=1,
+                worker_shape=gpu_shape,
+                requested_num_workers=requested,
+                over_provision_factor=None,
+            )
+            for name, requested in stage_specs
+        ],
+    )
+    scheduler = SaturationAwareScheduler(cfg)
+    scheduler.setup(problem)
+    return scheduler, problem
+
+
 def _problem_state(
     stage_specs: list[tuple[str, list[str], bool]],
     *,
@@ -141,6 +231,73 @@ def _problem_state(
             for name, worker_ids, finished in stage_specs
         ],
     )
+
+
+def _gpu_problem_state(
+    stage_specs: list[
+        tuple[
+            str,
+            list[tuple[str, list[tuple[str, int, float]]]],
+            bool,
+        ]
+    ],
+    *,
+    worker_used_slots: dict[str, int] | None = None,
+) -> data_structures.ProblemState:
+    """Build a ``ProblemState`` whose workers carry explicit GPU allocations.
+
+    The ``stage_specs`` schema is one row per stage:
+
+    ``(stage_name, [(worker_id, [(node, gpu_offset, used_fraction), ...]), ...], is_finished)``
+
+    Each inner list of ``(node, gpu_offset, used_fraction)`` triples
+    becomes a ``WorkerResourcesInternal`` with one ``GpuAllocationInternal``
+    per triple. Use this fixture for tests that need to pin the
+    ``host_gpu_used_fraction`` consolidation primary key.
+
+    Args:
+        stage_specs: One row per stage; see schema above.
+        worker_used_slots: Optional ``{worker_id: used_slots}`` mapping.
+            Workers absent from the mapping default to 0 used slots
+            (idle), matching the production default for Phase D.
+
+    """
+    used = worker_used_slots or {}
+    rows: list[data_structures.ProblemStageState] = []
+    for stage_name, worker_rows, finished in stage_specs:
+        workers = []
+        for worker_id, gpu_triples in worker_rows:
+            # Group GPU allocations by node so each WorkerResourcesInternal
+            # collects every GpuAllocation on the same node. Multiple
+            # WorkerResources entries per worker group correspond to SPMD
+            # workers spread across nodes; multiple GpuAllocation entries
+            # within a single WorkerResources correspond to a non-SPMD
+            # multi-GPU worker on one node.
+            gpus_by_node: dict[str, list[resources.GpuAllocationInternal]] = {}
+            for node, offset, fraction in gpu_triples:
+                gpus_by_node.setdefault(node, []).append(
+                    resources.GpuAllocationInternal(offset=offset, used_fraction=fraction),
+                )
+            allocations = [
+                resources.WorkerResourcesInternal(node=node, cpus=1.0, gpus=gpu_list)
+                for node, gpu_list in gpus_by_node.items()
+            ] or [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])]
+            workers.append(
+                data_structures.ProblemWorkerGroupState.make(
+                    worker_id,
+                    allocations,
+                    num_used_slots=used.get(worker_id, 0),
+                )
+            )
+        rows.append(
+            data_structures.ProblemStageState(
+                stage_name=stage_name,
+                workers=workers,
+                slots_per_worker=1,
+                is_finished=finished,
+            )
+        )
+    return data_structures.ProblemState(rows)
 
 
 def _autoscale_with_intents(
@@ -769,3 +926,206 @@ class TestPhaseDMultiCycleStability:
         assert not any("saturation-aware scale-down" in m for m in infos), (
             f"steady-state cycles must not emit clamp INFOs; got: {infos}"
         )
+
+
+class TestPhaseDConsolidationTiebreak:
+    """Pin the ``host_gpu_used_fraction`` primary sort key contract end-to-end.
+
+    Workers placed on GPUs whose total used fraction is lowest are
+    removed first so a fractional shrink can free whole GPUs for
+    downstream whole-GPU stages.
+    """
+
+    def test_three_to_one_shrink_frees_whole_gpus(self) -> None:
+        """A 3->1 shrink keeps the actor on the highest-fraction GPU and frees the others."""
+        scheduler, _ = _gpu_problem([("A", None)])
+        # Three actors, each on its own GPU, each with a different used_fraction. The
+        # 3->1 shrink must keep ``A-heavy`` (the actor on the most-loaded GPU) so the
+        # other two GPUs become whole-unallocated.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-light", [("node-0", 0, 0.20)]),
+                        ("A-medium", [("node-0", 1, 0.40)]),
+                        ("A-heavy", [("node-0", 2, 0.80)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        deleted_ids = sorted(worker.id for worker in solution.stages[0].deleted_workers)
+        assert deleted_ids == ["A-light", "A-medium"], (
+            "consolidation tiebreak must delete the workers on the lowest-fraction GPUs"
+        )
+
+    def test_cross_stage_fraction_visibility_drives_selection(self) -> None:
+        """An upstream stage's allocation on the same GPU lifts the consolidation key."""
+        scheduler, _ = _gpu_problem([("A", None), ("B", None)])
+        # Stage A has 2 actors. ``A-on-shared`` shares GPU offset 0 on node-0 with stage
+        # B's actor (which holds 0.50 of GPU-0). ``A-on-private`` has GPU-1 to itself
+        # at 0.30. The consolidation primary key sees:
+        #   (node-0, 0) -> 0.30 (A) + 0.50 (B) = 0.80
+        #   (node-0, 1) -> 0.30 (A only)
+        # Phase D shrinks A by one. ``A-on-private`` must be deleted (lower fraction)
+        # so GPU-1 becomes whole-unallocated; ``A-on-shared`` survives because deleting
+        # it would only drop GPU-0 from 0.80 to 0.50 (still allocated by B).
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-on-shared", [("node-0", 0, 0.30)]),
+                        ("A-on-private", [("node-0", 1, 0.30)]),
+                    ],
+                    False,
+                ),
+                (
+                    "B",
+                    [
+                        ("B-on-shared", [("node-0", 0, 0.50)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1, "B": 0})
+
+        a_deleted = [worker.id for worker in solution.stages[0].deleted_workers]
+        b_deleted = [worker.id for worker in solution.stages[1].deleted_workers]
+        assert a_deleted == ["A-on-private"], "the GPU shared with another stage must be deprioritized for deletion"
+        assert b_deleted == [], "stage B was not asked to shrink"
+
+    def test_cpu_only_stage_falls_back_to_idle_age_id_ordering(self) -> None:
+        """A CPU-only stage has no GPU footprint; consolidation degrades to the prior 3-key sort."""
+        scheduler, _ = _problem([("A", None)])
+        scheduler._worker_ages = {"A-w0": 100, "A-w1": 50, "A-w2": 1}
+        state = _problem_state([("A", ["A-w0", "A-w1", "A-w2"], False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -2})
+
+        # Without GPU fractions every worker has consolidation key 0; the sort
+        # degrades to (idle, age DESC, worker_id ASC). All workers idle, oldest-first.
+        deleted_ids = sorted(worker.id for worker in solution.stages[0].deleted_workers)
+        assert deleted_ids == ["A-w0", "A-w1"]
+
+    def test_equal_gpu_fraction_falls_back_to_idle_age_id(self) -> None:
+        """When every actor sees the same GPU fraction, the secondary keys decide."""
+        scheduler, _ = _gpu_problem([("A", None)])
+        scheduler._worker_ages = {"A-young": 1, "A-mid": 5, "A-old": 50}
+        # All three workers on GPUs with the same total fraction. The secondary
+        # idle/age/id key picks the oldest of the three for deletion.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-young", [("node-0", 0, 0.50)]),
+                        ("A-mid", [("node-0", 1, 0.50)]),
+                        ("A-old", [("node-0", 2, 0.50)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert deleted_ids == ["A-old"], "equal fractions must defer to age-DESC selection"
+
+    def test_multi_gpu_worker_uses_max_per_worker_fraction(self) -> None:
+        """For SPMD-style multi-GPU workers, the most-loaded GPU dominates the sort key."""
+        scheduler, _ = _gpu_problem([("A", None)])
+        # Two actors. ``A-spread`` straddles GPU-0 (0.95) and GPU-1 (0.10): MAX = 0.95.
+        # ``A-single`` sits alone on GPU-2 (0.20). ``A-single`` has the lower per-worker
+        # fraction and must be deleted first; ``A-spread`` survives because deleting it
+        # would not free GPU-0 (still 0.95 from the worker itself, but post-deletion 0).
+        # The MAX-of-allocations rule reflects the worst-case constraint that a worker
+        # contributes to: GPU-0 stays loaded when other stages are present.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-spread", [("node-0", 0, 0.95), ("node-0", 1, 0.10)]),
+                        ("A-single", [("node-0", 2, 0.20)]),
+                    ],
+                    False,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert deleted_ids == ["A-single"], "the per-worker MAX-fraction must drive the consolidation tiebreak"
+
+    def test_consolidation_outranks_idle_at_orchestrator_layer(self) -> None:
+        """A busy worker on a low-fraction GPU is removed before an idle worker on a heavy GPU."""
+        scheduler, _ = _gpu_problem([("A", None)])
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-idle-heavy", [("node-0", 0, 0.95)]),
+                        ("A-busy-light", [("node-0", 1, 0.10)]),
+                    ],
+                    False,
+                ),
+            ],
+            worker_used_slots={"A-idle-heavy": 0, "A-busy-light": 5},
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        deleted_ids = [worker.id for worker in solution.stages[0].deleted_workers]
+        assert deleted_ids == ["A-busy-light"], (
+            "consolidation must outrank idle-status: the heavy GPU is preserved even when its actor is idle"
+        )
+
+    def test_finished_stage_still_aggregates_into_fraction_map(self) -> None:
+        """Allocations held by a finished stage still count toward the consolidation key.
+
+        Even though a finished stage cannot be shrunk itself, its workers are still
+        physically holding GPU resources, so other stages' Phase D selection must see
+        those allocations when computing host-GPU-used-fraction.
+        """
+        scheduler, _ = _gpu_problem([("A", None), ("B", None)])
+        # B is finished but still holds an allocation on GPU-0 (0.5 fraction). A has
+        # two actors: one sharing GPU-0 (its own 0.3, total 0.8), one alone on GPU-1
+        # (only 0.3). A's shrink must drop A-on-private (lower total) and keep
+        # A-on-shared even though it is on a heavier GPU; the finished stage's
+        # fraction is part of the planner's input, not a candidate for deletion.
+        state = _gpu_problem_state(
+            [
+                (
+                    "A",
+                    [
+                        ("A-on-shared", [("node-0", 0, 0.30)]),
+                        ("A-on-private", [("node-0", 1, 0.30)]),
+                    ],
+                    False,
+                ),
+                (
+                    "B",
+                    [
+                        ("B-finished-on-shared", [("node-0", 0, 0.50)]),
+                    ],
+                    True,
+                ),
+            ],
+        )
+
+        solution = _autoscale_with_intents(scheduler, state, {"A": -1})
+
+        a_deleted = [worker.id for worker in solution.stages[0].deleted_workers]
+        b_deleted = [worker.id for worker in solution.stages[1].deleted_workers]
+        assert a_deleted == ["A-on-private"]
+        assert b_deleted == [], "finished stages must never be selected for Phase D shrink"

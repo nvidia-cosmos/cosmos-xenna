@@ -40,7 +40,9 @@ a working cluster snapshot; the staged plan is frozen into a
 
 import math
 
-from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import data_structures as rust_data_structures  # type: ignore[import-not-found]
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
+    data_structures as rust_data_structures,
+)
 from cosmos_xenna.pipelines.private import data_structures
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
