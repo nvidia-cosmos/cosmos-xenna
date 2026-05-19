@@ -43,6 +43,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_dag_depth_order
 from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, select_youngest_eligible_donor
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     PhaseBoundary,
@@ -100,6 +101,16 @@ class SaturationAwareScheduler:
             observability. Reset on every ``autoscale()`` cycle.
             Finished stages are absent (skipped by
             ``_compute_intent_deltas``).
+        _stuck_plan_counters: Per-stage count of consecutive
+            ``autoscale()`` cycles where Phase C had a positive
+            intent but could not place the full request. Increments
+            when ``added < intent`` (cluster placement exhausted or
+            a higher-priority downstream stage consumed the headroom
+            first under DAG-priority ordering); resets to ``0`` on a
+            cycle where the stage either fully met its intent or had
+            no positive intent. The counter is the input the
+            pipeline-level ``stuck_plan_detection_cycles`` watchdog
+            (Phase 4) will read.
 
     """
 
@@ -119,6 +130,7 @@ class SaturationAwareScheduler:
         self._regime_state: RegimeDetectorState = RegimeDetectorState()
         self._worker_ages: dict[str, int] = {}
         self._last_intent_deltas: dict[str, int] = {}
+        self._stuck_plan_counters: dict[str, int] = {}
         # Per-stage counter of consecutive cycles where floor enforcement
         # could not be satisfied because the cluster was full and no eligible
         # donor existed. Reset on any cycle where the receiver makes forward
@@ -143,6 +155,7 @@ class SaturationAwareScheduler:
         self._worker_ages = {}
         self._floor_stuck_counters = {}
         self._last_intent_deltas = {}
+        self._stuck_plan_counters = {}
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -306,6 +319,8 @@ class SaturationAwareScheduler:
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
         self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state)
+        self._run_phase_c_grow(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
 
         solution = ctx.into_solution()
         check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
@@ -379,7 +394,14 @@ class SaturationAwareScheduler:
             if runtime_stage.is_finished:
                 continue
             stage_name = runtime_stage.stage_name
-            stage_state = self._stage_states[stage_name]
+            stage_state = self._stage_states.get(stage_name)
+            if stage_state is None:
+                msg = (
+                    f"problem_state stage {stage_name!r} not found in setup() "
+                    f"state map (known: {sorted(self._stage_states)}); "
+                    "problem and problem_state shapes disagree."
+                )
+                raise ValueError(msg)
             stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
             current_workers = len(worker_ids_by_stage[stage_index])
             delta = run_per_stage_pipeline(
@@ -392,6 +414,85 @@ class SaturationAwareScheduler:
             )
             intents[stage_name] = delta
         return intents
+
+    def _run_phase_c_grow(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> None:
+        """Apply positive intent deltas as planner adds, DAG-priority order.
+
+        Walks stages in downstream-first order (greatest DAG depth
+        first) so any free cluster capacity is spent on the stage
+        most likely to bound pipeline throughput, and unwinds Phase
+        3's "stop on first failure" trap (see KG entity
+        ``stuck-bottleneck-phase3-greedy-break``): every stage with
+        positive intent is attempted independently. For each
+        non-finished stage whose :attr:`_last_intent_deltas` entry is
+        positive, calls ``ctx.try_add_worker(stage_index)`` up to
+        ``intent`` times. Cluster placement exhaustion (planner
+        returns ``None``) is non-fatal -- growth stops for that
+        stage in the current cycle and a single WARNING per affected
+        stage is emitted so operators retain visibility into
+        partially-satisfied saturation-driven growth. Negative or
+        zero intent (NORMAL, STARVED, OVER_PROVISIONED) is a no-op
+        here; saturation-driven scale-down lands as Phase D.
+
+        Iteration order is determined by
+        :func:`compute_dag_depth_order` when
+        ``config.enable_dag_priority_growth`` is True (the default);
+        otherwise stages are walked in problem order. Every stage
+        with a positive intent is attempted regardless of any
+        earlier capacity exhaustion.
+
+        Updates :attr:`_stuck_plan_counters`: per-stage count of
+        consecutive cycles where ``added < intent``. Resets to ``0``
+        on any cycle where the stage either fully met its intent or
+        had no positive intent. The counter is the input the
+        pipeline-level ``stuck_plan_detection_cycles`` watchdog
+        (Phase 4) will read.
+
+        Args:
+            ctx: The cycle's mutable planner context. Mutated in place
+                by ``try_add_worker``.
+            problem_state: The cycle's runtime snapshot. Used to skip
+                finished stages and to surface stage indices.
+
+        """
+        if self._problem is None:
+            msg = "_run_phase_c_grow called before setup()"
+            raise RuntimeError(msg)
+
+        if self._config.enable_dag_priority_growth:
+            stage_order = compute_dag_depth_order(self._problem)
+        else:
+            stage_order = list(range(len(problem_state.rust.stages)))
+
+        for stage_index in stage_order:
+            runtime_stage = problem_state.rust.stages[stage_index]
+            if runtime_stage.is_finished:
+                continue
+            stage_name = runtime_stage.stage_name
+            intent = self._last_intent_deltas.get(stage_name, 0)
+            if intent <= 0:
+                self._stuck_plan_counters[stage_name] = 0
+                continue
+            added = 0
+            while added < intent:
+                if ctx.try_add_worker(stage_index) is None:
+                    deficit = intent - added
+                    logger.warning(
+                        f"saturation-aware scale-up: stage {stage_name!r} intent "
+                        f"{intent} workers; cluster placement exhausted after "
+                        f"{added} (deficit={deficit}); request remains partially "
+                        "satisfied this cycle."
+                    )
+                    break
+                added += 1
+            if added < intent:
+                self._stuck_plan_counters[stage_name] = self._stuck_plan_counters.get(stage_name, 0) + 1
+            else:
+                self._stuck_plan_counters[stage_name] = 0
 
     def _run_phase_a_delete(
         self,

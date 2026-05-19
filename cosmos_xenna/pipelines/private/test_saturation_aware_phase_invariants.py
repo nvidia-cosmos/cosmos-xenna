@@ -347,11 +347,11 @@ class TestSchedulerWiringDoesNotRaise:
     def test_scheduler_invokes_invariants_at_each_phase_boundary(self) -> None:
         """The scheduler's autoscale path calls the invariant gate after each phase.
 
-        Verifies the wiring -- the gate is invoked between Phase A, Phase B,
-        and after ``into_solution()`` -- by patching the helpers and asserting
-        their call counts. A future refactor that drops one of the calls will
-        break this test, surfacing the regression at review time rather than
-        in production.
+        Verifies the wiring -- the gate is invoked between Phase A,
+        Phase B, Phase C, and after ``into_solution()`` -- by patching
+        the helpers and asserting their call counts. A future refactor
+        that drops one of the calls will break this test, surfacing
+        the regression at review time rather than in production.
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
@@ -369,13 +369,13 @@ class TestSchedulerWiringDoesNotRaise:
                 time=0.0,
                 problem_state=_problem_state([("A", 1, 1, False)]),
             )
-        # Two phase boundaries (after Phase A, after Phase B).
-        assert phase_check.call_count == 2
+        # Three phase boundaries: after Phase A, Phase B, and Phase C.
+        assert phase_check.call_count == 3
         # One Solution-shape check (after into_solution).
         assert shape_check.call_count == 1
         # The phase boundaries are tagged so operators can locate the violating phase.
         phase_names = {call.kwargs["phase_name"] for call in phase_check.call_args_list}
-        assert phase_names == {PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B}
+        assert phase_names == {PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B, PhaseBoundary.PHASE_C}
 
     def test_phase_a_invariant_failure_stops_before_phase_b(self) -> None:
         """A Phase A invariant failure propagates and prevents later plan mutation."""

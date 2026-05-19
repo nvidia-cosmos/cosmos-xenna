@@ -17,13 +17,15 @@ This module pins the wiring contract:
     * Multi-stage problems preserve per-stage signal isolation.
 """
 
-from typing import cast
+import collections
+from typing import Any, cast
 
 import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.streaming import Autoscaler
+from cosmos_xenna.ray_utils import actor_pool
 
 
 @attrs.define
@@ -82,8 +84,46 @@ def _worker_group(stage_name: str, worker_id: str) -> resources.WorkerGroup:
     )
 
 
+def _slot(*, used: bool) -> actor_pool._Slot[object]:
+    """Build a ready-actor slot with or without an assigned task."""
+    task = cast(actor_pool._SlotData[object], object()) if used else None
+    return actor_pool._Slot(task=task)
+
+
+def _ready_actor(*, used_slots: int, empty_slots: int) -> actor_pool._ReadyActor[object]:
+    """Build a ready actor with the requested used/empty slot counts."""
+    slots = [_slot(used=True) for _ in range(used_slots)]
+    slots.extend(_slot(used=False) for _ in range(empty_slots))
+    return actor_pool._ReadyActor(
+        metadata=resources.WorkerMetadata.make_dummy(),
+        actor_ref=cast(Any, object()),
+        start_time=0.0,
+        slots=collections.deque(slots),
+    )
+
+
+def _real_actor_pool(
+    *,
+    name: str,
+    slots_per_actor: int,
+    ready_slots: list[tuple[str, int, int]],
+    queued_tasks: int = 0,
+) -> actor_pool.ActorPool[object, object]:
+    """Build an ``ActorPool`` shell with real slot-count properties."""
+    pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
+    pool._name = name
+    pool._slots_per_actor = slots_per_actor
+    pool._ready_actors = {
+        actor_id: _ready_actor(used_slots=used_slots, empty_slots=empty_slots)
+        for actor_id, used_slots, empty_slots in ready_slots
+    }
+    pool._pending_actors = cast(Any, collections.OrderedDict({"pending": object()}))
+    pool._task_queue = cast(Any, collections.deque(object() for _ in range(queued_tasks)))
+    return cast(actor_pool.ActorPool[object, object], pool)
+
+
 def _make_problem_state(
-    pools: list[_FakeActorPool],
+    pools: list[Any],
     is_dones: list[bool],
     *,
     allocator: _FakeAllocator | None = None,
@@ -96,6 +136,55 @@ def _make_problem_state(
 
 class TestMakeProblemStateSlotSignals:
     """Pin the slot-signal wiring contract in ``Autoscaler._make_problem_state``."""
+
+    def test_num_used_and_empty_slots_sum_ready_actor_slots(self) -> None:
+        """Real ``ActorPool`` slot properties sum used and empty ready-actor slots."""
+        pool = _real_actor_pool(
+            name="pool",
+            slots_per_actor=4,
+            ready_slots=[
+                ("actor-a", 2, 1),
+                ("actor-b", 0, 3),
+                ("actor-c", 1, 0),
+            ],
+        )
+
+        assert pool.num_used_slots == 3
+        assert pool.num_empty_slots == 4
+
+    def test_num_used_and_empty_slots_ignore_pending_actors_and_task_queue(self) -> None:
+        """Ready-actor slot counts do not include pending actors or queued tasks."""
+        pool = _real_actor_pool(
+            name="pool",
+            slots_per_actor=4,
+            ready_slots=[("ready", 1, 2)],
+            queued_tasks=7,
+        )
+
+        assert pool.num_used_slots == 1
+        assert pool.num_empty_slots == 2
+        assert pool.num_queued_tasks == 7
+
+    def test_make_problem_state_uses_real_actor_pool_slot_properties(self) -> None:
+        """``_make_problem_state`` consumes real ``ActorPool`` slot-property values."""
+        pool = _real_actor_pool(
+            name="real",
+            slots_per_actor=4,
+            ready_slots=[
+                ("actor-a", 2, 1),
+                ("actor-b", 1, 3),
+            ],
+            queued_tasks=9,
+        )
+
+        state = _make_problem_state([pool], [False])
+
+        stage = state.rust.stages[0]
+        assert stage.stage_name == "real"
+        assert stage.slots_per_worker == 4
+        assert stage.num_used_slots == 3
+        assert stage.num_empty_slots == 4
+        assert stage.input_queue_depth == 9
 
     def test_active_stage_propagates_pool_signals(self) -> None:
         """An active stage carries the live ``ActorPool`` slot signals."""
@@ -157,6 +246,37 @@ class TestMakeProblemStateSlotSignals:
 
         stage = state.rust.stages[0]
         assert stage.is_finished is True
+        assert stage.num_used_slots == 0
+        assert stage.num_empty_slots == 0
+        assert stage.input_queue_depth == 0
+
+    def test_finished_stage_does_not_read_pool_signal_accessors(self) -> None:
+        """Finished stages skip signal accessors before zeroing the fields."""
+
+        class _RaisingSignalPool:
+            """Pool whose signal properties fail if read."""
+
+            name = "done"
+            slots_per_actor = 1
+
+            @property
+            def num_used_slots(self) -> int:
+                msg = "num_used_slots should not be read"
+                raise RuntimeError(msg)
+
+            @property
+            def num_empty_slots(self) -> int:
+                msg = "num_empty_slots should not be read"
+                raise RuntimeError(msg)
+
+            @property
+            def num_queued_tasks(self) -> int:
+                msg = "num_queued_tasks should not be read"
+                raise RuntimeError(msg)
+
+        state = _make_problem_state([_RaisingSignalPool()], [True])
+
+        stage = state.rust.stages[0]
         assert stage.num_used_slots == 0
         assert stage.num_empty_slots == 0
         assert stage.input_queue_depth == 0
@@ -310,7 +430,20 @@ class TestMakeProblemStateSlotSignals:
         with pytest.raises(RuntimeError, match="transient pool failure"):
             _make_problem_state([_RaisingPool()], [False])  # type: ignore[list-item]
 
-    def test_negative_signal_overflows_at_rust_boundary(self) -> None:
+    @pytest.mark.parametrize(
+        ("num_used_slots", "num_empty_slots", "num_queued_tasks"),
+        [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+        ],
+    )
+    def test_negative_signal_overflows_at_rust_boundary(
+        self,
+        num_used_slots: int,
+        num_empty_slots: int,
+        num_queued_tasks: int,
+    ) -> None:
         """A negative pool-property value triggers ``OverflowError`` at the ``usize`` cast.
 
         Pins the Rust-boundary contract: ``ProblemStageState`` stores
@@ -318,7 +451,7 @@ class TestMakeProblemStateSlotSignals:
         must surface immediately (``OverflowError``) rather than
         silently clamp to zero or wrap to a huge positive value.
         """
-        pool = _FakeActorPool("buggy", 1, -1, 0, 0)
+        pool = _FakeActorPool("buggy", 1, num_used_slots, num_empty_slots, num_queued_tasks)
 
         with pytest.raises(OverflowError):
             _make_problem_state([pool], [False])
@@ -343,6 +476,21 @@ class TestMakeProblemStateSlotSignals:
         assert first_stage.input_queue_depth == second_stage.input_queue_depth == 7
         assert first is not second
 
+    def test_repeated_calls_read_fresh_pool_signals(self) -> None:
+        """A second call reads changed live pool values rather than cached state."""
+        pool = _FakeActorPool("changing", 1, 1, 3, 5)
+        first = _make_problem_state([pool], [False])
+
+        pool.num_used_slots = 3
+        pool.num_empty_slots = 1
+        pool.num_queued_tasks = 9
+        second = _make_problem_state([pool], [False])
+
+        first_stage = first.rust.stages[0]
+        second_stage = second.rust.stages[0]
+        assert (first_stage.num_used_slots, first_stage.num_empty_slots, first_stage.input_queue_depth) == (1, 3, 5)
+        assert (second_stage.num_used_slots, second_stage.num_empty_slots, second_stage.input_queue_depth) == (3, 1, 9)
+
     def test_all_finished_pipeline_zeroes_every_stage(self) -> None:
         """A pipeline with every stage finished zeroes every per-stage signal."""
         pools = [
@@ -366,13 +514,13 @@ class TestMakeProblemStateSlotSignals:
         100-actor stage with high concurrency could hit thousands of
         slots / queued tasks) are preserved without truncation.
         """
-        pool = _FakeActorPool("hot", 64, 6_400, 0, 50_000)
+        pool = _FakeActorPool("hot", 64, 6_400, 3_200, 50_000)
 
         state = _make_problem_state([pool], [False])
 
         stage = state.rust.stages[0]
         assert stage.num_used_slots == 6_400
-        assert stage.num_empty_slots == 0
+        assert stage.num_empty_slots == 3_200
         assert stage.input_queue_depth == 50_000
 
     def test_mismatched_pool_and_done_lengths_raise_when_done_list_is_shorter(self) -> None:
