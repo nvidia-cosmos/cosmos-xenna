@@ -638,15 +638,21 @@ class SaturationAwareScheduler:
         ctx: data_structures.AutoscalePlanContext,
         problem_state: data_structures.ProblemState,
     ) -> None:
-        """Apply negative intent deltas as planner removes, idle-first then oldest-first.
+        """Apply negative intent deltas as planner removes, consolidation-first then idle-first then oldest-first.
 
         For each non-finished stage whose
         :attr:`_last_intent_deltas` entry is negative, removes
         ``min(|intent|, current_workers - floor, fraction_cap)``
         workers via :func:`select_workers_to_remove_oldest_first`,
         where ``fraction_cap = max(1, floor(current_workers *
-        stage_cfg.max_scale_down_fraction_per_cycle))``. Three
-        independent clamps bound the per-cycle shrink magnitude:
+        stage_cfg.max_scale_down_fraction_per_cycle))``. Selection
+        sorts by
+        ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
+        so workers placed on the lowest-fraction GPUs are removed
+        first, breaking the hidden-bottleneck failure mode where a
+        scattered fractional shrink leaves every GPU partially
+        occupied. Three independent clamps bound the per-cycle
+        shrink magnitude:
 
           * The configured per-stage / per-node floor (a stage is
             never reduced below ``min_workers`` or
@@ -771,8 +777,8 @@ class SaturationAwareScheduler:
                         f"removed (deficit={deficit}, current={current}, floor={floor})."
                     )
 
+    @staticmethod
     def _compute_host_gpu_used_fractions(
-        self,
         problem_state: data_structures.ProblemState,
     ) -> dict[tuple[str, int], float]:
         """Aggregate the cycle-start used fraction of every GPU in the cluster.
