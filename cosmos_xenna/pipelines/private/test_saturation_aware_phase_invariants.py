@@ -274,6 +274,23 @@ class TestCheckInvariantsAfterPhase:
         assert "stage 'A'" in log_msg
         assert "pending_add_count=-1" in log_msg
 
+    def test_stage_name_with_newline_is_repr_escaped_to_prevent_log_injection(self) -> None:
+        """Stage names containing newlines are ``!r``-escaped, so the embedded text cannot forge a log line."""
+        problem = _problem([("stage\nFAKE_LOG_LINE", None)])
+        ctx = _NegativePendingContext(num_stages=1, negative_add_for=0)
+        with pytest.raises(SchedulerInvariantError) as exc_info:
+            check_invariants_after_phase(
+                phase_name=PhaseBoundary.PHASE_A,
+                problem=problem,
+                ctx=cast(data_structures.AutoscalePlanContext, ctx),
+            )
+        msg = str(exc_info.value)
+        # Critical: the embedded ``\nFAKE_LOG_LINE`` must NOT appear as a bare line
+        # in the message; ``!r`` formatting escapes the newline so the injected
+        # text appears literally as ``\\n`` instead of producing a fake log entry.
+        assert "\nFAKE_LOG_LINE" not in msg
+        assert "\\nFAKE_LOG_LINE" in msg
+
 
 class TestCheckSolutionShape:
     """Pure-helper check for the Solution-shape invariant."""
@@ -359,3 +376,86 @@ class TestSchedulerWiringDoesNotRaise:
         # The phase boundaries are tagged so operators can locate the violating phase.
         phase_names = {call.kwargs["phase_name"] for call in phase_check.call_args_list}
         assert phase_names == {PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B}
+
+    def test_phase_a_invariant_failure_stops_before_phase_b(self) -> None:
+        """A Phase A invariant failure propagates and prevents later plan mutation."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1)),
+        )
+        scheduler.setup(_problem([("A", None)]))
+        error = SchedulerInvariantError("phase-a corrupted")
+
+        with (
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase",
+                side_effect=error,
+            ) as phase_check,
+            patch.object(scheduler, "_run_phase_b_floor") as phase_b_floor,
+            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape") as shape_check,
+        ):
+            with pytest.raises(SchedulerInvariantError, match="phase-a corrupted"):
+                scheduler.autoscale(
+                    time=0.0,
+                    problem_state=_problem_state([("A", 1, 1, False)]),
+                )
+
+        assert phase_check.call_count == 1
+        assert phase_check.call_args.kwargs["phase_name"] is PhaseBoundary.PHASE_A
+        phase_b_floor.assert_not_called()
+        shape_check.assert_not_called()
+
+    def test_phase_b_invariant_failure_stops_before_solution_shape_check(self) -> None:
+        """A Phase B invariant failure propagates before ``into_solution`` is trusted."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1)),
+        )
+        scheduler.setup(_problem([("A", None)]))
+
+        def _fail_on_phase_b(**kwargs: object) -> None:
+            if kwargs["phase_name"] is PhaseBoundary.PHASE_B:
+                raise SchedulerInvariantError("phase-b corrupted")
+
+        with (
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase",
+                side_effect=_fail_on_phase_b,
+            ) as phase_check,
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.data_structures."
+                "AutoscalePlanContext.into_solution"
+            ) as into_solution,
+            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape") as shape_check,
+        ):
+            with pytest.raises(SchedulerInvariantError, match="phase-b corrupted"):
+                scheduler.autoscale(
+                    time=0.0,
+                    problem_state=_problem_state([("A", 1, 1, False)]),
+                )
+
+        phase_names = [call.kwargs["phase_name"] for call in phase_check.call_args_list]
+        assert phase_names == [PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B]
+        into_solution.assert_not_called()
+        shape_check.assert_not_called()
+
+    def test_solution_shape_failure_stops_before_age_persistence(self) -> None:
+        """A Solution-shape invariant failure prevents post-cycle state persistence."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1)),
+        )
+        scheduler.setup(_problem([("A", None)]))
+
+        with (
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape",
+                side_effect=SchedulerInvariantError("solution shape corrupted"),
+            ) as shape_check,
+            patch.object(scheduler, "_persist_worker_ages") as persist_worker_ages,
+        ):
+            with pytest.raises(SchedulerInvariantError, match="solution shape corrupted"):
+                scheduler.autoscale(
+                    time=0.0,
+                    problem_state=_problem_state([("A", 1, 1, False)]),
+                )
+
+        assert shape_check.call_count == 1
+        persist_worker_ages.assert_not_called()
