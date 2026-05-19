@@ -77,12 +77,17 @@ impl ProblemStage {
 ///
 /// # Attributes
 /// * `id` - Unique identifier for the worker group.
-/// * `workers` - List of workers in this group.
+/// * `resources` - Per-allocation resource list.
+/// * `num_used_slots` - Number of task slots currently occupied on this worker
+///   at sample time. Defaults to 0; consumers that do not populate this
+///   field treat the default as "no signal" (any worker is equally
+///   eligible for selection).
 #[pyclass(get_all, set_all)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProblemWorkerGroupState {
     pub id: String,
     pub resources: Vec<resources::WorkerResources>,
+    pub num_used_slots: usize,
 }
 
 #[pymethods]
@@ -99,6 +104,7 @@ impl ProblemWorkerGroupState {
         Self {
             id: state.id,
             resources: state.allocations,
+            num_used_slots: 0,
         }
     }
 
@@ -107,12 +113,28 @@ impl ProblemWorkerGroupState {
         Self {
             id: state.id,
             resources: vec![state.allocation],
+            num_used_slots: 0,
         }
     }
 
+    /// Construct a `ProblemWorkerGroupState`.
+    ///
+    /// The `num_used_slots` field is an optional keyword argument
+    /// defaulting to 0 so existing call sites that built
+    /// `ProblemWorkerGroupState` from two positional arguments continue to
+    /// compile unchanged.
     #[new]
-    pub fn py_new(id: String, resources: Vec<resources::WorkerResources>) -> Self {
-        Self { id, resources }
+    #[pyo3(signature = (id, resources, num_used_slots = 0))]
+    pub fn py_new(
+        id: String,
+        resources: Vec<resources::WorkerResources>,
+        num_used_slots: usize,
+    ) -> Self {
+        Self {
+            id,
+            resources,
+            num_used_slots,
+        }
     }
 
     /// Converts this state to a Worker instance.

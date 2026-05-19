@@ -2187,6 +2187,7 @@ mod tests {
                     ],
                 },
             ],
+            num_used_slots: 0,
         };
 
         let existing_worker_group_2 = ds::ProblemWorkerGroupState {
@@ -2221,6 +2222,7 @@ mod tests {
                     ],
                 },
             ],
+            num_used_slots: 0,
         };
 
         let state = ds::ProblemState {

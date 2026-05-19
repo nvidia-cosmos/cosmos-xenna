@@ -452,6 +452,7 @@ impl AutoscalePlanContext {
                 let placement = ds::ProblemWorkerGroupState {
                     id: new_id,
                     resources: result.worker_allocations,
+                    num_used_slots: 0,
                 };
                 // Convert to a WorkerGroup so the cluster's
                 // allocate_multiple API accepts the allocations slice.
@@ -576,6 +577,7 @@ impl AutoscalePlanContext {
                     let placement = ds::ProblemWorkerGroupState {
                         id: new_id,
                         resources: vec![allocation_resources.clone()],
+                        num_used_slots: 0,
                     };
                     self.cluster.allocate(&allocation_resources).map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1185,6 +1187,7 @@ mod tests {
                     cpus: rds::FixedUtil::ONE,
                     gpus: Vec::new(),
                 }],
+                num_used_slots: 0,
             })
             .collect();
         ds::ProblemStageState {
@@ -1399,6 +1402,7 @@ mod tests {
                     }],
                 },
             ],
+            num_used_slots: 0,
         };
         let state = ds::ProblemState {
             stages: vec![ds::ProblemStageState {
@@ -1588,6 +1592,7 @@ mod tests {
                 worker_groups: vec![ds::ProblemWorkerGroupState {
                     id: "empty".to_string(),
                     resources: Vec::new(),
+                    num_used_slots: 0,
                 }],
                 slots_per_worker: 1,
                 is_finished: false,
@@ -1624,6 +1629,7 @@ mod tests {
                             gpus: Vec::new(),
                         },
                     ],
+                    num_used_slots: 0,
                 }],
                 slots_per_worker: 1,
                 is_finished: false,
@@ -1672,6 +1678,7 @@ mod tests {
                             used_fraction: rds::FixedUtil::ONE,
                         }],
                     }],
+                    num_used_slots: 0,
                 }],
                 slots_per_worker: 1,
                 is_finished: false,
@@ -1897,6 +1904,7 @@ mod tests {
                             cpus: rds::FixedUtil::ONE,
                             gpus: Vec::new(),
                         }],
+                        num_used_slots: 0,
                     },
                     ds::ProblemWorkerGroupState {
                         id: "1".to_string(),
@@ -1905,6 +1913,7 @@ mod tests {
                             cpus: rds::FixedUtil::ONE,
                             gpus: Vec::new(),
                         }],
+                        num_used_slots: 0,
                     },
                 ],
                 slots_per_worker: 1,
@@ -2054,6 +2063,7 @@ mod tests {
                 cpus: rds::FixedUtil::ONE,
                 gpus: Vec::new(),
             }],
+            num_used_slots: 0,
         };
         ctx.pending_removes
             .get_mut("stage_a")
@@ -2361,6 +2371,7 @@ mod tests {
                     }],
                 },
             ],
+            num_used_slots: 0,
         };
         let state = ds::ProblemState {
             stages: vec![ds::ProblemStageState {
@@ -3157,6 +3168,7 @@ mod tests {
                         }],
                     },
                 ],
+                num_used_slots: 0,
             }],
             slots_per_worker: 1,
             is_finished: false,
@@ -3481,6 +3493,7 @@ mod tests {
                     }],
                 },
             ],
+            num_used_slots: 0,
         };
         let state = ds::ProblemState {
             stages: vec![
