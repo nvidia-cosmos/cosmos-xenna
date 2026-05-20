@@ -505,6 +505,10 @@ class SaturationAwareScheduler:
         else:
             stage_order = list(range(len(problem_state.rust.stages)))
 
+        num_nodes = len(self._problem.rust.cluster_resources.nodes)
+        stage_ceilings = self._compute_stage_ceilings(num_nodes)
+        worker_ids_by_stage = ctx.worker_ids_by_stage()
+
         for stage_index in stage_order:
             runtime_stage = problem_state.rust.stages[stage_index]
             if runtime_stage.is_finished:
@@ -514,6 +518,25 @@ class SaturationAwareScheduler:
             if intent <= 0:
                 self._stuck_plan_counters[stage_name] = 0
                 continue
+            # Hard worker cap: clamp the grow request to the headroom
+            # left under ``ceiling = min(max_workers, max_workers_per_node * N)``.
+            # The planner refuses excess ``try_add_worker`` calls beyond the
+            # cap; an INFO log records the bound so operators can correlate
+            # the suppressed growth with the configured cap.
+            ceiling = stage_ceilings[stage_index]
+            if ceiling is not None:
+                current = len(worker_ids_by_stage[stage_index])
+                headroom = max(0, ceiling - current)
+                if intent > headroom:
+                    logger.info(
+                        f"saturation-aware scale-up: stage {stage_name!r} intent "
+                        f"+{intent} workers; hard worker cap left {headroom} "
+                        f"(current={current}, ceiling={ceiling})."
+                    )
+                    intent = headroom
+                if intent <= 0:
+                    self._stuck_plan_counters[stage_name] = 0
+                    continue
             added = 0
             while added < intent:
                 if ctx.try_add_worker(stage_index) is not None:
@@ -638,36 +661,42 @@ class SaturationAwareScheduler:
         ctx: data_structures.AutoscalePlanContext,
         problem_state: data_structures.ProblemState,
     ) -> None:
-        """Apply negative intent deltas as planner removes, consolidation-first then idle-first then oldest-first.
+        """Remove workers via the planner to satisfy negative intent or hard-cap overflow.
 
-        For each non-finished stage whose
-        :attr:`_last_intent_deltas` entry is negative, removes
-        ``min(|intent|, current_workers - floor, fraction_cap)``
-        workers via :func:`select_workers_to_remove_oldest_first`,
-        where ``fraction_cap = max(1, floor(current_workers *
-        stage_cfg.max_scale_down_fraction_per_cycle))``. Selection
-        sorts by
-        ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
-        so workers placed on the lowest-fraction GPUs are removed
-        first, breaking the hidden-bottleneck failure mode where a
-        scattered fractional shrink leaves every GPU partially
-        occupied. Three independent clamps bound the per-cycle
-        shrink magnitude:
+        For each non-finished, non-manual stage, computes the
+        per-stage requested shrink as the maximum of two drivers:
+
+          * Negative classifier intent: when
+            :attr:`_last_intent_deltas` is negative, the magnitude
+            ``-intent`` is the saturation-driven shrink request.
+          * Hard-cap overflow: when ``current_workers > ceiling`` (an
+            operator just lowered the cap), the excess
+            ``max(0, current - ceiling)`` is a forced shrink even if
+            the classifier intent is non-negative.
+
+        Three independent clamps then bound the per-cycle shrink:
 
           * The configured per-stage / per-node floor (a stage is
             never reduced below ``min_workers`` or
             ``min_workers_per_node * num_nodes``; the same target
-            Phase B enforces).
-          * The intent magnitude itself (already capped by
-            ``compute_delta._shrink_delta`` to the same fraction).
-          * The orchestrator-level fraction cap (defense-in-depth
-            against externally-injected intents that bypass
-            ``compute_delta``).
+            Phase B enforces). Floor wins over ceiling on
+            misconfiguration; cross-field validation in
+            ``SaturationAwareStageConfig`` already rejects
+            ``min_workers > max_workers``.
+          * The orchestrator-level fraction cap
+            ``fraction_cap = max(1, floor(current *
+            stage_cfg.max_scale_down_fraction_per_cycle))``
+            (defense-in-depth against externally-injected intents
+            that bypass ``compute_delta``).
+          * The classifier-side magnitude cap (already applied by
+            ``compute_delta._shrink_delta``).
 
         Manual stages (``requested_num_workers is not None``) are
         excluded so the operator-driven shrink path
-        (``_run_phase_a_delete``) remains the single source of
-        truth for those.
+        (``_run_phase_a_delete``) remains the single source of truth
+        for those. Operators using manual mode are expected to set
+        ``requested_num_workers`` consistently with any configured
+        ``max_workers``.
 
         Selection key is
         ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
@@ -708,6 +737,7 @@ class SaturationAwareScheduler:
 
         num_nodes = len(self._problem.rust.cluster_resources.nodes)
         stage_floors = self._compute_stage_floors(num_nodes)
+        stage_ceilings = self._compute_stage_ceilings(num_nodes)
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
         host_gpu_used_fractions = self._compute_host_gpu_used_fractions(problem_state)
@@ -720,13 +750,19 @@ class SaturationAwareScheduler:
                 continue
             stage_name = problem_stage.name
             intent = self._last_intent_deltas.get(stage_name, 0)
-            if intent >= 0:
+            current = len(worker_ids_by_stage[stage_index])
+            ceiling = stage_ceilings[stage_index]
+            ceiling_excess = max(0, current - ceiling) if ceiling is not None else 0
+            # Combine the two shrink drivers: negative intent and
+            # hard-cap overflow. The cap dominates non-negative intent
+            # (forced shrink); negative intent dominates a smaller cap
+            # excess (operator wants more shrink than the cap alone).
+            requested_remove = max(-intent if intent < 0 else 0, ceiling_excess)
+            if requested_remove == 0:
                 continue
 
-            current = len(worker_ids_by_stage[stage_index])
             floor = stage_floors[stage_index]
             stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
-            requested_remove = -intent
             allowed_by_floor = max(0, current - floor)
             fraction_cap = (
                 max(1, math.floor(current * stage_cfg.max_scale_down_fraction_per_cycle)) if current > 0 else 0
@@ -756,26 +792,69 @@ class SaturationAwareScheduler:
                     )
                     raise RuntimeError(msg)
 
-            if actual_remove < requested_remove:
-                deficit = requested_remove - actual_remove
-                # Distinguish which clamp bound the deletion. Both can apply; the
-                # operator-actionable clamp is the smaller of the two, and ties
-                # are reported as floor-bound for backward compatibility with the
-                # pre-2-vi log format.
-                fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
-                if fraction_bound:
-                    logger.info(
-                        f"saturation-aware scale-down: stage {stage_name!r} intent "
-                        f"-{requested_remove} workers; per-cycle fraction cap left "
-                        f"{actual_remove} removed (deficit={deficit}, current={current}, "
-                        f"max_scale_down_fraction_per_cycle={stage_cfg.max_scale_down_fraction_per_cycle})."
-                    )
-                else:
-                    logger.info(
-                        f"saturation-aware scale-down: stage {stage_name!r} intent "
-                        f"-{requested_remove} workers; floor cap left {actual_remove} "
-                        f"removed (deficit={deficit}, current={current}, floor={floor})."
-                    )
+            self._log_phase_d_shrink_outcome(
+                stage_name=stage_name,
+                intent=intent,
+                ceiling=ceiling,
+                ceiling_excess=ceiling_excess,
+                requested_remove=requested_remove,
+                actual_remove=actual_remove,
+                current=current,
+                floor=floor,
+                fraction_cap=fraction_cap,
+                allowed_by_floor=allowed_by_floor,
+                max_scale_down_fraction_per_cycle=stage_cfg.max_scale_down_fraction_per_cycle,
+            )
+
+    @staticmethod
+    def _log_phase_d_shrink_outcome(
+        *,
+        stage_name: str,
+        intent: int,
+        ceiling: int | None,
+        ceiling_excess: int,
+        requested_remove: int,
+        actual_remove: int,
+        current: int,
+        floor: int,
+        fraction_cap: int,
+        allowed_by_floor: int,
+        max_scale_down_fraction_per_cycle: float,
+    ) -> None:
+        """Emit the per-cycle Phase D outcome log distinguishing the binding clamp.
+
+        The four message variants surface the operator-actionable
+        cause of the achieved deletion count: the configured floor
+        bound the shrink, the per-cycle fraction cap bound it, the
+        request was satisfied in full but capped by an operator's
+        hard worker cap, or the deletion was driven by hard-cap
+        overflow rather than classifier intent. Ties between
+        ``fraction_cap`` and ``allowed_by_floor`` resolve to floor for
+        backward compatibility with the pre-2-vi log format.
+        """
+        cap_driven = ceiling_excess > 0 and (intent >= 0 or ceiling_excess >= -intent)
+        if actual_remove < requested_remove:
+            deficit = requested_remove - actual_remove
+            fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
+            if fraction_bound:
+                logger.info(
+                    f"saturation-aware scale-down: stage {stage_name!r} intent "
+                    f"-{requested_remove} workers; per-cycle fraction cap left "
+                    f"{actual_remove} removed (deficit={deficit}, current={current}, "
+                    f"max_scale_down_fraction_per_cycle={max_scale_down_fraction_per_cycle})."
+                )
+            else:
+                logger.info(
+                    f"saturation-aware scale-down: stage {stage_name!r} intent "
+                    f"-{requested_remove} workers; floor cap left {actual_remove} "
+                    f"removed (deficit={deficit}, current={current}, floor={floor})."
+                )
+        elif cap_driven:
+            logger.info(
+                f"saturation-aware scale-down: stage {stage_name!r} hard worker cap "
+                f"overflow removed {actual_remove} workers (current={current}, "
+                f"ceiling={ceiling}, intent={intent})."
+            )
 
     @staticmethod
     def _compute_host_gpu_used_fractions(
@@ -1175,6 +1254,60 @@ class SaturationAwareScheduler:
                 stage_cfg.min_workers_per_node * num_nodes if stage_cfg.min_workers_per_node is not None else 0,
             )
         return floors
+
+    def _compute_stage_ceilings(self, num_nodes: int) -> dict[int, int | None]:
+        """Compute the hard upper bound on workers for every stage in the problem.
+
+        Returns the effective ceiling per stage (problem-stage index ->
+        ceiling, or ``None`` for unbounded)::
+
+            ceiling = min(
+                stage_cfg.max_workers if stage_cfg.max_workers is not None else +inf,
+                (stage_cfg.max_workers_per_node * num_nodes) if stage_cfg.max_workers_per_node is not None else +inf,
+            )
+
+        Returns ``None`` when neither cap is configured (the common
+        case in production pipelines that rely on saturation-driven
+        sizing). When set, the cap is the final clamp on every
+        scale-up path: Phase C drops excess ``try_add_worker`` calls
+        and Phase D forces a shrink toward the cap when
+        ``current > ceiling`` (operator-driven cap reduction). The
+        ``min(...)`` semantics mirror the ``max(...)`` semantics of
+        :meth:`_compute_stage_floors` so the two clamps compose
+        symmetrically when both are configured.
+
+        Args:
+            num_nodes: Number of cluster nodes; multiplies
+                ``max_workers_per_node`` to get the absolute per-node
+                cap. Must be ``>= 1``; the caller already validates
+                cluster shape via the planner.
+
+        Returns:
+            Mapping ``{stage_index: ceiling_or_None}`` with one entry
+            per stage in :attr:`_problem.rust.stages`. ``None`` means
+            no per-stage hard cap is configured and Phase C / Phase D
+            should fall back to their pre-cap behavior for that stage.
+
+        Raises:
+            RuntimeError: The scheduler has not been set up.
+
+        """
+        if self._problem is None:
+            msg = "_compute_stage_ceilings called before setup()"
+            raise RuntimeError(msg)
+        ceilings: dict[int, int | None] = {}
+        for stage_index, problem_stage in enumerate(self._problem.rust.stages):
+            stage_cfg = self._config.get_effective_stage_config(
+                stage_name=problem_stage.name,
+                spec_override=None,
+            )
+            candidates: list[int] = []
+            if stage_cfg.max_workers is not None:
+                candidates.append(stage_cfg.max_workers)
+            if stage_cfg.max_workers_per_node is not None:
+                candidates.append(stage_cfg.max_workers_per_node * num_nodes)
+            ceilings[stage_index] = min(candidates) if candidates else None
+        return ceilings
 
     @staticmethod
     def _format_floor_unmet_message(
