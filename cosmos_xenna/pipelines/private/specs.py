@@ -841,11 +841,18 @@ class SaturationAwareConfig:
     per_stage_overrides: dict[str, SaturationAwareStageConfig] = attrs.field(factory=dict)
 
     def __attrs_post_init__(self) -> None:
-        """Validate cluster-wide cross-field invariants.
+        """Validate cluster-wide cross-field invariants for the configs known here.
 
         Single-field constraints are enforced by ``attrs.field(validator=...)``
         on each field above. This method validates invariants that span the
-        global config and any per-stage configs.
+        cluster guardrails and the per-stage configs visible at construction
+        time: ``stage_defaults`` and ``per_stage_overrides``. The
+        higher-precedence ``StageSpec.saturation_aware`` overrides live on
+        ``StageSpec``, not on this cluster config, so they are not yet
+        available; ``SaturationAwareScheduler.__init__`` re-runs
+        ``validate_effective_stage_configs(spec_overrides=...)`` once those
+        runtime overrides are collected, applying the same invariants to the
+        full three-tier set.
 
         Raises:
             ValueError: When two or more fields are set to mutually
@@ -859,13 +866,29 @@ class SaturationAwareConfig:
     ) -> None:
         """Validate cross-field invariants across every effective stage config.
 
-        ``StageSpec.saturation_aware`` overrides are collected after this
-        cluster config is constructed, so callers that install those runtime
-        overrides must invoke this method with the collected override configs.
+        Called twice in the pipeline-build lifecycle:
+
+        1. Eagerly from ``__attrs_post_init__`` with the default empty
+           ``spec_overrides``, when only ``stage_defaults`` and
+           ``per_stage_overrides`` are knowable. Catches misconfigured
+           cluster configs at the constructor where the bad value was
+           written.
+        2. From ``SaturationAwareScheduler.__init__`` with the collected
+           ``StageSpec.saturation_aware`` overrides, after the pipeline
+           spec is fully assembled. Re-validates the same invariants
+           against the full three-tier set so a higher-precedence
+           override cannot silently weaken a cluster guardrail.
+
+        The validated invariants are monotone in the set of configs (adding
+        more configs to ``all_stage_configs`` can only raise the longest
+        observed streak), so call 2 strictly extends call 1; both calls are
+        required because they fire at different times.
 
         Args:
             spec_overrides: Highest-precedence stage configs collected from
-                ``StageSpec.saturation_aware``.
+                ``StageSpec.saturation_aware``. Empty (the default) when the
+                cluster config is being constructed standalone, since those
+                overrides are not yet collected at that point.
 
         Raises:
             ValueError: When cluster-wide guardrails are weaker than any stage
