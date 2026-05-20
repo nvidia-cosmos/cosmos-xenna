@@ -271,12 +271,12 @@ class TestSaturationAwareConfigPositiveIntValidators:
     def test_zero_is_rejected(self, positive_int_field: str) -> None:
         """``positive_int`` validator forbids zero -- a zero-cycle window disables the guardrail."""
         with pytest.raises(ValueError):
-            SaturationAwareConfig(**{positive_int_field: 0})
+            SaturationAwareConfig(**{positive_int_field: 0})  # type: ignore[arg-type]
 
     def test_negative_is_rejected(self, positive_int_field: str) -> None:
         """A negative cycle count is structurally meaningless."""
         with pytest.raises(ValueError):
-            SaturationAwareConfig(**{positive_int_field: -1})
+            SaturationAwareConfig(**{positive_int_field: -1})  # type: ignore[arg-type]
 
 
 class TestSaturationAwareConfigBoundedFractionValidators:

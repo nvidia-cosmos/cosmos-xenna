@@ -230,7 +230,7 @@ class _RecordingStage(pipelines_v1.Stage[int, int]):
         self._cpus = float(cpus)
         self._process_dur_s = float(process_dur_s)
         self._tracker_name = tracker_name
-        self._tracker_handle: ray.actor.ActorHandle[Any] | None = None
+        self._tracker_handle: Any = None
 
     @property
     def stage_batch_size(self) -> int:
@@ -350,8 +350,8 @@ def test_pipeline_runs_to_completion_under_each_scheduler(
         elapsed = time.monotonic() - start
 
         setup_counts: dict[str, int] = ray.get(tracker.setup_counts.remote())  # type: ignore[attr-defined]
-        active_bounds: dict[str, tuple[int, int]] = ray.get(  # type: ignore[attr-defined]
-            tracker.observed_active_bounds.remote()
+        active_bounds: dict[str, tuple[int, int]] = ray.get(
+            tracker.observed_active_bounds.remote()  # type: ignore[attr-defined]
         )
 
         assert results is not None, (

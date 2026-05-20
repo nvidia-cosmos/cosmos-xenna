@@ -59,6 +59,7 @@ This module pins:
 
 import logging
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -176,7 +177,7 @@ class TestSaturationDonorWarmupFilter:
     """``find_saturation_donor`` honours the excluded set."""
 
     @pytest.fixture
-    def base_kwargs(self) -> dict[str, object]:
+    def base_kwargs(self) -> dict[str, Any]:
         """Shared call kwargs that pin the receiver / config / state baseline."""
         cfg = SaturationAwareConfig(
             enable_cross_stage_donor=True,
@@ -219,7 +220,7 @@ class TestSaturationDonorWarmupFilter:
             "donations_received_this_cycle": {},
         }
 
-    def test_excluded_donor_skipped(self, base_kwargs: dict[str, object]) -> None:
+    def test_excluded_donor_skipped(self, base_kwargs: dict[str, Any]) -> None:
         """An excluded donor candidate is skipped; the next eligible worker is picked."""
         result = find_saturation_donor(
             worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
@@ -231,7 +232,7 @@ class TestSaturationDonorWarmupFilter:
         assert result.worker_id != "a-w0"
         assert result.worker_id in {"a-w1", "a-w2"}
 
-    def test_full_donor_pool_excluded_returns_none(self, base_kwargs: dict[str, object]) -> None:
+    def test_full_donor_pool_excluded_returns_none(self, base_kwargs: dict[str, Any]) -> None:
         """When every donor stage's workers are excluded, no donor is selected."""
         result = find_saturation_donor(
             worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
@@ -241,7 +242,7 @@ class TestSaturationDonorWarmupFilter:
 
         assert result is None
 
-    def test_none_excluded_set_preserves_legacy_behavior(self, base_kwargs: dict[str, object]) -> None:
+    def test_none_excluded_set_preserves_legacy_behavior(self, base_kwargs: dict[str, Any]) -> None:
         """``excluded_worker_ids=None`` matches the prior unfiltered contract."""
         result = find_saturation_donor(
             worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
@@ -253,7 +254,7 @@ class TestSaturationDonorWarmupFilter:
         assert isinstance(result, DonorCandidate)
         assert result.worker_id == "a-w1"
 
-    def test_excluded_does_not_bypass_floor(self, base_kwargs: dict[str, object]) -> None:
+    def test_excluded_does_not_bypass_floor(self, base_kwargs: dict[str, Any]) -> None:
         """A stage at its floor is still ineligible regardless of the excluded set."""
         # Floor of A is 1; A has only one worker -> not eligible to donate.
         result = find_saturation_donor(
@@ -264,7 +265,7 @@ class TestSaturationDonorWarmupFilter:
 
         assert result is None
 
-    def test_excluded_does_not_bypass_master_toggle(self, base_kwargs: dict[str, object]) -> None:
+    def test_excluded_does_not_bypass_master_toggle(self, base_kwargs: dict[str, Any]) -> None:
         """``enable_cross_stage_donor=False`` short-circuits before the excluded check."""
         cfg = SaturationAwareConfig(
             enable_cross_stage_donor=False,
