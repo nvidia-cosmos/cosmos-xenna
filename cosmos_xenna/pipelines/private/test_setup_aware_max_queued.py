@@ -25,9 +25,11 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
+from cosmos_xenna.pipelines.private import resources, specs
 from cosmos_xenna.pipelines.private.scheduling_py.streaming_backpressure import (
     _SETUP_AWARE_MAX_QUEUED_FLOOR,
     compute_max_queued,
+    resolve_setup_aware_max_queued_enabled,
 )
 
 
@@ -43,6 +45,61 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
         yield caplog
     finally:
         loguru_logger.remove(handler_id)
+
+
+class _StageForSetupAwareResolver(specs.Stage[int, int]):
+    """Minimal CPU stage used only to build ``StageSpec`` fixtures."""
+
+    @property
+    def required_resources(self) -> resources.Resources:
+        return resources.Resources(cpus=1.0)
+
+    def process_data(self, in_data: list[int]) -> list[int]:
+        return in_data
+
+
+def _pipeline_spec(
+    *,
+    scheduler: specs.SchedulerKind,
+    stage_default: bool = True,
+    per_stage_override: bool | None = None,
+    spec_override: bool | None = None,
+    omit_mode_specific: bool = False,
+) -> specs.PipelineSpec:
+    """Build the smallest pipeline spec needed to resolve the per-stage flag."""
+    stage = specs.StageSpec(
+        _StageForSetupAwareResolver(),
+        saturation_aware=(
+            specs.SaturationAwareStageConfig(setup_aware_max_queued=spec_override)
+            if spec_override is not None
+            else None
+        ),
+    )
+    saturation_aware = specs.SaturationAwareConfig(
+        stage_defaults=specs.SaturationAwareStageConfig(setup_aware_max_queued=stage_default),
+        per_stage_overrides=(
+            {
+                "Stage 00 - _StageForSetupAwareResolver": specs.SaturationAwareStageConfig(
+                    setup_aware_max_queued=per_stage_override
+                )
+            }
+            if per_stage_override is not None
+            else {}
+        ),
+    )
+    mode_specific = (
+        None
+        if omit_mode_specific
+        else specs.StreamingSpecificSpec(
+            scheduler=scheduler,
+            saturation_aware=saturation_aware,
+        )
+    )
+    return specs.PipelineSpec(
+        input_data=[1],
+        stages=[stage],
+        config=specs.PipelineConfig(mode_specific=mode_specific),
+    )
 
 
 class TestSetupAwareMaxQueued:
@@ -95,7 +152,7 @@ class TestSetupAwareMaxQueued:
         assert cap == 12
 
     def test_zero_ready_zero_pending_uses_regular(self) -> None:
-        """A pool with no actors at all is not in cold start; legacy formula applies."""
+        """A pool with no actors at all is not in cold start; regular formula applies."""
         cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=0,
@@ -128,7 +185,7 @@ class TestSetupAwareMaxQueued:
         assert cap == max(0, 8, 1)
         assert cap == 8
 
-    def test_feature_flag_off_preserves_legacy_behaviour(self) -> None:
+    def test_feature_flag_off_uses_regular_formula(self) -> None:
         """The cold-start cap is never used when the per-stage flag is False."""
         cap = compute_max_queued(
             num_ready_actors=0,
@@ -188,3 +245,71 @@ class TestSetupAwareMaxQueued:
         assert "num_ready=0" in msg
         assert "num_pending=2" in msg
         assert "cold-start cap reduced from 8 to 1" in msg
+
+
+class TestResolveSetupAwareMaxQueuedEnabled:
+    """Resolver honours scheduler kind and saturation-aware config precedence."""
+
+    def test_fragmentation_scheduler_disables_setup_aware_cap(self) -> None:
+        """Fragmentation-based scheduling always uses the regular backpressure path."""
+        pipeline_spec = _pipeline_spec(
+            scheduler=specs.SchedulerKind.FRAGMENTATION_BASED,
+            stage_default=True,
+            spec_override=True,
+        )
+
+        enabled = resolve_setup_aware_max_queued_enabled(
+            pipeline_spec,
+            stage_idx=0,
+            stage_name="Stage 00 - _StageForSetupAwareResolver",
+        )
+
+        assert enabled is False
+
+    def test_missing_streaming_mode_specific_disables_setup_aware_cap(self) -> None:
+        """Batch-style specs without streaming config cannot enable the cold-start cap."""
+        pipeline_spec = _pipeline_spec(
+            scheduler=specs.SchedulerKind.SATURATION_AWARE,
+            omit_mode_specific=True,
+        )
+
+        enabled = resolve_setup_aware_max_queued_enabled(
+            pipeline_spec,
+            stage_idx=0,
+            stage_name="Stage 00 - _StageForSetupAwareResolver",
+        )
+
+        assert enabled is False
+
+    def test_per_stage_override_wins_over_default(self) -> None:
+        """Named saturation-aware override resolves above the cluster default."""
+        pipeline_spec = _pipeline_spec(
+            scheduler=specs.SchedulerKind.SATURATION_AWARE,
+            stage_default=True,
+            per_stage_override=False,
+        )
+
+        enabled = resolve_setup_aware_max_queued_enabled(
+            pipeline_spec,
+            stage_idx=0,
+            stage_name="Stage 00 - _StageForSetupAwareResolver",
+        )
+
+        assert enabled is False
+
+    def test_stage_spec_override_wins_over_named_override(self) -> None:
+        """``StageSpec.saturation_aware`` has highest precedence for the flag."""
+        pipeline_spec = _pipeline_spec(
+            scheduler=specs.SchedulerKind.SATURATION_AWARE,
+            stage_default=True,
+            per_stage_override=False,
+            spec_override=True,
+        )
+
+        enabled = resolve_setup_aware_max_queued_enabled(
+            pipeline_spec,
+            stage_idx=0,
+            stage_name="Stage 00 - _StageForSetupAwareResolver",
+        )
+
+        assert enabled is True

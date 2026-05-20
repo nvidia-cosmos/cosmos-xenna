@@ -54,6 +54,24 @@ def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> _S
     return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
 
 
+class TestThresholdLifecycleGuard:
+    """The pipeline refuses direct use before threshold resolution."""
+
+    def test_unresolved_thresholds_raise_contextual_runtime_error(self, cfg: SaturationAwareStageConfig) -> None:
+        """Direct callers must populate ``resolved_thresholds`` before running the pipeline."""
+        state = _StageRuntimeState(stage_name="TestStage")
+
+        with pytest.raises(RuntimeError, match="has no resolved_thresholds"):
+            run_per_stage_pipeline(
+                stage_state=state,
+                num_used_slots=3,
+                num_empty_slots=2,
+                input_queue_depth=10,
+                current_workers=4,
+                config=cfg,
+            )
+
+
 class TestNoActionPath:
     """NORMAL signal -> the pipeline fires no action and updates only the EWMA + streak."""
 
@@ -243,6 +261,7 @@ class TestZeroActorsCarryForward:
         )
         cached_ewma = state.slots_empty_ratio_ewma
         assert cached_ewma is not None
+        assert cfg.saturation_threshold is not None
         assert cached_ewma < cfg.saturation_threshold
 
         run_per_stage_pipeline(  # cycle 2: zero actors momentarily.

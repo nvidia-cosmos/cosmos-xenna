@@ -4,6 +4,7 @@
 """Defense-in-depth tests for Phase C ``try_add_worker`` exception absorption."""
 
 import logging
+import uuid
 from collections.abc import Iterator
 from unittest.mock import patch
 
@@ -107,6 +108,42 @@ def _problem_state_with_one_worker() -> data_structures.ProblemState:
 
 class TestAllocationErrorDefense:
     """Pin the AllocationError defense-in-depth contract for Phase C grow."""
+
+    def test_emit_allocation_failure_logs_gpu_fragmentation_rows(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A non-empty GPU cluster snapshot includes per-GPU used/free fractions."""
+        fake_counter = _FakeCounter()
+        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
+        cluster = resources.ClusterResources(
+            nodes={
+                "node-0": resources.NodeResources(
+                    used_cpus=0,
+                    total_cpus=8,
+                    gpus=[
+                        resources.GpuResources(index=1, uuid_=uuid.uuid4(), used_fraction=0.25),
+                        resources.GpuResources(index=0, uuid_=uuid.uuid4(), used_fraction=0.75),
+                    ],
+                    name="node-0",
+                ),
+            },
+        )
+
+        allocation_failures.emit_allocation_failure(
+            stage_name="stage",
+            pipeline_name="test-pipe",
+            cluster_resources=cluster,
+            exc=resources.AllocationError("synthetic placement failure"),
+        )
+
+        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}]
+        error_records = [r for r in loguru_caplog.records if r.levelno >= logging.ERROR]
+        assert len(error_records) == 1
+        assert "'gpu_index': 0" in error_records[0].message
+        assert "'used_fraction': 0.75" in error_records[0].message
+        assert "'free_fraction': 0.25" in error_records[0].message
 
     def test_allocation_error_absorbed_logs_snapshot_and_increments_counter(
         self,
