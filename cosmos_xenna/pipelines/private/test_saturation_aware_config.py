@@ -246,6 +246,68 @@ class TestRegimeAwareFields:
             SaturationAwareConfig(regime_transition_streak_cycles=-1)
 
 
+class TestSaturationAwareConfigPositiveIntValidators:
+    """Per-field positive-int validators reject zero / negative values.
+
+    Each field below uses ``attrs_utils.validate_positive_int``; a regression
+    that drops the validator (e.g. switching to a plain ``attrs.field``) would
+    silently accept zero or negative cycle counts and break anti-flap or
+    heterogeneity guardrails. Parameterised so adding a new positive-int
+    field requires only a new tuple in ``params``.
+    """
+
+    @pytest.fixture(
+        params=[
+            "cross_stage_donor_anti_flap_cycles",
+            "cross_stage_donor_max_per_cycle",
+            "cross_stage_donor_min_donation_interval_cycles",
+            "stuck_plan_detection_cycles",
+            "cluster_heterogeneity_warn_streak",
+        ]
+    )
+    def positive_int_field(self, request: pytest.FixtureRequest) -> str:
+        return cast(str, request.param)
+
+    def test_zero_is_rejected(self, positive_int_field: str) -> None:
+        """``positive_int`` validator forbids zero -- a zero-cycle window disables the guardrail."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(**{positive_int_field: 0})
+
+    def test_negative_is_rejected(self, positive_int_field: str) -> None:
+        """A negative cycle count is structurally meaningless."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(**{positive_int_field: -1})
+
+
+class TestSaturationAwareConfigBoundedFractionValidators:
+    """Validators that bound a knob to ``(0, 1]`` or ``> 1.0`` reject out-of-range values.
+
+    These knobs are operator-tunable; without the validator a misconfigured
+    value would slip into the watchdog / heterogeneity-warning path and
+    silently disable the alert.
+    """
+
+    def test_cycle_time_warn_threshold_zero_is_rejected(self) -> None:
+        """Threshold must be strictly positive (zero would warn every cycle)."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(cycle_time_warn_threshold=0.0)
+
+    def test_cycle_time_warn_threshold_above_one_is_rejected(self) -> None:
+        """Threshold is a fraction of ``interval_s``; values above 1.0 are nonsensical."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(cycle_time_warn_threshold=1.01)
+
+    def test_memory_pressure_polling_interval_zero_is_rejected(self) -> None:
+        """Polling interval must be strictly positive (zero would tight-loop)."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(memory_pressure_polling_interval_s=0.0)
+
+    def test_cluster_heterogeneity_warn_threshold_at_floor_is_rejected(self) -> None:
+        """Threshold must be strictly greater than 1.0 -- a homogeneous pipeline is ratio 1.0."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(cluster_heterogeneity_warn_threshold=1.0)
+
+
 class TestThreeTierResolver:
     """``get_effective_stage_config`` resolves overrides by precedence.
 
