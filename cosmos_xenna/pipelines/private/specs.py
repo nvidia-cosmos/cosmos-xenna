@@ -575,15 +575,14 @@ class SaturationAwareStageConfig:
     # so Phase C does not pile additional adds on top of an in-flight setup.
     # Phase D scale-down and Phase B floor are unaffected.
     setup_phase_quiescence_enabled: bool = True
-    # Reserved for warmup-aware sampling: per-worker grace window after the
-    # worker becomes ready, during which its samples are excluded from
-    # per-stage averages. Phase 2 does not yet carry ready timestamps into the
-    # scheduler, so this field is configuration-only until warmup filtering lands.
+    # Per-worker measurement grace: after a worker first appears in the
+    # ready snapshot, its slot samples are excluded from per-stage averages
+    # until this many seconds elapse. This keeps freshly-ready actors from
+    # biasing the EWMA while the dispatcher is still filling their queues.
     worker_warmup_measurement_grace_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
-    # Reserved for warmup-aware donation: per-worker grace window after the
-    # worker becomes ready, during which it cannot be selected as a cross-stage
-    # donor. Phase 2 donor selection does not yet carry ready timestamps; the
-    # cross-field validator still keeps the future configuration consistent.
+    # Donor warmup grace: after a worker first appears in the ready
+    # snapshot, it is excluded from Phase D and saturation-donor victim
+    # pools until this many seconds elapse.
     donor_warmup_grace_s: float = attrs.field(default=180.0, validator=attrs.validators.ge(0.0))
 
     # Optional cluster-wide minimum workers for this stage. ``None`` means the
@@ -604,10 +603,8 @@ class SaturationAwareStageConfig:
     # unbounded by this knob. Cross-field: must be >= min_workers_per_node.
     max_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
 
-    # Reserved for setup-aware queue caps: lower the ``max_queued`` cap while
-    # the stage is in initial setup. Phase 2 does not yet route setup state
-    # into max-queued calculation, so this field is configuration-only until
-    # that gate lands.
+    # Setup-aware queue cap: lower the upstream ``max_queued`` cap while the
+    # stage is in cold start (pending actors exist, no ready actors yet).
     setup_aware_max_queued: bool = True
 
     def __attrs_post_init__(self) -> None:
@@ -813,13 +810,13 @@ class SaturationAwareConfig:
     # memory and freezes Phase C scale-up when used fraction exceeds the
     # critical threshold below.
     enable_memory_pressure_gate: bool = True
-    # Fraction of cluster object-store memory above which future gate logic
-    # will freeze scale-up.
+    # Fraction of cluster object-store memory above which the gate freezes
+    # Phase C scale-up.
     memory_pressure_critical_threshold: float = attrs.field(
         default=0.85,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
-    # Polling interval (seconds) for the future Ray cluster memory query.
+    # Polling interval (seconds) for the Ray cluster memory query.
     memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
 
     # When True, an absorbed Phase C ``try_add_worker`` exception logs the

@@ -282,6 +282,71 @@ class TestMemoryPressureGate:
         assert scheduler._memory_pressure_monitor.last_pressure_active is False
         assert len(solution_first.stages[0].new_workers) == 3
 
+    def test_ray_not_initialized_degrades_silently(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
+        """Startup before Ray init reports pressure inactive without noisy WARN logs."""
+        scheduler = _scheduler()
+        ps = _problem_state_with_workers(worker_ids=["stage-w0"])
+
+        with (
+            patch(f"{MEMORY_PRESSURE_MODULE}.ray.is_initialized", return_value=False),
+            patch(f"{MEMORY_PRESSURE_MODULE}.ray.cluster_resources") as cluster_mock,
+            patch(f"{MEMORY_PRESSURE_MODULE}.ray.available_resources") as available_mock,
+            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+        ):
+            solution = scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert len(solution.stages[0].new_workers) == 3
+        assert scheduler._memory_pressure_monitor.last_pressure_active is False
+        assert scheduler._memory_pressure_monitor.last_used_fraction == 0.0
+        cluster_mock.assert_not_called()
+        available_mock.assert_not_called()
+        assert "memory pressure gate: failed to query" not in loguru_caplog.text
+
+    def test_missing_object_store_capacity_reports_inactive(self) -> None:
+        """Clusters reporting no object-store capacity clamp used fraction to zero."""
+        scheduler = _scheduler()
+        ps = _problem_state_with_workers(worker_ids=["stage-w0"])
+
+        with (
+            _patch_ray_resources(total=0.0, available=0.0),
+            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+        ):
+            solution = scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert len(solution.stages[0].new_workers) == 3
+        assert scheduler._memory_pressure_monitor.last_pressure_active is False
+        assert scheduler._memory_pressure_monitor.last_used_fraction == 0.0
+
+    def test_pressure_clear_emits_recovery_log(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
+        """Active pressure followed by a fresh low-pressure poll logs a single recovery INFO."""
+        scheduler = _scheduler(polling_interval_s=5.0)
+        ps = _problem_state_with_workers(worker_ids=["stage-w0"])
+
+        with (
+            patch(f"{MEMORY_PRESSURE_MODULE}.ray.is_initialized", return_value=True),
+            patch(
+                f"{MEMORY_PRESSURE_MODULE}.ray.cluster_resources",
+                return_value={"object_store_memory": 100.0},
+            ),
+            patch(
+                f"{MEMORY_PRESSURE_MODULE}.ray.available_resources",
+                side_effect=[
+                    {"object_store_memory": 5.0},
+                    {"object_store_memory": 80.0},
+                ],
+            ),
+            patch(f"{SATURATION_AWARE_MODULE}.time.monotonic", side_effect=[0.0, 6.0]),
+            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}),
+        ):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+            scheduler.autoscale(time=6.0, problem_state=ps)
+
+        assert scheduler._memory_pressure_monitor.last_pressure_active is False
+        assert scheduler._memory_pressure_monitor.last_used_fraction == pytest.approx(0.20)
+        clear_records = [r for r in loguru_caplog.records if "memory pressure gate: CLEARED" in r.message]
+        assert len(clear_records) == 1
+        assert clear_records[0].levelno == logging.INFO
+
     def test_polling_interval_caches_fraction(self) -> None:
         """Consecutive cycles inside one polling window make exactly one Ray API call."""
         scheduler = _scheduler(polling_interval_s=5.0)
