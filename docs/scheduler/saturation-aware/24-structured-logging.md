@@ -113,10 +113,17 @@ and redeploying:
 | Phase C donor donation accepted         | `INFO`    | `[scheduler] saturation-mode donation: donor stage 'preprocess' worker 'w-12' (age=18) -> receiver stage 'caption' at cycle 47 (pending retry).` |
 | Phase C ceiling clamp                   | `INFO`    | `saturation-aware scale-up: stage 'caption' intent +6 workers; hard worker cap left 2 (current=14, ceiling=16).` |
 | Phase D shrink clamp (floor / fraction) | `INFO`    | `saturation-aware scale-down: stage 'caption' intent -4 workers; floor cap left 2 removed (deficit=2, current=4, floor=2).` |
+| Stuck-plan threshold breached           | `INFO`    | `saturation-aware stuck plan: stage 'caption' stuck for 18 cycles (threshold=18, last_intent=2); growth blocked by cluster placement and donor selection.` |
+| Stuck-plan recovery                     | `INFO`    | `saturation-aware stuck plan: stage 'caption' recovered; growth is no longer blocked.` |
+| Memory-pressure gate engaged            | `WARNING` | `memory pressure gate: ACTIVE - cluster object-store used_fraction=0.91 exceeds critical_threshold=0.85; Phase C scale-up will be frozen until pressure clears.` |
+| Memory-pressure gate cleared            | `INFO`    | `memory pressure gate: CLEARED - cluster object-store used_fraction=0.62 now within critical_threshold=0.85; Phase C scale-up resumes.` |
 | Phase A manual placement exhausted      | `WARNING` | `manual grow: stage 'caption' requested 8 workers; cluster placement exhausted at 3 (deficit=5); manual request remains partially satisfied this cycle.` |
 | Phase C cluster placement exhausted     | `WARNING` | `saturation-aware scale-up: stage 'caption' intent 6 workers; cluster placement exhausted after 3 (deficit=3); request remains partially satisfied this cycle.` |
 | Donor refused by planner                | `WARNING` | `[scheduler] saturation-mode donor: stage 'preprocess' worker 'w-12' selected by donor helper but planner refused removal; donation cancelled and receiver retry skipped.` |
 | Floor stuck, approaching grace          | `WARNING` | `[scheduler] 'caption': minimum-worker floor stuck (3/5 grace cycles); target_min=4, achieved=2, no eligible cross-stage donor; will raise after 2 more consecutive failed cycles.` |
+| Loop watchdog over budget               | `WARNING` | `saturation-aware loop watchdog: autoscale cycle took 6.40s (threshold=5.00s = 0.5 * interval_s=10.0)` |
+| Allocation failure absorbed             | `ERROR`   | `saturation-aware allocation failure: stage 'caption' raised AllocationError: ...; Per-GPU fragmentation snapshot: [{...}, {...}, ...]` |
+| Per-cycle summary                       | `DEBUG`   | `saturation-aware cycle 47 summary: regime=SUB_HALFIN_WHITT, heterogeneity_streak=0, heterogeneity_fired=False, phase_c_allocation_failure=False` |
 | Cold-start / hot-pending intent skip    | `DEBUG`   | `saturation-aware: stage 'caption' cold-start quiescent (pending=2, ready=0); skipping intent pipeline.` |
 
 The loguru wrapper at

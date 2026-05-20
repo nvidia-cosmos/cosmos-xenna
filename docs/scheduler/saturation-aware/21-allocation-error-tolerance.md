@@ -123,6 +123,27 @@ credit reserved for stages whose actors are still warming,
 decoupling the "we asked for +2" decision from the "we observed an
 empty queue" feedback that arrives one or two cycles later.
 
+### Defense-in-depth for raised exceptions
+
+The default Phase C path consumes the documented `None` return
+contract directly. As a second line of defense for any future
+planner-internal raise (named `AllocationError` or otherwise
+unexpected), `_run_phase_c_grow` calls `try_add_worker` through
+`_try_add_worker_with_defense`. Both `except AllocationError` and
+`except Exception` clauses route through `_absorb_allocation_failure`,
+which:
+
+- emits an ERROR log carrying a per-GPU fragmentation snapshot
+  (`(node, gpu_index, used_fraction, free_fraction)` for every GPU
+  in the cluster, ordered by `(node_id, gpu.index)` so two snapshots
+  compare as identical strings);
+- increments the
+  `xenna_scheduler_allocation_failures_total{stage,pipeline}`
+  Counter;
+- when `skip_cycle_on_allocation_error=True` (default), sets a
+  per-cycle skip flag so the Phase C loop returns early; when
+  `False`, re-raises the original exception so the cycle dies loud.
+
 ## Knobs
 
 All fields live in
@@ -132,7 +153,7 @@ All fields live in
 |---|---|---|---|
 | `floor_stuck_grace_cycles` | `SaturationAwareConfig` | `6` | Cycles a Phase B floor miss may persist without progress before `RuntimeError` |
 | `stuck_plan_detection_cycles` | `SaturationAwareConfig` | `18` | Threshold against which `_stuck_plan_counters` is read by the operator-visible stuck-plan watchdog |
-| `skip_cycle_on_allocation_error` | `SaturationAwareConfig` | `True` | Reserved policy hook for catching allocator exceptions; current Phase C path consumes the `None` return value directly |
+| `skip_cycle_on_allocation_error` | `SaturationAwareConfig` | `True` | When True, an absorbed Phase C `try_add_worker` exception logs the fragmentation snapshot, bumps the Counter, and skips the rest of Phase C; when False, the exception propagates so the run-loop dies loud |
 | `enable_cross_stage_donor` | `SaturationAwareConfig` | `True` | Master toggle for the donor fallback Phase C consults before recording a partial add |
 | `setup_aware_max_queued` | `SaturationAwareStageConfig` | `True` | Reserve queue credit for stages whose actors are still warming, so a Phase C add is not starved by the dispatcher's measurement loop |
 

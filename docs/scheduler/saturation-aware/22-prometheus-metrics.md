@@ -54,11 +54,11 @@ label cardinality and a name-stability contract.
   [Prometheus recording rules](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/)
   rather than adding more labels.
 - **Names are the contract; logic is the implementation.** The
-  scheduler may rewrite `_handle_grow` or replace the classifier
-  wholesale, but it must keep emitting
-  `xenna_scheduler_grow_decisions_total` with the same labels and
-  monotonic semantics. Dashboards survive scheduler refactors
-  because they bind to names, not call sites.
+  scheduler may rewrite a phase or replace the classifier
+  wholesale, but it must keep emitting metrics like
+  `xenna_scheduler_cycle_duration_seconds` with the same labels and
+  semantics. Dashboards survive scheduler refactors because they
+  bind to names, not call sites.
 - **Two prefixes.** `xenna_scheduler_*` for cluster-wide series
   (one per pipeline), `xenna_stage_*` for per-stage series. The
   split lets PromQL aggregate cleanly without joining on
@@ -67,23 +67,26 @@ label cardinality and a name-stability contract.
 ```
                           xenna_*  catalogue
                                  │
-        ┌───────────────┬────────┴────────┬───────────────┬───────────────┐
-        ▼               ▼                 ▼               ▼               ▼
-  ┌──────────┐   ┌──────────────┐   ┌──────────────┐  ┌──────────┐  ┌──────────┐
-  │  Cycle   │   │ Per-stage    │   │ Decision     │  │  Safety  │  │  Config  │
-  │          │   │ state        │   │ counters     │  │          │  │          │
-  ├──────────┤   ├──────────────┤   ├──────────────┤  ├──────────┤  ├──────────┤
-  │ duration │   │ workers      │   │ grow_total   │  │ mem_     │  │ info     │
-  │ phase_   │   │ zone         │   │ shrink_total │  │  pressure│  │ thresh_  │
-  │  duration│   │ slots_empty_ │   │ donor_       │  │ cycle_   │  │  values  │
-  │ overrun_ │   │  ratio_ewma  │   │  transfers_  │  │  overrun │  │ aggr_k   │
-  │  total   │   │ streak{kind} │   │  total       │  │ stuck_   │  │ regime   │
-  │ cycles_  │   │ bottleneck_  │   │ cluster_full_│  │  plan    │  │          │
-  │  total   │   │  score       │   │  total       │  │ alloc_   │  │          │
-  │          │   │ growth_mode  │   │              │  │  errors  │  │          │
-  └──────────┘   └──────────────┘   └──────────────┘  └──────────┘  └──────────┘
-   one series    O(num_stages)      O(num_stages) +    cluster-wide  small fixed
-   per pipeline  per pipeline       O(donor pairs)     per pipeline  per pipeline
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+        ┌──────────┐     ┌──────────────┐     ┌──────────┐
+        │  Cycle   │     │ Per-stage    │     │  Safety  │
+        │          │     │ state        │     │          │
+        ├──────────┤     ├──────────────┤     ├──────────┤
+        │ duration │     │ bottleneck_  │     │ mem_     │
+        │ phase_   │     │  score       │     │  pressure│
+        │  duration│     │ heterogen.   │     │ object_  │
+        │          │     │  ratio       │     │  store_  │
+        │          │     │ stuck_plan_  │     │  used_   │
+        │          │     │  active      │     │  fraction│
+        │          │     │ stuck_plan_  │     │ alloc_   │
+        │          │     │  cycles_     │     │  failures│
+        │          │     │  total       │     │  _total  │
+        └──────────┘     └──────────────┘     └──────────┘
+         O(1) per         O(num_stages)        O(1) cluster
+         pipeline         per pipeline         per pipeline
+                          + cluster-wide
+                          ratio
 ```
 
 **Trade-off.** A fixed five-family catalogue is less flexible than
@@ -100,54 +103,43 @@ current state, counter for monotonically increasing decisions,
 histogram for latency distributions — with one metric per family-
 local question.
 
-| Family | Example metric | Type | Labels | What it tells the operator |
+| Family | Metric | Type | Labels | What it tells the operator |
 |---|---|---|---|---|
 | Cycle | `xenna_scheduler_cycle_duration_seconds` | histogram | `pipeline` | Cycle wall-clock distribution; tail tracks loop watchdog |
-| Cycle | `xenna_scheduler_cycle_phase_duration_seconds` | histogram | `pipeline`, `phase` | Which of A/B/C/D dominates cycle time |
-| Per-stage state | `xenna_stage_zone` | gauge (enum) | `pipeline`, `stage` | Five-zone classifier output as an int |
-| Per-stage state | `xenna_stage_slots_empty_ratio_ewma` | gauge | `pipeline`, `stage` | Smoothed saturation signal feeding the classifier |
-| Per-stage state | `xenna_stage_streak_cycles` | gauge | `pipeline`, `stage`, `kind=sat\|over` | How long the stage has held its current intent |
+| Cycle | `xenna_scheduler_cycle_phase_duration_seconds` | histogram | `pipeline`, `phase` | Which of `pre_phase_setup` / `phase_a` / `phase_b` / `intent` / `phase_c` / `phase_d` / `invariants` / `into_solution` dominated cycle time |
 | Per-stage state | `xenna_stage_bottleneck_score` | gauge | `pipeline`, `stage` | Forced-Flow-Law bottleneck — see [23](23-bottleneck-score-metric.md) |
-| Decision counters | `xenna_scheduler_grow_decisions_total` | counter | `pipeline`, `stage` | Did Phase C actually grow this stage? |
-| Decision counters | `xenna_scheduler_shrink_decisions_total` | counter | `pipeline`, `stage` | Did Phase D actually shrink this stage? |
-| Decision counters | `xenna_scheduler_donor_transfers_total` | counter | `pipeline`, `donor`, `receiver` | Cross-stage donor protocol activity |
+| Per-stage state | `xenna_scheduler_cluster_heterogeneity_ratio` | gauge | `pipeline` | `max_k D_k / min_k D_k` across stages with finite service demand |
+| Per-stage state | `xenna_scheduler_stuck_plan_active` | gauge (0/1) | `pipeline`, `stage` | 1 when a stage's Phase C grow has been stuck above the detection threshold |
+| Per-stage state | `xenna_scheduler_stuck_plan_cycles_total` | counter | `pipeline`, `stage` | Total cycles a stage has been stuck above the detection threshold |
 | Safety | `xenna_scheduler_memory_pressure_active` | gauge (0/1) | `pipeline` | Memory-pressure gate engaged this cycle |
-| Safety | `xenna_scheduler_cycle_overrun_total` | counter | `pipeline` | Loop watchdog fired — see [18](18-loop-watchdog.md) |
-| Safety | `xenna_scheduler_stuck_plan_cycles` | gauge | `pipeline` | Maximum of per-stage `_stuck_plan_counters` |
-| Configuration | `xenna_scheduler_config_info` | gauge (=1) | `pipeline`, `key` | One series per active flag — survives label joins |
-| Configuration | `xenna_stage_thresholds` | gauge | `pipeline`, `stage`, `kind=sat\|act\|over` | Resolved thresholds after auto-derivation |
+| Safety | `xenna_scheduler_cluster_object_store_used_fraction` | gauge | `pipeline` | Last polled Ray object-store used fraction (`0.0`-`1.0`) |
+| Safety | `xenna_scheduler_allocation_failures_total` | counter | `pipeline`, `stage` | Phase C `try_add_worker` exceptions absorbed by the defense layer |
 
-Enum-encoded gauges (`zone`, `growth_mode`, `regime`) map enum
-members to small non-negative integers; the mapping is documented
-in the producing module's docstring and never renumbered once
-emitted. Cycle and per-stage-state metrics are sampled at the end
-of each `autoscale()` cycle (after Phase D and the
-`Solution`-monotonicity invariant pass). Decision counters
-increment inside the phase that took the decision. Safety metrics
-update opportunistically — the loop watchdog increments
-`xenna_scheduler_cycle_overrun_total` when a cycle exceeds
-`cycle_time_warn_threshold * interval_s`; the memory-pressure gate
-flips `xenna_scheduler_memory_pressure_active` on entry and exit.
-Configuration metrics are set once at scheduler construction and
-republished on regime transitions so a relabel never silently
-drops a flag.
+Cycle metrics are observed once per `autoscale()` cycle: the
+`cycle_duration_seconds` histogram in the
+[loop watchdog](18-loop-watchdog.md) ctxmgr, the
+`cycle_phase_duration_seconds` histogram in the per-phase timer
+inside `SaturationAwareScheduler.autoscale`. Per-stage state metrics
+update at their own cadence: `bottleneck_score` and the
+heterogeneity ratio fire at the end of every cycle from the
+[bottleneck score helper](23-bottleneck-score-metric.md);
+`stuck_plan_active` and `stuck_plan_cycles_total` update each time
+the per-stage `_stuck_plan_counters` mutates (driven by
+`_set_stuck_plan_counter` in `saturation_aware.py`). Safety metrics
+update opportunistically: the memory-pressure gauges refresh on
+every `is_pressure_active()` call (whether a cache hit or a fresh
+Ray poll), and the allocation-failures counter increments only on
+the absorbed-exception path of `_try_add_worker_with_defense`.
 
 ## Knobs
 
 Metric **names** are not knobs — they are part of the catalogue
-contract and operators must be able to depend on them.
-Configuration **values** that surface as `xenna_scheduler_config_info`
-and `xenna_stage_thresholds` series are the scheduler config knobs
-that operators most often want to dashboard alongside behaviour. The
-canonical surfaced fields live on `SaturationAwareConfig` and
-`SaturationAwareStageConfig` in
-[`cosmos-xenna/cosmos_xenna/pipelines/private/specs.py`](../../../cosmos_xenna/pipelines/private/specs.py).
-
-| Family touchpoint | Config field surfaced as a metric series |
-|---|---|
-| `xenna_scheduler_config_info{key=...}` | each cluster boolean flag on `SaturationAwareConfig` (`enable_regime_aware_aggressiveness`, `enable_dag_priority_growth`, `enable_cross_stage_donor`, `enable_memory_pressure_gate`) is one series with `value = 1` |
-| `xenna_scheduler_aggressiveness_k` | `SaturationAwareStageConfig.saturation_aggressiveness` (per-stage effective `K`, after regime lift) |
-| `xenna_stage_thresholds{kind=sat\|act\|over}` | resolved `saturation_threshold`, `activation_threshold`, `over_provisioned_threshold` |
+contract and operators must be able to depend on them. The
+producing modules pin every metric name as a module-level constant
+(`CYCLE_DURATION_METRIC`, `STUCK_PLAN_ACTIVE_METRIC`,
+`MEMORY_PRESSURE_ACTIVE_METRIC`, etc.) so a refactor that renames a
+metric breaks `from ... import` rather than silently breaking
+dashboards.
 
 Pipelines exceeding ~100 stages should not raise the label budget;
 instead, pre-aggregate per-stage gauges via Prometheus recording
@@ -157,17 +149,16 @@ drill-down without being the default panel source.
 
 ## See also
 
-- [18 — Loop watchdog](18-loop-watchdog.md) — produces
-  `xenna_scheduler_cycle_overrun_total` and the cycle-duration
-  histogram tail that the safety family alerts on.
+- [18 — Loop watchdog](18-loop-watchdog.md) — produces the
+  `xenna_scheduler_cycle_duration_seconds` histogram tail that the
+  cycle family alerts on, and the WARN log that complements it.
 - [23 — Bottleneck score metric](23-bottleneck-score-metric.md) —
   the Forced-Flow-Law gauge in the per-stage-state family.
 - [24 — Structured logging](24-structured-logging.md) — the
   per-decision INFO log contract that complements the decision
   counters with human-readable context.
-- [`cosmos-xenna/cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py)
-  and
-  [`cosmos-xenna/cosmos_xenna/pipelines/private/specs.py`](../../../cosmos_xenna/pipelines/private/specs.py)
-  — emission sites for the cycle, per-stage-state, and decision
-  counter families, and the config fields surfaced through
-  `xenna_scheduler_config_info` and `xenna_stage_thresholds`.
+- [`cosmos-xenna/cosmos_xenna/pipelines/private/scheduling_py/`](../../../cosmos_xenna/pipelines/private/scheduling_py/)
+  — the modules that own the metric handles
+  (`loop_watchdog.py`, `bottleneck.py`, `stuck_plan.py`,
+  `memory_pressure.py`, `allocation_failures.py`, plus the
+  per-phase histogram in `saturation_aware.py`).

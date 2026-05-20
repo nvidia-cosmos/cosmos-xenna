@@ -12,12 +12,11 @@ cycle backs up.
 
 The `cycle_time_warn_threshold` knob ships on
 `SaturationAwareConfig` with a validated default of `0.5`. The
-wall-clock measurement, WARN log, and histogram observation are
-documented design intent; the field's source comment in
-[`specs.py`](../../../cosmos_xenna/pipelines/private/specs.py)
-is authoritative on the current implementation state and notes the
-field is reserved — the emission has not yet been wired into
-`autoscale()`.
+wall-clock measurement, histogram observation, and WARN log are
+implemented in
+[`scheduling_py/loop_watchdog.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/loop_watchdog.py)
+as a `@contextmanager` that wraps every
+`SaturationAwareScheduler.autoscale()` cycle.
 
 ## Problem
 
