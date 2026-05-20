@@ -51,10 +51,6 @@ from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
-# ---------------------------------------------------------------------------
-# Cluster / problem helpers
-# ---------------------------------------------------------------------------
-
 
 def _multi_node_cluster(*, num_nodes: int = 2, total_cpus_per_node: int = 64) -> resources.ClusterResources:
     """Build a CPU-only cluster with ``num_nodes`` nodes named ``node-0..N-1``.
@@ -100,11 +96,6 @@ def _problem(
         for name in stage_names
     ]
     return data_structures.Problem(cluster, stages)
-
-
-# ---------------------------------------------------------------------------
-# Per-cycle ProblemStageState builders
-# ---------------------------------------------------------------------------
 
 
 def _worker_group(
@@ -170,11 +161,6 @@ def _stage_state(
     )
 
 
-# ---------------------------------------------------------------------------
-# Scheduler builders
-# ---------------------------------------------------------------------------
-
-
 def _scheduler_with_node_churn_defaults(
     stage_names: list[str],
     *,
@@ -222,11 +208,6 @@ def _scheduler_with_node_churn_defaults(
     scheduler = SaturationAwareScheduler(cfg)
     scheduler.setup(_problem(stage_names, _multi_node_cluster(num_nodes=num_nodes)))
     return scheduler
-
-
-# ---------------------------------------------------------------------------
-# Group A -- node loss / worker disappearance
-# ---------------------------------------------------------------------------
 
 
 class TestGroupAWorkerDisappearance:
@@ -415,11 +396,6 @@ class TestGroupAWorkerDisappearance:
         assert len(scheduler._worker_ages) == 4
 
 
-# ---------------------------------------------------------------------------
-# Group B -- recovery / flap
-# ---------------------------------------------------------------------------
-
-
 class TestGroupBRecoveryAndFlap:
     """Workers reappearing after loss get fresh first_seen and re-enter warmup grace."""
 
@@ -526,11 +502,6 @@ class TestGroupBRecoveryAndFlap:
         assert "hot-node-0-w1" not in scheduler._donor_warmup_excluded_ids
 
 
-# ---------------------------------------------------------------------------
-# Group C -- edges
-# ---------------------------------------------------------------------------
-
-
 class TestGroupCEdges:
     """Defensive edges around node loss."""
 
@@ -635,31 +606,29 @@ class TestGroupCEdges:
         assert set(scheduler._worker_ready_first_seen_at) == live
 
 
-# ---------------------------------------------------------------------------
-# Donor-flow under churn (review M6 coverage gap from Phase 3-viii post-impl review)
-# ---------------------------------------------------------------------------
-#
-# Phase B floor donor (``select_youngest_eligible_donor``) and Phase C
-# saturation-mode cross-stage donor (``find_saturation_donor``) both consume
-# per-stage live worker sets sourced from the planner's cycle-start snapshot.
-# When a donor stage simultaneously suffers worker loss (peer node disappears
-# from the actor pool), the donor selection must:
-#
-#   1. Operate exclusively on surviving workers (lost ids never reach the
-#      pool because they are absent from ``ProblemState.worker_groups``).
-#   2. Honor the donor stage's floor against the post-loss live count, not
-#      the pre-loss count.
-#   3. Not leak per-worker state across cycles in a way that corrupts the
-#      anti-flap state (``_last_donation_cycle``).
-#
-# These tests cover the donor-flow paths under churn explicitly. The
-# scheduler-level Phase D / floor / EWMA paths under churn are covered by
-# Group A above; the warmup-grace integration is covered in test_donor_warmup_grace.
-# ---------------------------------------------------------------------------
-
-
 class TestDonorFlowUnderChurn:
-    """Donor selection paths degrade gracefully when the donor stage loses workers."""
+    """Donor selection paths degrade gracefully when the donor stage loses workers.
+
+    Phase B floor donor (``select_youngest_eligible_donor``) and Phase C
+    saturation-mode cross-stage donor (``find_saturation_donor``) both
+    consume per-stage live worker sets sourced from the planner's
+    cycle-start snapshot. When a donor stage simultaneously suffers
+    worker loss (peer node disappears from the actor pool), the donor
+    selection must:
+
+      1. Operate exclusively on surviving workers (lost ids never
+         reach the pool because they are absent from
+         ``ProblemState.worker_groups``).
+      2. Honor the donor stage's floor against the post-loss live
+         count, not the pre-loss count.
+      3. Not leak per-worker state across cycles in a way that
+         corrupts the anti-flap state (``_last_donation_cycle``).
+
+    These tests cover the donor-flow paths under churn explicitly.
+    The scheduler-level Phase D / floor / EWMA paths under churn are
+    covered by ``TestGroupAWorkerDisappearance``; the warmup-grace
+    integration is covered in ``test_donor_warmup_grace.py``.
+    """
 
     @staticmethod
     def _two_stage_scheduler(
@@ -774,9 +743,12 @@ class TestDonorFlowUnderChurn:
             f"receiver floor=3 not met: pre=1 new={len(receiver_solution.new_workers)} "
             f"deleted={len(receiver_solution.deleted_workers)} -> {receiver_post}"
         )
-        # Donor donated >= 1 survivor. The lost id "donor-node-0-w2" must NOT appear
-        # because it was never in worker_ids_by_stage at the time of donor selection.
-        deleted_ids = set(donor_solution.deleted_workers)
+        # Donor donated >= 1 survivor. ``deleted_workers`` is a list of
+        # ``ProblemWorkerGroupState`` objects, not strings, so the id has to be projected
+        # before comparing to the snapshot id space. The lost id "donor-node-0-w2" must
+        # NOT appear because it was never in worker_ids_by_stage at the time of donor
+        # selection.
+        deleted_ids = {worker.id for worker in donor_solution.deleted_workers}
         assert "donor-node-0-w2" not in deleted_ids, (
             f"phantom delete: donor.deleted_workers includes the lost id {deleted_ids}"
         )
@@ -887,26 +859,24 @@ class TestDonorFlowUnderChurn:
         """``_last_donation_cycle`` is keyed by stage name, not by worker id, so loss preserves the entry.
 
         The cross-stage donor anti-flap guard
-        (``cross_stage_donor_min_donation_interval_cycles``) gates the
-        donor stage by name. If a donor stage donates on cycle N and
-        loses every worker on cycle N+1, the gate must continue to
-        recognize the donor stage as "recently donated" - the entry
-        is keyed by stage name, not by any specific worker id, so
-        worker churn cannot leak it out of the anti-flap map.
+        (``cross_stage_donor_min_donation_interval_cycles``) gates
+        the donor stage by name. If a donor stage donates on cycle
+        N and loses every worker on cycle N+1, the gate must
+        continue to recognize the donor stage as "recently donated"
+        - the entry is keyed by stage name, not by any specific
+        worker id, so worker churn cannot leak it out of the
+        anti-flap map.
 
-        The map can be populated by either Phase B (floor donor) or
-        Phase C (saturation cross-stage donor). This test exercises
-        the map directly via Phase B floor donation in cycle 1, then
-        verifies the entry survives a full-stage loss in cycle 2.
+        The map is populated only by Phase C
+        (``_record_donation_success``); Phase B floor donor does
+        not stamp this map. To pin the churn contract regardless of
+        donation path, the test seeds the map directly with a
+        sentinel cycle value, then drives a cycle that loses every
+        donor worker, then asserts the seeded entry is still
+        present and unchanged.
         """
         scheduler = self._two_stage_scheduler(receiver_floor=3, donor_floor=1, total_cpus_per_node=4)
 
-        # Cycle 1: force a Phase B floor donation. donor=3, receiver=1, cluster full.
-        # Phase B grows receiver: try_add -> receiver=2 (one free CPU pre-loss... wait, no:
-        # cycle 1 is the *baseline* with cluster full, no loss yet).
-        # donor=3, receiver=1 = 4 = cluster full. receiver floor=3. try_add fails.
-        # Donor fallback -> donates 1. receiver=2. try_add fails. Donor fallback again
-        # -> donates 1. receiver=3. Floor met.
         ps_cycle_1 = data_structures.ProblemState(
             [
                 _stage_state(name="donor", workers_per_node={"node-0": 3}),
@@ -915,16 +885,14 @@ class TestDonorFlowUnderChurn:
         )
         scheduler.autoscale(time=0.0, problem_state=ps_cycle_1)
 
-        # Phase B floor donor populates _last_donation_cycle on the donor entry. The
-        # receiver consumes the donation but only the donor stage entry is recorded.
-        # The cycle counter starts at 0 and increments at the top of each autoscale call,
-        # so cycle 1's donations are stamped at cycle_counter == 0. (Phase C donations
-        # would also stamp this map, but cycle 1 has no saturation classifier output.)
-        # We accept either {} (Phase B does NOT populate the map; it is reserved for
-        # Phase C anti-flap) or {"donor": 0} depending on the implementation contract.
-        # Pin the architectural property: regardless of source, the map's entry for
-        # the donor stage survives even if every donor worker is lost in cycle 2.
-        donation_cycle_after_cycle_1 = dict(scheduler._last_donation_cycle)
+        # Seed the anti-flap map directly with a sentinel value pinned to the current
+        # cycle counter. The contract under test is: the seeded entry MUST survive a
+        # cycle in which every donor worker disappears -- per-worker churn must not
+        # mutate the stage-keyed map. Bypassing the donation-path requirement keeps
+        # the test focused on the churn contract instead of accidentally testing
+        # whether Phase B populates the map.
+        seeded_cycle = scheduler._cycle_counter
+        scheduler._last_donation_cycle["donor"] = seeded_cycle
 
         # Cycle 2: donor loses ALL workers. Cluster goes to receiver-only (3 workers, 1 free).
         ps_cycle_2 = data_structures.ProblemState(
@@ -939,12 +907,15 @@ class TestDonorFlowUnderChurn:
         for i in range(3):
             assert f"donor-node-0-w{i}" not in scheduler._worker_ages
             assert f"donor-node-0-w{i}" not in scheduler._worker_ready_first_seen_at
-        # The stage-keyed map is unaffected by per-worker churn. Whatever was in the
-        # map after cycle 1 stays in the map after cycle 2 (no key was deleted by the
-        # loss-pruning hooks).
-        assert dict(scheduler._last_donation_cycle) == donation_cycle_after_cycle_1, (
-            f"per-worker churn must not mutate stage-keyed _last_donation_cycle; "
-            f"before={donation_cycle_after_cycle_1}, after={dict(scheduler._last_donation_cycle)}"
+        # The seeded entry survives the full-stage loss with its original cycle value.
+        # No autoscale-side hook deletes stage-keyed map entries when a stage loses all
+        # workers; entries persist for as long as the stage exists in the problem.
+        assert "donor" in scheduler._last_donation_cycle, (
+            f"loss must not delete the stage-keyed entry; _last_donation_cycle={dict(scheduler._last_donation_cycle)}"
+        )
+        assert scheduler._last_donation_cycle["donor"] == seeded_cycle, (
+            f"loss must not overwrite the stage-keyed entry; "
+            f"seeded={seeded_cycle}, observed={scheduler._last_donation_cycle['donor']}"
         )
 
     def test_donor_stage_with_no_survivors_is_skipped_by_floor_donor(self) -> None:

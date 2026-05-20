@@ -537,15 +537,15 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
 class TestPhaseDShrinkLogWarmupBranch:
     """``_log_phase_d_shrink_outcome`` distinguishes the warmup-grace branch.
 
-    Pins the operator-facing accounting introduced for review M1:
+    Pins the operator-facing Phase D shrink accounting:
     when ``select_workers_to_remove_oldest_first`` returns fewer
     victims than ``actual_remove`` because the warmup-grace filter
-    excluded otherwise-eligible candidates, the deficit must be
-    reported as ``donor warmup grace left N removed``, NOT as a
-    floor / fraction-cap deficit. The previous code logged
-    ``actual_remove`` regardless of how many workers were actually
-    removed and mis-attributed the deficit to floor / fraction
-    clamps that did not bind.
+    excluded otherwise-eligible candidates, the deficit is reported
+    as ``donor warmup grace left N removed`` rather than a
+    floor / fraction-cap deficit. Logging ``actual_remove``
+    regardless of how many workers were actually removed
+    mis-attributes the deficit to floor / fraction clamps that did
+    not bind.
     """
 
     def _scheduler_with_warmup(
@@ -749,3 +749,62 @@ class TestPhaseDShrinkLogWarmupBranch:
         assert "intent -10 workers" in msg
         assert "floor cap left 2 removed" in msg
         assert "floor=2" in msg
+
+    def test_composite_floor_and_warmup_both_bind_emits_both_branches(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Floor cap AND warmup grace bind in the same cycle -> both branches log.
+
+        Setup:
+          * 6 workers, w0/w1 seeded at now=0 (mature in cycle 2),
+            w2..w5 seeded at now=70 (warmup in cycle 2 because the
+            grace is 60 s and only 0 s has elapsed since they
+            joined).
+          * floor=2, no fraction cap (default 1.0), intent ``-10``.
+          * Stage 1 binds: actual_remove = min(10, 6 - 2, 6 * 1.0)
+            = 4 (floor cap); deficit_1 = 6.
+          * Stage 2 binds: helper excludes {w2..w5} -> victims =
+            [w0, w1] -> effective_remove = 2; deficit_2 =
+            actual_remove - effective_remove = 2.
+          * Both clauses MUST fire so the operator sees the full
+            attribution; suppressing Stage 2 here mis-attributes the
+            warmup-grace deficit to the floor cap.
+        """
+        scheduler = self._scheduler_with_warmup(donor_grace_s=60.0, min_workers=2)
+        ps_early = self._state_with_workers(worker_ids=["hot-w0", "hot-w1"])
+        ps_full = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3", "hot-w4", "hot-w5"])
+
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+            scheduler.autoscale(time=0.0, problem_state=ps_early)
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+            scheduler.autoscale(time=70.0, problem_state=ps_full)
+        loguru_caplog.clear()
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -10}):
+            scheduler.autoscale(time=70.0, problem_state=ps_full)
+
+        warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
+        floor_logs = [r for r in loguru_caplog.records if "floor cap left" in r.message]
+        fraction_logs = [r for r in loguru_caplog.records if "per-cycle fraction cap left" in r.message]
+
+        assert len(floor_logs) == 1, (
+            f"expected exactly one floor-cap log, got {len(floor_logs)}; "
+            f"all phase-d records: {[r.message for r in loguru_caplog.records if 'scale-down' in r.message]}"
+        )
+        assert len(warmup_logs) == 1, (
+            f"expected exactly one warmup-branch log, got {len(warmup_logs)}; "
+            f"all phase-d records: {[r.message for r in loguru_caplog.records if 'scale-down' in r.message]}"
+        )
+        assert not fraction_logs, "fraction cap is 1.0 (default); branch must not fire"
+
+        floor_msg = floor_logs[0].message
+        assert "intent -10 workers" in floor_msg
+        assert "floor cap left 2 removed" in floor_msg
+        assert "deficit=6" in floor_msg
+        assert "floor=2" in floor_msg
+
+        warmup_msg = warmup_logs[0].message
+        assert "intent -10 workers" in warmup_msg
+        assert "donor warmup grace left 2 removed" in warmup_msg
+        assert "deficit=2" in warmup_msg
+        assert "warmup_excluded=4" in warmup_msg

@@ -21,14 +21,14 @@ temporarily full or the receiver's worker shape does not match the
 free fragments. Three causes recur in production:
 
 - The cluster placement budget is briefly exhausted because a peer
-stage absorbed the free slots earlier in the same cycle's
-DAG-priority walk.
+  stage absorbed the free slots earlier in the same cycle's
+  DAG-priority walk.
 - The receiver's worker shape (multi-GPU, fractional GPU, NVDEC
-reservation) does not fit the surviving fragmentation pattern on
-the working snapshot.
+  reservation) does not fit the surviving fragmentation pattern on
+  the working snapshot.
 - A donor was selected via the saturation-mode cross-stage donor,
-but the post-donation `try_add_worker` retry came back empty
-because the freed slot does not satisfy the receiver shape.
+  but the post-donation `try_add_worker` retry came back empty
+  because the freed slot does not satisfy the receiver shape.
 
 Raising `RuntimeError` on each of these would tear down a pipeline
 that is otherwise healthy and would re-fire seconds later under
@@ -86,15 +86,15 @@ At the bottom of the per-stage loop the counter is updated in one of
 three ways:
 
 - `intent <= 0` (no positive intent, or the hard worker-cap ceiling
-clamped the request to zero headroom) → `counter = 0`.
+  clamped the request to zero headroom) → `counter = 0`.
 - `added == intent` (request fully satisfied this cycle) →
-`counter = 0`.
+  `counter = 0`.
 - `added < intent` (partial add) →
-`counter = counter + 1`.
+  `counter = counter + 1`.
 
 The transition shape is enforced at the end of every cycle by
 `check_stuck_plan_monotonicity` in
-`[invariants.py](../../../cosmos_xenna/pipelines/private/scheduling_py/invariants.py)`.
+[`invariants.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/invariants.py).
 Only `curr == 0` (reset) or `curr == prev + 1` (strict increment)
 are legal; any other shape raises `SchedulerInvariantError`. The
 pre-Phase-C snapshot stored in `prev_stuck_plan_counters` is the
@@ -126,36 +126,33 @@ empty queue" feedback that arrives one or two cycles later.
 ## Knobs
 
 All fields live in
-`[specs.py](../../../cosmos_xenna/pipelines/private/specs.py)`.
+[`specs.py`](../../../cosmos_xenna/pipelines/private/specs.py).
 
-
-| Field                            | Class                        | Default | Role                                                                                                                                 |
-| -------------------------------- | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `floor_stuck_grace_cycles`       | `SaturationAwareConfig`      | `6`     | Cycles a Phase B floor miss may persist without progress before `RuntimeError`                                                       |
-| `stuck_plan_detection_cycles`    | `SaturationAwareConfig`      | `18`    | Threshold against which `_stuck_plan_counters` is read by the operator-visible stuck-plan watchdog                                   |
-| `skip_cycle_on_allocation_error` | `SaturationAwareConfig`      | `True`  | Reserved policy hook for catching allocator exceptions; current Phase C path consumes the `None` return value directly               |
-| `enable_cross_stage_donor`       | `SaturationAwareConfig`      | `True`  | Master toggle for the donor fallback Phase C consults before recording a partial add                                                 |
-| `setup_aware_max_queued`         | `SaturationAwareStageConfig` | `True`  | Reserve queue credit for stages whose actors are still warming, so a Phase C add is not starved by the dispatcher's measurement loop |
-
+| Field | Class | Default | Role |
+|---|---|---|---|
+| `floor_stuck_grace_cycles` | `SaturationAwareConfig` | `6` | Cycles a Phase B floor miss may persist without progress before `RuntimeError` |
+| `stuck_plan_detection_cycles` | `SaturationAwareConfig` | `18` | Threshold against which `_stuck_plan_counters` is read by the operator-visible stuck-plan watchdog |
+| `skip_cycle_on_allocation_error` | `SaturationAwareConfig` | `True` | Reserved policy hook for catching allocator exceptions; current Phase C path consumes the `None` return value directly |
+| `enable_cross_stage_donor` | `SaturationAwareConfig` | `True` | Master toggle for the donor fallback Phase C consults before recording a partial add |
+| `setup_aware_max_queued` | `SaturationAwareStageConfig` | `True` | Reserve queue credit for stages whose actors are still warming, so a Phase C add is not starved by the dispatcher's measurement loop |
 
 ## See also
 
 - [00 — Per-cycle overview](00-overview.md) — where Phase C sits in
-the four-phase cycle and how Phase D rebalances the cluster
-between consecutive Phase C calls.
+  the four-phase cycle and how Phase D rebalances the cluster
+  between consecutive Phase C calls.
 - [03 — Planning context](03-planning-context.md) — the
-`AutoscalePlanContext.try_add_worker` return contract that
-Phase C depends on.
+  `AutoscalePlanContext.try_add_worker` return contract that
+  Phase C depends on.
 - [13 — Cross-stage donor](13-cross-stage-donor.md) — the donor
-fallback Phase C invokes before recording a partial add.
+  fallback Phase C invokes before recording a partial add.
 - [16 — Hard caps and floors](16-hard-caps-and-floors.md) — the
-Phase B floor whose miss escalates to `RuntimeError` after
-`floor_stuck_grace_cycles`.
+  Phase B floor whose miss escalates to `RuntimeError` after
+  `floor_stuck_grace_cycles`.
 - [19 — Phase invariants](19-phase-invariants.md) — the
-monotonicity invariant on `_stuck_plan_counters`.
+  monotonicity invariant on `_stuck_plan_counters`.
 - [22 — Prometheus metrics](22-prometheus-metrics.md) — operator
-visibility into stuck-plan counter timeseries.
-- `[saturation_aware.py](../../../cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py)`
-— `_run_phase_c_grow`, `_run_phase_b_floor`,
-`_attempt_cross_stage_donation`, `_record_donation_success`.
-
+  visibility into stuck-plan counter timeseries.
+- [`saturation_aware.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py)
+  — `_run_phase_c_grow`, `_run_phase_b_floor`,
+  `_attempt_cross_stage_donation`, `_record_donation_success`.

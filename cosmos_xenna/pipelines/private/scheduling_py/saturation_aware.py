@@ -547,11 +547,15 @@ class SaturationAwareScheduler:
         #     delete a worker that has not yet contributed real
         #     measurements.
         #
-        # Workers that Phase A grows or Phase B / C / D donate are
-        # absent from this cache because they were not in the cycle-start
-        # snapshot; that is intentional - they have no first-seen
-        # timestamp yet, so any warmup decision would be vacuous. See
-        # ``_build_donor_warmup_excluded_ids`` for the per-stage filter.
+        # Workers added during the current cycle are absent from this cache
+        # because they were not in the cycle-start snapshot. Add paths:
+        # Phase A grow (manual stage placement), Phase B floor grow / floor
+        # donor, and Phase C saturation grow / saturation donor. Phase D
+        # only removes workers, so it cannot contribute new ids to this
+        # cache. Excluding intra-cycle additions is intentional - those
+        # workers have no first-seen timestamp yet, so any warmup
+        # decision would be vacuous. See ``_build_donor_warmup_excluded_ids``
+        # for the per-stage filter that consumes this cache.
         self._donor_warmup_excluded_ids = self._build_donor_warmup_excluded_ids(
             ctx.worker_ids_by_stage(),
             now=time,
@@ -1453,6 +1457,15 @@ class SaturationAwareScheduler:
         ``actual_remove`` is the post-clamp request before that
         filter ran. The two diverge only when the warmup grace
         excluded otherwise-eligible candidates.
+
+        When both clamps bind in the same cycle (Stage 1 floor /
+        fraction cap shrinks ``requested_remove`` to
+        ``actual_remove`` AND Stage 2 warmup grace shrinks
+        ``actual_remove`` to ``effective_remove``), both branches
+        emit a log line so the operator can see the full deficit
+        attribution. Only Stage 3 (cap-driven full removal) is
+        suppressed when either deficit branch already fired,
+        because Stage 3 reports the no-clamp success path.
         """
         cap_driven = ceiling_excess > 0 and (intent >= 0 or ceiling_excess >= -intent)
         if cap_driven:
@@ -1464,6 +1477,7 @@ class SaturationAwareScheduler:
         else:
             preamble = f"saturation-aware scale-down: stage {stage_name!r} intent -{requested_remove} workers"
             cap_kwargs = ""
+        deficit_reported = False
         # Stage 1: actual_remove (post-clamp request) vs requested_remove (pre-clamp).
         if actual_remove < requested_remove:
             deficit = requested_remove - actual_remove
@@ -1480,10 +1494,9 @@ class SaturationAwareScheduler:
                     f"{preamble}; floor cap left {effective_remove} removed "
                     f"(deficit={deficit}, current={current}, floor={floor}{cap_kwargs})."
                 )
-            return
-        # Stage 2: floor / fraction caps did not bind, but the warmup grace might still have
-        # truncated the helper output; report that distinctly so operators don't blame the
-        # floor / fraction caps for a deficit they did not cause.
+            deficit_reported = True
+        # Stage 2: warmup grace truncation reported even when Stage 1 also fired,
+        # so the operator sees the full clamp chain instead of only the first binding clamp.
         if effective_remove < actual_remove:
             warmup_deficit = actual_remove - effective_remove
             logger.info(
@@ -1491,9 +1504,11 @@ class SaturationAwareScheduler:
                 f"(deficit={warmup_deficit}, current={current}, "
                 f"warmup_excluded={warmup_excluded_count}{cap_kwargs})."
             )
-            return
-        # Stage 3: cap-driven full removal -- no clamp, no warmup interference.
-        if cap_driven:
+            deficit_reported = True
+        # Stage 3: cap-driven full removal -- only fires when no deficit branch fired,
+        # because reporting "removed N workers" alongside a deficit message would be
+        # contradictory.
+        if cap_driven and not deficit_reported:
             logger.info(
                 f"saturation-aware scale-down: stage {stage_name!r} hard worker cap "
                 f"overflow removed {effective_remove} workers (current={current}, "
