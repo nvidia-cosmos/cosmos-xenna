@@ -39,9 +39,17 @@ This module pins:
     ready-first-seen map and threads it through to both helpers.
   * Floor-mode donor selection has no ``excluded_worker_ids``
     parameter and therefore admits warmup workers unchanged.
+  * The scheduler-level Phase D shrink log distinguishes the
+    warmup-grace branch from floor / fraction caps so operators
+    can locate the binding constraint in the log stream.
 """
 
+import logging
+from collections.abc import Iterator
+from unittest.mock import patch
+
 import pytest
+from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
@@ -506,3 +514,238 @@ class TestParametricDonorGraceBoundary:
 
         assert excluded_below == frozenset({"hot-w0"})
         assert excluded_at == frozenset()
+
+
+@pytest.fixture
+def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Bridge loguru records into pytest's stdlib-based ``caplog`` fixture.
+
+    Mirrors the pattern used in test_saturation_aware_caps.py and
+    other Phase D log-discipline tests.
+    """
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").log(msg.record["level"].no, msg.record["message"]),
+        format="{message}",
+    )
+    caplog.set_level(logging.DEBUG, logger="loguru")
+    try:
+        yield caplog
+    finally:
+        loguru_logger.remove(handler_id)
+
+
+class TestPhaseDShrinkLogWarmupBranch:
+    """``_log_phase_d_shrink_outcome`` distinguishes the warmup-grace branch.
+
+    Pins the operator-facing accounting introduced for review M1:
+    when ``select_workers_to_remove_oldest_first`` returns fewer
+    victims than ``actual_remove`` because the warmup-grace filter
+    excluded otherwise-eligible candidates, the deficit must be
+    reported as ``donor warmup grace left N removed``, NOT as a
+    floor / fraction-cap deficit. The previous code logged
+    ``actual_remove`` regardless of how many workers were actually
+    removed and mis-attributed the deficit to floor / fraction
+    clamps that did not bind.
+    """
+
+    def _scheduler_with_warmup(
+        self,
+        *,
+        donor_grace_s: float,
+        min_workers: int = 1,
+        max_scale_down_fraction_per_cycle: float = 1.0,
+    ) -> SaturationAwareScheduler:
+        """Build a one-stage scheduler with the requested warmup graces."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(
+                setup_phase_quiescence_enabled=False,
+                worker_warmup_measurement_grace_s=donor_grace_s,
+                donor_warmup_grace_s=donor_grace_s,
+                min_workers=min_workers,
+                max_scale_down_fraction_per_cycle=max_scale_down_fraction_per_cycle,
+            ),
+        )
+        scheduler = SaturationAwareScheduler(cfg)
+        cluster = resources.ClusterResources(
+            nodes={
+                "node-0": resources.NodeResources(used_cpus=0, total_cpus=64, gpus=[], name="node-0"),
+            },
+        )
+        cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(cluster)
+        scheduler.setup(
+            data_structures.Problem(
+                cluster,
+                [
+                    data_structures.ProblemStage(
+                        name="hot",
+                        stage_batch_size=1,
+                        worker_shape=cpu_shape,
+                        requested_num_workers=None,
+                        over_provision_factor=None,
+                    ),
+                ],
+            )
+        )
+        return scheduler
+
+    def _state_with_workers(self, *, worker_ids: list[str]) -> data_structures.ProblemState:
+        """Build a single-stage ProblemState whose workers all have idle slots."""
+        return data_structures.ProblemState(
+            [
+                data_structures.ProblemStageState(
+                    stage_name="hot",
+                    workers=[
+                        data_structures.ProblemWorkerGroupState.make(
+                            wid,
+                            [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+                            num_used_slots=0,
+                        )
+                        for wid in worker_ids
+                    ],
+                    slots_per_worker=1,
+                    is_finished=False,
+                    num_used_slots=0,
+                    num_empty_slots=len(worker_ids),
+                    input_queue_depth=0,
+                ),
+            ]
+        )
+
+    def test_intent_shrink_with_all_workers_in_warmup_logs_grace_branch(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """All-warmup pool + intent shrink -> deficit attributed to warmup grace, not floor/fraction.
+
+        Setup:
+          * 4 workers, all freshly-ready (now < grace_s).
+          * floor=1 so floor would allow up to 3 removals; fraction
+            cap=1.0 so fraction does not bind either.
+          * Patched intent ``-2`` -> requested_remove=2, actual_remove=2.
+          * ``_donor_warmup_excluded_ids`` covers the entire pool ->
+            ``select_workers_to_remove_oldest_first`` returns ``[]`` ->
+            effective_remove=0.
+
+        Expected log line:
+          ``intent -2 workers; donor warmup grace left 0 removed
+          (deficit=2, current=4, warmup_excluded=4).``
+
+        Pre-fix bug: the log would say ``floor cap left 2 removed`` or
+        ``intent -2 workers`` with no warmup attribution, even though
+        zero workers were actually removed.
+        """
+        scheduler = self._scheduler_with_warmup(donor_grace_s=60.0, min_workers=1)
+        ps = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
+
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -2}):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+
+        warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
+        floor_logs = [r for r in loguru_caplog.records if "floor cap left" in r.message]
+        fraction_logs = [r for r in loguru_caplog.records if "per-cycle fraction cap left" in r.message]
+
+        assert len(warmup_logs) == 1, (
+            f"expected exactly one warmup-branch log, got {len(warmup_logs)}; "
+            f"all phase-d records: {[r.message for r in loguru_caplog.records if 'scale-down' in r.message]}"
+        )
+        assert not floor_logs, "floor-cap branch should not fire when warmup-grace truncated the pool"
+        assert not fraction_logs, "fraction-cap branch should not fire when warmup-grace truncated the pool"
+
+        msg = warmup_logs[0].message
+        assert "intent -2 workers" in msg
+        assert "donor warmup grace left 0 removed" in msg
+        assert "deficit=2" in msg
+        assert "current=4" in msg
+        assert "warmup_excluded=4" in msg
+
+    def test_partial_warmup_pool_logs_grace_branch_with_partial_removal(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Mixed pool: some workers mature, some warmup, intent shrink partially served.
+
+        Setup:
+          * 4 workers; cycle 1 seeds w0/w1 (now=0), cycle 2 adds w2/w3
+            (now=70) so on cycle 3 (now=70 again, within w2/w3 grace),
+            w0/w1 are mature, w2/w3 are still in warmup.
+          * floor=1, no fraction cap, intent ``-3``.
+          * actual_remove = min(3, 4-1, 4*1.0) = 3.
+          * warmup-grace excludes {w2, w3} -> helper returns
+            [w0, w1] -> effective_remove=2.
+
+        Expected log line:
+          ``intent -3 workers; donor warmup grace left 2 removed
+          (deficit=1, current=4, warmup_excluded=2).``
+        """
+        scheduler = self._scheduler_with_warmup(donor_grace_s=60.0, min_workers=1)
+        ps_early = self._state_with_workers(worker_ids=["hot-w0", "hot-w1"])
+        ps_full = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
+
+        # Cycle 1: seed first-seen for w0, w1 only.
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+            scheduler.autoscale(time=0.0, problem_state=ps_early)
+        # Cycle 2: w2, w3 join. Their first_seen=70.
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+            scheduler.autoscale(time=70.0, problem_state=ps_full)
+        loguru_caplog.clear()
+        # Cycle 3 at now=70 -> w0, w1 age=70 (mature), w2, w3 age=0 (warmup).
+        # Intent -3 -> actual_remove=min(3, 4-1, 4)=3 -> helper excludes {w2, w3}
+        # -> victims=[w0, w1] -> effective_remove=2 -> deficit=1.
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -3}):
+            scheduler.autoscale(time=70.0, problem_state=ps_full)
+
+        warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
+        floor_logs = [r for r in loguru_caplog.records if "floor cap left" in r.message]
+
+        assert len(warmup_logs) == 1, (
+            f"expected exactly one warmup-branch log, got {len(warmup_logs)}; "
+            f"all phase-d records: {[r.message for r in loguru_caplog.records if 'scale-down' in r.message]}"
+        )
+        assert not floor_logs, (
+            "floor-cap should not fire: floor=1 allowed 3 removals, the deficit came from warmup grace"
+        )
+
+        msg = warmup_logs[0].message
+        assert "intent -3 workers" in msg
+        assert "donor warmup grace left 2 removed" in msg
+        assert "deficit=1" in msg
+        assert "current=4" in msg
+        assert "warmup_excluded=2" in msg
+
+    def test_warmup_branch_does_not_fire_when_pool_is_fully_mature(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A mature-only pool with a floor-bound deficit logs the floor branch, not warmup.
+
+        Verifies the warmup branch is gated on
+        ``effective_remove < actual_remove`` and stays silent when
+        the helper returned the full requested count. The floor-cap
+        branch fires when ``actual_remove < requested_remove``
+        (floor binding) regardless of warmup state.
+        """
+        scheduler = self._scheduler_with_warmup(donor_grace_s=60.0, min_workers=2)
+        ps = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
+
+        # Cycle 1 seeds first-seen at 0.
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+            scheduler.autoscale(time=0.0, problem_state=ps)
+        loguru_caplog.clear()
+        # Cycle 2 at now=120 -> all workers age=120 (mature, > 60s grace).
+        # Intent -10 -> requested=10, actual=min(10, 4-2, 4*1.0)=2 -> deficit=8 (floor-bound).
+        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -10}):
+            scheduler.autoscale(time=120.0, problem_state=ps)
+
+        warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
+        floor_logs = [r for r in loguru_caplog.records if "floor cap left" in r.message]
+
+        assert not warmup_logs, "warmup branch must not fire when effective_remove == actual_remove"
+        assert len(floor_logs) == 1, (
+            f"expected exactly one floor-cap log, got {len(floor_logs)}; "
+            f"all phase-d records: {[r.message for r in loguru_caplog.records if 'scale-down' in r.message]}"
+        )
+        msg = floor_logs[0].message
+        assert "intent -10 workers" in msg
+        assert "floor cap left 2 removed" in msg
+        assert "floor=2" in msg

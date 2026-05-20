@@ -527,14 +527,18 @@ class TestSpmdGroupSharesTimestamp:
         assert (used_warmup, empty_warmup) == (0, 0)
 
         # Once mature the helper reports the group's per-group used count and
-        # the per-group empty count (slots_per_worker - num_used_slots).
+        # the per-group empty count.
+        # SPMD math: K=2 actors each with slots_per_worker=8 -> group capacity 16.
+        # num_used_slots=15 (sum across the 2 actors) -> empty = 16 - 15 = 1.
+        # Earlier (buggy) code computed slots_per_worker - num_used_slots = 8 - 15 -> max(0, ...) = 0,
+        # under-counting by (K-1)*slots_per_worker = 8 empties and biasing the classifier toward SATURATED.
         used_mature, empty_mature = scheduler._aggregate_slot_signals_excluding_warmup(
             runtime_stage=ps.rust.stages[0],
             stage_cfg=scheduler._stage_cfg("hot"),
             now=60.0,
         )
         assert used_mature == 15
-        assert empty_mature == 0  # max(0, 8 - 15) = 0; clamped at zero
+        assert empty_mature == 1
 
 
 class TestZeroWorkerStage:

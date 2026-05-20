@@ -523,12 +523,35 @@ class SaturationAwareScheduler:
             problem_state,
             worker_ages=self._next_cycle_worker_ages(),
         )
-        # Cache the per-cycle donor warmup excluded set after the planner
-        # context is built so worker_ids_by_stage() reflects the post-Phase-A
-        # placement. Saturation-mode cross-stage donor selection and Phase D
-        # shrink consume the cached set; floor donor selection bypasses it
-        # because the floor is a hard structural requirement (see
-        # _build_donor_warmup_excluded_ids docstring).
+        # Cache the per-cycle donor warmup excluded set immediately after
+        # AutoscalePlanContext.from_problem_state() seeds the planner from
+        # ``problem_state``. ``ctx.worker_ids_by_stage()`` at this point
+        # reflects the cycle-start snapshot (the live worker set as
+        # observed by the actor pool); Phase A (delete + grow), Phase B
+        # (floor), Phase C (grow), and Phase D (shrink) have NOT run yet
+        # and have not mutated the planner. The cache is therefore a
+        # cycle-start snapshot of "which observed workers are still in
+        # warmup according to ``donor_warmup_grace_s``", and it stays
+        # constant for the rest of the cycle so:
+        #
+        #   * Phase B floor donor selection
+        #     (``select_youngest_eligible_donor``) intentionally bypasses
+        #     this cache because the floor is a hard structural
+        #     requirement; deadlocking on warmup-protected donors is
+        #     worse than killing a young donor.
+        #   * Phase C saturation-mode cross-stage donor selection
+        #     (``find_saturation_donor``) consumes this cache so a
+        #     receiver does not absorb a donor still in its own warmup.
+        #   * Phase D shrink (``select_workers_to_remove_oldest_first``)
+        #     consumes this cache so a saturation-driven shrink cannot
+        #     delete a worker that has not yet contributed real
+        #     measurements.
+        #
+        # Workers that Phase A grows or Phase B / C / D donate are
+        # absent from this cache because they were not in the cycle-start
+        # snapshot; that is intentional - they have no first-seen
+        # timestamp yet, so any warmup decision would be vacuous. See
+        # ``_build_donor_warmup_excluded_ids`` for the per-stage filter.
         self._donor_warmup_excluded_ids = self._build_donor_warmup_excluded_ids(
             ctx.worker_ids_by_stage(),
             now=time,
@@ -700,11 +723,22 @@ class SaturationAwareScheduler:
 
         For non-SPMD stages each ``ProblemWorkerGroupState``
         corresponds to a single actor; ``num_used_slots`` is that
-        actor's used-slot count and ``slots_per_worker - num_used_slots``
-        is its empty-slot count. SPMD stages pack multiple actors into
+        actor's used-slot count and the per-group capacity is just
+        ``slots_per_worker``. SPMD stages pack multiple actors into
         one worker_group and share a first-seen timestamp, so the
-        filter still operates at the right granularity (every actor
-        in the group reached READY in the same cycle).
+        warmup admission decision is at the group level (every
+        actor in the group reached READY in the same cycle).
+
+        Capacity arithmetic for SPMD groups:
+        ``ActorPool.worker_group_num_used_slots`` sums occupied
+        slots across all K actors of a worker_group. The per-group
+        slot capacity is therefore ``slots_per_worker * K`` where
+        ``K = len(worker_group.resources)`` (one ``WorkerResourcesInternal``
+        per SPMD actor). Computing empties as
+        ``slots_per_worker - num_used_slots`` (treating the group as
+        a single actor) silently under-counts by ``(K - 1) *
+        slots_per_worker`` and biases the classifier toward
+        SATURATED. The fix uses the group-level capacity.
 
         Args:
             runtime_stage: The Rust ``ProblemStageState`` for the
@@ -733,9 +767,14 @@ class SaturationAwareScheduler:
             first_seen = self._worker_ready_first_seen_at.get(worker_group.id)
             if first_seen is None or (now - first_seen) < grace_s:
                 continue
+            # SPMD-aware capacity: per-group capacity is slots_per_worker * actor_count.
+            # actor_count is len(worker_group.resources): one WorkerResourcesInternal per
+            # SPMD actor (= 1 for non-SPMD groups, = K for K-way SPMD).
+            actor_count = len(worker_group.resources)
+            group_capacity = slots_per_worker * actor_count
             used = worker_group.num_used_slots
             mature_used += used
-            mature_empty += max(0, slots_per_worker - used)
+            mature_empty += max(0, group_capacity - used)
         return mature_used, mature_empty
 
     def _build_donor_warmup_excluded_ids(
@@ -1310,6 +1349,11 @@ class SaturationAwareScheduler:
                         ceiling_excess=ceiling_excess,
                         requested_remove=requested_remove,
                         actual_remove=actual_remove,
+                        # actual_remove == 0 means the floor / fraction cap clamped before the
+                        # warmup-grace filter would even run; nothing was effectively removed
+                        # and warmup did not contribute to the deficit.
+                        effective_remove=0,
+                        warmup_excluded_count=0,
                         current=current,
                         floor=floor,
                         fraction_cap=fraction_cap,
@@ -1322,6 +1366,9 @@ class SaturationAwareScheduler:
             worker_host_gpu_used_fractions = self._extract_worker_host_gpu_used_fractions(
                 runtime_stage=runtime_stage,
                 host_gpu_used_fractions=host_gpu_used_fractions,
+            )
+            stage_warmup_excluded = sum(
+                1 for wid in worker_ids_by_stage[stage_index] if wid in self._donor_warmup_excluded_ids
             )
             victims = select_workers_to_remove_oldest_first(
                 worker_ids=worker_ids_by_stage[stage_index],
@@ -1339,7 +1386,12 @@ class SaturationAwareScheduler:
                         "scheduler defect; the planner state and the runtime snapshot disagree."
                     )
                     raise RuntimeError(msg)
-
+            # ``effective_remove`` is the deletion count actually applied to the planner.
+            # When the warmup-grace filter removed candidates from the eligible pool the helper
+            # returns fewer victims than ``actual_remove``; logging ``actual_remove`` in that
+            # case would mislead operators about how many workers were really shrunk and
+            # mis-attribute the deficit to floor / fraction caps that did not bind.
+            effective_remove = len(victims)
             self._log_phase_d_shrink_outcome(
                 stage_name=stage_name,
                 intent=intent,
@@ -1347,6 +1399,8 @@ class SaturationAwareScheduler:
                 ceiling_excess=ceiling_excess,
                 requested_remove=requested_remove,
                 actual_remove=actual_remove,
+                effective_remove=effective_remove,
+                warmup_excluded_count=stage_warmup_excluded,
                 current=current,
                 floor=floor,
                 fraction_cap=fraction_cap,
@@ -1363,6 +1417,8 @@ class SaturationAwareScheduler:
         ceiling_excess: int,
         requested_remove: int,
         actual_remove: int,
+        effective_remove: int,
+        warmup_excluded_count: int,
         current: int,
         floor: int,
         fraction_cap: int,
@@ -1374,12 +1430,29 @@ class SaturationAwareScheduler:
         The message preamble names the dominant driver (classifier
         intent vs hard worker cap overflow) so operators can locate
         the source of the request without parsing the trailing
-        kwargs. The trailing clause names the binding clamp (floor,
-        per-cycle fraction, or no clamp) so operators can locate the
-        cause of any deficit. Ties between ``fraction_cap`` and
-        ``allowed_by_floor`` resolve to the floor branch so the
-        operator-configured floor is named in the log when both
-        clamps would have produced the same deletion count.
+        kwargs. The trailing clause names the binding clamp:
+
+          * floor cap (``allowed_by_floor`` was the smallest of the
+            three),
+          * per-cycle fraction cap (``fraction_cap`` was the
+            smallest),
+          * donor warmup grace (the floor / fraction caps did not
+            bind but ``select_workers_to_remove_oldest_first``
+            returned fewer workers than ``actual_remove`` because
+            the per-cycle ``_donor_warmup_excluded_ids`` filter
+            excluded eligible candidates), or
+          * no clamp (full removal applied).
+
+        Ties between ``fraction_cap`` and ``allowed_by_floor``
+        resolve to the floor branch so the operator-configured
+        floor is named in the log when both clamps would have
+        produced the same deletion count.
+
+        ``effective_remove`` is the count actually applied to the
+        planner (``len(victims)`` after the warmup-grace filter).
+        ``actual_remove`` is the post-clamp request before that
+        filter ran. The two diverge only when the warmup grace
+        excluded otherwise-eligible candidates.
         """
         cap_driven = ceiling_excess > 0 and (intent >= 0 or ceiling_excess >= -intent)
         if cap_driven:
@@ -1391,25 +1464,39 @@ class SaturationAwareScheduler:
         else:
             preamble = f"saturation-aware scale-down: stage {stage_name!r} intent -{requested_remove} workers"
             cap_kwargs = ""
+        # Stage 1: actual_remove (post-clamp request) vs requested_remove (pre-clamp).
         if actual_remove < requested_remove:
             deficit = requested_remove - actual_remove
             fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
             if fraction_bound:
                 logger.info(
-                    f"{preamble}; per-cycle fraction cap left {actual_remove} removed "
+                    f"{preamble}; per-cycle fraction cap left {effective_remove} removed "
                     f"(deficit={deficit}, current={current}, "
                     f"max_scale_down_fraction_per_cycle={max_scale_down_fraction_per_cycle}"
                     f"{cap_kwargs})."
                 )
             else:
                 logger.info(
-                    f"{preamble}; floor cap left {actual_remove} removed "
+                    f"{preamble}; floor cap left {effective_remove} removed "
                     f"(deficit={deficit}, current={current}, floor={floor}{cap_kwargs})."
                 )
-        elif cap_driven:
+            return
+        # Stage 2: floor / fraction caps did not bind, but the warmup grace might still have
+        # truncated the helper output; report that distinctly so operators don't blame the
+        # floor / fraction caps for a deficit they did not cause.
+        if effective_remove < actual_remove:
+            warmup_deficit = actual_remove - effective_remove
+            logger.info(
+                f"{preamble}; donor warmup grace left {effective_remove} removed "
+                f"(deficit={warmup_deficit}, current={current}, "
+                f"warmup_excluded={warmup_excluded_count}{cap_kwargs})."
+            )
+            return
+        # Stage 3: cap-driven full removal -- no clamp, no warmup interference.
+        if cap_driven:
             logger.info(
                 f"saturation-aware scale-down: stage {stage_name!r} hard worker cap "
-                f"overflow removed {actual_remove} workers (current={current}, "
+                f"overflow removed {effective_remove} workers (current={current}, "
                 f"ceiling={ceiling}, intent={intent})."
             )
 
