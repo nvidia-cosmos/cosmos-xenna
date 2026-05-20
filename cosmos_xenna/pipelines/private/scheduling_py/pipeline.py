@@ -18,14 +18,14 @@
 Per-cycle flow::
 
     snapshot -> resolve classifier signal -> classify -> update streak
-             -> fire-gate -> compute intent delta -> update growth mode
-             -> return delta
+             -> fire-gate -> compute intent delta -> stabilization gate
+             -> update growth mode -> return delta
 
 The returned delta is the algorithm's intent. Cluster-wide
 feasibility (per-stage min/max, per-node caps, capacity, memory
 pressure gate) is applied by the scheduler's main loop after this
 function returns, so the growth-mode transition observes the
-unclamped intent delta produced here.
+post-stabilization-gate intent delta produced here.
 """
 
 from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
@@ -35,6 +35,10 @@ from cosmos_xenna.pipelines.private.scheduling_py.decisions import (
     update_streak,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.growth_mode import compute_growth_mode_transition
+from cosmos_xenna.pipelines.private.scheduling_py.stabilization import (
+    _RecommendationHistory,
+    apply_stabilization_gate,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.state import (
     _StageRuntimeState,
     compute_slots_empty_ratio,
@@ -51,10 +55,12 @@ def run_per_stage_pipeline(
     input_queue_depth: int,
     current_workers: int,
     config: SaturationAwareStageConfig,
+    recommendation_history: _RecommendationHistory | None = None,
 ) -> int:
     """Run the per-cycle decision pipeline for one stage.
 
-    Mutates ``stage_state`` in place; returns the unclamped delta.
+    Mutates ``stage_state`` in place; returns the (possibly
+    stabilization-gated) delta.
 
     Args:
         stage_state: Per-stage runtime state. Mutated in place.
@@ -63,6 +69,16 @@ def run_per_stage_pipeline(
         input_queue_depth: Tasks waiting upstream of this stage.
         current_workers: Worker count at cycle start.
         config: Per-stage configuration.
+        recommendation_history: Optional asymmetric stabilization-window
+            buffer. When provided, the raw delta is recorded into the
+            buffer and replaced with ``0`` if the buffer cannot yet
+            confirm a sustained recommendation in the same direction;
+            this gates Phase C / Phase D against acting on a single
+            noisy cycle. The growth-mode transition observes the
+            post-gate delta so HOLD timers advance during gated cycles
+            instead of resetting on every suppressed shrink. ``None``
+            (the legacy contract used by helper-direct tests) skips
+            the stabilization layer entirely.
 
     Returns:
         Signed delta: positive to add, negative to remove, zero for
@@ -128,6 +144,15 @@ def run_per_stage_pipeline(
         )
     else:
         delta = 0
+
+    if recommendation_history is not None:
+        # Record-then-gate is encapsulated in ``apply_stabilization_gate`` so
+        # callers cannot accidentally gate without recording, which would
+        # leave the buffer one cycle behind reality and weaken every future
+        # gate decision. The growth-mode transition below sees the gated
+        # delta so HOLD-after-shrink timers advance correctly when the
+        # stabilization window suppresses a recommended action.
+        delta = apply_stabilization_gate(recommendation_history, delta)
 
     stage_state.growth_mode, stage_state.growth_streak = compute_growth_mode_transition(
         prev_mode=stage_state.growth_mode,

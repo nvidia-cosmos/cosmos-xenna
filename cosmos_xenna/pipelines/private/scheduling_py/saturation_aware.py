@@ -87,6 +87,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     update_regime_state,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
+from cosmos_xenna.pipelines.private.scheduling_py.stabilization import _RecommendationHistory
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
@@ -150,6 +151,17 @@ class SaturationAwareScheduler:
             no positive intent. The counter is the input the
             pipeline-level ``stuck_plan_detection_cycles`` watchdog
             consumes when it is wired in.
+        _recommendation_histories: Per-stage asymmetric
+            stabilization-window buffers, sized by the resolved
+            ``stabilization_window_cycles_up`` /
+            ``stabilization_window_cycles_down`` of each stage's
+            effective config. Threaded into
+            :func:`run_per_stage_pipeline` each cycle so the
+            per-stage decision pipeline gates the raw delta against a
+            consensus check before the growth-mode transition runs.
+            Populated at ``setup()`` and re-built only when ``setup()``
+            is called again; per-cycle config flux (regime-aware
+            aggressiveness lift) does not affect window sizes.
         _cycle_counter: Monotonic count of completed ``autoscale()``
             calls since ``setup()``. Used as the time index for the
             saturation-mode cross-stage donor anti-flap layers.
@@ -232,6 +244,12 @@ class SaturationAwareScheduler:
         self._cycle_counter: int = 0
         self._last_donation_cycle: dict[str, int] = {}
         self._donations_received_this_cycle: dict[str, int] = {}
+        # Per-stage stabilization-window buffer. Allocated at ``setup()`` once
+        # the pipeline shape is known; the per-cycle pipeline reads this map
+        # via :meth:`_compute_intent_deltas` and relies on the same
+        # ``_RecommendationHistory`` instance across cycles so the buffer can
+        # actually accumulate consensus.
+        self._recommendation_histories: dict[str, _RecommendationHistory] = {}
 
     def _stage_cfg(self, stage_name: str) -> SaturationAwareStageConfig:
         """Resolve the effective stage config including ``StageSpec`` overrides."""
@@ -261,6 +279,18 @@ class SaturationAwareScheduler:
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
+        # Build per-stage stabilization-window buffers from the resolved
+        # effective config; both windows are config-time invariants
+        # (cross-validated in ``SaturationAwareStageConfig.__attrs_post_init__``)
+        # and do not flex during runtime, so the buffers can outlive every
+        # ``autoscale()`` cycle without per-cycle re-allocation.
+        self._recommendation_histories = {
+            name: _RecommendationHistory(
+                window_up=self._stage_cfg(name).stabilization_window_cycles_up,
+                window_down=self._stage_cfg(name).stabilization_window_cycles_down,
+            )
+            for name in self._stage_names
+        }
 
     def _ensure_thresholds_resolved(self, problem_state: data_structures.ProblemState) -> None:
         """Lazily resolve per-stage classifier thresholds on the first cycle.
@@ -533,9 +563,14 @@ class SaturationAwareScheduler:
 
         For each non-finished stage, calls
         :func:`run_per_stage_pipeline` with the live slot signals
-        sourced from ``ProblemStageState`` and the post-Phase-B worker
-        count read from the planner context. The returned delta is the
-        algorithm's intent before any cluster-wide feasibility clamps.
+        sourced from ``ProblemStageState``, the post-Phase-B worker
+        count read from the planner context, and the per-stage
+        ``_RecommendationHistory`` allocated at ``setup()``. The
+        pipeline records the raw delta into the history and replaces
+        it with ``0`` if the asymmetric stabilization window has not
+        yet seen a sustained recommendation in the same direction;
+        the returned delta is therefore the post-stabilization-gate
+        intent that Phase C / Phase D must execute.
 
         The intent values are exposed via :attr:`_last_intent_deltas`
         for tests and observability. Saturation-driven scale-up
@@ -578,6 +613,11 @@ class SaturationAwareScheduler:
                 raise ValueError(msg)
             stage_cfg = self._stage_cfg(stage_name)
             current_workers = len(worker_ids_by_stage[stage_index])
+            # The stabilization-window buffer is allocated alongside the
+            # runtime state in ``setup()``; a missing entry would mean the
+            # ``problem`` -> ``problem_state`` shape contract above somehow
+            # admitted a stage the runtime state map already rejected.
+            history = self._recommendation_histories[stage_name]
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
                 num_used_slots=runtime_stage.num_used_slots,
@@ -585,6 +625,7 @@ class SaturationAwareScheduler:
                 input_queue_depth=runtime_stage.input_queue_depth,
                 current_workers=current_workers,
                 config=stage_cfg,
+                recommendation_history=history,
             )
             intents[stage_name] = delta
         return intents
@@ -1534,11 +1575,15 @@ class SaturationAwareScheduler:
 
         Computes the per-cycle regime signal, applies hysteresis via
         ``update_regime_state``, and on a regime transition drops
-        every stage's ``resolved_thresholds`` and threshold-relative
-        classifier history so the next call to
-        ``_ensure_thresholds_resolved`` re-derives thresholds with the
-        appropriate effective aggressiveness. Cycles whose signal is
-        unavailable (some active stage has not populated
+        every stage's ``resolved_thresholds``, threshold-relative
+        classifier history, and stabilization-window recommendation
+        buffer so the next call to ``_ensure_thresholds_resolved``
+        re-derives thresholds with the appropriate effective
+        aggressiveness and the post-transition cycles must rebuild
+        gate consensus from scratch (pre-transition recommendations
+        consumed a different threshold band and would otherwise let
+        stale consensus leak into the new regime). Cycles whose
+        signal is unavailable (some active stage has not populated
         ``num_used_slots`` / ``num_empty_slots`` yet) leave the regime
         state and resolved thresholds untouched. Respects the
         ``enable_regime_aware_aggressiveness`` flag.
@@ -1563,6 +1608,8 @@ class SaturationAwareScheduler:
             runtime.resolved_thresholds = None
             runtime.classifier_state = StageState.NORMAL
             runtime.classifier_streak = 0
+        for history in self._recommendation_histories.values():
+            history.clear()
 
 
 def _select_workers_to_delete_youngest_first(
