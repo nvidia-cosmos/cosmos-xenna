@@ -36,6 +36,20 @@ the updated effective aggressiveness.
 per-stage decision logic can stage worker adds and removes against
 a working cluster snapshot; the staged plan is frozen into a
 ``Solution`` via ``ctx.into_solution()``.
+
+Convergence is intentionally damped per cycle so the scheduler
+tolerates noisy measurements without oscillating. Phase C grows
+each stage by at most ``min(positive_intent, ceiling - current,
+cluster_placement_capacity)`` workers per cycle; Phase D shrinks
+each stage by at most ``min(max(-intent, ceiling_excess),
+allowed_by_floor, fraction_cap)`` workers per cycle. The per-cycle
+fraction cap (default 0.05 = 5% of current) bounds the worst-case
+descent rate even when ``ceiling_excess`` or negative intent ask
+for more, so a stage that lands at 100 workers and is asked to
+shrink to its floor takes O(log(workers)) cycles to converge under
+the default fraction. Aggressive operators can raise
+``max_scale_down_fraction_per_cycle`` per stage if oscillation
+margin is acceptable.
 """
 
 import math
@@ -597,11 +611,12 @@ class SaturationAwareScheduler:
                 # cycle without raising. The donor cooldown and
                 # receiver-per-cycle counters are updated only on a
                 # successfully completed donation+retry.
-                if not self._attempt_cross_stage_donation(
+                donor_stage_name = self._attempt_cross_stage_donation(
                     ctx=ctx,
                     receiver_stage_index=stage_index,
                     receiver_stage_name=stage_name,
-                ):
+                )
+                if donor_stage_name is None:
                     deficit = intent - added
                     logger.warning(
                         f"saturation-aware scale-up: stage {stage_name!r} intent "
@@ -620,6 +635,10 @@ class SaturationAwareScheduler:
                         "satisfied this cycle."
                     )
                     break
+                self._record_donation_success(
+                    donor_stage_name=donor_stage_name,
+                    receiver_stage_name=stage_name,
+                )
                 added += 1
             if added < intent:
                 self._stuck_plan_counters[stage_name] = self._stuck_plan_counters.get(stage_name, 0) + 1
@@ -632,21 +651,25 @@ class SaturationAwareScheduler:
         ctx: data_structures.AutoscalePlanContext,
         receiver_stage_index: int,
         receiver_stage_name: str,
-    ) -> bool:
+    ) -> str | None:
         """Try to free a placement for a saturation-driven receiver.
 
         Selects an eligible donor via
         :func:`find_saturation_donor` (five anti-flap layers + strict
-        upstream + master toggle), removes it from the planner, and
-        updates the donor cooldown + receiver per-cycle counter. The
-        caller is responsible for the immediate ``try_add_worker``
-        retry after this method returns ``True``.
+        upstream + master toggle) and removes it from the planner.
+        The donor cooldown and receiver per-cycle counters are NOT
+        updated here; the caller MUST advance them via
+        :meth:`_record_donation_success` only after the immediate
+        ``try_add_worker`` retry succeeds for the receiver. Recording
+        cooldowns before retry success would penalise the donor for
+        a transfer that never completed end-to-end.
 
         Returns:
-            True when a donor was selected, removed, and the donor /
-            receiver counters were advanced. False when the master
-            toggle is off, when no eligible donor exists, or when the
-            planner refuses the selected donor (defensive guard).
+            The donor stage name when a donor was selected and
+            removed (the caller now owns the receiver retry and the
+            cooldown bookkeeping). ``None`` when the master toggle is
+            off, when no eligible donor exists, or when the planner
+            refuses the selected donor (defensive guard).
 
         Raises:
             RuntimeError: The scheduler has not been set up.
@@ -680,7 +703,7 @@ class SaturationAwareScheduler:
             donations_received_this_cycle=self._donations_received_this_cycle,
         )
         if donor is None:
-            return False
+            return None
 
         donor_stage_name = self._stage_names[donor.stage_index]
         if not ctx.try_remove_worker(donor.stage_index, donor.worker_id):
@@ -689,18 +712,35 @@ class SaturationAwareScheduler:
                 f"worker {donor.worker_id!r} selected by donor helper but planner "
                 "refused removal; donation cancelled and receiver retry skipped."
             )
-            return False
+            return None
 
+        logger.info(
+            f"[scheduler] saturation-mode donation: donor stage {donor_stage_name!r} "
+            f"worker {donor.worker_id!r} (age={donor.age}) -> receiver stage "
+            f"{receiver_stage_name!r} at cycle {self._cycle_counter} (pending retry)."
+        )
+        return donor_stage_name
+
+    def _record_donation_success(
+        self,
+        *,
+        donor_stage_name: str,
+        receiver_stage_name: str,
+    ) -> None:
+        """Advance donor cooldown and receiver per-cycle counter on retry success.
+
+        Called by the receiver-side caller after the post-donation
+        ``try_add_worker`` retry completes successfully. Keeping the
+        update split from
+        :meth:`_attempt_cross_stage_donation` ensures cooldown state
+        only reflects donations that placed a worker on the receiver,
+        so a retry-failure path leaves the donor eligible to be
+        revisited on the next planning cycle.
+        """
         self._last_donation_cycle[donor_stage_name] = self._cycle_counter
         self._donations_received_this_cycle[receiver_stage_name] = (
             self._donations_received_this_cycle.get(receiver_stage_name, 0) + 1
         )
-        logger.info(
-            f"[scheduler] saturation-mode donation: donor stage {donor_stage_name!r} "
-            f"worker {donor.worker_id!r} (age={donor.age}) -> receiver stage "
-            f"{receiver_stage_name!r} at cycle {self._cycle_counter}."
-        )
-        return True
 
     def _run_phase_d_shrink(
         self,
@@ -875,8 +915,9 @@ class SaturationAwareScheduler:
         kwargs. The trailing clause names the binding clamp (floor,
         per-cycle fraction, or no clamp) so operators can locate the
         cause of any deficit. Ties between ``fraction_cap`` and
-        ``allowed_by_floor`` resolve to floor for backward
-        compatibility with the pre-2-vi log format.
+        ``allowed_by_floor`` resolve to the floor branch so the
+        operator-configured floor is named in the log when both
+        clamps would have produced the same deletion count.
         """
         cap_driven = ceiling_excess > 0 and (intent >= 0 or ceiling_excess >= -intent)
         if cap_driven:

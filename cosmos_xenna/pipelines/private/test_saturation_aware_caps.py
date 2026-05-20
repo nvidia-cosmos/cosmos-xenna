@@ -200,9 +200,6 @@ def autoscale_with_intents() -> AutoscaleFactory:
     return _factory
 
 
-# Tests: helper unit tests for ``_compute_stage_ceilings``.
-
-
 class TestComputeStageCeilings:
     """Pin the per-stage ceiling resolution against config and topology.
 
@@ -268,15 +265,12 @@ class TestComputeStageCeilings:
             scheduler._compute_stage_ceilings(num_nodes=1)
 
 
-# Tests: Phase C grow path with hard-cap clamp.
-
-
 class TestPhaseCCapClamp:
     """Pin the contract that Phase C never grows past the configured cap.
 
     The Phase C path is the canonical scale-up driver. Capping
-    ``try_add_worker`` calls is the central design contract of
-    Phase 2-ix; these tests pin every direction the clamp is
+    ``try_add_worker`` calls is the central design contract of the
+    hard worker cap; these tests pin every direction the clamp is
     expected to bind.
 
     Most tests seed each stage with one worker so Phase B's floor
@@ -411,6 +405,27 @@ class TestPhaseCCapClamp:
         assert "current=2" in cap_logs[0].message
         assert "ceiling=4" in cap_logs[0].message
 
+    def test_intent_within_headroom_emits_no_cap_log(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When intent fits within the headroom the cap stays silent.
+
+        Pins that the cap INFO log is operator-actionable: it fires
+        only when the cap actually clamps a request. Spurious logs on
+        unbound intents would erode the signal value of the message.
+        """
+        scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers=10))
+        state = make_state([("A", ["A-w0", "A-w1"], False)])
+
+        autoscale_with_intents(scheduler, state, {"A": 3})
+
+        cap_logs = [record for record in loguru_caplog.records if "hard worker cap" in record.message]
+        assert cap_logs == []
+
     def test_massive_intent_still_bounded_by_cap(
         self,
         make_scheduler: SchedulerFactory,
@@ -471,9 +486,6 @@ class TestPhaseCCapClamp:
         # B: headroom = 6 - 1 = 5; clamped from 10 to 5.
         assert len(solution.stages[0].new_workers) == 1
         assert len(solution.stages[1].new_workers) == 5
-
-
-# Tests: Phase D forced-shrink path when cap < current.
 
 
 class TestPhaseDCapForcedShrink:
@@ -635,7 +647,7 @@ class TestPhaseDCapForcedShrink:
         scheduler, _ = make_scheduler([("A", None)], cfg=_make_config())
         state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
 
-        # Zero intent + no cap = no shrink (matches pre-2-ix contract).
+        # Zero intent + no cap = no shrink: nothing drives a removal request.
         solution_zero = autoscale_with_intents(scheduler, state, {"A": 0})
         assert solution_zero.stages[0].deleted_workers == []
 
@@ -760,12 +772,12 @@ class TestPhaseDCapForcedShrink:
     ) -> None:
         """Pure classifier-intent shrinks (no cap overflow) keep the ``intent -X`` phrasing.
 
-        Pins that the cap-attribution fix only rewrites cap-driven
-        deficit logs; pure intent-driven shrinks (no cap, classifier
-        wants more deletes than the floor allows) retain the legacy
-        ``intent -X workers; floor cap left Y removed`` phrasing so
-        operators grepping for classifier-driven scale-down behavior
-        still see the same message.
+        Pins that the cap-attribution log distinction only rewrites
+        cap-driven deficit logs. Pure intent-driven shrinks (no cap;
+        classifier wants more deletes than the floor allows) preserve
+        the ``intent -X workers; floor cap left Y removed`` phrasing
+        so operators grepping for classifier-driven scale-down see a
+        stable message.
         """
         scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(min_workers=2))
         state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
@@ -777,6 +789,41 @@ class TestPhaseDCapForcedShrink:
         msg = deficit_logs[0].message
         assert "intent -10 workers" in msg
         assert "hard worker cap overflow" not in msg
+
+    def test_floor_cap_equals_fraction_cap_logs_floor_branch(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When the floor and fraction clamps tie, the deficit log names the floor branch.
+
+        Pins the operator-facing tie-break: the binding clamp is
+        reported as ``floor cap`` whenever ``allowed_by_floor ==
+        fraction_cap``. The branch chosen names the operator-set
+        ``min_workers`` floor, which is the more actionable cause.
+        """
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(min_workers=5, max_scale_down_fraction_per_cycle=0.375),
+        )
+        # current=8, allowed_by_floor = 8 - 5 = 3,
+        # fraction_cap = max(1, floor(8 * 0.375)) = 3 (tie),
+        # requested_remove = 5 (large negative intent),
+        # actual_remove = min(5, 3, 3) = 3, deficit = 2.
+        state = make_state([("A", [f"A-w{i}" for i in range(8)], False)])
+
+        autoscale_with_intents(scheduler, state, {"A": -5})
+
+        floor_logs = [record for record in loguru_caplog.records if "floor cap left" in record.message]
+        fraction_logs = [record for record in loguru_caplog.records if "per-cycle fraction cap left" in record.message]
+        assert len(floor_logs) == 1
+        assert fraction_logs == []
+        msg = floor_logs[0].message
+        assert "floor cap left 3 removed" in msg
+        assert "deficit=2" in msg
+        assert "floor=5" in msg
 
     def test_per_node_cap_on_multi_node_cluster_forces_shrink(
         self,
@@ -795,9 +842,6 @@ class TestPhaseDCapForcedShrink:
         solution = autoscale_with_intents(scheduler, state, {"A": 0})
 
         assert len(solution.stages[0].deleted_workers) == 4
-
-
-# Tests: multi-cycle convergence and stability under sustained load.
 
 
 class TestCapMultiCycleStability:

@@ -1308,9 +1308,10 @@ class TestPhaseDConsolidationEdgeCases:
     def test_two_gpu_stages_independently_consolidate_without_interference(self) -> None:
         """Two GPU stages each shrink to their own consolidation winner; no greedy-break.
 
-        Pins the anti-greedy-break invariant from Phase 2-iv extended to Phase D:
-        an over-provisioned stage's consolidation never blocks another stage's
-        consolidation, even if both are shrinking in the same cycle.
+        Pins the cross-stage independence invariant for the shrink
+        path: an over-provisioned stage's consolidation never blocks
+        another stage's consolidation, even if both are shrinking in
+        the same cycle.
         """
         scheduler, _ = _gpu_problem([("A", None), ("B", None)])
         state = _gpu_problem_state(

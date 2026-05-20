@@ -3,7 +3,7 @@
 
 """Tests for ``SaturationAwareScheduler._run_phase_c_grow_single_target``.
 
-Phase 2-iii applies positive intent deltas as planner adds via
+Phase C applies positive intent deltas as planner adds via
 ``ctx.try_add_worker``. The contract under test:
 
     * Positive intent grows the stage by exactly ``intent`` workers
@@ -264,10 +264,11 @@ class TestClusterExhaustion:
 class TestMultiStageIndependentGrowth:
     """Without DAG priority each stage with positive intent grows independently.
 
-    NOTE: this test deliberately captures the pre-DAG-priority
-    contract. When iteration 2-iv (DAG-priority multi-target growth)
-    lands, the iteration order will become DAG-depth DESC and this
-    test should be updated or replaced.
+    Captures the contract that, with DAG-priority multi-target growth
+    disabled, every stage with positive intent is attempted in
+    problem order regardless of upstream / downstream relationship.
+    The DAG-priority path is exercised in
+    ``test_saturation_aware_dag_growth.py``.
     """
 
     def test_two_saturated_stages_both_grow(self) -> None:

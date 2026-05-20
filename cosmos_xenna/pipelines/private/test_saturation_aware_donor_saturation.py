@@ -25,8 +25,6 @@ The five anti-flap layers under test:
 
 from unittest.mock import patch
 
-import pytest
-
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, find_saturation_donor
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
@@ -803,10 +801,6 @@ class TestSaturationDonorPhaseCOrchestration:
         assert scheduler._donations_received_this_cycle == {}
         assert scheduler._stuck_plan_counters == {}
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Current code records donor cooldown/cap before the receiver retry succeeds.",
-    )
     def test_post_donation_retry_failure_does_not_record_success_cooldowns(self) -> None:
         """A failed post-donation retry must not record success-only cooldown state."""
         scheduler = _scheduler_for_donation()
@@ -815,5 +809,18 @@ class TestSaturationDonorPhaseCOrchestration:
         with patch.object(data_structures.AutoscalePlanContext, "try_add_worker", return_value=None):
             _autoscale_with_intents(scheduler, state, {"B": 1})
 
+        assert scheduler._last_donation_cycle == {}
+        assert scheduler._donations_received_this_cycle == {}
+
+    def test_post_donation_retry_failure_still_emits_donor_removal(self) -> None:
+        """Retry failure leaves donor cooldown clean while still surfacing the donor removal."""
+        scheduler = _scheduler_for_donation()
+        state = _problem_state([("A", 3), ("B", 1)])
+
+        with patch.object(data_structures.AutoscalePlanContext, "try_add_worker", return_value=None):
+            solution = _autoscale_with_intents(scheduler, state, {"B": 1})
+
+        assert len(solution.stages[0].deleted_workers) == 1
+        assert solution.stages[1].new_workers == []
         assert scheduler._last_donation_cycle == {}
         assert scheduler._donations_received_this_cycle == {}

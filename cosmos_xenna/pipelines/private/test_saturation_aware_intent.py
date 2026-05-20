@@ -171,15 +171,14 @@ class TestColdStartDoesNotCrash:
 
 
 class TestSolutionShapeReflectsIntentAfterPhaseC:
-    """Once Phase C has shipped, positive intent flows into the Solution as worker adds.
+    """Positive intent flows into the Solution as worker adds via Phase C.
 
-    Phase 2-ii's intent-only contract was relaxed in Phase 2-iii: the
-    saturation-aware scheduler now applies positive intent deltas via
+    The saturation-aware scheduler applies positive intent deltas via
     ``ctx.try_add_worker`` before emitting the Solution. The Solution
     therefore reflects whichever portion of the intent the cluster
     could absorb. Negative intent (Phase D) and non-fatal capacity
-    exhaustion remain decoupled from this contract -- pinned in
-    ``test_saturation_aware_phase_c_basic.py``.
+    exhaustion remain decoupled from this contract; both are pinned
+    in ``test_saturation_aware_phase_c_basic.py``.
     """
 
     def test_saturated_critical_signal_grows_on_first_cycle(self) -> None:
