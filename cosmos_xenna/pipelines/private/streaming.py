@@ -27,7 +27,8 @@ from typing import Optional
 
 import attrs
 import ray
-from ray.util.metrics import Gauge
+from loguru import logger as _loguru_logger
+from ray.util.metrics import Gauge, Histogram
 
 from cosmos_xenna.pipelines.private import (
     allocator,
@@ -47,6 +48,123 @@ V = typing.TypeVar("V")
 
 
 _MAX_MAIN_LOOP_RATE_HZ = 100
+
+# Cold-start floor for the per-stage backpressure cap when a pool has
+# pending actors still in setup and no ready actors yet. A value of 1
+# lets the first actor that completes setup pull one task immediately
+# without pre-queueing more work behind sibling actors that are still
+# loading models, which would otherwise inflate Ray object-store usage.
+_SETUP_AWARE_MAX_QUEUED_FLOOR: typing.Final[int] = 1
+
+
+def _compute_max_queued(
+    *,
+    num_ready_actors: int,
+    num_pending_actors: int,
+    slots_per_actor: int,
+    max_queued_multiplier: float,
+    max_queued_lower_bound: int,
+    next_stage_batch_size: int,
+    setup_aware_enabled: bool,
+    is_done: bool,
+    stage_name: str,
+) -> int:
+    """Return the effective per-stage ``max_queued`` cap for the streaming loop.
+
+    The regular formula caps the inflight task count at
+    ``num_ready_actors * slots_per_actor * max_queued_multiplier``,
+    floored by ``max_queued_lower_bound`` and ``next_stage_batch_size``.
+
+    When ``setup_aware_enabled`` is True and the pool is in cold start
+    (``num_ready_actors == 0`` and ``num_pending_actors > 0`` and the
+    stage has not been marked done), the cap is reduced to
+    ``max(next_stage_batch_size, _SETUP_AWARE_MAX_QUEUED_FLOOR)``. The
+    downstream batch size is preserved so the next stage is never
+    starved by upstream backpressure.
+
+    Args:
+        num_ready_actors: Actors with completed setup.
+        num_pending_actors: Actors still in setup phases.
+        slots_per_actor: Slots per ready actor for this stage.
+        max_queued_multiplier: ``StreamingSpecificSpec.max_queued_multiplier``.
+        max_queued_lower_bound: ``StreamingSpecificSpec.max_queued_lower_bound``.
+        next_stage_batch_size: ``stage_batch_size`` of the downstream
+            stage; ``-1`` when this is the last stage.
+        setup_aware_enabled: Per-stage ``setup_aware_max_queued`` flag.
+        is_done: ``True`` when the stage is already finished (cold-start
+            branch is bypassed because a teardown pool can transiently
+            report mismatched ready/pending counts).
+        stage_name: Stage name for the debug log binding.
+
+    Returns:
+        Effective ``max_queued`` cap.
+
+    """
+    regular_max_queued = max(
+        int(num_ready_actors * slots_per_actor * max_queued_multiplier),
+        max_queued_lower_bound,
+        next_stage_batch_size,
+    )
+    in_cold_start = setup_aware_enabled and not is_done and num_ready_actors == 0 and num_pending_actors > 0
+    if not in_cold_start:
+        return regular_max_queued
+    cold_start_cap = max(next_stage_batch_size, _SETUP_AWARE_MAX_QUEUED_FLOOR)
+    _loguru_logger.bind(stage=stage_name).debug(
+        f"setup-aware max_queued: cold-start cap reduced from {regular_max_queued} to {cold_start_cap} "
+        f"(num_ready={num_ready_actors}, num_pending={num_pending_actors}, "
+        f"next_stage_batch_size={next_stage_batch_size}, floor={_SETUP_AWARE_MAX_QUEUED_FLOOR})"
+    )
+    return cold_start_cap
+
+
+def _resolve_setup_aware_max_queued_enabled(
+    pipeline_spec: specs.PipelineSpec,
+    stage_idx: int,
+    stage_name: str,
+) -> bool:
+    """Resolve the effective ``setup_aware_max_queued`` flag for a stage.
+
+    The flag is a per-stage tunable on ``SaturationAwareStageConfig`` and
+    therefore inherits the 3-tier precedence chain (``StageSpec.saturation_aware``
+    > ``SaturationAwareConfig.per_stage_overrides`` > ``stage_defaults``).
+    The cluster-level ``SaturationAwareConfig`` is documented as having no
+    effect when the scheduler is ``FRAGMENTATION_BASED``, so the resolver
+    returns ``False`` (legacy backpressure path) for that scheduler kind
+    and for any caller that runs without ``StreamingSpecificSpec``.
+    """
+    mode_specific = pipeline_spec.config.mode_specific
+    if mode_specific is None:
+        return False
+    if mode_specific.scheduler is not specs.SchedulerKind.SATURATION_AWARE:
+        return False
+    stage_spec = pipeline_spec.stages[stage_idx]
+    assert isinstance(stage_spec, specs.StageSpec)
+    effective_cfg = mode_specific.saturation_aware.get_effective_stage_config(
+        stage_name,
+        spec_override=stage_spec.saturation_aware,
+    )
+    return effective_cfg.setup_aware_max_queued
+
+
+# Loop watchdog histogram (section 4i.3 / docs/scheduler/saturation-aware/18-loop-watchdog.md).
+#
+# Bucket boundaries straddle the default ``cycle_time_warn_threshold *
+# interval_s = 0.5 * 10.0 = 5.0`` budget so the histogram captures both
+# the healthy sub-second cycles and the pathological multi-second
+# overruns without operator tuning. The 60.0 s upper edge keeps the
+# +Inf bucket reserved for stalls that exceed even the longest plausible
+# cycle, where the operator should already have alerted via the WARN log.
+_CYCLE_DURATION_HISTOGRAM = Histogram(
+    name="xenna_scheduler_cycle_duration_seconds",
+    description=(
+        "Wall-clock duration of one Autoscaler.start_autoscale_calculation "
+        "call. Operators read the histogram tail to alert on slow cycles; "
+        "the loop watchdog emits a WARN log when a single observation "
+        "exceeds cycle_time_warn_threshold * interval_s."
+    ),
+    boundaries=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0],
+    tag_keys=("pipeline",),
+)
 
 
 @attrs.define
@@ -550,6 +668,25 @@ class Autoscaler:
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
         self._enable_backlog_guard: bool = mode_specific.enable_backlog_aware_scaledown
+        # Loop watchdog (Phase 4-iv / docs/scheduler/saturation-aware/18-loop-watchdog.md).
+        #
+        # ``cycle_time_warn_threshold`` and ``interval_s`` are operator-facing
+        # knobs on the always-constructed ``SaturationAwareConfig`` (default
+        # factory on ``StreamingSpecificSpec``), so the watchdog applies
+        # regardless of which ``SchedulerKind`` is selected -- the histogram
+        # observes every cycle and the WARN log fires when a single
+        # ``start_autoscale_calculation`` body exceeds the operator-intended
+        # cycle budget.
+        saturation_aware_cfg = mode_specific.saturation_aware
+        self._cycle_time_warn_threshold: float = saturation_aware_cfg.cycle_time_warn_threshold
+        self._cycle_interval_s: float = saturation_aware_cfg.interval_s
+        # The ``pipeline`` Prometheus tag is part of the metric catalogue
+        # contract (docs/scheduler/saturation-aware/22-prometheus-metrics.md);
+        # ``JobInfo.pipeline_type`` is the closest user-supplied identifier
+        # and falls back to an empty string when no ``job_info`` is set so
+        # ``Histogram.observe`` always receives the declared tag key.
+        job_info = pipeline_spec.job_info
+        self._pipeline_name: str = job_info.pipeline_type if job_info is not None else ""
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -665,18 +802,48 @@ class Autoscaler:
 
         If a calculation is already in progress, this method does nothing.
 
+        The body is wrapped with a ``time.monotonic()`` watchdog (Phase
+        4-iv, section 4i.3 of the saturation-aware plan): every call --
+        including early-return paths and bodies that raise -- observes
+        the elapsed wall-clock duration on
+        ``xenna_scheduler_cycle_duration_seconds`` so operators can
+        dashboard p95/p99 latency, and emits a single WARN log via
+        ``loguru.logger.bind(pipeline=...)`` when the duration exceeds
+        ``cycle_time_warn_threshold * interval_s``. ``time.monotonic`` is
+        chosen over ``time.time`` because the comparison is against a
+        sub-``interval_s`` threshold and must be immune to wall-clock
+        jumps. The histogram observation lives in ``finally`` so the
+        watchdog still records duration when the body raises (the
+        original exception then propagates unchanged).
+
         Args:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
         """
-        if self._autoscale_future is not None:
-            if self._verbosity_level > verbosity.VerbosityLevel.INFO:
-                logger.info("Autoscale calculation already in progress or pending application. Skipping.")
-            return
+        start_monotonic = time.monotonic()
+        try:
+            if self._autoscale_future is not None:
+                if self._verbosity_level > verbosity.VerbosityLevel.INFO:
+                    logger.info("Autoscale calculation already in progress or pending application. Skipping.")
+                return
 
-        self._autoscale_start_time = time.time()
-        problem_state = self._make_problem_state(pools, stages_is_dones)
-        self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
+            self._autoscale_start_time = time.time()
+            problem_state = self._make_problem_state(pools, stages_is_dones)
+            self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
+        finally:
+            duration_s = time.monotonic() - start_monotonic
+            _CYCLE_DURATION_HISTOGRAM.observe(duration_s, tags={"pipeline": self._pipeline_name})
+            threshold_s = self._cycle_time_warn_threshold * self._cycle_interval_s
+            # Strict ``>`` so a cycle that precisely matches the
+            # threshold does not warn -- the operator-facing knob is
+            # interpreted as the maximum acceptable fraction, not the
+            # first cycle past it. See test_threshold_boundary_strict_greater_than.
+            if duration_s > threshold_s:
+                _loguru_logger.bind(pipeline=self._pipeline_name).warning(
+                    f"saturation-aware loop watchdog: autoscale cycle took {duration_s:.2f}s "
+                    f"(threshold={threshold_s:.2f}s = {self._cycle_time_warn_threshold} * "
+                    f"interval_s={self._cycle_interval_s})"
+                )
 
     def apply_autoscale_result_if_ready(
         self,
@@ -1229,14 +1396,17 @@ def run_pipeline(
                     if not is_last_stage:
                         next_stage_batch_size = pipeline_spec.stages[idx + 1].stage.stage_batch_size  # type: ignore
 
-                    max_queued = max(
-                        int(
-                            pool.num_ready_actors
-                            * pool.slots_per_actor
-                            * pipeline_spec.config.mode_specific.max_queued_multiplier
-                        ),
-                        pipeline_spec.config.mode_specific.max_queued_lower_bound,
-                        next_stage_batch_size,
+                    stage_name = pipeline_spec.stages[idx].name(idx)  # type: ignore
+                    max_queued = _compute_max_queued(
+                        num_ready_actors=pool.num_ready_actors,
+                        num_pending_actors=pool.num_pending_actors,
+                        slots_per_actor=pool.slots_per_actor,
+                        max_queued_multiplier=pipeline_spec.config.mode_specific.max_queued_multiplier,
+                        max_queued_lower_bound=pipeline_spec.config.mode_specific.max_queued_lower_bound,
+                        next_stage_batch_size=next_stage_batch_size,
+                        setup_aware_enabled=_resolve_setup_aware_max_queued_enabled(pipeline_spec, idx, stage_name),
+                        is_done=stage_is_dones[idx],
+                        stage_name=stage_name,
                     )
 
                     if num_tasks_in_progress + num_tasks_completed >= max_queued:

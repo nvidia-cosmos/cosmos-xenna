@@ -51,8 +51,11 @@ noisy probes. Operators tune the cap per stage on the
 """
 
 import math
+import time
 import types
 from collections.abc import Mapping
+
+from ray.util.metrics import Histogram
 
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     data_structures as rust_data_structures,
@@ -61,6 +64,11 @@ from cosmos_xenna.pipelines.private import data_structures
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+    HeterogeneityWarnState,
+    compute_heterogeneity_ratio,
+    emit_bottleneck_score,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_dag_depth_order
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
@@ -77,6 +85,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     check_solution_shape,
     check_stuck_plan_monotonicity,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryPressureMonitor
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     EXIT_BAND_MULTIPLIER,
@@ -91,6 +100,48 @@ from cosmos_xenna.pipelines.private.scheduling_py.stabilization import _Recommen
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
+
+# Local alias for ``time.monotonic`` so the per-phase wrappers inside
+# ``SaturationAwareScheduler.autoscale()`` can sample the wall-clock
+# despite the method's ``time: float`` parameter shadowing the ``time``
+# module within the function body. Module-level binding lets tests
+# inject a deterministic clock via
+# ``monkeypatch.setattr(saturation_aware, "_monotonic", fake_clock)``
+# without touching the canonical ``time.monotonic`` builtin.
+_monotonic = time.monotonic
+
+# Per-phase timing histogram (section 4-v of the saturation-aware
+# scheduler plan, docs/scheduler/saturation-aware/22-prometheus-metrics.md
+# row ``xenna_scheduler_cycle_phase_duration_seconds``).
+#
+# Each call to ``autoscale()`` brackets seven contiguous phase blocks
+# plus a closing ``into_solution`` block with ``time.monotonic()``
+# samples and emits one observation per phase per cycle on this
+# Histogram, tagged ``{"phase": <label>, "pipeline": <name>}``. Bucket
+# boundaries are inherited verbatim from the cycle histogram in
+# ``streaming.py`` so dashboards and alerts can share the same
+# ``histogram_quantile`` thresholds. The 60.0 s upper edge keeps the
+# ``+Inf`` bucket reserved for pathological per-phase stalls; under
+# normal operation every observation sits below the 0.1 s bucket.
+#
+# Tag-key choice: ``("phase", "pipeline")`` matches the canonical
+# label set in 22-prometheus-metrics.md and keeps cardinality bounded
+# at ``num_pipelines * num_phase_labels``. ``num_phase_labels`` is
+# fixed at 8 by the producer; ``num_pipelines`` is bounded by the
+# operator's job concurrency.
+_PHASE_DURATION_HISTOGRAM = Histogram(
+    name="xenna_scheduler_cycle_phase_duration_seconds",
+    description=(
+        "Wall-clock duration of one autoscale-cycle phase (pre_phase_setup, "
+        "phase_a, phase_b, intent, phase_c, phase_d, invariants, "
+        "into_solution). Operators consume the per-phase histogram to "
+        "locate which phase blew the cycle budget when the 4-iv loop "
+        "watchdog WARN fires; the sum across all 8 phases approximates the "
+        "cycle duration reported by xenna_scheduler_cycle_duration_seconds."
+    ),
+    boundaries=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0],
+    tag_keys=("phase", "pipeline"),
+)
 
 
 class SaturationAwareScheduler:
@@ -269,6 +320,15 @@ class SaturationAwareScheduler:
         self._donor_warmup_excluded_ids: frozenset[str] = frozenset()
         self._last_intent_deltas: dict[str, int] = {}
         self._stuck_plan_counters: dict[str, int] = {}
+        # Cluster-wide kill switch on Phase C scale-up. Holds a polled
+        # cache of Ray's object-store ``used_fraction`` so a single Ray
+        # API call serves every scheduler cycle inside one
+        # ``memory_pressure_polling_interval_s`` window. Reset by
+        # ``setup()`` so a fresh pipeline starts with an empty cache.
+        self._memory_pressure_monitor: MemoryPressureMonitor = MemoryPressureMonitor(
+            polling_interval_s=config.memory_pressure_polling_interval_s,
+            critical_threshold=config.memory_pressure_critical_threshold,
+        )
         self._floor_stuck_counters: dict[str, int] = {}
         # Saturation-mode cross-stage donor anti-flap state.
         # ``_cycle_counter`` is monotonic and increments at the top of every
@@ -286,6 +346,13 @@ class SaturationAwareScheduler:
         # ``_RecommendationHistory`` instance across cycles so the buffer can
         # actually accumulate consensus.
         self._recommendation_histories: dict[str, _RecommendationHistory] = {}
+        # Per-instance streak ledger for the cluster heterogeneity ratio
+        # warn log (Phase 4-vii.5). Owned at the instance level (not
+        # module-level) because the scheduler may be re-instantiated
+        # across tests; sharing a streak counter across instances would
+        # leak state into a fresh scheduler. ``setup()`` calls ``.reset()``
+        # so a re-setup of the scheduler starts from a clean ledger.
+        self._heterogeneity_state: HeterogeneityWarnState = HeterogeneityWarnState()
 
     def _stage_cfg(self, stage_name: str) -> SaturationAwareStageConfig:
         """Resolve the effective stage config including ``StageSpec`` overrides."""
@@ -314,6 +381,8 @@ class SaturationAwareScheduler:
         self._floor_stuck_counters = {}
         self._last_intent_deltas = {}
         self._stuck_plan_counters = {}
+        self._memory_pressure_monitor.reset()
+        self._heterogeneity_state.reset()
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
@@ -500,121 +569,258 @@ class SaturationAwareScheduler:
                 stage names or count.
 
         """
-        if self._problem is None:
-            msg = "SaturationAwareScheduler.autoscale() called before setup()"
-            raise RuntimeError(msg)
-
-        self._check_problem_state_shape_before_phase_a(problem_state)
-        self._cycle_counter += 1
-        self._donations_received_this_cycle = {}
-        # Refresh ready first-seen timestamps from this cycle's snapshot before
-        # any phase reads them. The per-worker measurement grace consumes them
-        # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
-        # cross-stage donor consult the resulting warmup-grace excluded set.
-        self._refresh_worker_ready_first_seen(problem_state, now=time)
-        # Snapshot the stuck-plan counters before Phase C mutates them so the
-        # post-Phase-D monotonicity check can compare prev vs. curr without an
-        # in-flight Phase C state.
-        prev_stuck_plan_counters = dict(self._stuck_plan_counters)
-        self._update_regime_aware_aggressiveness(problem_state)
-        self._ensure_thresholds_resolved(problem_state)
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(
-            self._problem,
-            problem_state,
-            worker_ages=self._next_cycle_worker_ages(),
-        )
-        # Cache the per-cycle donor warmup excluded set immediately after
-        # AutoscalePlanContext.from_problem_state() seeds the planner from
-        # ``problem_state``. ``ctx.worker_ids_by_stage()`` at this point
-        # reflects the cycle-start snapshot (the live worker set as
-        # observed by the actor pool); Phase A (delete + grow), Phase B
-        # (floor), Phase C (grow), and Phase D (shrink) have NOT run yet
-        # and have not mutated the planner. The cache is therefore a
-        # cycle-start snapshot of "which observed workers are still in
-        # warmup according to ``donor_warmup_grace_s``", and it stays
-        # constant for the rest of the cycle so:
+        # Per-phase timing wrappers (section 4-v of the saturation-aware
+        # scheduler plan). Each phase block is bracketed with
+        # ``_monotonic()`` samples in a ``try/finally`` so a phase that
+        # raises (planner-context invariant violation, classifier NaN,
+        # Phase D floor breach, stuck-plan monotonicity failure) still
+        # records its duration on ``_PHASE_DURATION_HISTOGRAM`` before
+        # the exception propagates. The 8 phase labels are pinned by
+        # the test ``test_every_phase_label_observed_once_per_cycle``;
+        # changing the label set requires updating both producer and
+        # consumer dashboards (see docs/scheduler/saturation-aware/
+        # 22-prometheus-metrics.md row
+        # ``xenna_scheduler_cycle_phase_duration_seconds``).
         #
-        #   * Phase B floor donor selection
-        #     (``select_youngest_eligible_donor``) intentionally bypasses
-        #     this cache because the floor is a hard structural
-        #     requirement; deadlocking on warmup-protected donors is
-        #     worse than killing a young donor.
-        #   * Phase C saturation-mode cross-stage donor selection
-        #     (``find_saturation_donor``) consumes this cache so a
-        #     receiver does not absorb a donor still in its own warmup.
-        #   * Phase D shrink (``select_workers_to_remove_oldest_first``)
-        #     consumes this cache so a saturation-driven shrink cannot
-        #     delete a worker that has not yet contributed real
-        #     measurements.
+        # The pipeline tag is the placeholder ``"default"`` string at
+        # every observe site; sub-iteration 4-iv-fix will thread the
+        # real pipeline name from ``pipeline_spec.job_info.pipeline_type``.
+        # Searching for the ``# 4-iv-fix-TODO: replace placeholder
+        # pipeline tag`` comments locates every observe site at once.
+        pre_phase_setup_start = _monotonic()
+        try:
+            if self._problem is None:
+                msg = "SaturationAwareScheduler.autoscale() called before setup()"
+                raise RuntimeError(msg)
+
+            self._check_problem_state_shape_before_phase_a(problem_state)
+            self._cycle_counter += 1
+            self._donations_received_this_cycle = {}
+            # Refresh ready first-seen timestamps from this cycle's snapshot before
+            # any phase reads them. The per-worker measurement grace consumes them
+            # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
+            # cross-stage donor consult the resulting warmup-grace excluded set.
+            self._refresh_worker_ready_first_seen(problem_state, now=time)
+            # Snapshot the stuck-plan counters before Phase C mutates them so the
+            # post-Phase-D monotonicity check can compare prev vs. curr without an
+            # in-flight Phase C state.
+            prev_stuck_plan_counters = dict(self._stuck_plan_counters)
+            self._update_regime_aware_aggressiveness(problem_state)
+            self._ensure_thresholds_resolved(problem_state)
+            ctx = data_structures.AutoscalePlanContext.from_problem_state(
+                self._problem,
+                problem_state,
+                worker_ages=self._next_cycle_worker_ages(),
+            )
+            # Cache the per-cycle donor warmup excluded set immediately after
+            # AutoscalePlanContext.from_problem_state() seeds the planner from
+            # ``problem_state``. ``ctx.worker_ids_by_stage()`` at this point
+            # reflects the cycle-start snapshot (the live worker set as
+            # observed by the actor pool); Phase A (delete + grow), Phase B
+            # (floor), Phase C (grow), and Phase D (shrink) have NOT run yet
+            # and have not mutated the planner. The cache is therefore a
+            # cycle-start snapshot of "which observed workers are still in
+            # warmup according to ``donor_warmup_grace_s``", and it stays
+            # constant for the rest of the cycle so:
+            #
+            #   * Phase B floor donor selection
+            #     (``select_youngest_eligible_donor``) intentionally bypasses
+            #     this cache because the floor is a hard structural
+            #     requirement; deadlocking on warmup-protected donors is
+            #     worse than killing a young donor.
+            #   * Phase C saturation-mode cross-stage donor selection
+            #     (``find_saturation_donor``) consumes this cache so a
+            #     receiver does not absorb a donor still in its own warmup.
+            #   * Phase D shrink (``select_workers_to_remove_oldest_first``)
+            #     consumes this cache so a saturation-driven shrink cannot
+            #     delete a worker that has not yet contributed real
+            #     measurements.
+            #
+            # Workers added during the current cycle are absent from this cache
+            # because they were not in the cycle-start snapshot. Add paths:
+            # Phase A grow (manual stage placement), Phase B floor grow / floor
+            # donor, and Phase C saturation grow / saturation donor. Phase D
+            # only removes workers, so it cannot contribute new ids to this
+            # cache. Excluding intra-cycle additions is intentional - those
+            # workers have no first-seen timestamp yet, so any warmup
+            # decision would be vacuous. See ``_build_donor_warmup_excluded_ids``
+            # for the per-stage filter that consumes this cache.
+            self._donor_warmup_excluded_ids = self._build_donor_warmup_excluded_ids(
+                ctx.worker_ids_by_stage(),
+                now=time,
+            )
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - pre_phase_setup_start,
+                tags={"phase": "pre_phase_setup", "pipeline": "default"},
+            )
+
+        phase_a_start = _monotonic()
+        try:
+            self._run_phase_a_delete(ctx, problem_state)
+            self._run_phase_a_grow(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - phase_a_start,
+                tags={"phase": "phase_a", "pipeline": "default"},
+            )
+
+        phase_b_start = _monotonic()
+        try:
+            self._run_phase_b_floor(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - phase_b_start,
+                tags={"phase": "phase_b", "pipeline": "default"},
+            )
+
+        intent_start = _monotonic()
+        try:
+            self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - intent_start,
+                tags={"phase": "intent", "pipeline": "default"},
+            )
+
+        phase_c_start = _monotonic()
+        try:
+            self._run_phase_c_grow(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
+            check_no_nan_in_classifier_state(
+                phase_name=PhaseBoundary.PHASE_C,
+                stage_runtime_states=self._stage_states,
+            )
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            # Memory-pressure gate semantics: when
+            # ``_run_phase_c_grow`` returns early because the
+            # cluster-wide pressure monitor is active, the wrapper
+            # STILL records duration (near-zero, not NaN). The
+            # invariant + NaN checks above still run because they
+            # are pass-through assertions when Phase C made no
+            # changes. This pins the "always observe" guarantee
+            # documented in section 4-v of the plan.
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - phase_c_start,
+                tags={"phase": "phase_c", "pipeline": "default"},
+            )
+
+        phase_d_start = _monotonic()
+        try:
+            # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
+            # post-Phase-D floor invariant can distinguish "Phase D reduced below
+            # floor" (a defect) from "Phase B left the stage below floor" (a
+            # grace-window scenario Phase D leaves untouched).
+            pre_phase_d_worker_counts = {
+                stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
+            }
+            self._run_phase_d_shrink(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
+            # Recompute floors once for the Phase D invariant check; the helper is
+            # O(num_stages) over an immutable Problem so the second call is cheap
+            # and avoids threading a precomputed dict through
+            # ``_run_phase_d_shrink``'s signature.
+            num_nodes = len(self._problem.rust.cluster_resources.nodes)
+            stage_floors = self._compute_stage_floors(num_nodes)
+            check_floor_after_phase_d(
+                phase_name=PhaseBoundary.PHASE_D,
+                problem=self._problem,
+                problem_state=problem_state,
+                ctx=ctx,
+                stage_floors=stage_floors,
+                pre_phase_d_worker_counts=pre_phase_d_worker_counts,
+            )
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - phase_d_start,
+                tags={"phase": "phase_d", "pipeline": "default"},
+            )
+
+        invariants_start = _monotonic()
+        try:
+            # Filter ``curr_counters`` to only the stages Phase C touched
+            # (non-finished); a stage that finished mid-run leaves its counter
+            # untouched at the prior cycle's value, which would otherwise surface
+            # as an illegal ``prev == curr`` transition. ``prev_counters`` is not
+            # filtered because the helper only iterates ``curr_counters`` and
+            # looks up ``prev_counters`` by key.
+            active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
+            check_stuck_plan_monotonicity(
+                prev_counters=prev_stuck_plan_counters,
+                curr_counters={
+                    name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
+                },
+            )
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - invariants_start,
+                tags={"phase": "invariants", "pipeline": "default"},
+            )
+
+        # 4-v-note: bottleneck/heterogeneity emission is intentionally outside
+        # phase wrappers (sub-millisecond, pure observability). The sibling
+        # 4-vii.5 subagent owns this block; leaving it unwrapped keeps the
+        # wrapper boundaries aligned with the canonical phase labels in
+        # docs/scheduler/saturation-aware/22-prometheus-metrics.md.
         #
-        # Workers added during the current cycle are absent from this cache
-        # because they were not in the cycle-start snapshot. Add paths:
-        # Phase A grow (manual stage placement), Phase B floor grow / floor
-        # donor, and Phase C saturation grow / saturation donor. Phase D
-        # only removes workers, so it cannot contribute new ids to this
-        # cache. Excluding intra-cycle additions is intentional - those
-        # workers have no first-seen timestamp yet, so any warmup
-        # decision would be vacuous. See ``_build_donor_warmup_excluded_ids``
-        # for the per-stage filter that consumes this cache.
-        self._donor_warmup_excluded_ids = self._build_donor_warmup_excluded_ids(
-            ctx.worker_ids_by_stage(),
-            now=time,
-        )
-        self._run_phase_a_delete(ctx, problem_state)
-        self._run_phase_a_grow(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
-
-        self._run_phase_b_floor(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
-
-        self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
-        self._run_phase_c_grow(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
-        check_no_nan_in_classifier_state(
-            phase_name=PhaseBoundary.PHASE_C,
-            stage_runtime_states=self._stage_states,
-        )
-
-        # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
-        # post-Phase-D floor invariant can distinguish "Phase D reduced below
-        # floor" (a defect) from "Phase B left the stage below floor" (a
-        # grace-window scenario Phase D leaves untouched).
-        pre_phase_d_worker_counts = {
-            stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
-        }
-        self._run_phase_d_shrink(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
-        # Recompute floors once for the Phase D invariant check; the helper is
-        # O(num_stages) over an immutable Problem so the second call is cheap
-        # and avoids threading a precomputed dict through
-        # ``_run_phase_d_shrink``'s signature.
-        num_nodes = len(self._problem.rust.cluster_resources.nodes)
-        stage_floors = self._compute_stage_floors(num_nodes)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
-            problem=self._problem,
-            problem_state=problem_state,
-            ctx=ctx,
-            stage_floors=stage_floors,
-            pre_phase_d_worker_counts=pre_phase_d_worker_counts,
-        )
-        # Filter ``curr_counters`` to only the stages Phase C touched
-        # (non-finished); a stage that finished mid-run leaves its counter
-        # untouched at the prior cycle's value, which would otherwise surface
-        # as an illegal ``prev == curr`` transition. ``prev_counters`` is not
-        # filtered because the helper only iterates ``curr_counters`` and
-        # looks up ``prev_counters`` by key.
-        active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
-        check_stuck_plan_monotonicity(
-            prev_counters=prev_stuck_plan_counters,
-            curr_counters={
-                name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
-            },
+        # Forced-Flow-Law bottleneck score (Phase 4-vii). Pure
+        # observability: emits the per-stage
+        # ``xenna_stage_bottleneck_score{stage, pipeline}`` gauge and
+        # one INFO log line naming argmax_k D_k for the cycle.
+        # ``service_times_s`` is intentionally empty here because the
+        # current ``autoscale()`` signature accepts only
+        # ``ProblemState``, which omits the
+        # ``processing_speed_tasks_per_second`` field that lives on
+        # ``ActorPoolStats`` (sampled in ``streaming.py``). The helper
+        # is wired in so the cold-start contract (empty mapping ->
+        # gauge stays NaN, no INFO log) is satisfied; threading the
+        # service-time data through the autoscale call is the
+        # responsibility of a follow-up sub-iteration that extends
+        # the scheduler protocol to carry pool stats.
+        emit_bottleneck_score(service_times_s={}, pipeline_name="default")
+        # Cluster heterogeneity ratio (Phase 4-vii.5). Pure
+        # observability: emits the cluster-wide
+        # ``xenna_scheduler_cluster_heterogeneity_ratio{pipeline}``
+        # gauge and an INFO tuning-recommendation log when the ratio
+        # ``max(D_k) / min(D_k)`` stays above
+        # ``cluster_heterogeneity_warn_threshold`` for
+        # ``cluster_heterogeneity_warn_streak`` consecutive cycles.
+        # Shares the same per-stage ``service_times_s`` view as
+        # ``emit_bottleneck_score`` so both helpers see the same
+        # ``D_k`` set in a given cycle. ``pipeline_name="default"`` is
+        # a placeholder pinned by 4-iv-fix consolidation; the
+        # service-time mapping itself comes through the same
+        # follow-up that lands ``ActorPoolStats`` plumbing for
+        # Phase 4-vii.
+        # 4-iv-fix-TODO: replace placeholder pipeline tag
+        compute_heterogeneity_ratio(
+            service_times_s={},
+            pipeline_name="default",
+            state=self._heterogeneity_state,
+            warn_threshold=self._config.cluster_heterogeneity_warn_threshold,
+            warn_streak_cycles=self._config.cluster_heterogeneity_warn_streak,
         )
 
-        solution = ctx.into_solution()
-        check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
-        self._persist_worker_ages(ctx)
+        into_solution_start = _monotonic()
+        try:
+            solution = ctx.into_solution()
+            check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
+            self._persist_worker_ages(ctx)
+        finally:
+            # 4-iv-fix-TODO: replace placeholder pipeline tag
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - into_solution_start,
+                tags={"phase": "into_solution", "pipeline": "default"},
+            )
         return solution
 
     def _next_cycle_worker_ages(self) -> dict[str, int]:
@@ -1046,6 +1252,26 @@ class SaturationAwareScheduler:
         if self._problem is None:
             msg = "_run_phase_c_grow called before setup()"
             raise RuntimeError(msg)
+
+        # Cluster-wide memory-pressure kill switch. When the Ray object-store
+        # ``used_fraction`` exceeds the configured threshold, every stage's
+        # positive intent is frozen for the cycle so the scheduler stops
+        # adding to a cluster already approaching OOM. The stuck-plan
+        # counters are reset to 0 on the freeze path so the post-Phase-D
+        # monotonicity check treats this as a ``no-attempt`` cycle (same
+        # branch as the existing ``intent <= 0`` reset path); operators
+        # still see the cluster-wide pressure via the
+        # ``xenna_scheduler_memory_pressure_active`` gauge. Phase A (manual),
+        # Phase B (floor), and Phase D (shrink) keep running because Phase B
+        # is the only recovery path for a stage at 0 workers and Phase D
+        # actively relieves pressure by shedding workers.
+        if self._config.enable_memory_pressure_gate and self._memory_pressure_monitor.is_pressure_active(
+            time.monotonic()
+        ):
+            for runtime_stage in problem_state.rust.stages:
+                if not runtime_stage.is_finished:
+                    self._stuck_plan_counters[runtime_stage.stage_name] = 0
+            return
 
         if self._config.enable_dag_priority_growth:
             stage_order = compute_dag_depth_order(self._problem)

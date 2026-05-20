@@ -835,6 +835,36 @@ class SaturationAwareConfig:
     # ``_stuck_plan_counters`` but does not yet emit the threshold log.
     stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
 
+    # --- Cluster heterogeneity warn (cluster-wide observability) ---
+    # Ratio of ``max(D_k) / min(D_k)`` (Forced-Flow service demand)
+    # above which the cluster is considered heterogeneous enough that
+    # the dominant bottleneck stage may benefit from a longer
+    # ``over_provisioned_streak_min_cycles`` to absorb measurement
+    # noise. Default 5.0 -- a homogeneous pipeline has a ratio of 1.0,
+    # so the threshold must be strictly greater than 1.0. Values
+    # between 3.0 and 10.0 are typical: lower values fire the tuning
+    # log on mildly skewed pipelines (CPU prep + GPU caption);
+    # higher values quiet the log unless one stage is an order of
+    # magnitude slower than the rest.
+    cluster_heterogeneity_warn_threshold: float = attrs.field(
+        default=5.0,
+        validator=attrs.validators.gt(1.0),
+    )
+    # Number of consecutive autoscale cycles the heterogeneity ratio
+    # must stay above
+    # ``cluster_heterogeneity_warn_threshold`` before exactly one
+    # INFO tuning-recommendation log fires. Default 30 cycles ~= 5 min
+    # at the default ``interval_s = 10.0``. The streak gate prevents
+    # alert fatigue on transient ratio spikes (cold-start, brief
+    # measurement noise) while sustained heterogeneity still
+    # surfaces in operator log scrapes within minutes. After firing
+    # once, the log re-arms only after the ratio drops back to or
+    # below the threshold and climbs above it again.
+    cluster_heterogeneity_warn_streak: int = attrs.field(
+        default=30,
+        validator=attrs_utils.validate_positive_int,
+    )
+
     # --- Per-stage default + explicit overrides ---
     # Default ``SaturationAwareStageConfig`` applied to every stage that has
     # no more specific override.
