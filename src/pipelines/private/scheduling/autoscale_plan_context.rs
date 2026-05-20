@@ -3394,7 +3394,10 @@ mod tests {
         assert_eq!(
             by_stage,
             vec![
-                vec!["stage_a_worker_0".to_string(), "stage_a_worker_1".to_string()],
+                vec![
+                    "stage_a_worker_0".to_string(),
+                    "stage_a_worker_1".to_string()
+                ],
                 vec![
                     "stage_b_worker_0".to_string(),
                     "stage_b_worker_1".to_string(),
@@ -3418,7 +3421,10 @@ mod tests {
         };
         let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
 
-        let added = ctx.try_add_worker(0).unwrap().expect("cluster has 4 cpus, add succeeds");
+        let added = ctx
+            .try_add_worker(0)
+            .unwrap()
+            .expect("cluster has 4 cpus, add succeeds");
         let added_id = added.id.clone();
         let after_add = ctx.worker_ids_by_stage();
         assert_eq!(after_add.len(), 1);
