@@ -61,7 +61,7 @@ class TestThresholdLifecycleGuard:
         """Direct callers must populate ``resolved_thresholds`` before running the pipeline."""
         state = _StageRuntimeState(stage_name="TestStage")
 
-        with pytest.raises(RuntimeError, match="has no resolved_thresholds"):
+        with pytest.raises(RuntimeError, match="TestStage.*has no resolved_thresholds"):
             run_per_stage_pipeline(
                 stage_state=state,
                 num_used_slots=3,
