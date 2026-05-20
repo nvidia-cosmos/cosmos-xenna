@@ -160,30 +160,17 @@ def check_no_nan_in_classifier_state(
     phase_name: PhaseBoundary,
     stage_runtime_states: dict[str, _StageRuntimeState],
 ) -> None:
-    """Ensure every per-stage EWMA value is finite at a phase boundary.
+    """Reject any per-stage EWMA value that is ``NaN`` or ``+/-Inf``.
 
-    Invariants for each ``_StageRuntimeState``:
-
-      1. ``slots_empty_ratio_ewma`` is either ``None`` or
-         ``math.isfinite``.
-      2. ``last_valid_slots_empty_ratio_ewma`` is either ``None``
-         or ``math.isfinite``.
-
-    A ``NaN`` value silently disables saturation-driven scale-up
-    because every comparison against ``NaN`` returns ``False``, so
-    the classifier pins the stage in ``NORMAL``; a ``+/-Inf`` value
-    poisons the next EWMA update via ``alpha * inf + (1 - alpha) *
-    inf = inf``. The gate catches the corruption at the source.
-
-    Empty ``stage_runtime_states`` (e.g. a zero-stage pipeline) is
-    a valid no-op boundary.
+    Validates ``slots_empty_ratio_ewma`` and
+    ``last_valid_slots_empty_ratio_ewma`` on each entry; ``None``
+    is treated as a valid cold-start sentinel.
 
     Args:
         phase_name: Identifier for the boundary, included in the
-            error message so operators can locate the violating
-            phase.
-        stage_runtime_states: Per-stage runtime state map, keyed by
-            stage name (the scheduler's ``_stage_states``).
+            error message.
+        stage_runtime_states: Per-stage runtime map keyed by stage
+            name (typically the scheduler's ``_stage_states``).
 
     Raises:
         SchedulerInvariantError: Any per-stage EWMA value is not
@@ -217,54 +204,27 @@ def check_floor_after_phase_d(
     stage_floors: dict[int, int],
     pre_phase_d_worker_counts: dict[int, int],
 ) -> None:
-    """Validate the Phase D shrink did not reduce any stage below its floor.
+    """Validate Phase D did not reduce any stage below its floor or grow it.
 
-    Invariants for every non-manual non-finished stage at index
-    ``i``:
-
-      1. ``current_after_phase_d >=
-         min(pre_phase_d_worker_counts[i], stage_floors[i])``.
-         Phase D must not reduce a stage below the configured
-         minimum-worker floor. The ``min`` accommodates the
-         grace-window scenario where Phase B could not satisfy the
-         floor and Phase D legitimately leaves the stage untouched.
-      2. ``current_after_phase_d <= pre_phase_d_worker_counts[i]``.
-         Phase D only removes workers; a count increase is a
-         scheduler defect.
-
-    Manual stages (``requested_num_workers is not None``) and
-    finished stages are exempt: Phase D skips them by design, and
-    the manual-shrink path enforces its own contract.
-
-    Per-cycle ceiling preservation is intentionally not enforced
-    here: the per-stage ``max_scale_down_fraction_per_cycle`` clamp
-    allows legitimate multi-cycle convergence toward a lowered hard
-    worker cap, so the ceiling-respecting invariant is a
-    multi-cycle convergence property and lives outside this
-    per-cycle gate.
+    For every non-manual non-finished stage at index ``i``:
+      ``min(pre_phase_d_worker_counts[i], stage_floors[i]) <= current
+      <= pre_phase_d_worker_counts[i]``. The lower bound's ``min``
+      tolerates Phase B grace-window states. The upper bound pins
+      Phase D as remove-only.
 
     Args:
-        phase_name: Identifier for the boundary, included in the
-            error message so operators can locate the violating
-            phase.
-        problem: The frozen pipeline ``Problem`` (read for stage
-            names and the manual-stage flag).
-        problem_state: The cycle's runtime snapshot. Used to skip
-            finished stages.
-        ctx: The planning context after Phase D (read-only here).
-        stage_floors: Mapping ``{stage_index: floor}`` produced by
-            the scheduler's ``_compute_stage_floors``.
-        pre_phase_d_worker_counts: Mapping
-            ``{stage_index: count}`` captured immediately before
-            ``_run_phase_d_shrink``. Required so the invariant can
-            distinguish "Phase D reduced below floor" (a defect)
-            from "Phase B left the stage below floor" (a grace-
-            window scenario Phase D leaves untouched).
+        phase_name: Identifier for the boundary.
+        problem: The frozen pipeline ``Problem``.
+        problem_state: The cycle's runtime snapshot.
+        ctx: The planning context after Phase D (read-only).
+        stage_floors: ``{stage_index: floor}`` from
+            ``_compute_stage_floors``.
+        pre_phase_d_worker_counts: ``{stage_index: count}``
+            captured immediately before ``_run_phase_d_shrink``.
 
     Raises:
         SchedulerInvariantError: A non-manual non-finished stage's
-            post-Phase-D worker count violates one of the two
-            invariants above.
+            post-Phase-D worker count is outside the bounds above.
 
     """
     worker_ids_by_stage = ctx.worker_ids_by_stage()
@@ -301,34 +261,20 @@ def check_stuck_plan_monotonicity(
     prev_counters: dict[str, int],
     curr_counters: dict[str, int],
 ) -> None:
-    """Validate that every stuck-plan counter either incremented by 1 or reset to 0.
+    """Reject stuck-plan counter transitions other than reset-to-0 or strict +1.
 
-    The only legal per-cycle transitions for a stage's stuck-plan
-    counter are:
-
-      * ``new_value == 0`` (Phase C either had no positive intent
-        for the stage, or fully met the intent and reset the
-        counter).
-      * ``new_value == prev_value + 1`` (Phase C had positive
-        intent but could not place the full request, so the counter
-        was incremented exactly once).
-
-    Stages absent from ``prev_counters`` start at ``0``; stages
-    absent from ``curr_counters`` are treated as missing (Phase C
-    legitimately omits stages it did not touch this cycle, e.g.
-    stages that became finished mid-run).
+    The only legal per-stage transitions are ``curr == 0`` or
+    ``curr == prev + 1``. Stages absent from ``prev_counters``
+    default to ``prev = 0``; stages absent from ``curr_counters``
+    are treated as untouched and skipped.
 
     Args:
-        prev_counters: Snapshot of ``_stuck_plan_counters`` taken
-            before Phase C ran.
-        curr_counters: Snapshot of ``_stuck_plan_counters`` taken
-            after Phase C ran.
+        prev_counters: Counter snapshot taken before Phase C ran.
+        curr_counters: Counter snapshot taken after Phase C ran.
 
     Raises:
-        SchedulerInvariantError: A stage's counter transition is
-            neither a reset (to 0) nor a strict +1 increment. The
-            message names the stage, the previous value, and the
-            current value.
+        SchedulerInvariantError: A stage's transition is neither a
+            reset nor a strict +1 increment.
 
     """
     for stage_name, curr in curr_counters.items():

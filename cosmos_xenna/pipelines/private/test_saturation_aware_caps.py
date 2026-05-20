@@ -690,6 +690,94 @@ class TestPhaseDCapForcedShrink:
         assert "current=8" in cap_logs[0].message
         assert "intent=0" in cap_logs[0].message
 
+    def test_cap_driven_shrink_with_floor_deficit_attributes_to_cap_overflow(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A floor-bound deficit on a cap-driven request is logged as cap overflow.
+
+        Before the log-discipline fix, a positive (or zero) classifier
+        intent combined with a floor-blocked cap-overflow shrink was
+        misleadingly logged as ``intent -X workers; floor cap left Y
+        removed``, which suggested the classifier had requested the
+        shrink. The driver was the operator-configured cap, not the
+        classifier; the message must say so.
+        """
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(max_workers=4, min_workers_per_node=6),
+        )
+        state = make_state([("A", [f"A-w{i}" for i in range(8)], False)])
+
+        autoscale_with_intents(scheduler, state, {"A": 0})
+
+        deficit_logs = [record for record in loguru_caplog.records if "floor cap left" in record.message]
+        assert len(deficit_logs) == 1
+        msg = deficit_logs[0].message
+        assert "hard worker cap overflow requested 4 workers" in msg
+        assert "intent -" not in msg
+        assert "floor cap left 2 removed" in msg
+        assert "ceiling=4" in msg
+
+    def test_cap_driven_shrink_with_fraction_deficit_attributes_to_cap_overflow(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A fraction-bound deficit on a cap-driven request is logged as cap overflow.
+
+        Same correction as the floor-deficit case: a fraction-clamped
+        cap-overflow shrink must be attributed to the cap, not to a
+        classifier ``intent -X`` that the classifier never produced.
+        """
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(max_workers=4, max_scale_down_fraction_per_cycle=0.25),
+        )
+        state = make_state([("A", [f"A-w{i}" for i in range(8)], False)])
+
+        autoscale_with_intents(scheduler, state, {"A": 0})
+
+        deficit_logs = [record for record in loguru_caplog.records if "per-cycle fraction cap left" in record.message]
+        assert len(deficit_logs) == 1
+        msg = deficit_logs[0].message
+        assert "hard worker cap overflow requested 4 workers" in msg
+        assert "intent -" not in msg
+        assert "per-cycle fraction cap left 2 removed" in msg
+        assert "ceiling=4" in msg
+
+    def test_intent_driven_floor_deficit_keeps_intent_phrasing(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Pure classifier-intent shrinks (no cap overflow) keep the ``intent -X`` phrasing.
+
+        Pins that the cap-attribution fix only rewrites cap-driven
+        deficit logs; pure intent-driven shrinks (no cap, classifier
+        wants more deletes than the floor allows) retain the legacy
+        ``intent -X workers; floor cap left Y removed`` phrasing so
+        operators grepping for classifier-driven scale-down behavior
+        still see the same message.
+        """
+        scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(min_workers=2))
+        state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
+
+        autoscale_with_intents(scheduler, state, {"A": -10})
+
+        deficit_logs = [record for record in loguru_caplog.records if "floor cap left" in record.message]
+        assert len(deficit_logs) == 1
+        msg = deficit_logs[0].message
+        assert "intent -10 workers" in msg
+        assert "hard worker cap overflow" not in msg
+
     def test_per_node_cap_on_multi_node_cluster_forces_shrink(
         self,
         make_scheduler: SchedulerFactory,

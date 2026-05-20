@@ -629,6 +629,23 @@ class TestCheckNoNanInClassifierState:
                 stage_runtime_states=states,
             )
 
+    def test_stage_name_with_newline_is_repr_escaped(self) -> None:
+        """Stage names containing newlines are ``!r``-escaped to prevent log forging."""
+        states = {
+            "stage\nFAKE_LOG_LINE": _StageRuntimeState(
+                stage_name="stage\nFAKE_LOG_LINE",
+                slots_empty_ratio_ewma=float("nan"),
+            ),
+        }
+        with pytest.raises(SchedulerInvariantError) as exc_info:
+            check_no_nan_in_classifier_state(
+                phase_name=PhaseBoundary.PHASE_C,
+                stage_runtime_states=states,
+            )
+        msg = str(exc_info.value)
+        assert "\nFAKE_LOG_LINE" not in msg
+        assert "\\nFAKE_LOG_LINE" in msg
+
 
 class TestCheckFloorAfterPhaseD:
     """Pure-helper check for the Phase D floor preservation invariant."""
@@ -774,3 +791,32 @@ class TestCheckStuckPlanMonotonicity:
             match=r"stage 'A' transitioned from 5 to 7",
         ):
             check_stuck_plan_monotonicity(prev_counters={"A": 5}, curr_counters={"A": 7})
+
+    def test_multi_stage_validates_each_independently(self) -> None:
+        """The helper iterates every entry in ``curr_counters``; one bad transition raises.
+
+        Pins that the helper does not short-circuit on the first valid
+        transition: stage ``A`` increments legitimately, stage ``B``
+        also increments legitimately, but stage ``C`` decrements -- the
+        helper must surface ``C`` regardless of where it appears in the
+        dict's iteration order.
+        """
+        with pytest.raises(
+            SchedulerInvariantError,
+            match=r"stage 'C' transitioned from 10 to 8",
+        ):
+            check_stuck_plan_monotonicity(
+                prev_counters={"A": 0, "B": 5, "C": 10},
+                curr_counters={"A": 1, "B": 6, "C": 8},
+            )
+
+    def test_stage_name_with_newline_is_repr_escaped(self) -> None:
+        """Stage names containing newlines are ``!r``-escaped to prevent log forging."""
+        with pytest.raises(SchedulerInvariantError) as exc_info:
+            check_stuck_plan_monotonicity(
+                prev_counters={"stage\nFAKE_LOG_LINE": 1},
+                curr_counters={"stage\nFAKE_LOG_LINE": 5},
+            )
+        msg = str(exc_info.value)
+        assert "\nFAKE_LOG_LINE" not in msg
+        assert "\\nFAKE_LOG_LINE" in msg

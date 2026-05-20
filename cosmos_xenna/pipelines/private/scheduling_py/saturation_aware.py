@@ -390,15 +390,15 @@ class SaturationAwareScheduler:
             stage_floors=stage_floors,
             pre_phase_d_worker_counts=pre_phase_d_worker_counts,
         )
-        # Stale counters for stages that finished mid-run would surface as
-        # ``prev == curr`` transitions; filter both snapshots to the stages
-        # Phase C actually touched (non-finished) so the monotonicity check
-        # only validates transitions Phase C is responsible for.
+        # Filter ``curr_counters`` to only the stages Phase C touched
+        # (non-finished); a stage that finished mid-run leaves its counter
+        # untouched at the prior cycle's value, which would otherwise surface
+        # as an illegal ``prev == curr`` transition. ``prev_counters`` is not
+        # filtered because the helper only iterates ``curr_counters`` and
+        # looks up ``prev_counters`` by key.
         active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
         check_stuck_plan_monotonicity(
-            prev_counters={
-                name: count for name, count in prev_stuck_plan_counters.items() if name in active_stage_names
-            },
+            prev_counters=prev_stuck_plan_counters,
             curr_counters={
                 name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
             },
@@ -869,31 +869,39 @@ class SaturationAwareScheduler:
     ) -> None:
         """Emit the per-cycle Phase D outcome log distinguishing the binding clamp.
 
-        The four message variants surface the operator-actionable
-        cause of the achieved deletion count: the configured floor
-        bound the shrink, the per-cycle fraction cap bound it, the
-        request was satisfied in full but capped by an operator's
-        hard worker cap, or the deletion was driven by hard-cap
-        overflow rather than classifier intent. Ties between
-        ``fraction_cap`` and ``allowed_by_floor`` resolve to floor for
-        backward compatibility with the pre-2-vi log format.
+        The message preamble names the dominant driver (classifier
+        intent vs hard worker cap overflow) so operators can locate
+        the source of the request without parsing the trailing
+        kwargs. The trailing clause names the binding clamp (floor,
+        per-cycle fraction, or no clamp) so operators can locate the
+        cause of any deficit. Ties between ``fraction_cap`` and
+        ``allowed_by_floor`` resolve to floor for backward
+        compatibility with the pre-2-vi log format.
         """
         cap_driven = ceiling_excess > 0 and (intent >= 0 or ceiling_excess >= -intent)
+        if cap_driven:
+            preamble = (
+                f"saturation-aware scale-down: stage {stage_name!r} hard worker cap "
+                f"overflow requested {requested_remove} workers"
+            )
+            cap_kwargs = f", ceiling={ceiling}, intent={intent}"
+        else:
+            preamble = f"saturation-aware scale-down: stage {stage_name!r} intent -{requested_remove} workers"
+            cap_kwargs = ""
         if actual_remove < requested_remove:
             deficit = requested_remove - actual_remove
             fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
             if fraction_bound:
                 logger.info(
-                    f"saturation-aware scale-down: stage {stage_name!r} intent "
-                    f"-{requested_remove} workers; per-cycle fraction cap left "
-                    f"{actual_remove} removed (deficit={deficit}, current={current}, "
-                    f"max_scale_down_fraction_per_cycle={max_scale_down_fraction_per_cycle})."
+                    f"{preamble}; per-cycle fraction cap left {actual_remove} removed "
+                    f"(deficit={deficit}, current={current}, "
+                    f"max_scale_down_fraction_per_cycle={max_scale_down_fraction_per_cycle}"
+                    f"{cap_kwargs})."
                 )
             else:
                 logger.info(
-                    f"saturation-aware scale-down: stage {stage_name!r} intent "
-                    f"-{requested_remove} workers; floor cap left {actual_remove} "
-                    f"removed (deficit={deficit}, current={current}, floor={floor})."
+                    f"{preamble}; floor cap left {actual_remove} removed "
+                    f"(deficit={deficit}, current={current}, floor={floor}{cap_kwargs})."
                 )
         elif cap_driven:
             logger.info(
