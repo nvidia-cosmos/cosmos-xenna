@@ -56,8 +56,11 @@ from cosmos_xenna.pipelines.private.scheduling_py.donor import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     PhaseBoundary,
+    check_floor_after_phase_d,
     check_invariants_after_phase,
+    check_no_nan_in_classifier_state,
     check_solution_shape,
+    check_stuck_plan_monotonicity,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
@@ -320,11 +323,12 @@ class SaturationAwareScheduler:
             RuntimeError: ``setup()`` was not called, planner context
                 construction failed, or the non-manual worker floor
                 cannot be satisfied by the current cluster.
-            SchedulerInvariantError: A planner-context or
-                Solution-shape invariant failed between phases; the
-                plan is corrupted and must not be applied. Caller
-                should treat as a must-fail signal: log, surface,
-                and refuse to apply the plan. See
+            SchedulerInvariantError: A planner-context, classifier
+                EWMA finiteness, Phase D floor / ceiling, stuck-plan
+                monotonicity, or Solution-shape invariant failed
+                between phases; the plan is corrupted and must not be
+                applied. Caller should treat as a must-fail signal:
+                log, surface, and refuse to apply the plan. See
                 ``scheduling_py/invariants.py``.
             ValueError: ``problem`` and ``problem_state`` disagree on
                 stage names or count.
@@ -337,6 +341,10 @@ class SaturationAwareScheduler:
 
         self._cycle_counter += 1
         self._donations_received_this_cycle = {}
+        # Snapshot the stuck-plan counters before Phase C mutates them so the
+        # post-Phase-D monotonicity check can compare prev vs. curr without an
+        # in-flight Phase C state.
+        prev_stuck_plan_counters = dict(self._stuck_plan_counters)
         self._update_regime_aware_aggressiveness(problem_state)
         self._ensure_thresholds_resolved(problem_state)
         ctx = data_structures.AutoscalePlanContext.from_problem_state(
@@ -354,9 +362,47 @@ class SaturationAwareScheduler:
         self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state)
         self._run_phase_c_grow(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
+        check_no_nan_in_classifier_state(
+            phase_name=PhaseBoundary.PHASE_C,
+            stage_runtime_states=self._stage_states,
+        )
 
+        # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
+        # post-Phase-D floor invariant can distinguish "Phase D reduced below
+        # floor" (a defect) from "Phase B left the stage below floor" (a
+        # grace-window scenario Phase D leaves untouched).
+        pre_phase_d_worker_counts = {
+            stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
+        }
         self._run_phase_d_shrink(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
+        # Recompute floors once for the Phase D invariant check; the helper is
+        # O(num_stages) over an immutable Problem so the second call is cheap
+        # and avoids threading a precomputed dict through
+        # ``_run_phase_d_shrink``'s signature.
+        num_nodes = len(self._problem.rust.cluster_resources.nodes)
+        stage_floors = self._compute_stage_floors(num_nodes)
+        check_floor_after_phase_d(
+            phase_name=PhaseBoundary.PHASE_D,
+            problem=self._problem,
+            problem_state=problem_state,
+            ctx=ctx,
+            stage_floors=stage_floors,
+            pre_phase_d_worker_counts=pre_phase_d_worker_counts,
+        )
+        # Stale counters for stages that finished mid-run would surface as
+        # ``prev == curr`` transitions; filter both snapshots to the stages
+        # Phase C actually touched (non-finished) so the monotonicity check
+        # only validates transitions Phase C is responsible for.
+        active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
+        check_stuck_plan_monotonicity(
+            prev_counters={
+                name: count for name, count in prev_stuck_plan_counters.items() if name in active_stage_names
+            },
+            curr_counters={
+                name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
+            },
+        )
 
         solution = ctx.into_solution()
         check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)

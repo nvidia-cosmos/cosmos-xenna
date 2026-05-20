@@ -529,6 +529,31 @@ class TestPhaseDCapForcedShrink:
         # max(|-6|, 8 - 4) = max(6, 4) = 6; intent dominates the smaller cap excess.
         assert len(solution.stages[0].deleted_workers) == 6
 
+    def test_current_above_cap_with_positive_intent_forces_shrink_via_cap(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+    ) -> None:
+        """A positive (grow) intent does not block Phase D's cap-driven shrink.
+
+        The classifier may still request growth on a stage that already
+        exceeds the cap (e.g. immediately after the operator lowered
+        ``max_workers`` while saturation signals are stale). Phase C
+        clamps the positive intent to zero (no headroom), and Phase D's
+        forced-shrink driver pulls the count back to the cap on the
+        same cycle. The ``max(-intent if intent < 0 else 0, ceiling_excess)``
+        composition collapses to ``max(0, 4) = 4`` here.
+        """
+        scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers=4))
+        state = make_state([("A", [f"A-w{i}" for i in range(8)], False)])
+
+        solution = autoscale_with_intents(scheduler, state, {"A": 5})
+
+        # Phase C grows nothing (current >= ceiling); Phase D shrinks to the cap.
+        assert solution.stages[0].new_workers == []
+        assert len(solution.stages[0].deleted_workers) == 4
+
     def test_fraction_cap_binds_below_cap_excess(
         self,
         make_scheduler: SchedulerFactory,
