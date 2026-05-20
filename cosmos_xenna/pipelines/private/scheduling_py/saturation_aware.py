@@ -61,7 +61,8 @@ from ray.util.metrics import Histogram
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     data_structures as rust_data_structures,
 )
-from cosmos_xenna.pipelines.private import data_structures
+from cosmos_xenna.pipelines.private import data_structures, resources
+from cosmos_xenna.pipelines.private.scheduling_py.allocation_failures import emit_allocation_failure
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
@@ -100,46 +101,23 @@ from cosmos_xenna.pipelines.private.scheduling_py.regime import (
 from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
 from cosmos_xenna.pipelines.private.scheduling_py.stabilization import _RecommendationHistory
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.stuck_plan import StuckPlanDetector
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.utils import python_log as logger
 
-# Local alias for ``time.monotonic`` so the per-phase wrappers inside
-# ``SaturationAwareScheduler.autoscale()`` can sample the wall-clock
-# despite the method's ``time: float`` parameter shadowing the ``time``
-# module within the function body. Module-level binding lets tests
-# inject a deterministic clock via
-# ``monkeypatch.setattr(saturation_aware, "_monotonic", fake_clock)``
-# without touching the canonical ``time.monotonic`` builtin.
+# Module-level alias for ``time.monotonic`` so per-phase wrappers inside
+# ``autoscale()`` can sample the wall-clock despite the method's
+# ``time: float`` parameter shadowing the ``time`` module. Tests inject a
+# deterministic clock via ``monkeypatch.setattr(saturation_aware, "_monotonic", fake)``.
 _monotonic = time.monotonic
 
-# Per-phase timing histogram (section 4-v of the saturation-aware
-# scheduler plan, docs/scheduler/saturation-aware/22-prometheus-metrics.md
-# row ``xenna_scheduler_cycle_phase_duration_seconds``).
-#
-# Each call to ``autoscale()`` brackets seven contiguous phase blocks
-# plus a closing ``into_solution`` block with ``time.monotonic()``
-# samples and emits one observation per phase per cycle on this
-# Histogram, tagged ``{"phase": <label>, "pipeline": <name>}``. Bucket
-# boundaries are inherited verbatim from the cycle histogram in
-# ``streaming.py`` so dashboards and alerts can share the same
-# ``histogram_quantile`` thresholds. The 60.0 s upper edge keeps the
-# ``+Inf`` bucket reserved for pathological per-phase stalls; under
-# normal operation every observation sits below the 0.1 s bucket.
-#
-# Tag-key choice: ``("phase", "pipeline")`` matches the canonical
-# label set in 22-prometheus-metrics.md and keeps cardinality bounded
-# at ``num_pipelines * num_phase_labels``. ``num_phase_labels`` is
-# fixed at 8 by the producer; ``num_pipelines`` is bounded by the
-# operator's job concurrency.
 _PHASE_DURATION_HISTOGRAM = Histogram(
     name="xenna_scheduler_cycle_phase_duration_seconds",
     description=(
-        "Wall-clock duration of one autoscale-cycle phase (pre_phase_setup, "
-        "phase_a, phase_b, intent, phase_c, phase_d, invariants, "
-        "into_solution). Operators consume the per-phase histogram to "
-        "locate which phase blew the cycle budget when the 4-iv loop "
-        "watchdog WARN fires; the sum across all 8 phases approximates the "
-        "cycle duration reported by xenna_scheduler_cycle_duration_seconds."
+        "Wall-clock duration of one autoscale-cycle phase. "
+        "Operators read this to locate which phase blew the cycle budget "
+        "when the loop-watchdog WARN fires; the sum across phases "
+        "approximates xenna_scheduler_cycle_duration_seconds."
     ),
     boundaries=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0],
     tag_keys=("phase", "pipeline"),
@@ -213,15 +191,12 @@ class SaturationAwareScheduler:
             type is widened to ``Mapping`` to express the read-only
             contract through static analysis.
         _stuck_plan_counters: Per-stage count of consecutive
-            ``autoscale()`` cycles where Phase C had a positive
-            intent but could not place the full request. Increments
-            when ``added < intent`` (cluster placement exhausted or
-            a higher-priority downstream stage consumed the headroom
-            first under DAG-priority ordering); resets to ``0`` on a
-            cycle where the stage either fully met its intent or had
-            no positive intent. The counter is the input the
-            pipeline-level ``stuck_plan_detection_cycles`` watchdog
-            consumes when it is wired in.
+            ``autoscale()`` cycles where Phase C had a positive intent
+            but could not place the full request. Increments when
+            ``added < intent``; resets to ``0`` on any cycle where the
+            stage met its intent or had none. Fed into
+            ``StuckPlanDetector`` for the threshold-promoted INFO log
+            and the per-stage Gauge / Counter.
         _recommendation_histories: Per-stage asymmetric
             stabilization-window buffers, sized by the resolved
             ``stabilization_window_cycles_up`` /
@@ -339,6 +314,10 @@ class SaturationAwareScheduler:
             pipeline_name=pipeline_name,
         )
         self._floor_stuck_counters: dict[str, int] = {}
+        # Transient cycle-skip flag set by ``_try_add_worker_with_defense``
+        # on absorbed exceptions; reset at the top of every Phase C grow.
+        self._phase_c_allocation_failure: bool = False
+        self._stuck_plan_detector: StuckPlanDetector = StuckPlanDetector()
         # Saturation-mode cross-stage donor anti-flap state.
         # ``_cycle_counter`` is monotonic and increments at the top of every
         # ``autoscale()`` call. ``_last_donation_cycle`` records the cycle at
@@ -392,6 +371,7 @@ class SaturationAwareScheduler:
         self._stuck_plan_counters = {}
         self._memory_pressure_monitor.reset()
         self._heterogeneity_state.reset()
+        self._stuck_plan_detector.reset()
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
@@ -792,7 +772,19 @@ class SaturationAwareScheduler:
             check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
             self._persist_worker_ages(ctx)
 
+        self._emit_cycle_summary()
+
         return solution
+
+    def _emit_cycle_summary(self) -> None:
+        """Emit one structured DEBUG summary line per cycle."""
+        logger.debug(
+            f"saturation-aware cycle {self._cycle_counter} summary: "
+            f"regime={self._regime_state.current_regime.value}, "
+            f"heterogeneity_streak={self._heterogeneity_state.streak_cycles}, "
+            f"heterogeneity_fired={self._heterogeneity_state.has_fired}, "
+            f"phase_c_allocation_failure={self._phase_c_allocation_failure}"
+        )
 
     def _next_cycle_worker_ages(self) -> dict[str, int]:
         """Build the planner's age seed for the next autoscale cycle.
@@ -1175,6 +1167,52 @@ class SaturationAwareScheduler:
             intents[stage_name] = delta
         return intents
 
+    def _set_stuck_plan_counter(self, stage_name: str, value: int, *, last_intent: int) -> None:
+        """Update ``_stuck_plan_counters[stage_name]`` and notify the detector."""
+        self._stuck_plan_counters[stage_name] = value
+        self._stuck_plan_detector.update(
+            stage_name=stage_name,
+            stuck_cycles=value,
+            threshold_cycles=self._config.stuck_plan_detection_cycles,
+            last_intent=last_intent,
+            pipeline_name=self._pipeline_name,
+        )
+
+    def _try_add_worker_with_defense(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        stage_index: int,
+        stage_name: str,
+    ) -> data_structures.ProblemWorkerGroupState | None:
+        """Call ``ctx.try_add_worker`` with the allocation-failure defense layer.
+
+        Absorbed exceptions return ``None`` and set
+        ``self._phase_c_allocation_failure`` so the caller aborts the
+        Phase C loop. Re-raises when ``skip_cycle_on_allocation_error``
+        is False.
+        """
+        try:
+            return ctx.try_add_worker(stage_index)
+        except resources.AllocationError as exc:
+            self._absorb_allocation_failure(stage_name=stage_name, exc=exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 - defense-in-depth catches non-AllocationError raises
+            self._absorb_allocation_failure(stage_name=stage_name, exc=exc)
+            return None
+
+    def _absorb_allocation_failure(self, *, stage_name: str, exc: BaseException) -> None:
+        """Log the fragmentation snapshot, bump the counter, and raise or set the skip flag."""
+        assert self._problem is not None
+        emit_allocation_failure(
+            stage_name=stage_name,
+            pipeline_name=self._pipeline_name,
+            cluster_resources=self._problem.rust.cluster_resources,
+            exc=exc,
+        )
+        if not self._config.skip_cycle_on_allocation_error:
+            raise exc
+        self._phase_c_allocation_failure = True
+
     def _run_phase_c_grow(
         self,
         ctx: data_structures.AutoscalePlanContext,
@@ -1206,12 +1244,11 @@ class SaturationAwareScheduler:
         with a positive intent is attempted regardless of any
         earlier capacity exhaustion.
 
-        Updates :attr:`_stuck_plan_counters`: per-stage count of
-        consecutive cycles where ``added < intent``. Resets to ``0``
-        on any cycle where the stage either fully met its intent or
-        had no positive intent. The counter is the input the
-        pipeline-level ``stuck_plan_detection_cycles`` watchdog
-        consumes when it is wired in.
+        Updates :attr:`_stuck_plan_counters` (per-stage count of
+        consecutive cycles where ``added < intent``; ``0`` when the
+        stage met its intent or had none) and routes every mutation
+        through :meth:`_set_stuck_plan_counter` so
+        :class:`StuckPlanDetector` stays in lockstep.
 
         Args:
             ctx: The cycle's mutable planner context. Mutated in place
@@ -1223,6 +1260,8 @@ class SaturationAwareScheduler:
         if self._problem is None:
             msg = "_run_phase_c_grow called before setup()"
             raise RuntimeError(msg)
+
+        self._phase_c_allocation_failure = False
 
         # Cluster-wide memory-pressure kill switch. When the Ray object-store
         # ``used_fraction`` exceeds the configured threshold, every stage's
@@ -1241,7 +1280,7 @@ class SaturationAwareScheduler:
         ):
             for runtime_stage in problem_state.rust.stages:
                 if not runtime_stage.is_finished:
-                    self._stuck_plan_counters[runtime_stage.stage_name] = 0
+                    self._set_stuck_plan_counter(runtime_stage.stage_name, 0, last_intent=0)
             return
 
         if self._config.enable_dag_priority_growth:
@@ -1260,7 +1299,7 @@ class SaturationAwareScheduler:
             stage_name = runtime_stage.stage_name
             intent = self._last_intent_deltas.get(stage_name, 0)
             if intent <= 0:
-                self._stuck_plan_counters[stage_name] = 0
+                self._set_stuck_plan_counter(stage_name, 0, last_intent=0)
                 continue
             # Hard worker cap: clamp the grow request to the headroom
             # left under ``ceiling = min(max_workers, max_workers_per_node * N)``.
@@ -1279,13 +1318,15 @@ class SaturationAwareScheduler:
                     )
                     intent = headroom
                 if intent <= 0:
-                    self._stuck_plan_counters[stage_name] = 0
+                    self._set_stuck_plan_counter(stage_name, 0, last_intent=0)
                     continue
             added = 0
             while added < intent:
-                if ctx.try_add_worker(stage_index) is not None:
+                if self._try_add_worker_with_defense(ctx, stage_index, stage_name) is not None:
                     added += 1
                     continue
+                if self._phase_c_allocation_failure:
+                    return
                 # Cluster placement exhausted. Try the saturation-mode
                 # cross-stage donor fallback before giving up. On donor
                 # success the planner has freed exactly one placement,
@@ -1309,7 +1350,9 @@ class SaturationAwareScheduler:
                         "satisfied this cycle."
                     )
                     break
-                if ctx.try_add_worker(stage_index) is None:
+                if self._try_add_worker_with_defense(ctx, stage_index, stage_name) is None:
+                    if self._phase_c_allocation_failure:
+                        return
                     deficit = intent - added
                     logger.warning(
                         f"saturation-aware scale-up: stage {stage_name!r} intent "
@@ -1325,9 +1368,10 @@ class SaturationAwareScheduler:
                 )
                 added += 1
             if added < intent:
-                self._stuck_plan_counters[stage_name] = self._stuck_plan_counters.get(stage_name, 0) + 1
+                next_count = self._stuck_plan_counters.get(stage_name, 0) + 1
+                self._set_stuck_plan_counter(stage_name, next_count, last_intent=intent)
             else:
-                self._stuck_plan_counters[stage_name] = 0
+                self._set_stuck_plan_counter(stage_name, 0, last_intent=intent)
 
     def _attempt_cross_stage_donation(
         self,

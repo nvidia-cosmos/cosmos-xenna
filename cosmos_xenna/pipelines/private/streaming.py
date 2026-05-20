@@ -615,8 +615,8 @@ class Autoscaler:
         that the planner has placed but whose ``stage_setup`` has
         not yet returned. The saturation-aware scheduler combines
         this with the ready-actor count (``len(workers)``) to detect
-        the half-initialised condition described by
-        ``setup_phase_quiescence_enabled`` (see Phase 3-iii).
+        the half-initialised condition gated by
+        ``setup_phase_quiescence_enabled``.
 
         Args:
             actor_pools: The list of actor pools for each stage.

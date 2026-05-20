@@ -827,12 +827,13 @@ class SaturationAwareConfig:
     memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
 
     # --- Robustness (cluster-wide) ---
-    # Reserved for allocation-error recovery policy. Phase 2 planner calls
-    # currently use return-value based placement failures rather than catching
-    # allocator ``AllocationError``.
+    # When True, an absorbed Phase C ``try_add_worker`` exception logs the
+    # per-GPU fragmentation snapshot + bumps the failure counter and skips
+    # the rest of Phase C for that cycle; when False, the exception
+    # propagates so the run-loop crashes loudly.
     skip_cycle_on_allocation_error: bool = True
-    # Reserved for the stuck-plan watchdog. Phase 2 records monotonic
-    # ``_stuck_plan_counters`` but does not yet emit the threshold log.
+    # Consecutive Phase C cycles a stage must stay stuck before the
+    # detector promotes the per-cycle WARN to a one-shot INFO.
     stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
 
     # --- Cluster heterogeneity warn (cluster-wide observability) ---
