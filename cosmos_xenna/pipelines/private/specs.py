@@ -341,7 +341,7 @@ class StageSpec(typing.Generic[T, V]):
     # scheduler resolver falls through to ``SaturationAwareConfig.per_stage_overrides``
     # and then ``SaturationAwareConfig.stage_defaults``. Honoured only when
     # ``StreamingSpecificSpec.scheduler == SchedulerKind.SATURATION_AWARE``.
-    saturation_aware: Optional["SaturationAwareStageConfig"] = None
+    saturation_aware: "SaturationAwareStageConfig | None" = None
 
     def name(self, index: int | None = None) -> str:
         if index is None:
@@ -764,7 +764,6 @@ class SaturationAwareConfig:
     # aggressiveness.
     regime_transition_streak_cycles: int = attrs.field(default=3, validator=attrs_utils.validate_positive_int)
 
-    # --- DAG priority + cross-stage donor (cluster-wide) ---
     # When True, growth attempts are sorted by DAG depth descending
     # (downstream stages first). Reflects the invariant that pipeline
     # throughput is bounded by the tail stage.
@@ -776,7 +775,6 @@ class SaturationAwareConfig:
     # receiver (never take from a downstream stage).
     donor_must_be_strictly_upstream: bool = True
 
-    # --- Cross-stage donor anti-flap (5 layers) ---
     # When True, donor candidates must be in OVER_PROVISIONED state with a
     # full streak (not merely non-SATURATED). Strongest anti-flap layer.
     cross_stage_donor_require_over_provisioned: bool = True
@@ -803,19 +801,17 @@ class SaturationAwareConfig:
     # immediately because the donor removal cannot be rolled back safely.
     floor_stuck_grace_cycles: int = attrs.field(default=6, validator=attrs.validators.ge(0))
 
-    # --- Loop watchdog (cluster-wide) ---
-    # Reserved for the cycle-duration watchdog: fraction of ``interval_s``
-    # above which a cycle's wall-clock duration triggers a WARN log. Phase 2
-    # does not yet emit this watchdog metric or log.
+    # Fraction of ``interval_s`` above which a cycle's wall-clock duration
+    # triggers a WARN log via ``loop_watchdog`` (cluster-wide). Range
+    # ``(0.0, 1.0]``.
     cycle_time_warn_threshold: float = attrs.field(
         default=0.5,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
-    # --- Cluster memory pressure gate (defensive kill-switch) ---
-    # Reserved for the memory-pressure gate: query Ray cluster object-store
-    # memory and freeze scale-up when used fraction exceeds the threshold.
-    # Phase 2 does not yet query or consume this signal.
+    # When True, ``MemoryPressureMonitor`` polls Ray's cluster object-store
+    # memory and freezes Phase C scale-up when used fraction exceeds the
+    # critical threshold below.
     enable_memory_pressure_gate: bool = True
     # Fraction of cluster object-store memory above which future gate logic
     # will freeze scale-up.
@@ -826,7 +822,6 @@ class SaturationAwareConfig:
     # Polling interval (seconds) for the future Ray cluster memory query.
     memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
 
-    # --- Robustness (cluster-wide) ---
     # When True, an absorbed Phase C ``try_add_worker`` exception logs the
     # per-GPU fragmentation snapshot + bumps the failure counter and skips
     # the rest of Phase C for that cycle; when False, the exception
@@ -836,7 +831,6 @@ class SaturationAwareConfig:
     # detector promotes the per-cycle WARN to a one-shot INFO.
     stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
 
-    # --- Cluster heterogeneity warn (cluster-wide observability) ---
     # Ratio of ``max(D_k) / min(D_k)`` (Forced-Flow service demand)
     # above which the cluster is considered heterogeneous enough that
     # the dominant bottleneck stage may benefit from a longer
@@ -866,7 +860,6 @@ class SaturationAwareConfig:
         validator=attrs_utils.validate_positive_int,
     )
 
-    # --- Per-stage default + explicit overrides ---
     # Default ``SaturationAwareStageConfig`` applied to every stage that has
     # no more specific override.
     stage_defaults: SaturationAwareStageConfig = attrs.field(factory=SaturationAwareStageConfig)
@@ -1000,7 +993,6 @@ class StreamingSpecificSpec:
     # queued work has drained.
     enable_backlog_aware_scaledown: bool = False
 
-    # --- Saturation-aware scheduler (opt-in) ---
     # Selects the autoscaler implementation. ``FRAGMENTATION_BASED`` (default)
     # uses the Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python
     # saturation-aware scheduler. The flag is read once at

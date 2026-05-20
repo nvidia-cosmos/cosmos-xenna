@@ -184,9 +184,17 @@ class TestStressNoLeakOrCrash:
         # operational signal we care about.
 
     def test_thousand_problem_constructions_complete_cleanly(self) -> None:
-        """1000 Problem construct-and-discard cycles."""
+        """1000 Problem construct-and-discard cycles preserve per-construction stage names.
+
+        Pins that a high construction rate does not corrupt the Rust
+        ``stages`` Vec across consecutive ``Problem`` instances (the
+        loop is ~ thirty cycles per second on a CI runner). Asserting
+        the stage name on every iteration catches a regression where
+        the FFI boundary returns a stale or shared Vec.
+        """
         for i in range(1000):
-            _make_problem([f"stage-{i}"])
+            problem = _make_problem([f"stage-{i}"])
+            assert problem.rust.stages[0].name == f"stage-{i}"
         gc.collect()
 
 

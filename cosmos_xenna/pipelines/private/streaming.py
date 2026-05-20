@@ -425,35 +425,32 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
 
     """
     mode_specific = pipeline_spec.config.mode_specific
-    assert mode_specific is not None, "_make_scheduler_algorithm requires StreamingSpecificSpec; got mode_specific=None"
+    if mode_specific is None:
+        msg = "_make_scheduler_algorithm requires StreamingSpecificSpec; got mode_specific=None"
+        raise RuntimeError(msg)
     kind = mode_specific.scheduler
-    if kind is specs.SchedulerKind.FRAGMENTATION_BASED:
-        return autoscaling_algorithms.FragmentationBasedAutoscaler(
-            mode_specific.autoscale_speed_estimation_window_duration_s,
-            mode_specific.autoscale_speed_estimation_min_data_points,
-        )
-    if kind is specs.SchedulerKind.SATURATION_AWARE:
-        # Deferred import: the saturation-aware scheduler module
-        # constructs Prometheus metric handles (cycle-duration histogram,
-        # per-phase histogram, bottleneck/heterogeneity gauges,
-        # memory-pressure gauges) at module import time. Importing them
-        # only when the saturation-aware kind is selected keeps the
-        # fragmentation-based path free of metric series it never observes.
-        from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+    match kind:
+        case specs.SchedulerKind.FRAGMENTATION_BASED:
+            return autoscaling_algorithms.FragmentationBasedAutoscaler(
+                mode_specific.autoscale_speed_estimation_window_duration_s,
+                mode_specific.autoscale_speed_estimation_min_data_points,
+            )
+        case specs.SchedulerKind.SATURATION_AWARE:
+            # Deferred import: the saturation-aware scheduler module
+            # constructs Prometheus metric handles at import time, so
+            # only loading it here keeps the fragmentation-based path
+            # free of metric series it never observes.
+            from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 
-        job_info = pipeline_spec.job_info
-        # ``JobInfo.pipeline_type`` is the closest user-supplied identifier for
-        # the ``pipeline`` Prometheus tag carried by every saturation-aware
-        # scheduler metric. Falls back to an empty string when no ``job_info``
-        # is set so ``Histogram.observe`` / ``Gauge.set`` always receive the
-        # declared tag key.
-        pipeline_name = job_info.pipeline_type if job_info is not None else ""
-        return SaturationAwareScheduler(
-            mode_specific.saturation_aware,
-            stage_spec_overrides=_collect_saturation_aware_stage_overrides(pipeline_spec),
-            pipeline_name=pipeline_name,
-        )
-    raise ValueError(f"Unrecognized SchedulerKind: {kind!r}")
+            job_info = pipeline_spec.job_info
+            pipeline_name = job_info.pipeline_type if job_info is not None else ""
+            return SaturationAwareScheduler(
+                mode_specific.saturation_aware,
+                stage_spec_overrides=_collect_saturation_aware_stage_overrides(pipeline_spec),
+                pipeline_name=pipeline_name,
+            )
+        case _:
+            typing.assert_never(kind)
 
 
 class Autoscaler:
