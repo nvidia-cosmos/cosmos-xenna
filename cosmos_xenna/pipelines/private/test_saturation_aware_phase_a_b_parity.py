@@ -33,7 +33,8 @@ fragmentation-based scheduler and the saturation-aware scheduler:
 Single-cycle structural parity only; multi-cycle numerical convergence
 is covered by the saturation-aware focused tests, not this parity
 harness. Rationale for the structural-vs-numerical scoping decision
-lives in ``docs/curator/scheduler-tuning.md``.
+lives in
+``cosmos-xenna/docs/scheduler/saturation-aware/04-per-cycle-pipeline.md``.
 """
 
 import uuid

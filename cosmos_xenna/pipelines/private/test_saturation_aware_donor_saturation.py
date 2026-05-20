@@ -64,6 +64,12 @@ def _stage_cfg(*, over_provisioned_streak: int = 30) -> SaturationAwareStageConf
     return SaturationAwareStageConfig(
         min_workers=1,
         over_provisioned_streak_min_cycles=over_provisioned_streak,
+        # Saturation donor tests focus on the five-layer anti-flap and
+        # cooldown contract, not on the donor warmup grace. Pin both
+        # warmup graces to zero so victim and donor candidate pools are
+        # unfiltered and the legacy contract remains observable.
+        worker_warmup_measurement_grace_s=0.0,
+        donor_warmup_grace_s=0.0,
     )
 
 
@@ -203,7 +209,12 @@ def _scheduler_for_donation(
     cfg = _config(
         cross_stage_donor_max_per_cycle=max_per_cycle,
         cross_stage_donor_min_donation_interval_cycles=min_interval_cycles,
-        stage_defaults=SaturationAwareStageConfig(min_workers=1, over_provisioned_streak_min_cycles=3),
+        stage_defaults=SaturationAwareStageConfig(
+            min_workers=1,
+            over_provisioned_streak_min_cycles=3,
+            worker_warmup_measurement_grace_s=0.0,
+            donor_warmup_grace_s=0.0,
+        ),
     )
     scheduler = SaturationAwareScheduler(cfg)
     scheduler.setup(_problem(["A", "B"], total_cpus_per_node=total_cpus_per_node))
@@ -219,7 +230,7 @@ def _autoscale_with_intents(
 ) -> data_structures.Solution:
     """Run autoscale with injected intent deltas."""
 
-    def _inject(_ctx: object, _state: object) -> dict[str, int]:
+    def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
         return dict(intents)
 
     with (

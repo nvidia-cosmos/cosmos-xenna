@@ -152,8 +152,9 @@ class ProblemStageState:
     signals sampled at the same instant as ``worker_groups``.
 
     The slot-signal kwargs (``num_used_slots``, ``num_empty_slots``,
-    ``input_queue_depth``) default to 0, so existing call sites that pass
-    only the four positional arguments continue to work unchanged.
+    ``input_queue_depth``) and the setup-phase quiescence signal
+    (``num_pending_actors``) default to 0, so existing call sites that
+    pass only the four positional arguments continue to work unchanged.
     Consumers that do not populate these fields treat the default as
     "no signal".
 
@@ -172,6 +173,13 @@ class ProblemStageState:
             is the total in-stage slot capacity at sample time.
         input_queue_depth: Number of pre-batch tasks queued upstream of
             this stage at sample time.
+        num_pending_actors: Number of actors currently in setup phases
+            (not yet ready to dispatch tasks). The saturation-aware
+            scheduler combines this with the ready-actor count
+            (``len(workers)``) to detect the setup-phase quiescence
+            condition: when at least one actor is pending and zero are
+            ready, the stage is half-initialised and any signal-driven
+            scale decision would amplify the cold-start spike.
 
     """
 
@@ -185,6 +193,7 @@ class ProblemStageState:
         num_used_slots: int = 0,
         num_empty_slots: int = 0,
         input_queue_depth: int = 0,
+        num_pending_actors: int = 0,
     ) -> None:
         self._r = rust.ProblemStageState(
             stage_name,
@@ -194,6 +203,7 @@ class ProblemStageState:
             num_used_slots,
             num_empty_slots,
             input_queue_depth,
+            num_pending_actors,
         )
 
     @property

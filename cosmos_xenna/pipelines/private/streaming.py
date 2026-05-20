@@ -583,11 +583,21 @@ class Autoscaler:
         """Creates a `ProblemState` instance from the current pipeline state.
 
         Populates the per-stage slot signals (``num_used_slots``,
-        ``num_empty_slots``, ``input_queue_depth``) from the live
-        ``ActorPool`` snapshot. Finished stages carry zero signals
-        because their autoscaling decisions are short-circuited
-        upstream and any drain-state slot / queue counts would be
-        misleading saturation signal.
+        ``num_empty_slots``, ``input_queue_depth``) and the
+        setup-phase quiescence signal (``num_pending_actors``) from
+        the live ``ActorPool`` snapshot. Finished stages carry zero
+        on every signal because their autoscaling decisions are
+        short-circuited upstream and any drain-state slot, queue, or
+        pending-actor counts would be misleading saturation signal.
+
+        ``num_pending_actors`` is the count of actors past
+        :meth:`ActorPool.add_actor` but before
+        :meth:`ActorPool._move_pending_actors_to_ready` -- i.e. ones
+        that the planner has placed but whose ``stage_setup`` has
+        not yet returned. The saturation-aware scheduler combines
+        this with the ready-actor count (``len(workers)``) to detect
+        the half-initialised condition described by
+        ``setup_phase_quiescence_enabled`` (see Phase 3-iii).
 
         Args:
             actor_pools: The list of actor pools for each stage.
@@ -603,16 +613,19 @@ class Autoscaler:
                 num_used_slots = 0
                 num_empty_slots = 0
                 input_queue_depth = 0
+                num_pending_actors = 0
                 worker_group_idle: dict[str, int] = {}
             else:
                 num_used_slots = pool.num_used_slots
                 num_empty_slots = pool.num_empty_slots
                 input_queue_depth = pool.num_queued_tasks
+                num_pending_actors = pool.num_pending_actors
                 worker_group_idle = pool.worker_group_num_used_slots()
                 for field_name, value in (
                     ("num_used_slots", num_used_slots),
                     ("num_empty_slots", num_empty_slots),
                     ("input_queue_depth", input_queue_depth),
+                    ("num_pending_actors", num_pending_actors),
                 ):
                     _validate_non_negative_signal(stage_name=pool.name, field_name=field_name, value=value)
                 for worker_id, used_slots in worker_group_idle.items():
@@ -642,6 +655,7 @@ class Autoscaler:
                     num_used_slots=num_used_slots,
                     num_empty_slots=num_empty_slots,
                     input_queue_depth=input_queue_depth,
+                    num_pending_actors=num_pending_actors,
                 )
             )
         return data_structures.ProblemState(stages)

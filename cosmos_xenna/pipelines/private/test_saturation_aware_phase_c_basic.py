@@ -117,10 +117,22 @@ def _problem_state(
 
 
 def _scheduler(stage_specs: list[tuple[str, int | None]]) -> SaturationAwareScheduler:
-    """Build a setup-completed scheduler over the given stages."""
+    """Build a setup-completed scheduler over the given stages.
+
+    The Phase C tests focus on placement orchestration and intent
+    consumption, both orthogonal to the warmup grace mechanisms.
+    The two grace fields are zeroed so a signal injected on cycle
+    one is absorbed by the EWMA immediately, matching the legacy
+    pre-grace behaviour the test cases were written against. The
+    warmup-grace contract has its own dedicated test module.
+    """
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
-        stage_defaults=SaturationAwareStageConfig(min_workers=1),
+        stage_defaults=SaturationAwareStageConfig(
+            min_workers=1,
+            worker_warmup_measurement_grace_s=0.0,
+            donor_warmup_grace_s=0.0,
+        ),
     )
     scheduler = SaturationAwareScheduler(cfg)
     scheduler.setup(_problem(stage_specs))
@@ -134,7 +146,7 @@ def _autoscale_with_intents(
 ) -> data_structures.Solution:
     """Run autoscale with ``intents`` injected as ``_compute_intent_deltas`` output."""
 
-    def _inject(_ctx: object, _state: object) -> dict[str, int]:
+    def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
         return dict(intents)
 
     with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):

@@ -135,6 +135,7 @@ def find_saturation_donor(
     cycle: int,
     last_donation_cycle: dict[str, int],
     donations_received_this_cycle: dict[str, int],
+    excluded_worker_ids: frozenset[str] | None = None,
 ) -> DonorCandidate | None:
     """Pick a donor for saturation-driven Phase C growth, with five anti-flap layers.
 
@@ -193,12 +194,23 @@ def find_saturation_donor(
             each stage most recently donated.
         donations_received_this_cycle: Per-stage receiver counter,
             reset at the top of every autoscale cycle.
+        excluded_worker_ids: Optional set of worker ids to drop
+            from the candidate pool before donor selection.
+            Saturation-aware callers populate this with the donor
+            warmup grace set so freshly-warmed workers are not
+            yanked off their stage before they have had a chance to
+            absorb load. The donor stage itself remains eligible if
+            any of its other workers are mature; donor-stage
+            elimination only happens when every one of the stage's
+            workers is in warmup. ``None`` or an empty set leaves
+            the candidate pool unfiltered.
 
     Returns:
         The selected ``DonorCandidate`` or ``None`` when the master
         toggle is disabled, the receiver is itself in cooldown, the
-        receiver has hit its per-cycle absorption cap, or no donor
-        stage passes every filter.
+        receiver has hit its per-cycle absorption cap, no donor
+        stage passes every filter, or every potential donor worker
+        is in ``excluded_worker_ids``.
 
     """
     if not config.enable_cross_stage_donor:
@@ -249,6 +261,7 @@ def find_saturation_donor(
     if not eligible_stages:
         return None
 
+    excluded = excluded_worker_ids or frozenset()
     candidates = [
         DonorCandidate(
             stage_index=donor_index,
@@ -257,6 +270,7 @@ def find_saturation_donor(
         )
         for donor_index in eligible_stages
         for wid in worker_ids_by_stage[donor_index]
+        if wid not in excluded
     ]
     if not candidates:
         return None

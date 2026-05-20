@@ -15,11 +15,12 @@
 
 """Tests for ``ProblemStageState`` slot-signal fields.
 
-``ProblemStageState`` carries three optional runtime signals:
+``ProblemStageState`` carries four optional runtime signals:
 
-  * ``num_used_slots``     -- occupied task slots across all workers
-  * ``num_empty_slots``    -- free task slots across all workers
-  * ``input_queue_depth``  -- pre-batch tasks queued upstream
+  * ``num_used_slots``      -- occupied task slots across all workers
+  * ``num_empty_slots``     -- free task slots across all workers
+  * ``input_queue_depth``   -- pre-batch tasks queued upstream
+  * ``num_pending_actors``  -- actors past placement but pre-``stage_setup``
 
 These tests pin three observable contracts at the data layer:
 
@@ -65,6 +66,7 @@ class TestPositionalArgumentBackwardCompatibility:
         assert state.rust.num_used_slots == 0
         assert state.rust.num_empty_slots == 0
         assert state.rust.input_queue_depth == 0
+        assert state.rust.num_pending_actors == 0
 
 
 class TestNumUsedSlotsRoundTrip:
@@ -92,6 +94,36 @@ class TestInputQueueDepthRoundTrip:
         """A populated Python kwarg shows up unchanged on the Rust object."""
         state = _make_state(input_queue_depth=128)
         assert state.rust.input_queue_depth == 128
+
+
+class TestNumPendingActorsRoundTrip:
+    """``num_pending_actors`` round-trips from the Python wrapper to the Rust struct.
+
+    The setup-phase quiescence gate consumes this signal directly off the
+    Rust struct, so a corruption here would silently disarm the gate.
+    """
+
+    def test_constructor_kwarg_is_visible_via_rust(self) -> None:
+        """A populated Python kwarg shows up unchanged on the Rust object."""
+        state = _make_state(num_pending_actors=4)
+        assert state.rust.num_pending_actors == 4
+
+    def test_independent_of_other_signals(self) -> None:
+        """``num_pending_actors`` does not bleed into the slot signals.
+
+        Catches a regression where the Rust constructor positionally
+        scrambled the new field with one of the existing slot signals.
+        """
+        state = _make_state(
+            num_used_slots=1,
+            num_empty_slots=2,
+            input_queue_depth=3,
+            num_pending_actors=99,
+        )
+        assert state.rust.num_used_slots == 1
+        assert state.rust.num_empty_slots == 2
+        assert state.rust.input_queue_depth == 3
+        assert state.rust.num_pending_actors == 99
 
 
 class TestExistingFieldsUnchanged:
@@ -134,6 +166,12 @@ class TestPostConstructionMutation:
         state.rust.input_queue_depth = 999
         assert state.rust.input_queue_depth == 999
 
+    def test_num_pending_actors_is_settable_after_construction(self) -> None:
+        """Streaming will refresh ``num_pending_actors`` each autoscale cycle."""
+        state = _make_state()
+        state.rust.num_pending_actors = 7
+        assert state.rust.num_pending_actors == 7
+
 
 class TestSignalsThroughProblemState:
     """``ProblemState`` carries multi-stage signals end-to-end."""
@@ -144,8 +182,22 @@ class TestSignalsThroughProblemState:
         Catches regressions where ``ProblemState`` rebuilds its inner
         Rust list but loses the slot-signal fields on the way.
         """
-        s_a = _make_state(stage_name="s-a", num_used_slots=1, num_empty_slots=1, input_queue_depth=10)
-        s_b = _make_state(stage_name="s-b", num_used_slots=4, num_empty_slots=0, input_queue_depth=0)
+        s_a = _make_state(
+            stage_name="s-a",
+            num_used_slots=1,
+            num_empty_slots=1,
+            input_queue_depth=10,
+            num_pending_actors=2,
+        )
+        s_b = _make_state(
+            stage_name="s-b",
+            num_used_slots=4,
+            num_empty_slots=0,
+            input_queue_depth=0,
+            num_pending_actors=0,
+        )
         ps = data_structures.ProblemState([s_a, s_b])
-        signals = [(s.num_used_slots, s.num_empty_slots, s.input_queue_depth) for s in ps.rust.stages]
-        assert signals == [(1, 1, 10), (4, 0, 0)]
+        signals = [
+            (s.num_used_slots, s.num_empty_slots, s.input_queue_depth, s.num_pending_actors) for s in ps.rust.stages
+        ]
+        assert signals == [(1, 1, 10, 2), (4, 0, 0, 0)]

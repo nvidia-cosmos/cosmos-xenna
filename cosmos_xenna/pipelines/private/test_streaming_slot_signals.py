@@ -47,6 +47,7 @@ class _FakeActorPool:
     num_used_slots: int
     num_empty_slots: int
     num_queued_tasks: int
+    num_pending_actors: int = 0
     worker_group_used_slots: dict[str, int] = attrs.Factory(dict)
 
     def worker_group_num_used_slots(self) -> dict[str, int]:
@@ -119,7 +120,14 @@ def _real_actor_pool(
     queued_tasks: int = 0,
     worker_groups: dict[str, set[str]] | None = None,
 ) -> actor_pool.ActorPool[object, object]:
-    """Build an ``ActorPool`` shell with real slot-count properties."""
+    """Build an ``ActorPool`` shell with real slot-count properties.
+
+    The shell mirrors every actor-set attribute the production
+    ``ActorPool`` properties read; ``num_pending_actors`` aggregates
+    across ``_pending_actors``, ``_pending_node_actors`` and
+    ``_actors_waiting_for_node_setup`` so each container must exist
+    even when the test only exercises the ready-actor path.
+    """
     pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
     pool._name = name
     pool._slots_per_actor = slots_per_actor
@@ -128,6 +136,8 @@ def _real_actor_pool(
         for actor_id, used_slots, empty_slots in ready_slots
     }
     pool._pending_actors = cast(Any, collections.OrderedDict({"pending": object()}))
+    pool._pending_node_actors = cast(Any, collections.OrderedDict())
+    pool._actors_waiting_for_node_setup = cast(Any, {})
     pool._task_queue = cast(Any, collections.deque(object() for _ in range(queued_tasks)))
     pool._worker_groups = {
         worker_group_id: actor_pool._WorkerGroup(
@@ -644,6 +654,7 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
             num_used_slots = 99
             num_empty_slots = 1
             num_queued_tasks = 0
+            num_pending_actors = 0
 
             def worker_group_num_used_slots(self) -> dict[str, int]:
                 return {"active-w0": 3, "active-w1": 0}
@@ -670,6 +681,7 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
             num_used_slots = 5
             num_empty_slots = 3
             num_queued_tasks = 0
+            num_pending_actors = 0
 
             def worker_group_num_used_slots(self) -> dict[str, int]:
                 return {"ingest-w0": 2}
@@ -766,6 +778,7 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
             num_used_slots = 0
             num_empty_slots = 1
             num_queued_tasks = 0
+            num_pending_actors = 0
 
             def worker_group_num_used_slots(self) -> dict[str, int]:
                 msg = "transient pool failure"

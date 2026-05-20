@@ -121,6 +121,24 @@ class SaturationAwareScheduler:
         _worker_ages: Cross-cycle worker age snapshot keyed by worker
             id. Seeded into each planner context so manual shrink and
             floor donor fallback can prefer younger workers.
+        _worker_ready_first_seen_at: Per-worker wall-clock timestamp
+            of the first cycle in which the worker was observed in
+            ``ProblemStageState.worker_groups`` (i.e. when the actor
+            pool reported it as READY). Distinct from
+            ``_worker_ages``: ``_worker_ages`` measures "cycles since
+            planner add" and starts ticking the moment a fresh
+            placement is staged, so a stage with a multi-minute model
+            load already has a non-zero ``_worker_ages`` for the
+            actor that has not yet finished ``stage_setup``.
+            ``_worker_ready_first_seen_at`` only starts the clock
+            once the actor reaches READY and contributes to slot
+            signals, which is what the warmup grace mechanisms
+            (per-worker measurement grace, donor warmup grace) need
+            to suppress noise from freshly-warmed actors. Mutated
+            each cycle by ``_refresh_worker_ready_first_seen`` from
+            the live ``problem_state.rust.stages[*].worker_groups``
+            snapshot; workers no longer observed are dropped so the
+            map mirrors live READY state.
         _last_intent_deltas: Per-stage signed worker-count intent
             produced by the per-stage decision pipeline on the most
             recent ``autoscale()`` call. Saturation-driven scale-up
@@ -231,6 +249,24 @@ class SaturationAwareScheduler:
             self._stage_spec_overrides = types.MappingProxyType(dict(stage_spec_overrides))
         self._regime_state: RegimeDetectorState = RegimeDetectorState()
         self._worker_ages: dict[str, int] = {}
+        # Wall-clock first-seen timestamps are tracked separately from planner
+        # ages because the warmup grace mechanisms need a clock that starts at
+        # READY transition, not at planner add. A stage with a 10-minute model
+        # load has its planner-age already at ~60 cycles by the time the actor
+        # is ready; the donor and measurement graces would be silently
+        # bypassed if they consumed planner ages. Storing wall-clock
+        # timestamps (instead of incrementing cycle counts) lets the grace
+        # comparison be a direct seconds-vs-seconds check and stays correct
+        # even if the autoscale interval drifts (catch-up cycles, planner
+        # stalls, or any operator-driven mid-run interval change).
+        self._worker_ready_first_seen_at: dict[str, float] = {}
+        # Per-cycle cache of the donor warmup excluded set. Populated at the
+        # top of autoscale() from _build_donor_warmup_excluded_ids; consumed
+        # by the saturation-mode cross-stage donor and Phase D shrink to skip
+        # workers younger than donor_warmup_grace_s. Lives on the instance
+        # rather than threading it through every call so all consumers see a
+        # single consistent snapshot for the cycle.
+        self._donor_warmup_excluded_ids: frozenset[str] = frozenset()
         self._last_intent_deltas: dict[str, int] = {}
         self._stuck_plan_counters: dict[str, int] = {}
         self._floor_stuck_counters: dict[str, int] = {}
@@ -273,6 +309,8 @@ class SaturationAwareScheduler:
         self._stage_states = {name: _StageRuntimeState(stage_name=name) for name in self._stage_names}
         self._regime_state = RegimeDetectorState()
         self._worker_ages = {}
+        self._worker_ready_first_seen_at = {}
+        self._donor_warmup_excluded_ids = frozenset()
         self._floor_stuck_counters = {}
         self._last_intent_deltas = {}
         self._stuck_plan_counters = {}
@@ -431,7 +469,14 @@ class SaturationAwareScheduler:
         """Compute the autoscale plan for the current cycle.
 
         Args:
-            time: Current wall-clock time in seconds.
+            time: Current wall-clock time in seconds. Threaded
+                through the per-worker measurement grace and donor
+                warmup grace helpers as the elapsed-time reference
+                so a worker's "ready age" is real seconds since its
+                first observation in ``worker_groups``, not an
+                approximation derived from the cycle counter (which
+                drifts when cycles are uneven, e.g. during
+                catch-up loops or planner stalls).
             problem_state: Current per-stage runtime snapshot.
 
         Returns:
@@ -455,7 +500,6 @@ class SaturationAwareScheduler:
                 stage names or count.
 
         """
-        del time
         if self._problem is None:
             msg = "SaturationAwareScheduler.autoscale() called before setup()"
             raise RuntimeError(msg)
@@ -463,6 +507,11 @@ class SaturationAwareScheduler:
         self._check_problem_state_shape_before_phase_a(problem_state)
         self._cycle_counter += 1
         self._donations_received_this_cycle = {}
+        # Refresh ready first-seen timestamps from this cycle's snapshot before
+        # any phase reads them. The per-worker measurement grace consumes them
+        # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
+        # cross-stage donor consult the resulting warmup-grace excluded set.
+        self._refresh_worker_ready_first_seen(problem_state, now=time)
         # Snapshot the stuck-plan counters before Phase C mutates them so the
         # post-Phase-D monotonicity check can compare prev vs. curr without an
         # in-flight Phase C state.
@@ -474,6 +523,16 @@ class SaturationAwareScheduler:
             problem_state,
             worker_ages=self._next_cycle_worker_ages(),
         )
+        # Cache the per-cycle donor warmup excluded set after the planner
+        # context is built so worker_ids_by_stage() reflects the post-Phase-A
+        # placement. Saturation-mode cross-stage donor selection and Phase D
+        # shrink consume the cached set; floor donor selection bypasses it
+        # because the floor is a hard structural requirement (see
+        # _build_donor_warmup_excluded_ids docstring).
+        self._donor_warmup_excluded_ids = self._build_donor_warmup_excluded_ids(
+            ctx.worker_ids_by_stage(),
+            now=time,
+        )
         self._run_phase_a_delete(ctx, problem_state)
         self._run_phase_a_grow(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
@@ -481,7 +540,7 @@ class SaturationAwareScheduler:
         self._run_phase_b_floor(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
-        self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state)
+        self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
         self._run_phase_c_grow(ctx, problem_state)
         check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
         check_no_nan_in_classifier_state(
@@ -554,10 +613,185 @@ class SaturationAwareScheduler:
         worker_ages = ctx.worker_ages()
         self._worker_ages = {worker_id: worker_ages.get(worker_id, 0) for worker_id in live_worker_ids}
 
+    def _refresh_worker_ready_first_seen(
+        self,
+        problem_state: data_structures.ProblemState,
+        now: float,
+    ) -> None:
+        """Update per-worker ready first-seen timestamps from this cycle's snapshot.
+
+        For every worker observed in
+        ``problem_state.rust.stages[*].worker_groups`` (workers the
+        actor pool reports as READY), records ``now`` as the
+        first-seen timestamp on first observation and carries an
+        existing timestamp forward on subsequent cycles. Workers
+        absent from the snapshot are dropped because their pool
+        actor was lost between cycles, so any prior timestamp no
+        longer corresponds to live measurement state.
+
+        ::
+
+           prev_seen = self._worker_ready_first_seen_at.get(wid)
+           new map:
+             wid first observed: prev_seen is None -> store now
+             wid carried forward: prev_seen is set -> keep it
+             wid disappeared:                       -> not added
+
+        Drives the warmup grace mechanisms downstream:
+
+          * :meth:`_aggregate_slot_signals_excluding_warmup` excludes
+            workers younger than ``worker_warmup_measurement_grace_s``
+            from EWMA contribution.
+          * Phase D shrink and saturation-mode cross-stage donor
+            selection exclude workers younger than
+            ``donor_warmup_grace_s`` from victim / donor candidate
+            pools.
+
+        Args:
+            problem_state: The cycle's runtime snapshot. Read-only.
+            now: Wall-clock time at the top of the autoscale cycle,
+                as passed to :meth:`autoscale`. New READY workers get
+                this value as their first-seen timestamp.
+
+        """
+        new_seen: dict[str, float] = {}
+        for stage in problem_state.rust.stages:
+            for worker_group in stage.worker_groups:
+                new_seen[worker_group.id] = self._worker_ready_first_seen_at.get(worker_group.id, now)
+        self._worker_ready_first_seen_at = new_seen
+
+    def _aggregate_slot_signals_excluding_warmup(
+        self,
+        runtime_stage: rust_data_structures.ProblemStageState,
+        stage_cfg: SaturationAwareStageConfig,
+        now: float,
+    ) -> tuple[int, int]:
+        """Re-aggregate per-worker slot signals, dropping workers in the warmup grace window.
+
+        Cold-start readings from a freshly-ready worker pull the
+        slots-empty ratio toward 1.0 because the dispatcher takes
+        several cycles to fill the new actor's queue. EWMA-smoothing
+        these readings drags the running average toward
+        "over-provisioned" and risks a false Phase D shrink one cycle
+        after a Phase B / Phase C grow. Excluding workers whose ready
+        age (``now - first_seen_at``) is below
+        ``worker_warmup_measurement_grace_s`` lets the EWMA see only
+        steady-state samples from mature actors.
+
+        ``input_queue_depth`` is a stage-level signal (not per-worker)
+        and is therefore left untouched; the caller continues to read
+        it directly from ``runtime_stage``.
+
+        ::
+
+           filter loop (per worker_group wg in stage):
+             first_seen = self._worker_ready_first_seen_at.get(wg.id)
+             if first_seen is None or (now - first_seen) < grace_s:
+                 skip (warmup)
+             else:
+               mature_used  += wg.num_used_slots
+               mature_empty += slots_per_worker - wg.num_used_slots
+
+           all-warmup case (no mature workers): return (0, 0)
+                       -> _resolve_classifier_signal observes
+                          total_slots == 0 and carries forward the
+                          last valid EWMA, holding the classifier
+                          state constant until a worker matures.
+
+        For non-SPMD stages each ``ProblemWorkerGroupState``
+        corresponds to a single actor; ``num_used_slots`` is that
+        actor's used-slot count and ``slots_per_worker - num_used_slots``
+        is its empty-slot count. SPMD stages pack multiple actors into
+        one worker_group and share a first-seen timestamp, so the
+        filter still operates at the right granularity (every actor
+        in the group reached READY in the same cycle).
+
+        Args:
+            runtime_stage: The Rust ``ProblemStageState`` for the
+                stage being filtered.
+            stage_cfg: The stage's effective config; carries
+                ``worker_warmup_measurement_grace_s``.
+            now: Wall-clock time at the top of the autoscale cycle.
+                Compared against each worker's first-seen timestamp
+                to compute its ready age in seconds.
+
+        Returns:
+            ``(num_used_slots, num_empty_slots)`` after excluding
+            warmup workers. When the configured grace is non-positive
+            or the stage has no ``worker_groups`` to filter, returns
+            the unfiltered totals from ``runtime_stage`` so existing
+            behaviour is preserved.
+
+        """
+        grace_s = stage_cfg.worker_warmup_measurement_grace_s
+        if grace_s <= 0 or not runtime_stage.worker_groups:
+            return runtime_stage.num_used_slots, runtime_stage.num_empty_slots
+        slots_per_worker = runtime_stage.slots_per_worker
+        mature_used = 0
+        mature_empty = 0
+        for worker_group in runtime_stage.worker_groups:
+            first_seen = self._worker_ready_first_seen_at.get(worker_group.id)
+            if first_seen is None or (now - first_seen) < grace_s:
+                continue
+            used = worker_group.num_used_slots
+            mature_used += used
+            mature_empty += max(0, slots_per_worker - used)
+        return mature_used, mature_empty
+
+    def _build_donor_warmup_excluded_ids(
+        self,
+        worker_ids_by_stage: list[list[str]],
+        now: float,
+    ) -> frozenset[str]:
+        """Build the set of worker ids in donor warmup grace, indexed across all stages.
+
+        Each stage contributes ids of workers whose ready age
+        (``now - first_seen_at``) is below the stage's effective
+        ``donor_warmup_grace_s``. Used by Phase D shrink (filters
+        victim candidates) and the saturation-mode cross-stage donor
+        (filters donor candidates) to leave freshly-warmed workers
+        alone for at least one full warmup horizon. Floor donor
+        selection (``select_youngest_eligible_donor``) does NOT
+        consult this set because the floor is a hard structural
+        requirement; deadlocking on warmup-protected donors is worse
+        than killing a young donor.
+
+        Args:
+            worker_ids_by_stage: Per-stage live worker ids in problem
+                order. Built from the planner's
+                ``ctx.worker_ids_by_stage()``.
+            now: Wall-clock time at the top of the autoscale cycle.
+
+        Returns:
+            A frozen set of worker ids. Empty when every stage's
+            grace is configured to ``0`` or when no observed worker
+            falls within its stage's grace window. A worker that is
+            in ``worker_ids_by_stage`` but not in
+            ``_worker_ready_first_seen_at`` is treated as warmup
+            (defensive: it has not been observed in ``worker_groups``
+            yet, so any prior knowledge of when it became READY is
+            unavailable).
+
+        """
+        excluded: set[str] = set()
+        for stage_index, worker_ids in enumerate(worker_ids_by_stage):
+            stage_name = self._stage_names[stage_index]
+            stage_cfg = self._stage_cfg(stage_name)
+            grace_s = stage_cfg.donor_warmup_grace_s
+            if grace_s <= 0:
+                continue
+            for worker_id in worker_ids:
+                first_seen = self._worker_ready_first_seen_at.get(worker_id)
+                if first_seen is None or (now - first_seen) < grace_s:
+                    excluded.add(worker_id)
+        return frozenset(excluded)
+
     def _compute_intent_deltas(
         self,
         ctx: data_structures.AutoscalePlanContext,
         problem_state: data_structures.ProblemState,
+        *,
+        now: float,
     ) -> dict[str, int]:
         """Compute the per-stage signed worker-count intent for this cycle.
 
@@ -571,6 +805,45 @@ class SaturationAwareScheduler:
         yet seen a sustained recommendation in the same direction;
         the returned delta is therefore the post-stabilization-gate
         intent that Phase C / Phase D must execute.
+
+        Per-worker measurement grace (gated by
+        :attr:`SaturationAwareStageConfig.worker_warmup_measurement_grace_s`)
+        re-aggregates the slot signals before the EWMA absorbs them:
+        workers whose ready-age is below the configured grace are
+        excluded from ``num_used_slots`` and ``num_empty_slots`` so a
+        freshly-ready actor cannot drag the steady-state ratio toward
+        "over-provisioned" while the dispatcher is still racing to
+        fill its queue. ``input_queue_depth`` is unfiltered because
+        it is a stage-level signal. When every observed worker is
+        in warmup, the filter returns ``(0, 0)`` and
+        ``_resolve_classifier_signal`` carries forward the last valid
+        EWMA, holding the classifier state until at least one worker
+        matures.
+
+        Setup-phase quiescence (gated by
+        :attr:`SaturationAwareStageConfig.setup_phase_quiescence_enabled`)
+        intercepts two distinct half-initialised states before they
+        feed the classifier or Phase C scale-up:
+
+          1. **Cold-start** (``pending > 0`` and ``ready == 0``):
+             every slot signal is zero by construction (no actor has
+             ever processed a task), so the classifier would emit
+             arbitrary noise. The pipeline is skipped entirely; the
+             stage's recommendation history and runtime state are
+             left untouched, and the intent map carries no entry.
+             Phase C and Phase D both no-op for the stage this cycle
+             via their ``intents.get(stage_name, 0)`` fallback.
+          2. **Hot-pending** (``pending > 0`` and ``ready > 0``):
+             ready actors are producing valid signal, so the
+             classifier and the stabilization gate continue to run
+             on real measurements. A positive intent (Phase C
+             scale-up) is suppressed because adding another worker
+             while a prior add has not finished setup would amplify
+             cold-start noise and risk over-provisioning once the
+             pending actor lands. Negative intents (Phase D
+             scale-down) are preserved -- they only act on ready
+             actors, and the still-pending actor's lifecycle is
+             unaffected.
 
         The intent values are exposed via :attr:`_last_intent_deltas`
         for tests and observability. Saturation-driven scale-up
@@ -589,13 +862,19 @@ class SaturationAwareScheduler:
                 pipeline observes the post-Phase-B worker count.
             problem_state: The cycle's runtime snapshot. Provides the
                 three slot signals (``num_used_slots``,
-                ``num_empty_slots``, ``input_queue_depth``) populated
-                in the streaming layer.
+                ``num_empty_slots``, ``input_queue_depth``) and the
+                ``num_pending_actors`` quiescence signal populated in
+                the streaming layer.
+            now: Wall-clock time at the top of the autoscale cycle,
+                threaded into the per-worker measurement grace
+                helper for elapsed-time comparisons against each
+                worker's first-seen-READY timestamp.
 
         Returns:
             Mapping of stage name -> signed intent. Positive values
             indicate scale-up intent, negative values scale-down,
-            zero a no-op. Finished stages are absent.
+            zero a no-op. Finished stages and cold-start-quiescent
+            stages are absent.
         """
         intents: dict[str, int] = {}
         worker_ids_by_stage = ctx.worker_ids_by_stage()
@@ -613,20 +892,66 @@ class SaturationAwareScheduler:
                 raise ValueError(msg)
             stage_cfg = self._stage_cfg(stage_name)
             current_workers = len(worker_ids_by_stage[stage_index])
+            pending_actors = runtime_stage.num_pending_actors
+            # The quiescence check evaluates the snapshot's ready count
+            # (workers visible to the actor pool at observation time), not
+            # the post-Phase-B planner count. Phase B's floor enforcement
+            # may have staged a fresh add for this same cycle, but that
+            # add is not yet visible to the streaming snapshot's slot
+            # signals - the per-worker measurements still come from the
+            # ready actors that existed at observation time, of which
+            # there are zero in the cold-start case.
+            ready_at_snapshot = len(runtime_stage.worker_groups)
+            quiescence_active = stage_cfg.setup_phase_quiescence_enabled and pending_actors > 0
+            if quiescence_active and ready_at_snapshot == 0:
+                # Cold-start: zero ready actors means every slot signal is
+                # an artifact of the empty pool, not a real measurement.
+                # Recording it would corrupt the classifier streak and the
+                # stabilization-window history; better to wait until at
+                # least one actor reaches ready and the signal is real.
+                logger.debug(
+                    f"saturation-aware: stage {stage_name!r} cold-start quiescent "
+                    f"(pending={pending_actors}, ready=0); skipping intent pipeline."
+                )
+                continue
             # The stabilization-window buffer is allocated alongside the
             # runtime state in ``setup()``; a missing entry would mean the
             # ``problem`` -> ``problem_state`` shape contract above somehow
             # admitted a stage the runtime state map already rejected.
             history = self._recommendation_histories[stage_name]
+            # Per-worker measurement grace: drop slot-signal contributions
+            # from workers younger than ``worker_warmup_measurement_grace_s``
+            # so the EWMA does not absorb cold-start noise from freshly-ready
+            # actors. ``input_queue_depth`` is a stage-level signal (not
+            # per-worker) and is therefore left unfiltered.
+            num_used_slots, num_empty_slots = self._aggregate_slot_signals_excluding_warmup(
+                runtime_stage=runtime_stage,
+                stage_cfg=stage_cfg,
+                now=now,
+            )
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
-                num_used_slots=runtime_stage.num_used_slots,
-                num_empty_slots=runtime_stage.num_empty_slots,
+                num_used_slots=num_used_slots,
+                num_empty_slots=num_empty_slots,
                 input_queue_depth=runtime_stage.input_queue_depth,
                 current_workers=current_workers,
                 config=stage_cfg,
                 recommendation_history=history,
             )
+            if quiescence_active and delta > 0:
+                # Hot-pending: ready actors observe real saturation, but a
+                # prior scale-up has not finished setup yet. Suppress the
+                # additional Phase C add to avoid amplifying cold-start
+                # noise; the next cycle re-evaluates with the new ready
+                # count. Phase D shrink (delta < 0) is left untouched
+                # because the still-pending actor is independent of any
+                # ready-actor removal Phase D might perform.
+                logger.debug(
+                    f"saturation-aware: stage {stage_name!r} hot-pending quiescent "
+                    f"(pending={pending_actors}, ready={ready_at_snapshot}); "
+                    f"clamping Phase C intent +{delta} -> 0."
+                )
+                delta = 0
             intents[stage_name] = delta
         return intents
 
@@ -817,6 +1142,7 @@ class SaturationAwareScheduler:
             cycle=self._cycle_counter,
             last_donation_cycle=self._last_donation_cycle,
             donations_received_this_cycle=self._donations_received_this_cycle,
+            excluded_worker_ids=self._donor_warmup_excluded_ids,
         )
         if donor is None:
             return None
@@ -1003,6 +1329,7 @@ class SaturationAwareScheduler:
                 delete_count=actual_remove,
                 worker_used_slots=worker_used_slots,
                 worker_host_gpu_used_fractions=worker_host_gpu_used_fractions,
+                excluded_worker_ids=self._donor_warmup_excluded_ids,
             )
             for victim_id in victims:
                 if not ctx.try_remove_worker(stage_index, victim_id):

@@ -66,6 +66,7 @@ def select_workers_to_remove_oldest_first(
     delete_count: int,
     worker_used_slots: dict[str, int] | None = None,
     worker_host_gpu_used_fractions: dict[str, float] | None = None,
+    excluded_worker_ids: frozenset[str] | None = None,
 ) -> list[str]:
     """Pick ``delete_count`` workers to delete using the consolidation-first sort.
 
@@ -90,6 +91,15 @@ def select_workers_to_remove_oldest_first(
         ``(idle, age, worker_id)`` ordering. This matches the
         behavior expected by CPU-only stages (no GPU footprint
         means consolidation is irrelevant).
+      - Workers in ``excluded_worker_ids`` are dropped from the
+        candidate pool before the sort; the donor warmup grace
+        protects freshly-warmed actors from being shrunk in the
+        same cycle they reached READY (the dispatcher has not yet
+        had time to fill their queues, so their idle reading is
+        unreliable). When ``excluded_worker_ids`` is omitted or
+        empty no filtering is applied. If the entire stage falls
+        inside the excluded set the helper returns ``[]`` and the
+        caller leaves the stage untouched for the cycle.
 
     Args:
         worker_ids: Worker ids in the stage's current snapshot.
@@ -107,16 +117,23 @@ def select_workers_to_remove_oldest_first(
             workers this is the maximum across the worker's GPU
             allocations (the GPU least likely to become fully
             unallocated dominates).
+        excluded_worker_ids: Optional set of worker ids to drop
+            from the candidate pool before sorting. The
+            saturation-aware scheduler builds this set every cycle
+            from the donor warmup grace and passes it in; non-grace
+            callers omit it.
 
     Returns:
         The first ``delete_count`` worker ids of the
-        consolidation-first ordering.
+        consolidation-first ordering, with workers in
+        ``excluded_worker_ids`` filtered out.
 
     """
     if delete_count <= 0:
         return []
     used_slots = worker_used_slots or {}
     gpu_fractions = worker_host_gpu_used_fractions or {}
+    excluded = excluded_worker_ids or frozenset()
     for worker_id, fraction in gpu_fractions.items():
         if math.isfinite(fraction) and fraction >= 0.0:
             continue
@@ -131,6 +148,7 @@ def select_workers_to_remove_oldest_first(
                 wid,
             )
             for wid in worker_ids
+            if wid not in excluded
         ),
         key=lambda quad: (quad[0], quad[1], -quad[2], quad[3]),
     )

@@ -190,6 +190,11 @@ impl ProblemWorkerGroupState {
 ///   gives the total in-stage slot capacity at sample time. Defaults to 0.
 /// * `input_queue_depth` - Number of pre-batch tasks queued upstream of this
 ///   stage at sample time. Defaults to 0.
+/// * `num_pending_actors` - Number of actors currently in setup phases (not
+///   yet ready to process tasks). Defaults to 0; the saturation-aware
+///   scheduler combines this with `worker_groups.len()` (the ready-actor
+///   count) to detect the setup-phase quiescence condition described by the
+///   `setup_phase_quiescence_enabled` configuration field.
 #[pyclass(get_all, set_all)]
 #[derive(Debug, Clone, Default)]
 pub struct ProblemStageState {
@@ -200,6 +205,7 @@ pub struct ProblemStageState {
     pub num_used_slots: usize,
     pub num_empty_slots: usize,
     pub input_queue_depth: usize,
+    pub num_pending_actors: usize,
 }
 
 #[pymethods]
@@ -207,7 +213,8 @@ impl ProblemStageState {
     /// Construct a `ProblemStageState`.
     ///
     /// The slot-signal fields (`num_used_slots`, `num_empty_slots`,
-    /// `input_queue_depth`) are optional keyword arguments defaulting to 0
+    /// `input_queue_depth`) and the setup-phase quiescence signal
+    /// (`num_pending_actors`) are optional keyword arguments defaulting to 0
     /// so existing call sites that built `ProblemStageState` from four
     /// positional arguments continue to compile unchanged.
     #[new]
@@ -219,6 +226,7 @@ impl ProblemStageState {
         num_used_slots = 0,
         num_empty_slots = 0,
         input_queue_depth = 0,
+        num_pending_actors = 0,
     ))]
     pub fn py_new(
         stage_name: String,
@@ -228,6 +236,7 @@ impl ProblemStageState {
         num_used_slots: usize,
         num_empty_slots: usize,
         input_queue_depth: usize,
+        num_pending_actors: usize,
     ) -> Self {
         Self {
             stage_name,
@@ -237,6 +246,7 @@ impl ProblemStageState {
             num_used_slots,
             num_empty_slots,
             input_queue_depth,
+            num_pending_actors,
         }
     }
 

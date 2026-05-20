@@ -37,6 +37,24 @@ from cosmos_xenna.pipelines.private.streaming import Autoscaler
 from cosmos_xenna.ray_utils import actor_pool
 
 
+def _test_stage_config(**overrides: object) -> SaturationAwareStageConfig:
+    """Build a :class:`SaturationAwareStageConfig` with both warmup graces disabled.
+
+    Phase D fixtures focus on shrink victim selection, floor and
+    fraction caps, and the consolidation-first sort. None of those
+    contracts are about the donor warmup grace, so this helper
+    pins both grace fields to ``0.0`` and forwards every other
+    setting through. The dedicated warmup-grace tests live in
+    ``test_worker_warmup_grace.py`` and
+    ``test_donor_warmup_grace.py``.
+    """
+    return SaturationAwareStageConfig(
+        worker_warmup_measurement_grace_s=0.0,
+        donor_warmup_grace_s=0.0,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
 @pytest.fixture
 def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
     """Bridge loguru records into pytest's stdlib-based ``caplog`` fixture.
@@ -121,7 +139,7 @@ def _problem(
     if cfg is None:
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -176,7 +194,7 @@ def _gpu_problem(
     if cfg is None:
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -354,7 +372,15 @@ class _FakeAllocator:
 
 
 def _real_actor_pool_for_phase_d() -> actor_pool.ActorPool[object, object]:
-    """Build an ``ActorPool`` shell whose per-worker signal differentiates workers."""
+    """Build an ``ActorPool`` shell whose per-worker signal differentiates workers.
+
+    The shell mirrors the production ``ActorPool`` shape that the streaming
+    snapshot reads: every actor-set attribute the production
+    ``num_pending_actors`` and ``num_used_slots`` properties touch must
+    exist, otherwise ``_make_problem_state`` raises ``AttributeError``
+    against ``ActorPool.__new__`` shells. The test only exercises ready
+    actors, so every pending-side container is empty.
+    """
     pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
     pool._name = "A"
     pool._slots_per_actor = 1
@@ -364,6 +390,8 @@ def _real_actor_pool_for_phase_d() -> actor_pool.ActorPool[object, object]:
         "actor-idle-c": _ready_actor(used_slots=0, empty_slots=1),
     }
     pool._pending_actors = cast(Any, collections.OrderedDict())
+    pool._pending_node_actors = cast(Any, collections.OrderedDict())
+    pool._actors_waiting_for_node_setup = cast(Any, {})
     pool._task_queue = cast(Any, collections.deque())
     pool._worker_groups = {
         "busy-A": actor_pool._WorkerGroup(
@@ -432,7 +460,7 @@ class TestPhaseDScaleDownContract:
         """Scale-down never deletes below the configured stage floor."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=3,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -448,7 +476,7 @@ class TestPhaseDScaleDownContract:
         """Scale-down respects ``min_workers_per_node * num_nodes``."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 min_workers_per_node=2,
                 max_scale_down_fraction_per_cycle=1.0,
@@ -640,7 +668,7 @@ class TestPhaseDScaleDownContract:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -659,7 +687,7 @@ class TestPhaseDScaleDownContract:
         """Boundary: one above floor clamps and surfaces ``deficit=1`` in the INFO log."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -679,7 +707,7 @@ class TestPhaseDScaleDownContract:
         """Shrink is a no-op when ``current == floor`` regardless of intent magnitude."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -723,12 +751,12 @@ class TestPhaseDScaleDownContract:
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
             per_stage_overrides={
-                "A": SaturationAwareStageConfig(
+                "A": _test_stage_config(
                     min_workers=2,
                     max_scale_down_fraction_per_cycle=1.0,
                 ),
             },
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -750,7 +778,7 @@ class TestPhaseDScaleDownContract:
         """A negative intent of ``-sys.maxsize`` floor-clamps without infinite loop."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -801,7 +829,7 @@ class TestPhaseDPerCycleFractionClamp:
         """100-worker stage with ``fraction=0.05`` and ``intent=-50`` deletes only 5."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=0.05,
             ),
@@ -823,7 +851,7 @@ class TestPhaseDPerCycleFractionClamp:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=0.05,
             ),
@@ -839,7 +867,7 @@ class TestPhaseDPerCycleFractionClamp:
         """When the floor cap is the tighter constraint, it binds; fraction cap is non-binding."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=4,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -860,7 +888,7 @@ class TestPhaseDPerCycleFractionClamp:
         """Operators see a fraction-specific INFO log when the fraction cap binds, not the floor log."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=0.10,
             ),
@@ -883,7 +911,7 @@ class TestPhaseDPerCycleFractionClamp:
         """When ``|intent|`` is smaller than both caps, no clamp binds; intent passes through."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -906,7 +934,7 @@ class TestPhaseDMultiCycleStability:
         """After a stage hits its floor, repeated negative intent is a clean no-op."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
@@ -1256,7 +1284,7 @@ class TestPhaseDConsolidationEdgeCases:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=2,
                 max_scale_down_fraction_per_cycle=1.0,
             ),

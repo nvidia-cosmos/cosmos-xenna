@@ -36,6 +36,23 @@ from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
+
+def _test_stage_config(**overrides: object) -> SaturationAwareStageConfig:
+    """Build a :class:`SaturationAwareStageConfig` with both warmup graces disabled.
+
+    Cap tests focus on hard-cap clamps and the floor / ceiling
+    sandwich, all orthogonal to the donor warmup grace. Pinning
+    both grace fields to ``0.0`` keeps Phase D shrink and the
+    saturation-mode donor unfiltered so the cap clamps remain the
+    single binding constraint under test.
+    """
+    return SaturationAwareStageConfig(
+        worker_warmup_measurement_grace_s=0.0,
+        donor_warmup_grace_s=0.0,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
 # Type aliases that document the factory-fixture call shapes.
 SchedulerFactory = Callable[..., tuple[SaturationAwareScheduler, data_structures.Problem]]
 ProblemStateFactory = Callable[..., data_structures.ProblemState]
@@ -71,7 +88,7 @@ def _make_config(
     """Build a default config with optional cap and floor configuration."""
     return SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
-        stage_defaults=SaturationAwareStageConfig(
+        stage_defaults=_test_stage_config(
             min_workers=min_workers,
             min_workers_per_node=min_workers_per_node,
             max_workers=max_workers,
@@ -260,13 +277,13 @@ class TestComputeStageCeilings:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(max_workers=10),
-            per_stage_overrides={"A": SaturationAwareStageConfig(max_workers=8)},
+            stage_defaults=_test_stage_config(max_workers=10),
+            per_stage_overrides={"A": _test_stage_config(max_workers=8)},
         )
         scheduler, _ = make_scheduler(
             [("A", None)],
             cfg=cfg,
-            stage_spec_overrides={"A": SaturationAwareStageConfig(max_workers=2)},
+            stage_spec_overrides={"A": _test_stage_config(max_workers=2)},
         )
 
         ceilings = scheduler._compute_stage_ceilings(num_nodes=1)
@@ -288,14 +305,14 @@ class TestComputeStageCeilings:
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
             cross_stage_donor_anti_flap_cycles=3,
-            stage_defaults=SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3),
+            stage_defaults=_test_stage_config(over_provisioned_streak_min_cycles=3),
         )
 
         with pytest.raises(ValueError, match=r"cross_stage_donor_anti_flap_cycles \(3\).*4"):
             make_scheduler(
                 [("A", None)],
                 cfg=cfg,
-                stage_spec_overrides={"A": SaturationAwareStageConfig(over_provisioned_streak_min_cycles=4)},
+                stage_spec_overrides={"A": _test_stage_config(over_provisioned_streak_min_cycles=4)},
             )
 
     def test_max_workers_dominates_when_smaller_than_per_node_total(self, make_scheduler: SchedulerFactory) -> None:
@@ -346,16 +363,16 @@ class TestStageSpecOverrideConstructorContract:
         """A non-empty override map is stored as a copy, not by reference."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(),
+            stage_defaults=_test_stage_config(),
         )
-        overrides = {"A": SaturationAwareStageConfig(max_workers=2)}
+        overrides = {"A": _test_stage_config(max_workers=2)}
 
         scheduler = SaturationAwareScheduler(cfg, stage_spec_overrides=overrides)
 
         assert scheduler._stage_spec_overrides == overrides
         # Mutating the caller's map after construction must not leak
         # into the scheduler; the constructor copies via ``dict(...)``.
-        overrides["A"] = SaturationAwareStageConfig(max_workers=99)
+        overrides["A"] = _test_stage_config(max_workers=99)
         assert scheduler._stage_spec_overrides["A"].max_workers == 2
 
     def test_stored_overrides_reject_post_construction_mutation(self) -> None:
@@ -371,19 +388,19 @@ class TestStageSpecOverrideConstructorContract:
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(),
+            stage_defaults=_test_stage_config(),
         )
 
         scheduler_with_overrides = SaturationAwareScheduler(
             cfg,
-            stage_spec_overrides={"A": SaturationAwareStageConfig(max_workers=2)},
+            stage_spec_overrides={"A": _test_stage_config(max_workers=2)},
         )
         scheduler_empty = SaturationAwareScheduler(cfg)
 
         with pytest.raises(TypeError):
-            scheduler_with_overrides._stage_spec_overrides["A"] = SaturationAwareStageConfig(max_workers=99)  # type: ignore[index]
+            scheduler_with_overrides._stage_spec_overrides["A"] = _test_stage_config(max_workers=99)  # type: ignore[index]
         with pytest.raises(TypeError):
-            scheduler_empty._stage_spec_overrides["A"] = SaturationAwareStageConfig(max_workers=99)  # type: ignore[index]
+            scheduler_empty._stage_spec_overrides["A"] = _test_stage_config(max_workers=99)  # type: ignore[index]
 
 
 class TestPhaseCCapClamp:
@@ -589,13 +606,13 @@ class TestPhaseCCapClamp:
         """Each stage's cap is resolved independently of other stages."""
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
-            stage_defaults=SaturationAwareStageConfig(
+            stage_defaults=_test_stage_config(
                 min_workers=1,
                 max_scale_down_fraction_per_cycle=1.0,
             ),
             per_stage_overrides={
-                "A": SaturationAwareStageConfig(min_workers=1, max_workers=2),
-                "B": SaturationAwareStageConfig(min_workers=1, max_workers=6),
+                "A": _test_stage_config(min_workers=1, max_workers=2),
+                "B": _test_stage_config(min_workers=1, max_workers=6),
             },
         )
         scheduler, _ = make_scheduler([("A", None), ("B", None)], cfg=cfg)

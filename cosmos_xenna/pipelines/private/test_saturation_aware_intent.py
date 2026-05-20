@@ -31,6 +31,32 @@ from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
+def _no_warmup_grace_config(**overrides: object) -> SaturationAwareConfig:
+    """Build a ``SaturationAwareConfig`` with both warmup graces disabled.
+
+    These tests focus on intent-shape, classifier convergence, and
+    Phase C orchestration -- mechanisms orthogonal to warmup grace.
+    Disabling ``worker_warmup_measurement_grace_s`` and
+    ``donor_warmup_grace_s`` keeps the legacy "absorb signal
+    immediately" behaviour the tests were originally written
+    against. Tests that exercise warmup behaviour live in
+    ``test_worker_warmup_grace.py`` and configure those fields
+    explicitly.
+
+    Args:
+        **overrides: Optional field overrides forwarded to
+            :class:`SaturationAwareStageConfig`. Used by the few
+            tests that pin a non-default ``min_workers`` etc.
+
+    """
+    stage_defaults = SaturationAwareStageConfig(
+        worker_warmup_measurement_grace_s=0.0,
+        donor_warmup_grace_s=0.0,
+        **overrides,  # type: ignore[arg-type]
+    )
+    return SaturationAwareConfig(stage_defaults=stage_defaults)
+
+
 def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 8) -> resources.ClusterResources:
     """Single-node CPU cluster sufficient for ProblemStage construction."""
     return resources.ClusterResources(
@@ -104,7 +130,7 @@ class TestIntentDictShape:
 
     def test_zero_stage_pipeline_yields_empty_intent_dict(self) -> None:
         """An empty problem produces an empty intent dict, no error."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages([]))
         ps = data_structures.ProblemState([])
 
@@ -114,7 +140,7 @@ class TestIntentDictShape:
 
     def test_all_finished_pipeline_yields_empty_intent_dict(self) -> None:
         """Finished stages do not produce intent entries."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["A", "B"]))
         ps = _problem_state_with_signals(
             [
@@ -129,7 +155,7 @@ class TestIntentDictShape:
 
     def test_mixed_finished_active_pipeline_keys_only_active_stages(self) -> None:
         """Finished stages absent; active stages each get one entry."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["upstream", "draining", "downstream"]))
         ps = _problem_state_with_signals(
             [
@@ -149,7 +175,7 @@ class TestShapeMismatchSurfacesAsInvariantError:
 
     def test_unknown_stage_in_problem_state_raises_scheduler_invariant_error(self) -> None:
         """A stage in ``problem_state`` not present in ``setup()`` fails before Phase A."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_signals([("ghost", 1, 1, 1, 0, 0, False)])
 
@@ -162,7 +188,7 @@ class TestColdStartDoesNotCrash:
 
     def test_zero_slot_stage_produces_intent_zero(self) -> None:
         """Cold-start (no actors) with no prior EWMA returns intent 0; classifier holds."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_signals([("A", 0, 1, 0, 0, 0, False)])
 
@@ -192,7 +218,7 @@ class TestSolutionShapeReflectsIntentAfterPhaseC:
         workers. Pins the integration: classifier output ->
         intent dict -> Phase C planner mutation -> Solution.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         # 8-CPU cluster (default) -> 4 seeded workers + headroom for adds.
         scheduler.setup(_problem_with_stages(["hot"]))
         # 4 workers, 8 slots/worker = 32 slots; 31 used, 1 empty -> ratio ~ 0.03
@@ -217,7 +243,7 @@ class TestMultiCycleClassifierConvergence:
         classifier each cycle and the EWMA tracks the live ratio
         across multiple ``autoscale()`` calls.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["busy"]))
         ps = _problem_state_with_signals([("busy", 4, 8, 30, 2, 10, False)])
 
@@ -232,7 +258,7 @@ class TestMultiCycleClassifierConvergence:
 
     def test_steady_idle_signal_settles_into_over_provisioned_or_starved(self) -> None:
         """A steady-idle signal classifies the stage in the idle zone after enough cycles."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["idle"]))
         # Mostly empty slots and zero queue -> STARVED zone.
         ps = _problem_state_with_signals([("idle", 4, 8, 4, 28, 0, False)])
@@ -249,7 +275,7 @@ class TestIntentDictResetsAcrossCycles:
 
     def test_setup_resets_intent_dict_to_empty(self) -> None:
         """A fresh ``setup()`` clears any prior cycle's intent dict."""
-        cfg = SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1))
+        cfg = _no_warmup_grace_config(min_workers=1)
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem_with_stages(["A"]))
         ps_first = _problem_state_with_signals([("A", 1, 1, 1, 0, 0, False)])
@@ -262,7 +288,7 @@ class TestIntentDictResetsAcrossCycles:
 
     def test_each_cycle_reassigns_the_intent_dict(self) -> None:
         """Successive cycles produce distinct dict instances rather than mutating one in place."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_signals([("A", 1, 1, 1, 0, 0, False)])
         scheduler.autoscale(time=0.0, problem_state=ps)
@@ -281,7 +307,7 @@ class TestScaleHandlesLargePipeline:
         """Each active stage in a large pipeline gets exactly one intent entry."""
         cluster = _cluster(total_cpus_per_node=200)
         stage_names = [f"s{i}" for i in range(100)]
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(stage_names, cluster=cluster))
         ps = _problem_state_with_signals([(name, 1, 1, 0, 1, 0, False) for name in stage_names])
 

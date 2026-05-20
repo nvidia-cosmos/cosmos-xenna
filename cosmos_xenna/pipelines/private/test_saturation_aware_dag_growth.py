@@ -136,7 +136,7 @@ def _autoscale_with_intents(
 ) -> data_structures.Solution:
     """Run autoscale with ``intents`` injected as ``_compute_intent_deltas`` output."""
 
-    def _inject(_ctx: object, _state: object) -> dict[str, int]:
+    def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
         return dict(intents)
 
     with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):

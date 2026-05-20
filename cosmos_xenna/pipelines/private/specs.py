@@ -409,7 +409,7 @@ class SaturationAwareStageConfig:
     3. ``SaturationAwareConfig.stage_defaults`` (cluster-wide default)
 
     Detailed tuning guidance per workload class lives in
-    ``docs/curator/scheduler-tuning.md``.
+    ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
     """
 
     # Minimum cycles with at least one ready actor before the classifier is
@@ -422,7 +422,7 @@ class SaturationAwareStageConfig:
     # canonical balanced QED value. Power users tune this single primary knob;
     # the explicit threshold overrides below stay available for stage-level
     # pinning. Range: [0.10, 0.60]. Tuning guidance lives in
-    # ``docs/curator/scheduler-tuning.md``.
+    # ``cosmos-xenna/docs/scheduler/saturation-aware/08-auto-derived-thresholds.md``.
     saturation_aggressiveness: float = attrs.field(
         default=0.30,
         validator=attrs.validators.and_(attrs.validators.ge(0.10), attrs.validators.le(0.60)),
@@ -565,10 +565,15 @@ class SaturationAwareStageConfig:
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
-    # Reserved for setup-aware scheduling: suspend all decisions for a stage
-    # that has pending actors but no ready actors. Phase 2 does not yet carry
-    # pending/ready actor counts into the scheduler, so this field is
-    # configuration-only until the setup-aware gate lands.
+    # Setup-phase quiescence gate. When True (default) and a stage has any
+    # pending actors at the start of an autoscale cycle, the saturation-aware
+    # scheduler suppresses scale-up decisions for that stage until at least
+    # one of the pending actors becomes ready. Cold-start (pending > 0 and
+    # ready == 0) skips the entire intent pipeline so the classifier streak
+    # and stabilization-window buffer are not polluted by zero-signal cycles;
+    # hot-pending (pending > 0 and ready > 0) clamps positive intents to 0
+    # so Phase C does not pile additional adds on top of an in-flight setup.
+    # Phase D scale-down and Phase B floor are unaffected.
     setup_phase_quiescence_enabled: bool = True
     # Reserved for warmup-aware sampling: per-worker grace window after the
     # worker becomes ready, during which its samples are excluded from
@@ -725,7 +730,7 @@ class SaturationAwareConfig:
     per-stage override registry. Stage-local tunables live on
     ``SaturationAwareStageConfig``; see that class for resolution order.
     Detailed tuning guidance per workload class lives in
-    ``docs/curator/scheduler-tuning.md``.
+    ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
     """
 
     # Cycle period for the autoscaler control loop, in seconds. Effective
