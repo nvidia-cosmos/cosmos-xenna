@@ -566,6 +566,11 @@ class Autoscaler:
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
         self._enable_backlog_guard: bool = mode_specific.enable_backlog_aware_scaledown
+        # Post-Ready grace period. See ``StreamingSpecificSpec`` for
+        # rationale. Pending-actor protection is independent of this
+        # value and always on; the grace only extends protection past
+        # the Pending -> Ready transition.
+        self._scale_down_grace_after_ready_s: float = mode_specific.scale_down_grace_after_ready_s
 
     def __enter__(self) -> Autoscaler:
         """Enters the context manager."""
@@ -839,9 +844,41 @@ class Autoscaler:
                 logger.debug(f"Adding actor to create: {w.to_worker_group(pool.name)}")
                 pool.add_actor_to_create(w.to_worker_group(pool.name))
 
+            # Defer scale-down of worker groups that either haven't
+            # finished setup *or* finished setup within the last
+            # ``scale_down_grace_after_ready_s`` seconds. The Rust
+            # autoscaler reasons in terms of integer worker counts and
+            # has no notion of "this actor is mid-setup" or "this
+            # actor just came online". Killing a freshly-provisioned
+            # actor would (a) waste the in-flight setup cost (vLLM
+            # model load + ``torch.compile`` is ~60-90 s for a 27B
+            # FP8 model) and (b) for GPU stages, escalate to SIGKILL
+            # of EngineCore mid-init -- a known source of ghost CUDA
+            # contexts that the destroy() hook cannot recover from.
+            # The autoscaler will reconsider the deletion next tick
+            # once setup completes and the grace expires.
+            #
+            # End-of-stage teardown bypasses this guard via the
+            # ``stages_is_dones`` flag so final drain can still kill
+            # in-flight setups.
+            deferred_setup = 0
             for w in deletions:
-                logger.debug(f"Adding actor to delete: {w.to_worker_group(pool.name)}")
-                pool.add_actor_to_delete(w.to_worker_group(pool.name))
+                wg = w.to_worker_group(pool.name)
+                if not stages_is_dones[idx] and not pool.is_worker_group_ready(
+                    wg.id, min_age_s=self._scale_down_grace_after_ready_s
+                ):
+                    deferred_setup += 1
+                    continue
+                logger.debug(f"Adding actor to delete: {wg}")
+                pool.add_actor_to_delete(wg)
+
+            if deferred_setup > 0:
+                logger.info(
+                    f"Deferred scale-down of {deferred_setup} worker group(s) for stage "
+                    f"{pool.name} that are still in setup or within the "
+                    f"{self._scale_down_grace_after_ready_s:.0f}s post-Ready grace; "
+                    f"will reconsider next tick."
+                )
 
         self._autoscale_future = None
         autoscale_end_time = time.time()

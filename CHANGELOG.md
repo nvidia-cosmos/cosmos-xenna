@@ -2,6 +2,19 @@
 
 ## Latest
 
+## [0.4.2]
+
+### Released
+
+- 2026-05-18
+
+### Fixed
+
+- Protect mid-setup and freshly-ready workers from autoscaler scale-down
+  - Pending-actor protection: defer any proposed deletion whose worker group is not yet in READY state.
+  - Post-Ready grace: defer any deletion whose worker group transitioned to READY less than ``StreamingSpecificSpec.scale_down_grace_after_ready_s`` (default 60.0) ago. Set to 0.0 to disable.
+  - End-of-stage drain bypasses both filters via ``stages_is_dones`` so final teardown is never delayed.
+
 ## [0.4.1]
 
 ### Released
