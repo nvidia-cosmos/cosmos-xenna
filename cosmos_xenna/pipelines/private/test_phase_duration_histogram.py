@@ -1,15 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the Phase 4-v per-phase timing histogram in ``SaturationAwareScheduler.autoscale()``.
+"""Tests for the per-phase timing histogram in ``SaturationAwareScheduler.autoscale()``.
 
-The wrappers (section 4-v of the saturation-aware scheduler plan,
+The ``_phase_timer`` context manager (see
 docs/scheduler/saturation-aware/22-prometheus-metrics.md row
-``xenna_scheduler_cycle_phase_duration_seconds``) bracket every phase
-block in ``autoscale()`` with ``_monotonic()`` ``try/finally`` so each
-cycle observes exactly one duration per phase on the
-``_PHASE_DURATION_HISTOGRAM`` Histogram, tagged
-``{"phase": <label>, "pipeline": "default"}``.
+``xenna_scheduler_cycle_phase_duration_seconds``) brackets every phase
+block in ``autoscale()`` so each cycle observes exactly one duration
+per phase on the ``_PHASE_DURATION_HISTOGRAM`` Histogram, tagged
+``{"phase": <label>, "pipeline": <pipeline_name>}``.
 
 These tests pin five behaviours of the wrapper contract:
 
@@ -18,8 +17,9 @@ These tests pin five behaviours of the wrapper contract:
     (within histogram-observe overhead tolerance).
   * Memory-pressure gate freezing Phase C still records a ``phase_c``
     observation (always-observe guarantee).
-  * Every observation carries the placeholder ``"pipeline": "default"``
-    tag so sub-iteration 4-iv-fix can grep the placeholder reliably.
+  * Every observation carries the ``pipeline`` tag value threaded into
+    ``SaturationAwareScheduler.__init__`` so multi-pipeline clusters
+    stay distinguishable in Prometheus.
   * A phase whose body raises still observes its duration via
     ``try/finally`` before the exception propagates.
 """
@@ -87,12 +87,18 @@ def _cluster() -> resources.ClusterResources:
     )
 
 
-def _scheduler() -> SaturationAwareScheduler:
+def _scheduler(*, pipeline_name: str = "") -> SaturationAwareScheduler:
     """Build a setup-completed single-stage scheduler.
 
     Disables warmup graces and floor-stuck grace so a single cycle's
     signal is sufficient and all phases execute without short-circuit
     paths interfering with phase-observation accounting.
+
+    Args:
+        pipeline_name: Threaded into ``SaturationAwareScheduler.__init__``
+            so tests can verify the Prometheus ``pipeline`` tag travels
+            from constructor to observation site. Defaults to the empty
+            string for tests that do not exercise the tag value.
     """
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
@@ -117,7 +123,7 @@ def _scheduler() -> SaturationAwareScheduler:
             ),
         ],
     )
-    scheduler = SaturationAwareScheduler(cfg)
+    scheduler = SaturationAwareScheduler(cfg, pipeline_name=pipeline_name)
     scheduler.setup(problem)
     return scheduler
 
@@ -148,7 +154,7 @@ def _problem_state_with_workers(*, worker_ids: list[str]) -> data_structures.Pro
 
 
 class TestPhaseDurationHistogram:
-    """Pin the five behaviours of the Phase 4-v per-phase timing histogram."""
+    """Pin the five behaviours of the per-phase timing histogram."""
 
     def test_every_phase_label_observed_once_per_cycle(
         self,
@@ -268,25 +274,25 @@ class TestPhaseDurationHistogram:
             "the gate did not short-circuit"
         )
 
-    def test_pipeline_tag_is_placeholder_default(
+    def test_pipeline_tag_threaded_from_constructor(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Every observation carries ``tags["pipeline"] == "default"`` (placeholder pinned for 4-iv-fix)."""
+        """Every observation carries the ``pipeline_name`` value passed into ``SaturationAwareScheduler.__init__``."""
         fake_histogram = _FakeHistogram()
         monkeypatch.setattr(saturation_aware, "_PHASE_DURATION_HISTOGRAM", fake_histogram)
 
-        scheduler = _scheduler()
+        scheduler = _scheduler(pipeline_name="my-pipeline")
         ps = _problem_state_with_workers(worker_ids=["stage-w0"])
 
         with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         for value, tags in fake_histogram.observations:
-            assert tags["pipeline"] == "default", (
+            assert tags["pipeline"] == "my-pipeline", (
                 f"Observation (phase={tags.get('phase')!r}, value={value:.6f}) carried "
-                f"pipeline={tags.get('pipeline')!r} but the placeholder must be 'default' "
-                f"so sub-iteration 4-iv-fix can grep for it"
+                f"pipeline={tags.get('pipeline')!r} but the constructor was called with "
+                f"pipeline_name='my-pipeline'"
             )
 
     def test_phase_a_delete_failure_still_observes(

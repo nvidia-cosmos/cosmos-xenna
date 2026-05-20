@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the cluster heterogeneity ratio helper (Phase 4-vii.5).
+"""Tests for the cluster heterogeneity ratio helper.
 
 Pin the contract of
 :func:`cosmos_xenna.pipelines.private.scheduling_py.bottleneck.compute_heterogeneity_ratio`:

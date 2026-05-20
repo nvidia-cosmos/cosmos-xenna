@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the Forced-Flow-Law bottleneck-score emitter (Phase 4-vii).
+"""Tests for the Forced-Flow-Law bottleneck-score emitter.
 
 Pin the contract of
 :func:`cosmos_xenna.pipelines.private.scheduling_py.bottleneck.emit_bottleneck_score`

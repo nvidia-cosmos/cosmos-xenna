@@ -103,8 +103,8 @@ ASCII flow
         logger.info("bottleneck stage: caption "
                     "(D = 2.00s, throughput bound = 0.50 tasks/s)")
 
-Cluster heterogeneity ratio extension (Phase 4-vii.5)
-=====================================================
+Cluster heterogeneity ratio extension
+=====================================
 
 The Forced-Flow-Law per-stage view above is augmented by a
 **cluster-wide** scalar -- the ratio ``max_k D_k / min_k D_k``
@@ -262,9 +262,7 @@ def emit_bottleneck_score(
     )
 
 
-# ---------------------------------------------------------------------------
-# Cluster heterogeneity ratio (Phase 4-vii.5)
-# ---------------------------------------------------------------------------
+# Cluster heterogeneity ratio.
 #
 # Module-level Gauge for the cluster-wide ratio. ``tag_keys`` is
 # ``("pipeline",)`` only -- the ratio is a single scalar per cluster,

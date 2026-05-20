@@ -53,7 +53,8 @@ noisy probes. Operators tune the cap per stage on the
 import math
 import time
 import types
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 
 from ray.util.metrics import Histogram
 
@@ -85,6 +86,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     check_solution_shape,
     check_stuck_plan_monotonicity,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog import loop_watchdog
 from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryPressureMonitor
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
@@ -251,6 +253,8 @@ class SaturationAwareScheduler:
         self,
         config: SaturationAwareConfig,
         stage_spec_overrides: dict[str, SaturationAwareStageConfig] | None = None,
+        *,
+        pipeline_name: str = "",
     ) -> None:
         """Initialize the scheduler.
 
@@ -271,6 +275,9 @@ class SaturationAwareScheduler:
                 resolver consults them. ``None`` (the default) and an
                 empty mapping behave identically: no overrides are
                 installed and no validation is performed.
+            pipeline_name: Value of the ``pipeline`` Prometheus tag
+                attached to every scheduler metric. Empty string when
+                the caller has no job-level pipeline identifier.
 
         Raises:
             ValueError: If any override config violates a cluster-wide
@@ -282,6 +289,7 @@ class SaturationAwareScheduler:
 
         """
         self._config = config
+        self._pipeline_name: str = pipeline_name
         self._problem: data_structures.Problem | None = None
         self._stage_states: dict[str, _StageRuntimeState] = {}
         self._stage_names: list[str] = []
@@ -328,6 +336,7 @@ class SaturationAwareScheduler:
         self._memory_pressure_monitor: MemoryPressureMonitor = MemoryPressureMonitor(
             polling_interval_s=config.memory_pressure_polling_interval_s,
             critical_threshold=config.memory_pressure_critical_threshold,
+            pipeline_name=pipeline_name,
         )
         self._floor_stuck_counters: dict[str, int] = {}
         # Saturation-mode cross-stage donor anti-flap state.
@@ -347,11 +356,11 @@ class SaturationAwareScheduler:
         # actually accumulate consensus.
         self._recommendation_histories: dict[str, _RecommendationHistory] = {}
         # Per-instance streak ledger for the cluster heterogeneity ratio
-        # warn log (Phase 4-vii.5). Owned at the instance level (not
-        # module-level) because the scheduler may be re-instantiated
-        # across tests; sharing a streak counter across instances would
-        # leak state into a fresh scheduler. ``setup()`` calls ``.reset()``
-        # so a re-setup of the scheduler starts from a clean ledger.
+        # warn log. Owned at the instance level (not module-level)
+        # because the scheduler may be re-instantiated across tests;
+        # sharing a streak counter across instances would leak state
+        # into a fresh scheduler. ``setup()`` calls ``.reset()`` so a
+        # re-setup of the scheduler starts from a clean ledger.
         self._heterogeneity_state: HeterogeneityWarnState = HeterogeneityWarnState()
 
     def _stage_cfg(self, stage_name: str) -> SaturationAwareStageConfig:
@@ -537,6 +546,11 @@ class SaturationAwareScheduler:
     ) -> data_structures.Solution:
         """Compute the autoscale plan for the current cycle.
 
+        Wraps the per-cycle body with ``loop_watchdog`` so every cycle
+        observes its wall-clock duration on
+        ``xenna_scheduler_cycle_duration_seconds`` and a slow cycle
+        emits a WARN log.
+
         Args:
             time: Current wall-clock time in seconds. Threaded
                 through the per-worker measurement grace and donor
@@ -569,8 +583,47 @@ class SaturationAwareScheduler:
                 stage names or count.
 
         """
-        # Per-phase timing wrappers (section 4-v of the saturation-aware
-        # scheduler plan). Each phase block is bracketed with
+        with loop_watchdog(
+            pipeline_name=self._pipeline_name,
+            threshold_fraction=self._config.cycle_time_warn_threshold,
+            interval_s=self._config.interval_s,
+        ):
+            return self._autoscale_body(time, problem_state)
+
+    @contextmanager
+    def _phase_timer(self, phase: str) -> Iterator[None]:
+        """Bracket one phase of ``_autoscale_body`` with a duration timer.
+
+        Records one observation on ``_PHASE_DURATION_HISTOGRAM`` tagged
+        ``{"phase": phase, "pipeline": self._pipeline_name}``. The
+        observation lives in ``finally`` so a phase that raises still
+        records its duration.
+
+        Args:
+            phase: One of the 8 canonical phase labels pinned by
+                ``test_every_phase_label_observed_once_per_cycle``.
+        """
+        start = _monotonic()
+        try:
+            yield
+        finally:
+            _PHASE_DURATION_HISTOGRAM.observe(
+                _monotonic() - start,
+                tags={"phase": phase, "pipeline": self._pipeline_name},
+            )
+
+    def _autoscale_body(
+        self,
+        time: float,
+        problem_state: data_structures.ProblemState,
+    ) -> data_structures.Solution:
+        """Run one autoscale cycle without the loop-watchdog wrap.
+
+        ``autoscale()`` wraps this method with ``loop_watchdog`` so the
+        per-cycle duration histogram and WARN log fire on every call,
+        including paths that raise.
+        """
+        # Per-phase timing wrappers. Each phase block is bracketed with
         # ``_monotonic()`` samples in a ``try/finally`` so a phase that
         # raises (planner-context invariant violation, classifier NaN,
         # Phase D floor breach, stuck-plan monotonicity failure) still
@@ -581,14 +634,7 @@ class SaturationAwareScheduler:
         # consumer dashboards (see docs/scheduler/saturation-aware/
         # 22-prometheus-metrics.md row
         # ``xenna_scheduler_cycle_phase_duration_seconds``).
-        #
-        # The pipeline tag is the placeholder ``"default"`` string at
-        # every observe site; sub-iteration 4-iv-fix will thread the
-        # real pipeline name from ``pipeline_spec.job_info.pipeline_type``.
-        # Searching for the ``# 4-iv-fix-TODO: replace placeholder
-        # pipeline tag`` comments locates every observe site at once.
-        pre_phase_setup_start = _monotonic()
-        try:
+        with self._phase_timer("pre_phase_setup"):
             if self._problem is None:
                 msg = "SaturationAwareScheduler.autoscale() called before setup()"
                 raise RuntimeError(msg)
@@ -649,71 +695,35 @@ class SaturationAwareScheduler:
                 ctx.worker_ids_by_stage(),
                 now=time,
             )
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - pre_phase_setup_start,
-                tags={"phase": "pre_phase_setup", "pipeline": "default"},
-            )
 
-        phase_a_start = _monotonic()
-        try:
+        with self._phase_timer("phase_a"):
             self._run_phase_a_delete(ctx, problem_state)
             self._run_phase_a_grow(ctx, problem_state)
             check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - phase_a_start,
-                tags={"phase": "phase_a", "pipeline": "default"},
-            )
 
-        phase_b_start = _monotonic()
-        try:
+        with self._phase_timer("phase_b"):
             self._run_phase_b_floor(ctx, problem_state)
             check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - phase_b_start,
-                tags={"phase": "phase_b", "pipeline": "default"},
-            )
 
-        intent_start = _monotonic()
-        try:
+        with self._phase_timer("intent"):
             self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - intent_start,
-                tags={"phase": "intent", "pipeline": "default"},
-            )
 
-        phase_c_start = _monotonic()
-        try:
+        # Memory-pressure gate semantics: when ``_run_phase_c_grow``
+        # returns early because the cluster-wide pressure monitor is
+        # active, the timer STILL records a (near-zero) duration. The
+        # invariant + NaN checks below still run because they are
+        # pass-through assertions when Phase C made no changes. This
+        # pins the "always observe" guarantee for the per-phase
+        # histogram contract.
+        with self._phase_timer("phase_c"):
             self._run_phase_c_grow(ctx, problem_state)
             check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
             check_no_nan_in_classifier_state(
                 phase_name=PhaseBoundary.PHASE_C,
                 stage_runtime_states=self._stage_states,
             )
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            # Memory-pressure gate semantics: when
-            # ``_run_phase_c_grow`` returns early because the
-            # cluster-wide pressure monitor is active, the wrapper
-            # STILL records duration (near-zero, not NaN). The
-            # invariant + NaN checks above still run because they
-            # are pass-through assertions when Phase C made no
-            # changes. This pins the "always observe" guarantee
-            # documented in section 4-v of the plan.
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - phase_c_start,
-                tags={"phase": "phase_c", "pipeline": "default"},
-            )
 
-        phase_d_start = _monotonic()
-        try:
+        with self._phase_timer("phase_d"):
             # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
             # post-Phase-D floor invariant can distinguish "Phase D reduced below
             # floor" (a defect) from "Phase B left the stage below floor" (a
@@ -737,15 +747,8 @@ class SaturationAwareScheduler:
                 stage_floors=stage_floors,
                 pre_phase_d_worker_counts=pre_phase_d_worker_counts,
             )
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - phase_d_start,
-                tags={"phase": "phase_d", "pipeline": "default"},
-            )
 
-        invariants_start = _monotonic()
-        try:
+        with self._phase_timer("invariants"):
             # Filter ``curr_counters`` to only the stages Phase C touched
             # (non-finished); a stage that finished mid-run leaves its counter
             # untouched at the prior cycle's value, which would otherwise surface
@@ -759,68 +762,36 @@ class SaturationAwareScheduler:
                     name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
                 },
             )
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - invariants_start,
-                tags={"phase": "invariants", "pipeline": "default"},
-            )
 
-        # 4-v-note: bottleneck/heterogeneity emission is intentionally outside
-        # phase wrappers (sub-millisecond, pure observability). The sibling
-        # 4-vii.5 subagent owns this block; leaving it unwrapped keeps the
-        # wrapper boundaries aligned with the canonical phase labels in
-        # docs/scheduler/saturation-aware/22-prometheus-metrics.md.
+        # Bottleneck score and heterogeneity emission live OUTSIDE the
+        # per-phase wrappers above so the wrapper boundaries stay aligned
+        # with the canonical phase labels in
+        # docs/scheduler/saturation-aware/22-prometheus-metrics.md. Both
+        # calls are sub-millisecond pure observability.
         #
-        # Forced-Flow-Law bottleneck score (Phase 4-vii). Pure
-        # observability: emits the per-stage
-        # ``xenna_stage_bottleneck_score{stage, pipeline}`` gauge and
-        # one INFO log line naming argmax_k D_k for the cycle.
         # ``service_times_s`` is intentionally empty here because the
-        # current ``autoscale()`` signature accepts only
-        # ``ProblemState``, which omits the
-        # ``processing_speed_tasks_per_second`` field that lives on
-        # ``ActorPoolStats`` (sampled in ``streaming.py``). The helper
-        # is wired in so the cold-start contract (empty mapping ->
-        # gauge stays NaN, no INFO log) is satisfied; threading the
-        # service-time data through the autoscale call is the
-        # responsibility of a follow-up sub-iteration that extends
-        # the scheduler protocol to carry pool stats.
-        emit_bottleneck_score(service_times_s={}, pipeline_name="default")
-        # Cluster heterogeneity ratio (Phase 4-vii.5). Pure
-        # observability: emits the cluster-wide
-        # ``xenna_scheduler_cluster_heterogeneity_ratio{pipeline}``
-        # gauge and an INFO tuning-recommendation log when the ratio
-        # ``max(D_k) / min(D_k)`` stays above
-        # ``cluster_heterogeneity_warn_threshold`` for
-        # ``cluster_heterogeneity_warn_streak`` consecutive cycles.
-        # Shares the same per-stage ``service_times_s`` view as
-        # ``emit_bottleneck_score`` so both helpers see the same
-        # ``D_k`` set in a given cycle. ``pipeline_name="default"`` is
-        # a placeholder pinned by 4-iv-fix consolidation; the
-        # service-time mapping itself comes through the same
-        # follow-up that lands ``ActorPoolStats`` plumbing for
-        # Phase 4-vii.
-        # 4-iv-fix-TODO: replace placeholder pipeline tag
+        # current ``autoscale()`` signature accepts only ``ProblemState``,
+        # which omits the ``processing_speed_tasks_per_second`` field
+        # that lives on ``ActorPoolStats`` (sampled in ``streaming.py``).
+        # Both helpers honour the cold-start contract (empty mapping ->
+        # NaN gauge, no INFO log); threading the service-time data
+        # through the autoscale call is the responsibility of a
+        # follow-up that extends the scheduler protocol to carry pool
+        # stats.
+        emit_bottleneck_score(service_times_s={}, pipeline_name=self._pipeline_name)
         compute_heterogeneity_ratio(
             service_times_s={},
-            pipeline_name="default",
+            pipeline_name=self._pipeline_name,
             state=self._heterogeneity_state,
             warn_threshold=self._config.cluster_heterogeneity_warn_threshold,
             warn_streak_cycles=self._config.cluster_heterogeneity_warn_streak,
         )
 
-        into_solution_start = _monotonic()
-        try:
+        with self._phase_timer("into_solution"):
             solution = ctx.into_solution()
             check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
             self._persist_worker_ages(ctx)
-        finally:
-            # 4-iv-fix-TODO: replace placeholder pipeline tag
-            _PHASE_DURATION_HISTOGRAM.observe(
-                _monotonic() - into_solution_start,
-                tags={"phase": "into_solution", "pipeline": "default"},
-            )
+
         return solution
 
     def _next_cycle_worker_ages(self) -> dict[str, int]:

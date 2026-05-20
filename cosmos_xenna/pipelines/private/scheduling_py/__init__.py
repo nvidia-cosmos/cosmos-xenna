@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure-Python streaming-mode autoscalers."""
+"""Pure-Python streaming-mode autoscaler package.
+
+``SaturationAwareScheduler`` is intentionally **not** re-exported here:
+its module constructs Prometheus metrics at import time, so eager
+re-export would register saturation-aware series for fragmentation-based
+pipelines that never observe them. Callers should import the class from
+``cosmos_xenna.pipelines.private.scheduling_py.saturation_aware``.
+"""
 
 from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 
 __all__ = [
-    "SaturationAwareScheduler",
     "SchedulerInvariantError",
 ]

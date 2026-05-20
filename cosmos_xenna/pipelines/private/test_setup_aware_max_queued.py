@@ -25,9 +25,9 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
-from cosmos_xenna.pipelines.private.streaming import (
+from cosmos_xenna.pipelines.private.scheduling_py.streaming_backpressure import (
     _SETUP_AWARE_MAX_QUEUED_FLOOR,
-    _compute_max_queued,
+    compute_max_queued,
 )
 
 
@@ -46,11 +46,11 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
 
 
 class TestSetupAwareMaxQueued:
-    """``_compute_max_queued`` honours the cold-start branch and its gates."""
+    """``compute_max_queued`` honours the cold-start branch and its gates."""
 
     def test_zero_ready_one_pending_reduces_max_queued(self) -> None:
         """Cold-start input lowers the cap when the flag is on; flag off keeps the regular value."""
-        cold_start_cap = _compute_max_queued(
+        cold_start_cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=1,
             slots_per_actor=2,
@@ -61,7 +61,7 @@ class TestSetupAwareMaxQueued:
             is_done=False,
             stage_name="Stage 00 - Foo",
         )
-        regular_cap = _compute_max_queued(
+        regular_cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=1,
             slots_per_actor=2,
@@ -79,7 +79,7 @@ class TestSetupAwareMaxQueued:
 
     def test_some_ready_uses_regular_max_queued(self) -> None:
         """Any ready actor blocks the cold-start branch even when pending actors exist."""
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=3,
             num_pending_actors=2,
             slots_per_actor=4,
@@ -96,7 +96,7 @@ class TestSetupAwareMaxQueued:
 
     def test_zero_ready_zero_pending_uses_regular(self) -> None:
         """A pool with no actors at all is not in cold start; legacy formula applies."""
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=0,
             slots_per_actor=2,
@@ -113,7 +113,7 @@ class TestSetupAwareMaxQueued:
 
     def test_finished_stage_excluded(self) -> None:
         """``is_done=True`` bypasses the cold-start branch even with pending actors present."""
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=1,
             slots_per_actor=2,
@@ -130,7 +130,7 @@ class TestSetupAwareMaxQueued:
 
     def test_feature_flag_off_preserves_legacy_behaviour(self) -> None:
         """The cold-start cap is never used when the per-stage flag is False."""
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=4,
             slots_per_actor=2,
@@ -149,7 +149,7 @@ class TestSetupAwareMaxQueued:
         next_stage_batch_size = 16
         assert next_stage_batch_size > _SETUP_AWARE_MAX_QUEUED_FLOOR
 
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=1,
             slots_per_actor=2,
@@ -165,7 +165,7 @@ class TestSetupAwareMaxQueued:
 
     def test_cold_start_emits_debug_log(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
         """Operators can correlate cap reductions with stage state via a debug log."""
-        cap = _compute_max_queued(
+        cap = compute_max_queued(
             num_ready_actors=0,
             num_pending_actors=2,
             slots_per_actor=2,
