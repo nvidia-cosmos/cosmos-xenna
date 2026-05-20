@@ -187,23 +187,7 @@ class _RecordingStage(pipelines_v1.Stage[int, int]):
 
 
 def _make_saturation_aware_stage_config() -> specs.SaturationAwareStageConfig:
-    """Build the cluster-wide stage config with an explicit floor and ceiling.
-
-    Pins ``min_workers`` and ``max_workers`` so the saturation-aware run can
-    be checked against operator-configured bounds. The config is attached to
-    ``SaturationAwareConfig.stage_defaults`` (cluster-wide default) rather
-    than to ``StageSpec.saturation_aware`` because the per-stage spec field
-    is currently not threaded through the scheduler resolver; the cluster
-    default is the supported route for applying per-stage tunables to every
-    stage uniformly.
-
-    ``floor_stuck_grace_cycles`` lives on the cluster-level
-    ``SaturationAwareConfig`` and keeps its default value (6 cycles).
-
-    Other tunables are left at their defaults; this test deliberately avoids
-    tuning the classifier so any regression in the default behaviour surfaces
-    here rather than being masked by knob-tweaking.
-    """
+    """Build a stage config pinning only ``min_workers`` and ``max_workers``."""
     return specs.SaturationAwareStageConfig(
         min_workers=_MIN_WORKERS_PER_STAGE,
         max_workers=_MAX_WORKERS_PER_STAGE,
@@ -218,27 +202,7 @@ def _build_pipeline_spec(
     process_dur_s: float,
     tracker_name: str,
 ) -> pipelines_v1.PipelineSpec:
-    """Construct the parameterised pipeline spec for one scheduler kind.
-
-    Builds a three-stage CPU-only pipeline with ``return_last_stage_outputs``
-    enabled so the test can count completed tasks. The
-    ``SaturationAwareStageConfig`` is installed as the cluster-wide
-    ``stage_defaults`` on the ``SaturationAwareConfig`` block. The
-    fragmentation-based scheduler ignores the block entirely while the
-    saturation-aware scheduler honours the ``min_workers`` / ``max_workers``
-    bounds on every stage.
-
-    Args:
-        scheduler: Which ``SchedulerKind`` to drive the autoscaler with.
-        num_tasks: Number of input integers to feed the pipeline.
-        cpus_per_stage: Per-worker CPU budget for each stage.
-        process_dur_s: Per-call sleep applied inside ``process_data``.
-        tracker_name: Named-actor handle the stages call into for PID
-            registration.
-
-    Returns:
-        A ``PipelineSpec`` ready for ``pipelines_v1.run_pipeline``.
-    """
+    """Construct the parameterised pipeline spec for one scheduler kind."""
     sat_aware_config = specs.SaturationAwareConfig(stage_defaults=_make_saturation_aware_stage_config())
     stage_specs = [
         pipelines_v1.StageSpec(_RecordingStage(stage_name, cpus_per_stage, process_dur_s, tracker_name))
@@ -274,35 +238,16 @@ def test_pipeline_runs_to_completion_under_each_scheduler(
 ) -> None:
     """Run a small CPU-only pipeline through both autoscaler implementations.
 
-    Universal contract (asserted for both ``SchedulerKind`` values):
+    Universal assertions apply to both ``SchedulerKind`` values: every
+    input task reaches the last stage, every stage materialises at least
+    one worker, and wall-clock time stays under ``_WALL_CLOCK_TIMEOUT_S``.
 
-    * Every input task reaches the last stage. The presence of
-      ``return_last_stage_outputs=True`` means
-      ``pipelines_v1.run_pipeline`` returns the collected outputs;
-      ``len(results) == NUM_TASKS`` rules out task drops.
-    * Every stage materialises at least one worker, observable via the
-      named ``_WorkerTracker`` actor. A count of zero would prove the
-      autoscaler never applied a placement decision for that stage.
-    * Wall-clock time stays under a generous backstop so a genuine
-      deadlock terminates the test instead of hanging.
-
-    Saturation-aware-only contract (asserted only when ``scheduler is
-    SchedulerKind.SATURATION_AWARE``):
-
-    * Distinct worker PIDs per stage stay within the operator-configured
-      ``[min_workers, max_workers]`` band declared on
-      ``SaturationAwareConfig.stage_defaults``. The fragmentation-based
-      scheduler ignores ``SaturationAwareStageConfig`` entirely, so the
-      cap check would be vacuous (and potentially wrong) under it.
-
-    Tolerated flake sources (and how this test handles them):
-
-    * Autoscaler convergence latency: the wall-clock backstop is
-      generous (``_WALL_CLOCK_TIMEOUT_S``).
-    * Per-cycle scheduler state evolves nondeterministically across
-      runs, so assertions are strictly structural (no exact worker
-      counts). Only the operator-configured bounds and the universal
-      floor are checked.
+    Under ``SchedulerKind.SATURATION_AWARE`` the test additionally checks
+    that distinct worker PIDs per stage stay within the
+    ``[min_workers, max_workers]`` band declared on
+    ``SaturationAwareConfig.stage_defaults``; the fragmentation-based
+    scheduler ignores ``SaturationAwareStageConfig`` so the cap check is
+    skipped for it.
     """
     num_tasks = 30 if is_running_in_cicd() else 60
     cpus_per_stage = 0.25 if is_running_in_cicd() else 0.5
@@ -355,6 +300,9 @@ def test_pipeline_runs_to_completion_under_each_scheduler(
                     f"({_MAX_WORKERS_PER_STAGE}); observed {stage_count} distinct worker PIDs; "
                     f"counts={counts}"
                 )
+                # Currently coincident with the universal `>= 1` check above; kept
+                # explicit so raising ``_MIN_WORKERS_PER_STAGE`` above 1 in a future
+                # change automatically tightens the saturation-aware contract.
                 assert stage_count >= _MIN_WORKERS_PER_STAGE, (
                     f"Stage '{stage_name}' fell below the operator-configured min_workers "
                     f"({_MIN_WORKERS_PER_STAGE}); observed {stage_count} distinct worker PIDs; "
