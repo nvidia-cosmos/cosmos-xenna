@@ -279,6 +279,13 @@ def check_stuck_plan_monotonicity(
     """
     for stage_name, curr in curr_counters.items():
         prev = prev_counters.get(stage_name, 0)
+        if prev < 0 or curr < 0:
+            _log_and_raise_invariant(
+                f"Stuck-plan counter for stage {stage_name!r} contains a "
+                f"negative value (prev={prev}, curr={curr}). Counters must "
+                "be non-negative cycle counts. This is a scheduler defect; "
+                "report it with the autoscale cycle's problem_state."
+            )
         if curr == 0:
             continue
         if curr == prev + 1:

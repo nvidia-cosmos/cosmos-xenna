@@ -259,17 +259,18 @@ class TestCapacitySumInvariant:
         assert stage.rust.num_empty_slots == num_empty_slots
 
 
-class TestSlotsPerWorkerMidCycleChange:
-    """Same logical load survives a mid-run ``slots_per_worker`` change.
+class TestClassifierInvariantUnderProportionalCountDoubling:
+    """Same logical load survives a proportional doubling of raw counts.
 
-    The full ordering invariant (``pool.set_num_slots_per_actor``
-    runs before any worker mutation in
-    ``apply_autoscale_result_if_ready``) is verified at the
-    integration layer alongside the actor pool. This test instead
-    pins the algebraic property the orchestrator relies on: feeding
-    proportionally-doubled raw counts (both ``num_used_slots`` and
-    ``num_empty_slots`` doubled) to ``run_per_stage_pipeline``
-    produces the same classifier state as the original counts.
+    The full ``slots_per_worker`` mid-cycle ordering invariant
+    (``pool.set_num_slots_per_actor`` runs before any worker
+    mutation in ``apply_autoscale_result_if_ready``) is verified at
+    the integration layer alongside the actor pool. This test
+    instead pins the algebraic property the orchestrator relies on:
+    feeding proportionally-doubled raw counts (both
+    ``num_used_slots`` and ``num_empty_slots`` doubled) to
+    ``run_per_stage_pipeline`` produces the same classifier state
+    as the original counts.
     """
 
     def test_classifier_unchanged_when_slots_per_worker_doubles_with_proportional_load(

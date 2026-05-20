@@ -241,6 +241,39 @@ def make_problem_worker_state_from_worker_state(
     )
 
 
+def _validate_non_negative_signal(
+    *, stage_name: str, field_name: str, value: int, worker_id: str | None = None
+) -> None:
+    """Reject negative autoscaling signals before they reach Rust ``usize`` fields."""
+    if value >= 0:
+        return
+    worker_clause = f" worker {worker_id!r}" if worker_id is not None else ""
+    msg = f"stage {stage_name!r}{worker_clause} {field_name} must be >= 0, got {value}"
+    raise ValueError(msg)
+
+
+def _validate_allocator_pool_worker_ids(
+    *,
+    stage_name: str,
+    allocator_worker_ids: set[str],
+    pool: actor_pool.ActorPool[typing.Any, typing.Any],
+) -> None:
+    """Ensure production pool and allocator snapshots describe the same worker groups."""
+    pool_worker_groups = getattr(pool, "_worker_groups", None)
+    if not isinstance(pool_worker_groups, dict):
+        return
+    pool_worker_ids = set(pool_worker_groups)
+    if allocator_worker_ids == pool_worker_ids:
+        return
+    allocator_only = sorted(allocator_worker_ids - pool_worker_ids)
+    pool_only = sorted(pool_worker_ids - allocator_worker_ids)
+    msg = (
+        f"stage {stage_name!r} worker-group snapshot mismatch between allocator and actor pool "
+        f"(allocator-only={allocator_only}, pool-only={pool_only})"
+    )
+    raise ValueError(msg)
+
+
 def _required_workers_for_stage(
     slots_per_actor: int,
     stage_batch_size: int,
@@ -318,26 +351,78 @@ class _SchedulerAlgorithm(typing.Protocol):
     ) -> data_structures.Solution: ...
 
 
-def _make_scheduler_algorithm(mode_specific: specs.StreamingSpecificSpec) -> _SchedulerAlgorithm:
-    """Construct the algorithm for ``Autoscaler._algorithm`` based on the spec.
+def _collect_saturation_aware_stage_overrides(
+    pipeline_spec: specs.PipelineSpec,
+) -> dict[str, specs.SaturationAwareStageConfig]:
+    """Collect ``StageSpec.saturation_aware`` overrides keyed by runtime stage name.
 
-    Reads ``mode_specific.scheduler`` once and returns the corresponding
-    instance. Selection is frozen for the lifetime of the run; switching
-    schedulers requires re-instantiating ``Autoscaler``.
+    The Rust-backed ``FragmentationBasedAutoscaler`` does not consume
+    these overrides; only the ``SaturationAwareScheduler`` branch in
+    ``_make_scheduler_algorithm`` reads the result. Stages that are
+    bare ``Stage`` instances (no ``StageSpec`` wrapper) and stages
+    without a ``saturation_aware`` block are silently filtered out so
+    the returned mapping contains exactly the stage names that carry
+    a runtime override.
 
     Args:
-        mode_specific: ``StreamingSpecificSpec`` carrying the scheduler
-            kind plus the per-kind configuration blocks.
+        pipeline_spec: The pipeline spec being autoscaled. Iterated by
+            position so the keys match ``ProblemStage.name`` produced
+            in ``_make_problem_from_pipeline_spec``.
+
+    Returns:
+        A mapping from runtime stage name to its
+        ``SaturationAwareStageConfig`` override. Empty when no stage
+        carries an override.
+    """
+    return {
+        stage.name(index): stage.saturation_aware
+        for index, stage in enumerate(pipeline_spec.stages)
+        if isinstance(stage, specs.StageSpec) and stage.saturation_aware is not None
+    }
+
+
+def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAlgorithm:
+    """Construct the algorithm for ``Autoscaler._algorithm`` based on the spec.
+
+    Reads ``pipeline_spec.config.mode_specific.scheduler`` once and
+    returns the corresponding instance. Selection is frozen for the
+    lifetime of the run; switching schedulers requires re-instantiating
+    ``Autoscaler``.
+
+    The ``FragmentationBasedAutoscaler`` branch is intentionally a
+    pure passthrough of ``StreamingSpecificSpec`` fields - the
+    Rust-backed solver does not consume any per-stage overrides, so
+    no extra wiring is performed. The ``SaturationAwareScheduler``
+    branch additionally collects ``StageSpec.saturation_aware``
+    overrides via ``_collect_saturation_aware_stage_overrides`` and
+    injects them through the constructor; this is the single
+    integration point for runtime spec overrides on the saturation
+    path.
+
+    Args:
+        pipeline_spec: The full pipeline spec being autoscaled. The
+            factory reads ``config.mode_specific`` for the scheduler
+            kind and per-kind configuration, and (for saturation-aware
+            only) iterates ``stages`` to collect per-stage overrides.
 
     Returns:
         An object satisfying the ``_SchedulerAlgorithm`` protocol.
 
     Raises:
+        AssertionError: If ``pipeline_spec.config.mode_specific`` is
+            ``None``. ``Autoscaler`` is only used in streaming mode,
+            so this is a programmer error (the surrounding
+            ``Autoscaler.__init__`` asserts the same precondition).
         ValueError: If ``mode_specific.scheduler`` holds an unrecognized
-            ``SchedulerKind`` value (defensive against future enum values
-            that have not been wired up yet).
+            ``SchedulerKind`` value (defensive against future enum
+            values that have not been wired up yet), or if collected
+            saturation-aware stage overrides violate cluster-wide
+            guardrails (validation runs inside the
+            ``SaturationAwareScheduler`` constructor).
 
     """
+    mode_specific = pipeline_spec.config.mode_specific
+    assert mode_specific is not None, "_make_scheduler_algorithm requires StreamingSpecificSpec; got mode_specific=None"
     kind = mode_specific.scheduler
     if kind is specs.SchedulerKind.FRAGMENTATION_BASED:
         return autoscaling_algorithms.FragmentationBasedAutoscaler(
@@ -345,7 +430,10 @@ def _make_scheduler_algorithm(mode_specific: specs.StreamingSpecificSpec) -> _Sc
             mode_specific.autoscale_speed_estimation_min_data_points,
         )
     if kind is specs.SchedulerKind.SATURATION_AWARE:
-        return scheduling_py.SaturationAwareScheduler(mode_specific.saturation_aware)
+        return scheduling_py.SaturationAwareScheduler(
+            mode_specific.saturation_aware,
+            stage_spec_overrides=_collect_saturation_aware_stage_overrides(pipeline_spec),
+        )
     raise ValueError(f"Unrecognized SchedulerKind: {kind!r}")
 
 
@@ -448,7 +536,15 @@ class Autoscaler:
         assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = _make_scheduler_algorithm(mode_specific)
+        # ``_make_scheduler_algorithm`` is the single integration point for
+        # scheduler construction: it picks the algorithm class from
+        # ``mode_specific.scheduler``, wires per-kind configuration, and
+        # (for the saturation-aware branch) injects
+        # ``StageSpec.saturation_aware`` overrides through the constructor.
+        # The returned algorithm's override map is fully resolved before
+        # ``setup()`` is called, so the per-cycle hot path never has to
+        # reason about partial configuration.
+        self._algorithm = _make_scheduler_algorithm(pipeline_spec)
         self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
@@ -513,6 +609,24 @@ class Autoscaler:
                 num_empty_slots = pool.num_empty_slots
                 input_queue_depth = pool.num_queued_tasks
                 worker_group_idle = pool.worker_group_num_used_slots()
+                for field_name, value in (
+                    ("num_used_slots", num_used_slots),
+                    ("num_empty_slots", num_empty_slots),
+                    ("input_queue_depth", input_queue_depth),
+                ):
+                    _validate_non_negative_signal(stage_name=pool.name, field_name=field_name, value=value)
+                for worker_id, used_slots in worker_group_idle.items():
+                    _validate_non_negative_signal(
+                        stage_name=pool.name,
+                        worker_id=worker_id,
+                        field_name="num_used_slots",
+                        value=used_slots,
+                    )
+                _validate_allocator_pool_worker_ids(
+                    stage_name=pool.name,
+                    allocator_worker_ids={w.id for w in workers},
+                    pool=pool,
+                )
             stages.append(
                 data_structures.ProblemStageState(
                     pool.name,

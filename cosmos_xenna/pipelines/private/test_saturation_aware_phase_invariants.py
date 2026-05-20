@@ -355,6 +355,21 @@ class TestSchedulerWiringDoesNotRaise:
         )
         assert len(solution.stages) == 2
 
+    def test_problem_state_missing_stage_raises_scheduler_invariant_error_before_phase_a(self) -> None:
+        """Shape mismatches surface as invariant errors before Phase A indexes the snapshot."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1)),
+        )
+        scheduler.setup(_problem([("A", None), ("B", None)]))
+
+        with pytest.raises(
+            SchedulerInvariantError, match=r"Before phase_a:.*problem_state has 1 stages.*problem has 2"
+        ):
+            scheduler.autoscale(
+                time=0.0,
+                problem_state=_problem_state([("A", 1, 1, False)]),
+            )
+
     def test_scheduler_invokes_invariants_at_each_phase_boundary(self) -> None:
         """The scheduler's autoscale path calls the invariant gate after each phase.
 
@@ -775,6 +790,16 @@ class TestCheckStuckPlanMonotonicity:
     def test_five_to_zero_reset_does_not_raise(self) -> None:
         """A reset to 0 from any prior value is always valid."""
         check_stuck_plan_monotonicity(prev_counters={"A": 5}, curr_counters={"A": 0})
+
+    def test_negative_previous_counter_raises(self) -> None:
+        """A counter snapshot cannot contain negative stuck-cycle counts."""
+        with pytest.raises(SchedulerInvariantError, match=r"stage 'A'.*negative.*prev=-2.*curr=-1"):
+            check_stuck_plan_monotonicity(prev_counters={"A": -2}, curr_counters={"A": -1})
+
+    def test_negative_current_counter_raises(self) -> None:
+        """A current counter cannot be negative even when the previous value is absent."""
+        with pytest.raises(SchedulerInvariantError, match=r"stage 'A'.*negative.*prev=0.*curr=-1"):
+            check_stuck_plan_monotonicity(prev_counters={}, curr_counters={"A": -1})
 
     def test_five_to_four_decrement_raises(self) -> None:
         """A decrement (5 -> 4) violates the strict-increment-or-reset contract."""

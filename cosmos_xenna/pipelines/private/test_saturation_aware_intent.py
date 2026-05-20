@@ -25,6 +25,7 @@ This module pins:
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
+from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
@@ -143,16 +144,16 @@ class TestIntentDictShape:
         assert sorted(scheduler._last_intent_deltas) == ["downstream", "upstream"]
 
 
-class TestShapeMismatchSurfacesAsValueError:
-    """The intent loop must raise ``ValueError`` (not bare ``KeyError``) on a name mismatch."""
+class TestShapeMismatchSurfacesAsInvariantError:
+    """The pre-phase gate must raise a contextual invariant error on a name mismatch."""
 
-    def test_unknown_stage_in_problem_state_raises_value_error(self) -> None:
-        """A stage in ``problem_state`` not present in ``setup()`` raises ``ValueError``."""
+    def test_unknown_stage_in_problem_state_raises_scheduler_invariant_error(self) -> None:
+        """A stage in ``problem_state`` not present in ``setup()`` fails before Phase A."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_signals([("ghost", 1, 1, 1, 0, 0, False)])
 
-        with pytest.raises(ValueError, match="ghost"):
+        with pytest.raises(SchedulerInvariantError, match="ghost"):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
 

@@ -4,9 +4,11 @@
 """Tests for ``SaturationAwareScheduler._run_phase_d_shrink``.
 
 Phase D applies negative intent deltas as planner removes via
-``ctx.try_remove_worker``. Selection is idle-first, then age-DESC,
+``ctx.try_remove_worker``. Selection is consolidation-first
+(``host_gpu_used_fraction`` ASC), then idle-first, then age-DESC,
 then ``worker_id`` ASC, using per-worker ``num_used_slots`` from
-``ProblemWorkerGroupState``. The contract under test:
+``ProblemWorkerGroupState`` and GPU allocation fractions from the
+cycle snapshot. The contract under test:
 
     * Negative intent removes ``min(|intent|, current - floor)``
       workers, idle-first and oldest within each idle/busy bucket.

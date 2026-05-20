@@ -565,15 +565,20 @@ class SaturationAwareStageConfig:
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
-    # When True, suspend all decisions for a stage that has pending actors but
-    # no ready actors (initial setup phase).
+    # Reserved for setup-aware scheduling: suspend all decisions for a stage
+    # that has pending actors but no ready actors. Phase 2 does not yet carry
+    # pending/ready actor counts into the scheduler, so this field is
+    # configuration-only until the setup-aware gate lands.
     setup_phase_quiescence_enabled: bool = True
-    # Per-worker grace window after the worker becomes ready, during which its
-    # samples are excluded from per-stage averages.
+    # Reserved for warmup-aware sampling: per-worker grace window after the
+    # worker becomes ready, during which its samples are excluded from
+    # per-stage averages. Phase 2 does not yet carry ready timestamps into the
+    # scheduler, so this field is configuration-only until warmup filtering lands.
     worker_warmup_measurement_grace_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
-    # Per-worker grace window after the worker becomes ready, during which it
-    # cannot be selected as a cross-stage donor. Cross-field: must be >=
-    # worker_warmup_measurement_grace_s.
+    # Reserved for warmup-aware donation: per-worker grace window after the
+    # worker becomes ready, during which it cannot be selected as a cross-stage
+    # donor. Phase 2 donor selection does not yet carry ready timestamps; the
+    # cross-field validator still keeps the future configuration consistent.
     donor_warmup_grace_s: float = attrs.field(default=180.0, validator=attrs.validators.ge(0.0))
 
     # Optional cluster-wide minimum workers for this stage. ``None`` means the
@@ -594,9 +599,10 @@ class SaturationAwareStageConfig:
     # unbounded by this knob. Cross-field: must be >= min_workers_per_node.
     max_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
 
-    # When True, lower the ``max_queued`` cap while the stage is in initial
-    # setup (pending actors > 0 and ready actors == 0) to prevent Ray
-    # object-store pressure during long warmups.
+    # Reserved for setup-aware queue caps: lower the ``max_queued`` cap while
+    # the stage is in initial setup. Phase 2 does not yet route setup state
+    # into max-queued calculation, so this field is configuration-only until
+    # that gate lands.
     setup_aware_max_queued: bool = True
 
     def __attrs_post_init__(self) -> None:
@@ -793,34 +799,35 @@ class SaturationAwareConfig:
     floor_stuck_grace_cycles: int = attrs.field(default=6, validator=attrs.validators.ge(0))
 
     # --- Loop watchdog (cluster-wide) ---
-    # Fraction of ``interval_s`` above which a cycle's wall-clock duration
-    # triggers a WARN log. The watchdog records every cycle's duration as a
-    # histogram regardless of this threshold.
+    # Reserved for the cycle-duration watchdog: fraction of ``interval_s``
+    # above which a cycle's wall-clock duration triggers a WARN log. Phase 2
+    # does not yet emit this watchdog metric or log.
     cycle_time_warn_threshold: float = attrs.field(
         default=0.5,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
     # --- Cluster memory pressure gate (defensive kill-switch) ---
-    # When True, query Ray cluster object-store memory each cycle and freeze
-    # all scale-up when used fraction exceeds the threshold.
+    # Reserved for the memory-pressure gate: query Ray cluster object-store
+    # memory and freeze scale-up when used fraction exceeds the threshold.
+    # Phase 2 does not yet query or consume this signal.
     enable_memory_pressure_gate: bool = True
-    # Fraction of cluster object-store memory above which all scale-up is
-    # frozen. Defensive kill-switch for global OOM prevention.
+    # Fraction of cluster object-store memory above which future gate logic
+    # will freeze scale-up.
     memory_pressure_critical_threshold: float = attrs.field(
         default=0.85,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
-    # Polling interval (seconds) for Ray cluster memory query. Independent of
-    # ``interval_s``; the cached value is read by every scale-up decision.
+    # Polling interval (seconds) for the future Ray cluster memory query.
     memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
 
     # --- Robustness (cluster-wide) ---
-    # When True, a transient AllocationError causes the cycle to be skipped
-    # instead of raised. Tolerates allocator races during snapshot-then-apply.
+    # Reserved for allocation-error recovery policy. Phase 2 planner calls
+    # currently use return-value based placement failures rather than catching
+    # allocator ``AllocationError``.
     skip_cycle_on_allocation_error: bool = True
-    # Consecutive cycles of stuck plan (proposed adds > 0, applied adds = 0)
-    # before an INFO log fires.
+    # Reserved for the stuck-plan watchdog. Phase 2 records monotonic
+    # ``_stuck_plan_counters`` but does not yet emit the threshold log.
     stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
 
     # --- Per-stage default + explicit overrides ---
@@ -844,11 +851,27 @@ class SaturationAwareConfig:
             ValueError: When two or more fields are set to mutually
                 inconsistent values.
         """
-        # Anti-flap window vs the longest stage's expected shrink streak --
-        # the anti-flap cooldown must dominate every stage's
-        # OVER_PROVISIONED streak so reciprocal donations cannot fire within
-        # the same shrink-decision horizon.
-        all_stage_configs = [self.stage_defaults, *self.per_stage_overrides.values()]
+        self.validate_effective_stage_configs()
+
+    def validate_effective_stage_configs(
+        self,
+        spec_overrides: Sequence[SaturationAwareStageConfig] = (),
+    ) -> None:
+        """Validate cross-field invariants across every effective stage config.
+
+        ``StageSpec.saturation_aware`` overrides are collected after this
+        cluster config is constructed, so callers that install those runtime
+        overrides must invoke this method with the collected override configs.
+
+        Args:
+            spec_overrides: Highest-precedence stage configs collected from
+                ``StageSpec.saturation_aware``.
+
+        Raises:
+            ValueError: When cluster-wide guardrails are weaker than any stage
+                config they must dominate.
+        """
+        all_stage_configs = [self.stage_defaults, *self.per_stage_overrides.values(), *spec_overrides]
         longest_shrink_streak = max(cfg.over_provisioned_streak_min_cycles for cfg in all_stage_configs)
         if self.cross_stage_donor_anti_flap_cycles < longest_shrink_streak:
             msg = (

@@ -40,19 +40,19 @@ a working cluster snapshot; the staged plan is frozen into a
 Convergence is intentionally damped per cycle so the scheduler
 tolerates noisy measurements without oscillating. Phase C grows
 each stage by at most ``min(positive_intent, ceiling - current,
-cluster_placement_capacity)`` workers per cycle; Phase D shrinks
+cluster_placement_capacity)`` workers per cycle and Phase D shrinks
 each stage by at most ``min(max(-intent, ceiling_excess),
 allowed_by_floor, fraction_cap)`` workers per cycle. The per-cycle
-fraction cap (default 0.05 = 5% of current) bounds the worst-case
-descent rate even when ``ceiling_excess`` or negative intent ask
-for more, so a stage that lands at 100 workers and is asked to
-shrink to its floor takes O(log(workers)) cycles to converge under
-the default fraction. Aggressive operators can raise
-``max_scale_down_fraction_per_cycle`` per stage if oscillation
-margin is acceptable.
+fraction cap (``max_scale_down_fraction_per_cycle``) bounds the
+descent rate even when ``ceiling_excess`` or negative intent would
+ask for a larger removal, trading absolute speed for stability under
+noisy probes. Operators tune the cap per stage on the
+``SaturationAwareStageConfig`` when faster reactions are required.
 """
 
 import math
+import types
+from collections.abc import Mapping
 
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     data_structures as rust_data_structures,
@@ -68,6 +68,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.donor import (
     find_saturation_donor,
     select_youngest_eligible_donor,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
     PhaseBoundary,
     check_floor_after_phase_d,
@@ -122,12 +123,23 @@ class SaturationAwareScheduler:
         _last_intent_deltas: Per-stage signed worker-count intent
             produced by the per-stage decision pipeline on the most
             recent ``autoscale()`` call. Saturation-driven scale-up
-            (Phase C) and scale-down (Phase D) consume this map; the
-            current iteration computes intent only and does not act
-            on the values, so they are exposed for tests and
-            observability. Reset on every ``autoscale()`` cycle.
-            Finished stages are absent (skipped by
-            ``_compute_intent_deltas``).
+            consumes the positive intents in :meth:`_run_phase_c_grow`
+            (capping each request at the available headroom and
+            cluster placement budget) and saturation-driven scale-down
+            consumes the negative intents in :meth:`_run_phase_d_shrink`
+            (combining them with the shrink eligibility filter). The
+            map is also surfaced unchanged for tests and observability.
+            Reset on every ``autoscale()`` cycle. Finished stages are
+            absent (skipped by ``_compute_intent_deltas``).
+        _stage_spec_overrides: Per-stage config overrides sourced from
+            ``StageSpec.saturation_aware`` and supplied to ``__init__``
+            by ``streaming.Autoscaler``. These outrank named overrides
+            and cluster defaults during runtime config resolution.
+            Validated against the cluster ``config`` in ``__init__``
+            and wrapped in a ``types.MappingProxyType`` so the stored
+            view rejects post-construction mutation at runtime; the
+            type is widened to ``Mapping`` to express the read-only
+            contract through static analysis.
         _stuck_plan_counters: Per-stage count of consecutive
             ``autoscale()`` cycles where Phase C had a positive
             intent but could not place the full request. Increments
@@ -137,7 +149,7 @@ class SaturationAwareScheduler:
             cycle where the stage either fully met its intent or had
             no positive intent. The counter is the input the
             pipeline-level ``stuck_plan_detection_cycles`` watchdog
-            (Phase 4) will read.
+            consumes when it is wired in.
         _cycle_counter: Monotonic count of completed ``autoscale()``
             calls since ``setup()``. Used as the time index for the
             saturation-mode cross-stage donor anti-flap layers.
@@ -154,19 +166,57 @@ class SaturationAwareScheduler:
 
     """
 
-    def __init__(self, config: SaturationAwareConfig) -> None:
+    def __init__(
+        self,
+        config: SaturationAwareConfig,
+        stage_spec_overrides: dict[str, SaturationAwareStageConfig] | None = None,
+    ) -> None:
         """Initialize the scheduler.
+
+        Constructor injection is the single entry point for installing
+        per-stage overrides; the override map is cross-validated against
+        ``config`` here so a misconfigured pipeline fails at build time,
+        before ``setup()`` runs.
 
         Args:
             config: Cluster-wide ``SaturationAwareConfig``. Stored by
                 reference; per-stage configs are resolved lazily via
                 ``config.get_effective_stage_config``.
+            stage_spec_overrides: Per-stage overrides sourced from
+                ``StageSpec.saturation_aware`` and keyed by runtime
+                stage name. These outrank named overrides
+                (``config.per_stage_overrides``) and the cluster
+                defaults (``config.stage_defaults``) when the runtime
+                resolver consults them. ``None`` (the default) and an
+                empty mapping behave identically: no overrides are
+                installed and no validation is performed.
+
+        Raises:
+            ValueError: If any override config violates a cluster-wide
+                guardrail (see
+                ``SaturationAwareConfig.validate_effective_stage_configs``).
+                The error fires synchronously from the constructor so
+                misconfigurations surface during ``Autoscaler.__init__``
+                rather than mid-``autoscale()``.
 
         """
         self._config = config
         self._problem: data_structures.Problem | None = None
         self._stage_states: dict[str, _StageRuntimeState] = {}
         self._stage_names: list[str] = []
+        # ``stage_spec_overrides`` is validated eagerly so a misconfigured
+        # pipeline cannot reach the per-cycle hot path with a weakened
+        # cross-stage donor anti-flap guardrail. The empty-input fast path
+        # skips the validator call to keep constructor cost negligible for
+        # the common case where no spec-level overrides are present. The
+        # caller's map is copied into a fresh ``dict`` and then wrapped in
+        # a ``MappingProxyType`` so subsequent caller mutations cannot
+        # leak in and post-construction mutation of the stored map fails
+        # at runtime (not just by underscore-prefix convention).
+        self._stage_spec_overrides: Mapping[str, SaturationAwareStageConfig] = types.MappingProxyType({})
+        if stage_spec_overrides:
+            self._config.validate_effective_stage_configs(tuple(stage_spec_overrides.values()))
+            self._stage_spec_overrides = types.MappingProxyType(dict(stage_spec_overrides))
         self._regime_state: RegimeDetectorState = RegimeDetectorState()
         self._worker_ages: dict[str, int] = {}
         self._last_intent_deltas: dict[str, int] = {}
@@ -182,6 +232,13 @@ class SaturationAwareScheduler:
         self._cycle_counter: int = 0
         self._last_donation_cycle: dict[str, int] = {}
         self._donations_received_this_cycle: dict[str, int] = {}
+
+    def _stage_cfg(self, stage_name: str) -> SaturationAwareStageConfig:
+        """Resolve the effective stage config including ``StageSpec`` overrides."""
+        return self._config.get_effective_stage_config(
+            stage_name=stage_name,
+            spec_override=self._stage_spec_overrides.get(stage_name),
+        )
 
     def setup(self, problem: data_structures.Problem) -> None:
         """Capture the pipeline shape and seed empty per-stage state.
@@ -236,10 +293,7 @@ class SaturationAwareScheduler:
                 raise ValueError(msg)
             if runtime.resolved_thresholds is not None:
                 continue
-            stage_cfg = self._config.get_effective_stage_config(
-                stage_name=stage.stage_name,
-                spec_override=None,
-            )
+            stage_cfg = self._stage_cfg(stage.stage_name)
             effective_aggressiveness = self._effective_aggressiveness(stage_cfg.saturation_aggressiveness)
             resolved = _resolve_auto_thresholds(
                 stage_cfg,
@@ -293,6 +347,29 @@ class SaturationAwareScheduler:
             f"activation_threshold={resolved.activation_threshold:.6f} ({act_source}), "
             f"over_provisioned_threshold={stage_cfg.over_provisioned_threshold} (config; not auto-derived)"
         )
+
+    def _check_problem_state_shape_before_phase_a(self, problem_state: data_structures.ProblemState) -> None:
+        """Reject problem / problem_state shape drift before phase-specific indexing."""
+        if self._problem is None:
+            msg = "_check_problem_state_shape_before_phase_a called before setup()"
+            raise RuntimeError(msg)
+        problem_stages = self._problem.rust.stages
+        runtime_stages = problem_state.rust.stages
+        if len(runtime_stages) != len(problem_stages):
+            msg = (
+                f"Before {PhaseBoundary.PHASE_A}: problem_state has {len(runtime_stages)} stages "
+                f"but problem has {len(problem_stages)}. The autoscale cycle snapshot is corrupted."
+            )
+            raise SchedulerInvariantError(msg)
+        for stage_index, (problem_stage, runtime_stage) in enumerate(zip(problem_stages, runtime_stages, strict=True)):
+            if runtime_stage.stage_name == problem_stage.name:
+                continue
+            msg = (
+                f"Before {PhaseBoundary.PHASE_A}: stage index {stage_index} has problem stage "
+                f"{problem_stage.name!r} but problem_state stage {runtime_stage.stage_name!r}. "
+                "The autoscale cycle snapshot is corrupted."
+            )
+            raise SchedulerInvariantError(msg)
 
     def update_with_measurements(
         self,
@@ -353,6 +430,7 @@ class SaturationAwareScheduler:
             msg = "SaturationAwareScheduler.autoscale() called before setup()"
             raise RuntimeError(msg)
 
+        self._check_problem_state_shape_before_phase_a(problem_state)
         self._cycle_counter += 1
         self._donations_received_this_cycle = {}
         # Snapshot the stuck-plan counters before Phase C mutates them so the
@@ -498,7 +576,7 @@ class SaturationAwareScheduler:
                     "problem and problem_state shapes disagree."
                 )
                 raise ValueError(msg)
-            stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
+            stage_cfg = self._stage_cfg(stage_name)
             current_workers = len(worker_ids_by_stage[stage_index])
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
@@ -547,7 +625,7 @@ class SaturationAwareScheduler:
         on any cycle where the stage either fully met its intent or
         had no positive intent. The counter is the input the
         pipeline-level ``stuck_plan_detection_cycles`` watchdog
-        (Phase 4) will read.
+        consumes when it is wired in.
 
         Args:
             ctx: The cycle's mutable planner context. Mutated in place
@@ -683,10 +761,7 @@ class SaturationAwareScheduler:
         stage_floors = self._compute_stage_floors(num_nodes)
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
-        stage_configs = {
-            name: self._config.get_effective_stage_config(stage_name=name, spec_override=None)
-            for name in self._stage_names
-        }
+        stage_configs = {name: self._stage_cfg(name) for name in self._stage_names}
 
         donor = find_saturation_donor(
             receiver_stage_index=receiver_stage_index,
@@ -848,13 +923,32 @@ class SaturationAwareScheduler:
                 continue
 
             floor = stage_floors[stage_index]
-            stage_cfg = self._config.get_effective_stage_config(stage_name=stage_name, spec_override=None)
+            stage_cfg = self._stage_cfg(stage_name)
             allowed_by_floor = max(0, current - floor)
             fraction_cap = (
                 max(1, math.floor(current * stage_cfg.max_scale_down_fraction_per_cycle)) if current > 0 else 0
             )
             actual_remove = min(requested_remove, allowed_by_floor, fraction_cap)
             if actual_remove == 0:
+                # The zero-removal log only fires when the operator-configured
+                # cap was actively pressing (``ceiling_excess > 0``) and was
+                # blocked by the floor or fraction cap. Pure intent-at-floor
+                # is steady state and stays silent so the log stream does not
+                # repeat once a stage settles at ``min_workers``.
+                if ceiling_excess > 0:
+                    self._log_phase_d_shrink_outcome(
+                        stage_name=stage_name,
+                        intent=intent,
+                        ceiling=ceiling,
+                        ceiling_excess=ceiling_excess,
+                        requested_remove=requested_remove,
+                        actual_remove=actual_remove,
+                        current=current,
+                        floor=floor,
+                        fraction_cap=fraction_cap,
+                        allowed_by_floor=allowed_by_floor,
+                        max_scale_down_fraction_per_cycle=stage_cfg.max_scale_down_fraction_per_cycle,
+                    )
                 continue
 
             worker_used_slots = {wg.id: wg.num_used_slots for wg in runtime_stage.worker_groups}
@@ -1181,10 +1275,7 @@ class SaturationAwareScheduler:
             # Read the receiver's count from the planner's live snapshot so any
             # mutation by an earlier-iteration donation is observed correctly.
             current = len(ctx.worker_ids_by_stage()[stage_index])
-            stage_cfg = self._config.get_effective_stage_config(
-                stage_name=problem_stage.name,
-                spec_override=None,
-            )
+            stage_cfg = self._stage_cfg(problem_stage.name)
             made_progress = False
             stuck = False
             while current < target_min:
@@ -1340,10 +1431,7 @@ class SaturationAwareScheduler:
             raise RuntimeError(msg)
         floors: dict[int, int] = {}
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
-            stage_cfg = self._config.get_effective_stage_config(
-                stage_name=problem_stage.name,
-                spec_override=None,
-            )
+            stage_cfg = self._stage_cfg(problem_stage.name)
             floors[stage_index] = max(
                 stage_cfg.min_workers if stage_cfg.min_workers is not None else 1,
                 stage_cfg.min_workers_per_node * num_nodes if stage_cfg.min_workers_per_node is not None else 0,
@@ -1392,10 +1480,7 @@ class SaturationAwareScheduler:
             raise RuntimeError(msg)
         ceilings: dict[int, int | None] = {}
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
-            stage_cfg = self._config.get_effective_stage_config(
-                stage_name=problem_stage.name,
-                spec_override=None,
-            )
+            stage_cfg = self._stage_cfg(problem_stage.name)
             candidates: list[int] = []
             if stage_cfg.max_workers is not None:
                 candidates.append(stage_cfg.max_workers)

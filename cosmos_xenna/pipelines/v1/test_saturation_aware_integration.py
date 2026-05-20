@@ -40,10 +40,17 @@ Universal invariants (asserted for both schedulers):
 Saturation-aware-only invariants (asserted only when
 ``scheduler is SchedulerKind.SATURATION_AWARE``):
 
-* The number of distinct worker PIDs per stage never exceeds the
-  operator-configured ``max_workers`` cap.
-* The number of distinct worker PIDs per stage never falls below the
-  operator-configured ``min_workers`` floor.
+* Peak simultaneous worker count per stage stays at or below the
+  operator-configured ``max_workers`` cap. The cap is a
+  simultaneous-count cap, so lifetime distinct PIDs would
+  over-count whenever Phase D shrinks a stage and Phase C later
+  re-grows it (even when the cap is honoured at every instant).
+  The test records each ``process_data`` active span and computes the
+  maximum number of distinct PIDs with overlapping spans.
+* Observed active worker count per stage stays at or above the
+  operator-configured ``min_workers`` floor while that stage is
+  processing work. Lifetime setup count would not catch a stage that
+  shrank below the floor after first materialising a worker.
 
 Resource scaling follows the
 ``cosmos_xenna.utils.ci.is_running_in_cicd`` pattern used throughout
@@ -63,6 +70,7 @@ Pipeline shape:
 import os
 import time
 from collections.abc import Iterator
+from typing import Any, cast
 
 import pytest
 import ray
@@ -131,35 +139,90 @@ def _init_ray_for_test(monkeypatch: pytest.MonkeyPatch, num_cpus: int) -> None:
 
 @ray.remote(num_cpus=0)
 class _WorkerTracker:
-    """Collects distinct ``(stage_name, pid)`` pairs from stage setups.
+    """Collects per-stage worker liveness signals from stage actors.
 
-    Each Ray worker actor lives in its own OS process, so the count of
-    distinct PIDs per stage equals the number of unique workers the
-    autoscaler placed for that stage over the pipeline lifetime.
+    Two records are maintained per stage. Each Ray worker actor lives
+    in its own OS process, so PIDs uniquely identify workers within a
+    single test run.
+
+    * ``_setups`` -- set of PIDs that called ``setup()`` at any point
+      in the run. Drives the universal "the autoscaler placed at least
+      one worker for this stage" check. Robust against worker churn:
+      a worker that was created and later removed still contributes
+      its PID to this set, which is the desired semantic for that
+      check.
+    * ``_active_spans`` -- list of ``(pid, start_ts, end_ts)`` tuples
+      emitted on every ``process_data`` call. Drives
+      :meth:`observed_active_bounds`, which counts distinct PIDs with
+      overlapping processing spans. This pins the operator-configured
+      worker band during real work without relying on lifetime PID
+      counts.
+
     ``num_cpus=0`` keeps the tracker out of the autoscaler's resource
     budget so a CI host with a small core count still has all of its
     CPUs available to the pipeline stages.
     """
 
     def __init__(self) -> None:
-        self._pids: dict[str, set[int]] = {}
+        self._setups: dict[str, set[int]] = {}
+        self._active_spans: dict[str, list[tuple[int, float, float]]] = {}
 
-    def register(self, stage_name: str, pid: int) -> None:
-        self._pids.setdefault(stage_name, set()).add(pid)
+    def register_setup(self, stage_name: str, pid: int) -> None:
+        """Record that a worker for ``stage_name`` called ``setup()``."""
+        self._setups.setdefault(stage_name, set()).add(pid)
 
-    def counts(self) -> dict[str, int]:
-        return {k: len(v) for k, v in self._pids.items()}
+    def record_active_span(self, stage_name: str, pid: int, start_ts: float, end_ts: float) -> None:
+        """Record the wall-clock interval where one worker processed one item."""
+        self._active_spans.setdefault(stage_name, []).append((pid, start_ts, end_ts))
+
+    def setup_counts(self) -> dict[str, int]:
+        """Distinct PIDs that called ``setup()`` per stage (lifetime count).
+
+        Returns:
+            Mapping from stage name to lifetime distinct setup-PID count.
+        """
+        return {k: len(v) for k, v in self._setups.items()}
+
+    def observed_active_bounds(self) -> dict[str, tuple[int, int]]:
+        """Minimum and peak distinct PIDs actively processing at span starts.
+
+        For each stage anchors a concurrency snapshot at every recorded
+        ``process_data`` start and counts distinct PIDs whose active
+        spans include that timestamp. Anchoring at starts catches cap
+        breaches exactly when new overlapping work begins while keeping
+        the floor check scoped to windows where the stage is doing work.
+
+        Returns:
+            Mapping from stage name to ``(min_observed, peak_observed)``.
+        """
+        result: dict[str, tuple[int, int]] = {}
+        for stage_name, spans in self._active_spans.items():
+            if not spans:
+                result[stage_name] = (0, 0)
+                continue
+            counts = [
+                len({pid for pid, start_ts, end_ts in spans if start_ts <= anchor_ts < end_ts})
+                for _, anchor_ts, _ in spans
+            ]
+            result[stage_name] = (min(counts), max(counts))
+        return result
 
 
 class _RecordingStage(pipelines_v1.Stage[int, int]):
-    """Lightweight CPU-only stage that records its worker PID.
+    """Lightweight CPU-only stage that records its worker liveness.
 
     The stage performs a deterministic fan-out-of-one transform
     (``[x * 2 for x in batch]``) and sleeps for a configurable duration
     per ``process_data`` call to simulate work without burning CPU.
+
     On every ``setup`` it registers ``(stage_name, os.getpid())`` with
-    the named tracker actor so the test can observe how many distinct
-    workers the autoscaler created for this stage.
+    the named tracker actor (``register_setup``) so the test can assert
+    that the autoscaler placed at least one worker for this stage.
+
+    On every ``process_data`` call it records the active processing
+    span (``record_active_span``) carrying the same PID plus start/end
+    timestamps. The call is awaited so the test observes a causally
+    complete timeline after ``run_pipeline`` returns.
     """
 
     def __init__(self, stage_name: str, cpus: float, process_dur_s: float, tracker_name: str) -> None:
@@ -167,6 +230,7 @@ class _RecordingStage(pipelines_v1.Stage[int, int]):
         self._cpus = float(cpus)
         self._process_dur_s = float(process_dur_s)
         self._tracker_name = tracker_name
+        self._tracker_handle: ray.actor.ActorHandle[Any] | None = None
 
     @property
     def stage_batch_size(self) -> int:
@@ -177,12 +241,25 @@ class _RecordingStage(pipelines_v1.Stage[int, int]):
         return pipelines_v1.Resources(cpus=self._cpus, gpus=0.0)
 
     def setup(self, worker_metadata: resources.WorkerMetadata) -> None:
-        tracker = ray.get_actor(self._tracker_name)
-        ray.get(tracker.register.remote(self._stage_name, os.getpid()))
+        self._tracker_handle = ray.get_actor(self._tracker_name)
+        ray.get(self._tracker_handle.register_setup.remote(self._stage_name, os.getpid()))
 
     def process_data(self, in_data: list[int]) -> list[int]:
+        # ``setup`` is guaranteed to run before the first ``process_data``
+        # call, so ``_tracker_handle`` is always populated here.
+        assert self._tracker_handle is not None, "process_data invoked before setup()"
+        start_ts = time.time()
         if self._process_dur_s > 0.0:
             time.sleep(self._process_dur_s)
+        tracker_handle = cast(Any, self._tracker_handle)
+        ray.get(
+            tracker_handle.record_active_span.remote(
+                self._stage_name,
+                os.getpid(),
+                start_ts,
+                time.time(),
+            )
+        )
         return [x * 2 for x in in_data]
 
 
@@ -242,12 +319,14 @@ def test_pipeline_runs_to_completion_under_each_scheduler(
     input task reaches the last stage, every stage materialises at least
     one worker, and wall-clock time stays under ``_WALL_CLOCK_TIMEOUT_S``.
 
-    Under ``SchedulerKind.SATURATION_AWARE`` the test additionally checks
-    that distinct worker PIDs per stage stay within the
-    ``[min_workers, max_workers]`` band declared on
-    ``SaturationAwareConfig.stage_defaults``; the fragmentation-based
-    scheduler ignores ``SaturationAwareStageConfig`` so the cap check is
-    skipped for it.
+    Under ``SchedulerKind.SATURATION_AWARE`` the test additionally
+    checks both ends of the operator band on
+    ``SaturationAwareConfig.stage_defaults``:
+
+    * Peak observed active worker count per stage stays at or below
+      ``max_workers``.
+    * Minimum observed active worker count per stage stays at or above
+      ``min_workers`` while that stage is processing work.
     """
     num_tasks = 30 if is_running_in_cicd() else 60
     cpus_per_stage = 0.25 if is_running_in_cicd() else 0.5
@@ -270,43 +349,49 @@ def test_pipeline_runs_to_completion_under_each_scheduler(
         results = pipelines_v1.run_pipeline(spec)
         elapsed = time.monotonic() - start
 
-        counts: dict[str, int] = ray.get(tracker.counts.remote())  # type: ignore[attr-defined]
+        setup_counts: dict[str, int] = ray.get(tracker.setup_counts.remote())  # type: ignore[attr-defined]
+        active_bounds: dict[str, tuple[int, int]] = ray.get(  # type: ignore[attr-defined]
+            tracker.observed_active_bounds.remote()
+        )
 
         assert results is not None, (
             f"run_pipeline returned None despite return_last_stage_outputs=True; scheduler={scheduler.value}"
         )
         assert len(results) == num_tasks, (
-            f"Dropped tasks: expected {num_tasks}, got {len(results)}; scheduler={scheduler.value}, counts={counts}"
+            f"Dropped tasks: expected {num_tasks}, got {len(results)}; "
+            f"scheduler={scheduler.value}, setup_counts={setup_counts}"
         )
         assert sorted(results) == [x * 8 for x in range(num_tasks)], (
             f"Output values diverged from the expected x*8 transform; scheduler={scheduler.value}"
         )
 
         for stage_name in _STAGE_NAMES:
-            assert counts.get(stage_name, 0) >= 1, (
-                f"Stage '{stage_name}' never materialised a worker; scheduler={scheduler.value}, counts={counts}"
+            assert setup_counts.get(stage_name, 0) >= 1, (
+                f"Stage '{stage_name}' never materialised a worker; "
+                f"scheduler={scheduler.value}, setup_counts={setup_counts}"
             )
 
         assert elapsed < _WALL_CLOCK_TIMEOUT_S, (
             f"Pipeline took {elapsed:.1f}s (limit {_WALL_CLOCK_TIMEOUT_S:.1f}s); "
-            f"likely deadlocked; scheduler={scheduler.value}, counts={counts}"
+            f"likely deadlocked; scheduler={scheduler.value}, setup_counts={setup_counts}"
         )
 
         if scheduler is specs.SchedulerKind.SATURATION_AWARE:
             for stage_name in _STAGE_NAMES:
-                stage_count = counts.get(stage_name, 0)
-                assert stage_count <= _MAX_WORKERS_PER_STAGE, (
+                # The operator-configured cap is a simultaneous-count cap,
+                # so the assertion uses peak observed active workers rather
+                # than lifetime distinct PIDs, which would over-count under
+                # worker churn even when the cap is honoured.
+                observed_min, peak = active_bounds.get(stage_name, (0, 0))
+                assert peak <= _MAX_WORKERS_PER_STAGE, (
                     f"Stage '{stage_name}' exceeded the operator-configured max_workers "
-                    f"({_MAX_WORKERS_PER_STAGE}); observed {stage_count} distinct worker PIDs; "
-                    f"counts={counts}"
+                    f"({_MAX_WORKERS_PER_STAGE}); active_peak={peak}, "
+                    f"setup_counts={setup_counts}, active_bounds={active_bounds}"
                 )
-                # Currently coincident with the universal `>= 1` check above; kept
-                # explicit so raising ``_MIN_WORKERS_PER_STAGE`` above 1 in a future
-                # change automatically tightens the saturation-aware contract.
-                assert stage_count >= _MIN_WORKERS_PER_STAGE, (
+                assert observed_min >= _MIN_WORKERS_PER_STAGE, (
                     f"Stage '{stage_name}' fell below the operator-configured min_workers "
-                    f"({_MIN_WORKERS_PER_STAGE}); observed {stage_count} distinct worker PIDs; "
-                    f"counts={counts}"
+                    f"({_MIN_WORKERS_PER_STAGE}) while processing work; "
+                    f"setup_counts={setup_counts}, active_bounds={active_bounds}"
                 )
     finally:
         ray.kill(tracker)

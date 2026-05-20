@@ -106,11 +106,13 @@ def make_scheduler() -> SchedulerFactory:
     """Build a fresh setup-completed scheduler with the requested topology and config.
 
     Returns a closure ``factory(stage_specs, *, cfg=None, num_nodes=1,
-    total_cpus=16)`` so each test creates exactly the number of
-    schedulers it needs, with full control over the cluster shape and
-    stage configuration. Each invocation returns a brand-new
-    ``SaturationAwareScheduler`` so internal state never leaks across
-    tests or across multiple calls within one test.
+    total_cpus=16, stage_spec_overrides=None)`` so each test creates
+    exactly the number of schedulers it needs, with full control over
+    the cluster shape, stage configuration, and any
+    ``StageSpec.saturation_aware`` overrides that streaming would
+    inject through the constructor. Each invocation returns a
+    brand-new ``SaturationAwareScheduler`` so internal state never
+    leaks across tests or across multiple calls within one test.
     """
 
     def _factory(
@@ -119,6 +121,7 @@ def make_scheduler() -> SchedulerFactory:
         cfg: SaturationAwareConfig | None = None,
         num_nodes: int = 1,
         total_cpus: int = 16,
+        stage_spec_overrides: dict[str, SaturationAwareStageConfig] | None = None,
     ) -> tuple[SaturationAwareScheduler, data_structures.Problem]:
         if cfg is None:
             cfg = _make_config()
@@ -137,7 +140,7 @@ def make_scheduler() -> SchedulerFactory:
                 for name, requested in stage_specs
             ],
         )
-        scheduler = SaturationAwareScheduler(cfg)
+        scheduler = SaturationAwareScheduler(cfg, stage_spec_overrides=stage_spec_overrides)
         scheduler.setup(problem)
         return scheduler, problem
 
@@ -245,6 +248,56 @@ class TestComputeStageCeilings:
         # max_workers=10, max_workers_per_node*num_nodes=1*4=4. min(10, 4) = 4.
         assert ceilings == {0: 4}
 
+    def test_stage_spec_override_wins_at_runtime(self, make_scheduler: SchedulerFactory) -> None:
+        """The runtime resolver honors ``StageSpec.saturation_aware`` above named overrides.
+
+        ``stage_spec_overrides`` is injected through the
+        ``SaturationAwareScheduler`` constructor (mirroring the wiring
+        ``streaming.Autoscaler`` performs via
+        ``_make_scheduler_algorithm``) and must outrank both
+        ``per_stage_overrides`` and ``stage_defaults`` when the
+        runtime resolver computes ceilings.
+        """
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(max_workers=10),
+            per_stage_overrides={"A": SaturationAwareStageConfig(max_workers=8)},
+        )
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=cfg,
+            stage_spec_overrides={"A": SaturationAwareStageConfig(max_workers=2)},
+        )
+
+        ceilings = scheduler._compute_stage_ceilings(num_nodes=1)
+
+        assert ceilings == {0: 2}
+
+    def test_stage_spec_override_participates_in_anti_flap_validation(
+        self,
+        make_scheduler: SchedulerFactory,
+    ) -> None:
+        """Runtime overrides cannot weaken the cross-stage donor anti-flap invariant.
+
+        With constructor injection the cross-validation runs eagerly
+        inside ``SaturationAwareScheduler.__init__``, so a
+        misconfigured pipeline fails fast at build time rather than
+        mid-``autoscale()``. The fixture surfaces the constructor's
+        ``ValueError`` directly through ``make_scheduler``.
+        """
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            cross_stage_donor_anti_flap_cycles=3,
+            stage_defaults=SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3),
+        )
+
+        with pytest.raises(ValueError, match=r"cross_stage_donor_anti_flap_cycles \(3\).*4"):
+            make_scheduler(
+                [("A", None)],
+                cfg=cfg,
+                stage_spec_overrides={"A": SaturationAwareStageConfig(over_provisioned_streak_min_cycles=4)},
+            )
+
     def test_max_workers_dominates_when_smaller_than_per_node_total(self, make_scheduler: SchedulerFactory) -> None:
         """``max_workers`` wins when smaller than the per-node total."""
         scheduler, _ = make_scheduler(
@@ -263,6 +316,74 @@ class TestComputeStageCeilings:
 
         with pytest.raises(RuntimeError, match="_compute_stage_ceilings called before setup"):
             scheduler._compute_stage_ceilings(num_nodes=1)
+
+
+class TestStageSpecOverrideConstructorContract:
+    """Pin the constructor contract for ``stage_spec_overrides``.
+
+    The constructor docstring promises that ``None`` and an empty
+    mapping behave identically (no overrides installed, no validation
+    performed). Pinning this with a focused unit test prevents a
+    future ``is not None`` rewrite from silently breaking the
+    empty-input fast path or from invoking
+    ``validate_effective_stage_configs`` on an empty tuple in the hot
+    construction path.
+    """
+
+    def test_none_and_empty_mapping_install_no_overrides(self) -> None:
+        """``None`` and ``{}`` both leave ``_stage_spec_overrides`` empty."""
+        cfg = _make_config()
+
+        scheduler_none = SaturationAwareScheduler(cfg)
+        scheduler_default = SaturationAwareScheduler(cfg, stage_spec_overrides=None)
+        scheduler_empty = SaturationAwareScheduler(cfg, stage_spec_overrides={})
+
+        assert scheduler_none._stage_spec_overrides == {}
+        assert scheduler_default._stage_spec_overrides == {}
+        assert scheduler_empty._stage_spec_overrides == {}
+
+    def test_non_empty_mapping_is_copied_into_scheduler(self) -> None:
+        """A non-empty override map is stored as a copy, not by reference."""
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(),
+        )
+        overrides = {"A": SaturationAwareStageConfig(max_workers=2)}
+
+        scheduler = SaturationAwareScheduler(cfg, stage_spec_overrides=overrides)
+
+        assert scheduler._stage_spec_overrides == overrides
+        # Mutating the caller's map after construction must not leak
+        # into the scheduler; the constructor copies via ``dict(...)``.
+        overrides["A"] = SaturationAwareStageConfig(max_workers=99)
+        assert scheduler._stage_spec_overrides["A"].max_workers == 2
+
+    def test_stored_overrides_reject_post_construction_mutation(self) -> None:
+        """The stored override view raises ``TypeError`` on direct mutation.
+
+        Pinned because the override map is documented as immutable
+        post-construction. The constructor wraps the copied dict in
+        ``types.MappingProxyType`` so the runtime closure does not rely
+        on underscore-prefix convention alone; this test guards against
+        a future refactor that swaps the proxy back for a bare dict.
+        Both the populated and empty-input paths produce a read-only
+        view, so the assertion fires on both.
+        """
+        cfg = SaturationAwareConfig(
+            floor_stuck_grace_cycles=0,
+            stage_defaults=SaturationAwareStageConfig(),
+        )
+
+        scheduler_with_overrides = SaturationAwareScheduler(
+            cfg,
+            stage_spec_overrides={"A": SaturationAwareStageConfig(max_workers=2)},
+        )
+        scheduler_empty = SaturationAwareScheduler(cfg)
+
+        with pytest.raises(TypeError):
+            scheduler_with_overrides._stage_spec_overrides["A"] = SaturationAwareStageConfig(max_workers=99)  # type: ignore[index]
+        with pytest.raises(TypeError):
+            scheduler_empty._stage_spec_overrides["A"] = SaturationAwareStageConfig(max_workers=99)  # type: ignore[index]
 
 
 class TestPhaseCCapClamp:
@@ -609,6 +730,32 @@ class TestPhaseDCapForcedShrink:
         # min(4, 2) = 2. The floor never lets the stage drop below 6.
         assert len(solution.stages[0].deleted_workers) == 2
 
+    def test_cap_driven_shrink_fully_blocked_by_floor_logs_conflict(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A floor that blocks every cap-driven deletion still emits operator context."""
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(max_workers=4, min_workers_per_node=8),
+        )
+        state = make_state([("A", [f"A-w{i}" for i in range(8)], False)])
+
+        solution = autoscale_with_intents(scheduler, state, {"A": 0})
+
+        assert solution.stages[0].deleted_workers == []
+        deficit_logs = [record for record in loguru_caplog.records if "floor cap left 0 removed" in record.message]
+        assert len(deficit_logs) == 1
+        msg = deficit_logs[0].message
+        assert "hard worker cap overflow requested 4 workers" in msg
+        assert "deficit=4" in msg
+        assert "current=8" in msg
+        assert "floor=8" in msg
+        assert "ceiling=4" in msg
+
     def test_current_at_cap_zero_shrink(
         self,
         make_scheduler: SchedulerFactory,
@@ -847,10 +994,10 @@ class TestPhaseDCapForcedShrink:
 class TestCapMultiCycleStability:
     """Pin that the cap holds across long runs of saturated demand.
 
-    The plan calls for "1-stage saturated 100 cycles + cap=4 -> count
-    never exceeds 4". The induction is: cycle N grows up to the cap;
-    cycle N+1 with current already at cap drops every positive
-    intent to zero. These tests pin both base case and step case.
+    A saturated stage capped at four workers grows up to the cap, then
+    subsequent cycles with current already at the cap drop every
+    positive intent to zero. These tests pin both base case and step
+    case.
     """
 
     def test_first_cycle_with_zero_workers_grows_to_cap(

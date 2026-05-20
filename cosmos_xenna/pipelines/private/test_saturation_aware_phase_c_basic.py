@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ``SaturationAwareScheduler._run_phase_c_grow_single_target``.
+"""Tests for ``SaturationAwareScheduler._run_phase_c_grow``.
 
 Phase C applies positive intent deltas as planner adds via
 ``ctx.try_add_worker``. The contract under test:

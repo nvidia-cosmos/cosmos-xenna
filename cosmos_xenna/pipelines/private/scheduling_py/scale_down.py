@@ -55,6 +55,7 @@ of saturation; this helper only governs the order in which Phase D
 selects victims among the workers eligible for removal this cycle.
 """
 
+import math
 from operator import itemgetter
 
 
@@ -116,6 +117,11 @@ def select_workers_to_remove_oldest_first(
         return []
     used_slots = worker_used_slots or {}
     gpu_fractions = worker_host_gpu_used_fractions or {}
+    for worker_id, fraction in gpu_fractions.items():
+        if math.isfinite(fraction) and fraction >= 0.0:
+            continue
+        msg = f"host_gpu_used_fraction for worker {worker_id!r} must be finite and >= 0, got {fraction!r}"
+        raise ValueError(msg)
     ranked = sorted(
         (
             (

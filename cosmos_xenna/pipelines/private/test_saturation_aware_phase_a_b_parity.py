@@ -23,17 +23,17 @@ fragmentation-based scheduler and the saturation-aware scheduler:
   - **Non-manual stages, lower bound only** - both respect the
     minimum-worker floor (``legacy_final >= floor`` AND
     ``new_final >= floor``). Upper-bound divergence is expected and
-    not asserted: legacy Phase 3 (FGD max-min balancing) fills free
-    cluster capacity even without measurements, while the
-    saturation-aware scheduler's Phase C / Phase D scale-up /
-    scale-down are not yet shipped.
+    not asserted: the fragmentation-based scheduler may fill free
+    cluster capacity from fragmentation signals, while the
+    saturation-aware scheduler grows or shrinks only when saturation
+    signals produce an intent.
   - **Finished stages** - neither scheduler may add or delete a
     worker on a stage with ``is_finished=True``.
 
-Single-cycle structural parity only; multi-cycle convergence parity
-is not tested today (will be added when saturation-driven scale-up
-and scale-down ship). Rationale for the structural-vs-numerical
-scoping decision lives in ``docs/curator/scheduler-tuning.md``.
+Single-cycle structural parity only; multi-cycle numerical convergence
+is covered by the saturation-aware focused tests, not this parity
+harness. Rationale for the structural-vs-numerical scoping decision
+lives in ``docs/curator/scheduler-tuning.md``.
 """
 
 import uuid
@@ -323,11 +323,11 @@ def _assert_structural_parity(
     non-manual non-finished stages call
     :func:`_assert_non_manual_satisfies_floor` (lower bound) and, when
     seeded at or above the floor, also
-    :func:`_assert_new_scheduler_does_not_churn` - saturation-driven
-    scale-up and scale-down are not yet shipped, so any add or delete
-    on a non-manual stage already at or above its floor is a
-    regression. Per-stage floors are computed from ``cfg`` via
-    :func:`_stage_floor` so per-stage overrides flow through correctly.
+    :func:`_assert_new_scheduler_does_not_churn`. The parity fixtures
+    provide no saturation signals, so a non-manual stage already at or
+    above its floor should not add or delete workers in this harness.
+    Per-stage floors are computed from ``cfg`` via :func:`_stage_floor`
+    so per-stage overrides flow through correctly.
     """
     legacy_stages = legacy_sol.stages
     new_stages = new_sol.stages

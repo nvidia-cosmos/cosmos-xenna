@@ -3,6 +3,8 @@
 
 """Tests for saturation-aware scale-down worker selection helpers."""
 
+import math
+
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
@@ -359,3 +361,15 @@ class TestConsolidationTiebreakEdgeCases:
 
         assert first == second
         assert sorted(first) == sorted(worker_ids)
+
+    @pytest.mark.parametrize("bad_fraction", [-0.1, math.nan, math.inf, -math.inf])
+    def test_invalid_gpu_fraction_raises_value_error(self, bad_fraction: float) -> None:
+        """Direct helper callers cannot feed invalid consolidation fractions into sorting."""
+        with pytest.raises(ValueError, match=r"host_gpu_used_fraction.*worker 'bad'.*finite and >= 0"):
+            select_workers_to_remove_oldest_first(
+                worker_ids=["bad"],
+                worker_ages={"bad": 1},
+                worker_used_slots={"bad": 0},
+                worker_host_gpu_used_fractions={"bad": bad_fraction},
+                delete_count=1,
+            )

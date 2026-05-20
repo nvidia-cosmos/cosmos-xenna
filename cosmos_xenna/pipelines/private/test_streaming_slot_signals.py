@@ -516,22 +516,25 @@ class TestMakeProblemStateSlotSignals:
             (0, 0, -1),
         ],
     )
-    def test_negative_signal_overflows_at_rust_boundary(
+    def test_negative_signal_raises_contextual_value_error(
         self,
         num_used_slots: int,
         num_empty_slots: int,
         num_queued_tasks: int,
     ) -> None:
-        """A negative pool-property value triggers ``OverflowError`` at the ``usize`` cast.
-
-        Pins the Rust-boundary contract: ``ProblemStageState`` stores
-        signals as ``usize``, so a buggy pool returning a negative int
-        must surface immediately (``OverflowError``) rather than
-        silently clamp to zero or wrap to a huge positive value.
-        """
+        """A negative pool-property value fails before the Rust ``usize`` cast."""
         pool = _FakeActorPool("buggy", 1, num_used_slots, num_empty_slots, num_queued_tasks)
+        negative_field = next(
+            field
+            for field, value in {
+                "num_used_slots": num_used_slots,
+                "num_empty_slots": num_empty_slots,
+                "input_queue_depth": num_queued_tasks,
+            }.items()
+            if value < 0
+        )
 
-        with pytest.raises(OverflowError):
+        with pytest.raises(ValueError, match=rf"stage 'buggy'.*{negative_field} must be >= 0"):
             _make_problem_state([pool], [False])
 
     def test_repeated_calls_are_idempotent(self) -> None:
@@ -658,8 +661,8 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
 
         assert self._per_worker_used_slots(state) == {"active-w0": 3, "active-w1": 0}
 
-    def test_worker_missing_from_idle_map_defaults_to_zero(self) -> None:
-        """A worker absent from the pool's map defaults to 0 (idle) per ``.get(w.id, 0)``."""
+    def test_worker_missing_from_partial_fake_idle_map_defaults_to_zero(self) -> None:
+        """A duck-typed pool without structural worker IDs can still omit a worker signal."""
 
         class _PartialMapPool:
             name = "ingest"
@@ -684,8 +687,8 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
 
         assert self._per_worker_used_slots(state) == {"ingest-w0": 2, "ingest-w1": 0}
 
-    def test_negative_worker_group_signal_overflows_at_rust_boundary(self) -> None:
-        """A negative per-worker map value surfaces before reaching Phase D."""
+    def test_negative_worker_group_signal_raises_contextual_value_error(self) -> None:
+        """A negative per-worker map value names the stage, worker, and field."""
         allocator = _FakeAllocator(
             workers_by_stage={"active": [_worker_group("active", "active-w0")]},
         )
@@ -698,7 +701,27 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
             worker_group_used_slots={"active-w0": -1},
         )
 
-        with pytest.raises(OverflowError):
+        with pytest.raises(ValueError, match=r"stage 'active'.*worker 'active-w0'.*num_used_slots must be >= 0"):
+            _make_problem_state([pool], [False], allocator=allocator)
+
+    def test_real_pool_allocator_worker_mismatch_raises_contextual_value_error(self) -> None:
+        """A stale allocator worker cannot be silently modelled as idle."""
+        allocator = _FakeAllocator(
+            workers_by_stage={
+                "active": [
+                    _worker_group("active", "active-w0"),
+                    _worker_group("active", "stale-w1"),
+                ],
+            },
+        )
+        pool = _real_actor_pool(
+            name="active",
+            slots_per_actor=4,
+            ready_slots=[("actor-a", 1, 3)],
+            worker_groups={"active-w0": {"actor-a"}},
+        )
+
+        with pytest.raises(ValueError, match=r"stage 'active'.*allocator-only.*stale-w1"):
             _make_problem_state([pool], [False], allocator=allocator)
 
     def test_repeated_calls_read_fresh_per_worker_signals(self) -> None:
