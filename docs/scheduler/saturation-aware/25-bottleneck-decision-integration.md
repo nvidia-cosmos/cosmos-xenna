@@ -152,6 +152,113 @@ required; the existing `_completed_counts` and
 no longer make wrong-stage-first decisions on heterogeneous
 pipelines.
 
+## What gets grown vs. what gets ordered
+
+A common mis-reading of "bottleneck-priority growth" is that the
+gate **decides which stages to grow**. It does not. The candidate
+set for Phase C is filtered by the classifier *before* this doc's
+priority sort runs. The bottleneck gate only orders the visit
+sequence among stages the classifier already marked saturated.
+
+```
+              ┌──────────────────────────────────────────────────┐
+              │  STEP 1 — Classifier (per-stage, evidence-only)  │
+              │  intent[k] is a function of stage k's own slot   │
+              │  occupancy, queue depth, and streak counters.    │
+              │  No cross-stage prediction. No DAG awareness.    │
+              │  No D_k input.                                   │
+              └──────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                    candidate_set = { k : intent[k] > 0 }
+                                    │
+                                    ▼
+              ┌──────────────────────────────────────────────────┐
+              │  STEP 2 — Phase C grow priority (this doc)       │
+              │  Orders ONLY the candidate set for visit         │
+              │  sequence under cluster-headroom contention.     │
+              │  Does NOT add stages. Does NOT filter the set.   │
+              └──────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                  for each candidate (in priority order):
+                      try_add_worker(stage, intent[k] times)
+                      stop when cluster headroom exhausted
+```
+
+The classifier is **evidence-only**: it does not predict, does not
+look at static capacity hints, and does not anticipate the effect
+of upstream growth. A stage with low slot-occupancy and a short
+queue stays NORMAL with `intent = 0` no matter how saturated its
+upstream is, so the candidate set never includes "fast enough"
+downstream stages.
+
+### Worked example: `A → B → C → D → E → F` with B as bottleneck
+
+Capacities: `A=0.5, B=0.1, C=0.2, D=0.5, E=1.0, F=1.0`.
+B is the bottleneck. Steady-state classifier output:
+
+| Stage | What the classifier observes | Zone | Intent |
+|---|---|---|---|
+| A | Slot occupancy ≪ 1 (throttled by B) | OVER_PROVISIONED | ≤ 0 |
+| B | Slot occupancy = 1 (saturated) | SATURATED | `+N` |
+| C | Idle slots, short queue (starved by B) | STARVED | 0 |
+| D | Idle slots, short queue | STARVED | 0 |
+| E | Idle slots, short queue | NORMAL | 0 |
+| F | Idle slots, short queue | NORMAL | 0 |
+
+Candidate set is `{ B }`. Phase C grows **only B**. The bottleneck
+priority sort is a no-op for a single candidate; downstream fast
+stages (D, E, F) are not in the set, so the gate cannot grow them
+even when engaged.
+
+After B grows enough to push the bottleneck downstream (say B's
+effective capacity rises to `0.2`, matching C), the **next** cycle
+re-runs the classifier with fresh measurements. Now C may report
+SATURATED in its own right, joining the candidate set:
+
+```
+   cycle N      candidate_set = { B }            grow B
+                                ─────────────
+   cycle N+k    candidate_set = { B, C }         multi-saturated:
+                                ─────────────    bottleneck gate
+                                                 picks B over C
+                                                 (B still slightly
+                                                 slower per
+                                                 D_k_ewma)
+
+   cycle N+m    candidate_set = { C }            B no longer
+                                ─────────────    saturated;
+                                                 bottleneck has
+                                                 shifted to C
+```
+
+The bottleneck "chases" downstream one stage at a time, **driven
+by observation, not by prediction**. There is no speculative
+growth — every Phase C add is backed by classifier evidence on
+that specific stage in the previous cycle.
+
+### Where the priority sort actually matters
+
+The sort is meaningful only when the candidate set has more than
+one entry **and** the cluster has less headroom than the sum of
+intents. Both conditions must hold; either alone makes the sort
+a no-op.
+
+| Scenario | Candidate set | Cluster headroom | Priority sort effect |
+|---|---|---|---|
+| Single bottleneck, steady state | `{ B }` | Any | No-op (one candidate). |
+| Single bottleneck, headroom unlimited | `{ B }` | ≥ intent[B] | No-op. |
+| Multi-saturated burst, headroom unlimited | `{ B, C }` | ≥ intent[B] + intent[C] | No-op (both grow fully). |
+| Multi-saturated burst, headroom scarce | `{ B, C }` | < intent[B] + intent[C] | **Bottleneck wins** the contended slot when engaged; otherwise DAG-deepest wins. |
+| Cold-start ramp (every stage saturates briefly) | `{ A, B, C, D, E, F }` | Typically scarce | **B (highest D_k) wins**, not F (deepest in DAG). |
+
+In single-bottleneck steady state — the most common case — the
+gate is observably idle; it neither grows extra stages nor blocks
+the natural one. Its value shows up exactly in the burst /
+cold-start / shifting-bottleneck cases that the prior DAG-only
+ordering handled wrong.
+
 ## How it works
 
 The integration is three short blocks: a helper, a pair of state
