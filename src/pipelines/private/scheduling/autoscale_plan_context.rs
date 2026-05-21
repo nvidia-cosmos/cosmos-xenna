@@ -502,16 +502,14 @@ impl AutoscalePlanContext {
                 // O(R) where R = pending removes for this stage; small
                 // by construction (one removed worker per scale-down
                 // event).
-                let reuse_map: HashMap<String, rds::Worker> = match self
-                    .pending_removes
-                    .get(&stage_name)
-                {
-                    Some(list) => list
-                        .iter()
-                        .map(|p| p.to_worker(stage_name.clone()).map(|w| (p.id.clone(), w)))
-                        .collect::<PyResult<HashMap<_, _>>>()?,
-                    None => HashMap::new(),
-                };
+                let reuse_map: HashMap<String, rds::Worker> =
+                    match self.pending_removes.get(&stage_name) {
+                        Some(list) => list
+                            .iter()
+                            .map(|p| p.to_worker(stage_name.clone()).map(|w| (p.id.clone(), w)))
+                            .collect::<PyResult<HashMap<_, _>>>()?,
+                        None => HashMap::new(),
+                    };
 
                 let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
                     &self.cluster,

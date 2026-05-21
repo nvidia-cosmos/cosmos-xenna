@@ -394,7 +394,9 @@ fn make_workers_from_problem_state(
                     w.to_worker_group(stage.name.clone()),
                 ));
             } else {
-                out.push(WorkerOrWorkerGroup::Worker(w.to_worker(stage.name.clone())?));
+                out.push(WorkerOrWorkerGroup::Worker(
+                    w.to_worker(stage.name.clone())?,
+                ));
             }
         }
     }
