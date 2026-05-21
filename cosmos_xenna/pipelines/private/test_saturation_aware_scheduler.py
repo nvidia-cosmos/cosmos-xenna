@@ -36,7 +36,7 @@ from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.regime import Regime
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
-from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
 def _cluster() -> resources.ClusterResources:
@@ -349,18 +349,359 @@ class TestAutoscaleEdgeCases:
         assert scheduler._stage_states["A"] is original_state_a
 
 
-class TestUpdateWithMeasurementsIsNoOp:
-    """``update_with_measurements`` accepts and discards measurements -- signal-driven scheduler ignores them."""
+class TestUpdateWithMeasurementsAccumulator:
+    """``update_with_measurements`` accumulates per-stage completion counts under the lock.
 
-    def test_does_not_raise_or_mutate_state(self) -> None:
-        """The method is a documented no-op so call sites in streaming.py can be branchless."""
+    The MFI-pressure signal needs a ``observed_throughput`` sample once
+    per autoscale cycle, but ``streaming.Autoscaler`` calls
+    ``update_with_measurements`` on every monitor tick. The scheduler
+    therefore accumulates ``len(task_measurements)`` per stage into
+    ``_completed_counts`` under ``self._lock`` and lets
+    ``_consume_throughput_samples`` produce ``dcount/dt`` once per cycle.
+    These tests pin that contract.
+    """
+
+    def test_empty_measurements_do_not_touch_counts(self) -> None:
+        """Empty measurements leave both ``_completed_counts`` and ``_stage_states`` unchanged."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         snapshot_before = dict(scheduler._stage_states)
+        # ``setup()`` zero-initialises every stage's count.
+        assert scheduler._completed_counts == {"A": 0}
         empty_measurements = data_structures.Measurements(time=0.0, stage_measurements=[])
         scheduler.update_with_measurements(time=0.0, measurements=empty_measurements)
-        # Same dict, same values -- nothing was mutated.
         assert scheduler._stage_states == snapshot_before
+        assert scheduler._completed_counts == {"A": 0}
+
+    def test_task_count_accumulates_across_calls(self) -> None:
+        """Each ``TaskMeasurement`` adds 1 to the per-stage count regardless of ``num_returns``."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # First batch: 3 tasks, each producing different num_returns.
+        # Counting policy is ``len(task_measurements)`` (matches per-task drain rate).
+        ms1 = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[
+                        data_structures.TaskMeasurement(0.0, 1.0, num_returns=1),
+                        data_structures.TaskMeasurement(0.0, 1.0, num_returns=5),
+                        data_structures.TaskMeasurement(0.0, 1.0, num_returns=3),
+                    ]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms1)
+        assert scheduler._completed_counts["A"] == 3
+
+        # Second batch: 2 more tasks -> running total = 5.
+        ms2 = data_structures.Measurements(
+            time=1.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[
+                        data_structures.TaskMeasurement(0.0, 1.0, num_returns=10),
+                        data_structures.TaskMeasurement(0.0, 1.0, num_returns=2),
+                    ]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=1.0, measurements=ms2)
+        assert scheduler._completed_counts["A"] == 5
+
+    def test_per_stage_attribution_follows_dag_order(self) -> None:
+        """Stage order from the Problem zips with the rust ``stages`` iterator."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["upstream", "downstream"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                # upstream -> 1 task
+                data_structures.StageMeasurements(task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1)]),
+                # downstream -> 4 tasks
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(4)]
+                ),
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        assert scheduler._completed_counts == {"upstream": 1, "downstream": 4}
+
+    def test_setup_resets_completed_counts(self) -> None:
+        """A second ``setup()`` zeroes out the running totals from the prior pipeline."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(7)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        assert scheduler._completed_counts["A"] == 7
+
+        # New pipeline -> fresh counters and the throughput-snapshot
+        # cleared so the next sample is cold-start.
+        scheduler.setup(_problem_with_stages(["X", "Y"]))
+        assert scheduler._completed_counts == {"X": 0, "Y": 0}
+        assert scheduler._last_throughput_sample == {}
+
+
+class TestConsumeThroughputSamples:
+    """``_consume_throughput_samples`` derives per-stage tasks/sec from the accumulator."""
+
+    def test_first_cycle_returns_zero_throughput_for_every_stage(self) -> None:
+        """The cold-start contract: first cycle has no prior snapshot so dt is undefined."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(10)]
+                ),
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(20)]
+                ),
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        samples = scheduler._consume_throughput_samples(now_ts=1.0)
+        # Cold-start: every stage seeds the snapshot with current count, returns 0.0.
+        assert samples == {"A": 0.0, "B": 0.0}
+        # Snapshot now holds the cold-start (count, ts) pair.
+        assert scheduler._last_throughput_sample["A"] == (10, 1.0)
+        assert scheduler._last_throughput_sample["B"] == (20, 1.0)
+
+    def test_steady_state_returns_dcount_over_dt(self) -> None:
+        """Second cycle returns ``(now_count - prev_count) / (now_ts - prev_ts)``."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Cycle 1: 10 tasks, seed snapshot at t=1.0.
+        ms1 = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(10)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms1)
+        scheduler._consume_throughput_samples(now_ts=1.0)
+
+        # Cycle 2: 20 more tasks, sampled at t=2.0 -> dcount=20, dt=1.0 -> 20.0 tasks/sec.
+        ms2 = data_structures.Measurements(
+            time=1.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(20)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=1.0, measurements=ms2)
+        samples = scheduler._consume_throughput_samples(now_ts=2.0)
+        assert samples == {"A": 20.0}
+
+    def test_zero_dt_yields_zero_throughput_no_division_error(self) -> None:
+        """A clock that does not advance must return 0.0, not raise ``ZeroDivisionError``."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1)])
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        scheduler._consume_throughput_samples(now_ts=5.0)
+        # Same now_ts -> dt = 0; must short-circuit to 0.0 instead of dividing.
+        samples = scheduler._consume_throughput_samples(now_ts=5.0)
+        assert samples == {"A": 0.0}
+
+    def test_negative_dcount_clamps_to_zero(self) -> None:
+        """A reset that lowers the running count must not produce negative throughput.
+
+        In production ``setup()`` would zero the counters AND clear the
+        snapshot dict, so this branch is defensive against an unforeseen
+        path that resets only the count. ``max(0, ...)`` keeps the
+        sample non-negative; pressure thresholds assume tasks/sec is a
+        non-negative scalar.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        # Manually seed a high snapshot count.
+        scheduler._completed_counts["A"] = 100
+        scheduler._consume_throughput_samples(now_ts=1.0)
+        assert scheduler._last_throughput_sample["A"] == (100, 1.0)
+
+        # Reset the counter (NOT the snapshot) and sample again.
+        scheduler._completed_counts["A"] = 50
+        samples = scheduler._consume_throughput_samples(now_ts=2.0)
+        assert samples == {"A": 0.0}
+
+
+class TestPressureEndToEnd:
+    """End-to-end smoke: ``update_with_measurements`` -> ``autoscale`` updates ``pressure_ewma``.
+
+    Pins the wiring between the three integration points:
+
+    *   ``update_with_measurements`` accumulates the per-stage count.
+    *   ``autoscale`` consumes the count delta into a tasks/sec sample.
+    *   ``run_per_stage_pipeline`` smooths it with the slot-empty
+        utilisation EWMA into ``stage_state.pressure_ewma``.
+
+    A single cycle is enough to prove the contract -- the underlying
+    primitives (compute_pressure, update_ewma, classify) each have
+    dedicated unit tests, so this smoke test only verifies that the
+    sample is threaded through the integration boundary.
+    """
+
+    def _problem_state_with_queue(
+        self,
+        stage_name: str,
+        num_workers: int,
+        slots_per_worker: int,
+        num_used_slots: int,
+        num_empty_slots: int,
+        input_queue_depth: int,
+    ) -> data_structures.ProblemState:
+        """Same shape as :func:`_problem_state_with_slot_signals` plus an explicit queue depth."""
+        worker_groups = [
+            data_structures.ProblemWorkerGroupState.make(
+                f"{stage_name}-w{i}",
+                [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
+            )
+            for i in range(num_workers)
+        ]
+        return data_structures.ProblemState(
+            [
+                data_structures.ProblemStageState(
+                    stage_name=stage_name,
+                    workers=worker_groups,
+                    slots_per_worker=slots_per_worker,
+                    is_finished=False,
+                    num_used_slots=num_used_slots,
+                    num_empty_slots=num_empty_slots,
+                    input_queue_depth=input_queue_depth,
+                )
+            ]
+        )
+
+    def test_sustained_pressure_threads_through_full_cycle(self) -> None:
+        """Two cycles of completed tasks against a non-empty queue populate ``pressure_ewma``.
+
+        The default ``worker_warmup_measurement_grace_s=60`` would zero out the slot
+        signals when the test clock is < 60 (so the classifier short-circuits and
+        the pressure helper is intentionally skipped). The override pins the grace
+        to zero so the integration boundary is exercised at t=1.0 / t=2.0.
+        """
+        cfg = SaturationAwareConfig(
+            stage_defaults=SaturationAwareStageConfig(
+                worker_warmup_measurement_grace_s=0.0,
+                donor_warmup_grace_s=0.0,
+                min_data_points=1,
+            ),
+        )
+        scheduler = SaturationAwareScheduler(cfg)
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Cycle 1: seed the throughput snapshot at t=1.0 with no completed work yet,
+        # autoscale here cold-starts and observed_throughput stays at 0.0.
+        # Slot signals: 31 used / 1 empty -> ratio ~ 0.031 (within SATURATED band).
+        # input_queue_depth=200 -> pressure should be high.
+        ps = self._problem_state_with_queue(
+            stage_name="A",
+            num_workers=4,
+            slots_per_worker=8,
+            num_used_slots=31,
+            num_empty_slots=1,
+            input_queue_depth=200,
+        )
+
+        # 10 tasks completed before cycle 1.
+        ms = data_structures.Measurements(
+            time=0.5,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(10)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.5, measurements=ms)
+        scheduler.autoscale(time=1.0, problem_state=ps)
+
+        # Cycle 1 is cold-start for throughput (no prior snapshot) so observed_throughput=0.0
+        # which triggers the cold-start branch in compute_pressure -> normalized_backlog=cap.
+        # pressure should be positive (utilisation * cap).
+        first_pressure = scheduler._stage_states["A"].pressure_ewma
+        assert first_pressure is not None
+        assert first_pressure > 0.0
+
+        # Cycle 2: 50 more tasks completed between t=1.0 and t=2.0 -> 50 tasks/sec.
+        ms2 = data_structures.Measurements(
+            time=1.5,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(50)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=1.5, measurements=ms2)
+        scheduler.autoscale(time=2.0, problem_state=ps)
+
+        # Cycle 2 has a real throughput sample (50 tasks/sec); the EWMA blends it
+        # with the cycle 1 cold-start value so pressure stays elevated.
+        second_pressure = scheduler._stage_states["A"].pressure_ewma
+        assert second_pressure is not None
+        # pressure_ewma is bounded by BACKLOG_CAP * 1.0 = 3.0; >= 0 sanity.
+        assert 0.0 <= second_pressure <= 3.0
+
+
+class TestUpdateWithMeasurementsThreadSafety:
+    """Concurrent ``update_with_measurements`` callers do not lose or double-count tasks."""
+
+    def test_concurrent_calls_aggregate_correctly(self) -> None:
+        """Hammering the accumulator from multiple threads preserves the running total.
+
+        ``streaming.Autoscaler`` only calls ``update_with_measurements``
+        from a single monitor thread today, but the lock contract is
+        the integration point any future multi-producer path will rely
+        on. This test pins the ``threading.Lock``-protected accumulator
+        so a refactor that drops the lock immediately surfaces.
+        """
+        import threading
+
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Each thread reports 10 tasks; with 5 threads that is 50 total.
+        ms_template = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(10)]
+                )
+            ],
+        )
+
+        def call_update() -> None:
+            scheduler.update_with_measurements(time=0.0, measurements=ms_template)
+
+        threads = [threading.Thread(target=call_update) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert scheduler._completed_counts["A"] == 50
 
 
 class TestAutoscalePlanContextLifecycle:

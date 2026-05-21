@@ -611,6 +611,72 @@ class SaturationAwareStageConfig:
     # stage is in cold start (pending actors exist, no ready actors yet).
     setup_aware_max_queued: bool = True
 
+    # Backlog-time compound classifier knobs (06-backlog-time-signal.md).
+    #
+    # The classifier currently fires SATURATED whenever the slots-empty EWMA
+    # crosses ``saturation_threshold``. That signal is utilisation-only: it
+    # does not distinguish a transient occupancy burst (a brief queue spike
+    # that drains itself) from a persistent build-up of upstream backlog.
+    # The pressure compound combines utilisation with a normalised backlog
+    # time (Little's Law ``W_q = queue / throughput`` divided by an
+    # operator-facing target) so genuine saturation requires BOTH factors to
+    # be elevated; either factor near zero kills the product. The classifier
+    # then uses the smoothed pressure as a demotion gate inside the existing
+    # slot-ratio branches (no restructuring of the zone shape).
+
+    # Queue drain time at which ``normalized_backlog == 1.0``. Operator-facing
+    # primary knob; the three pressure thresholds derive their effective
+    # semantics from this value. A higher target tolerates longer queues
+    # before the classifier reads pressure as elevated.
+    target_backlog_seconds: float = attrs.field(
+        default=30.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # EWMA alpha on the composite pressure signal. Same semantics as
+    # ``slots_empty_ratio_smoothing_level``: ``1.0`` disables smoothing,
+    # smaller values dampen noise. Default ``0.20`` mirrors the slot EWMA
+    # half-life so the two smoothed signals converge on similar timescales.
+    pressure_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # In the SATURATED branch (``slots_empty_ratio_ewma < saturation_boundary``):
+    # smoothed pressure below this threshold demotes the classifier output to
+    # ``NORMAL`` because the queue is draining despite busy slots (transient
+    # burst). Default ``1.0`` matches the natural unit boundary
+    # ``utilisation == 1.0 AND queue drains in target_backlog_seconds``.
+    pressure_saturation_threshold: float = attrs.field(
+        default=1.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # In the SATURATED_CRITICAL branch
+    # (``slots_empty_ratio_ewma < activation_threshold``): smoothed pressure
+    # MUST exceed this threshold to fire CRITICAL; otherwise the classifier
+    # demotes to ``NORMAL``. Higher than ``pressure_saturation_threshold``
+    # because CRITICAL needs a genuinely large backlog at near-zero free
+    # slots, not just slot pinning.
+    pressure_critical_threshold: float = attrs.field(
+        default=2.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # In the OVER_PROVISIONED branch
+    # (``slots_empty_ratio_ewma >= over_provisioned_boundary AND queue > 0``):
+    # smoothed pressure ABOVE this threshold demotes to ``NORMAL`` because
+    # the queue is stuck elsewhere (downstream bottleneck) and shrinking
+    # would make the downstream stall worse. Lower than
+    # ``pressure_saturation_threshold``.
+    pressure_normal_threshold: float = attrs.field(
+        default=0.3,
+        validator=attrs.validators.gt(0.0),
+    )
+    # Master toggle. ``False`` reverts the classifier to today's
+    # utilisation-only behaviour for this stage (escape hatch for
+    # workloads pre-tuned against the slot-only signal).
+    enable_backlog_time_classifier: bool = attrs.field(
+        default=True,
+        validator=attrs.validators.instance_of(bool),
+    )
+
     def __attrs_post_init__(self) -> None:
         """Validate cross-field invariants only.
 
@@ -719,6 +785,40 @@ class SaturationAwareStageConfig:
             msg = (
                 f"min_workers_per_node ({self.min_workers_per_node}) must be <= "
                 f"max_workers_per_node ({self.max_workers_per_node})"
+            )
+            raise ValueError(msg)
+
+        # Pressure-threshold ordering - the demotion semantics require
+        # ``critical > saturation > normal``. ``critical`` gates SATURATED
+        # _CRITICAL upward; ``saturation`` gates SATURATED upward; ``normal``
+        # gates OVER_PROVISIONED demotion. Reversing any pair would either
+        # make the SATURATED branch impossible to reach via pressure, or
+        # turn the OVER_PROVISIONED demotion into a hair-trigger that
+        # demotes on every elevated cycle.
+        if not (self.pressure_critical_threshold > self.pressure_saturation_threshold):
+            msg = (
+                f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be > "
+                f"pressure_saturation_threshold ({self.pressure_saturation_threshold}); "
+                "CRITICAL needs a strictly larger pressure than SATURATED to fire."
+            )
+            raise ValueError(msg)
+        if not (self.pressure_saturation_threshold > self.pressure_normal_threshold):
+            msg = (
+                f"pressure_saturation_threshold ({self.pressure_saturation_threshold}) must be > "
+                f"pressure_normal_threshold ({self.pressure_normal_threshold}); "
+                "SATURATED needs a strictly larger pressure than the OVER_PROVISIONED demotion gate."
+            )
+            raise ValueError(msg)
+        # Pressure values are bounded above by the backlog cap (3.0); a
+        # threshold above the cap can never fire (utilisation in [0, 1]
+        # multiplied by normalized_backlog in [0, 3] cannot exceed 3.0).
+        # The cap lives in scheduling_py/pressure.py as ``BACKLOG_CAP``.
+        max_pressure = 3.0
+        if self.pressure_critical_threshold > max_pressure:
+            msg = (
+                f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be <= "
+                f"{max_pressure} (the backlog cap on the composite pressure signal); "
+                "thresholds above the cap can never fire."
             )
             raise ValueError(msg)
 

@@ -152,6 +152,7 @@ group is rationalised in a sibling document.
 | ``SaturationAwareConfig`` | Loop / stuck-plan watchdog | [18 — Loop watchdog](18-loop-watchdog.md) |
 | ``SaturationAwareStageConfig`` | Trust gate (``min_data_points``) | [05 — State classifier](05-state-classifier.md) |
 | ``SaturationAwareStageConfig`` | Classifier thresholds | [05 — State classifier](05-state-classifier.md), [08 — Auto-derived thresholds](08-auto-derived-thresholds.md) |
+| ``SaturationAwareStageConfig`` | MFI pressure / backlog-time gate (6 knobs) | [06 — Backlog-time signal](06-backlog-time-signal.md) |
 | ``SaturationAwareStageConfig`` | Streak counters | [07 — Streak stabilization](07-streak-stabilization.md) |
 | ``SaturationAwareStageConfig`` | Growth mode + slow-start (``enable_growth_mode_state_machine``) | [10 — Slow-start mechanisms](10-slow-start-mechanisms.md), [11 — Growth-mode state machine](11-growth-mode-state-machine.md) |
 | ``SaturationAwareStageConfig`` | Per-stage caps and floors | [16 — Hard caps and floors](16-hard-caps-and-floors.md) |
@@ -193,6 +194,30 @@ Two per-stage knobs gate the classifier-driven action loop:
   ``record_executed_delta`` skips the state machine update, so the
   per-stage runtime state stays frozen at its construction-time
   defaults. Re-enabling the flag mid-run resumes from ACQUIRING.
+
+### MFI pressure / backlog-time gate
+
+Six per-stage knobs control the compound pressure classifier introduced in
+[06 — Backlog-time signal](06-backlog-time-signal.md). These extend
+the slot-ratio gate with a smoothed compound `pressure = utilisation
+* normalized_backlog` scalar, used as a demotion gate inside each
+slot-pin branch:
+
+| Knob | Default | Effect |
+|---|---|---|
+| ``target_backlog_seconds`` | ``30.0`` | Operator-facing primary knob: queue drain-time at which ``normalized_backlog == 1.0``. Higher = more conservative (longer queue accepted before scale-up); lower = more aggressive. |
+| ``pressure_smoothing_level`` | ``0.20`` | EWMA alpha applied to the composite pressure scalar. Lower = smoother (filters throughput noise); higher = reacts faster. Bounded ``(0.0, 1.0]``. |
+| ``pressure_critical_threshold`` | ``2.0`` | Smoothed pressure above which a slot-pin ``SATURATED_CRITICAL`` actually fires. Strictly larger than ``pressure_saturation_threshold`` and ``≤ BACKLOG_CAP`` (``3.0``). |
+| ``pressure_saturation_threshold`` | ``1.0`` | Pressure above which a slot-pin ``SATURATED`` actually fires. Strictly larger than ``pressure_normal_threshold``. |
+| ``pressure_normal_threshold`` | ``0.3`` | Pressure above which a slot-pin ``OVER_PROVISIONED`` is demoted to ``NORMAL`` (queue is stuck downstream; shrinking would worsen the bottleneck). |
+| ``enable_backlog_time_classifier`` | ``True`` | Escape hatch: ``False`` reverts the stage to legacy slot-only behaviour (no demotion, no pressure refresh). |
+
+Cross-field invariants enforced at construction time:
+
+```
+pressure_critical_threshold > pressure_saturation_threshold > pressure_normal_threshold
+pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
+```
 
 ## See also
 

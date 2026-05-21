@@ -116,6 +116,67 @@ class TestSaturationAwareStageConfigFieldValidators:
             SaturationAwareStageConfig(donor_warmup_grace_s=-1.0)
 
 
+class TestPressureFieldValidators:
+    """Single-field validators for the MFI-pressure compound classifier knobs.
+
+    The 5 numeric knobs (``target_backlog_seconds``,
+    ``pressure_smoothing_level``, and the three pressure thresholds) and
+    the boolean escape-hatch flag are gated by attrs validators so a
+    misconfigured stage cannot reach the classifier with values that
+    would silently disable the demotion gate or freeze the pressure EWMA.
+    """
+
+    @pytest.fixture(
+        params=[
+            "target_backlog_seconds",
+            "pressure_saturation_threshold",
+            "pressure_normal_threshold",
+        ]
+    )
+    def positive_float_field(self, request: pytest.FixtureRequest) -> str:
+        return cast(str, request.param)
+
+    def test_zero_is_rejected(self, positive_float_field: str) -> None:
+        """Strictly-positive validator forbids zero values."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(**{positive_float_field: 0.0})  # type: ignore[arg-type]
+
+    def test_negative_is_rejected(self, positive_float_field: str) -> None:
+        """Strictly-positive validator forbids negatives."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(**{positive_float_field: -0.1})  # type: ignore[arg-type]
+
+    def test_pressure_critical_threshold_negative_is_rejected(self) -> None:
+        """The CRITICAL gate must be strictly positive (otherwise the slot pin always fires)."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(pressure_critical_threshold=-0.1)
+
+    def test_pressure_critical_threshold_zero_is_rejected(self) -> None:
+        """Zero would let any positive pressure fire CRITICAL on a slot pin."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(pressure_critical_threshold=0.0)
+
+    def test_pressure_smoothing_level_zero_is_rejected(self) -> None:
+        """Smoothing level of 0 would freeze the pressure EWMA forever."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(pressure_smoothing_level=0.0)
+
+    def test_pressure_smoothing_level_above_one_is_rejected(self) -> None:
+        """Smoothing level is bounded at 1.0 (alpha == 1.0 disables smoothing)."""
+        with pytest.raises(ValueError):
+            SaturationAwareStageConfig(pressure_smoothing_level=1.01)
+
+    def test_enable_backlog_time_classifier_default_is_true(self) -> None:
+        """The MFI-pressure classifier is enabled by default."""
+        cfg = SaturationAwareStageConfig()
+        assert cfg.enable_backlog_time_classifier is True
+
+    def test_enable_backlog_time_classifier_must_be_bool(self) -> None:
+        """Truthy strings are rejected so an operator typo cannot silently disable the gate."""
+        with pytest.raises(TypeError):
+            SaturationAwareStageConfig(enable_backlog_time_classifier=cast(bool, "yes"))
+
+
 class TestSaturationAwareStageConfigCrossFieldValidators:
     """Cross-field invariants enforced in __attrs_post_init__.
 
@@ -169,6 +230,35 @@ class TestSaturationAwareStageConfigCrossFieldValidators:
         cfg = SaturationAwareStageConfig(min_workers=4, max_workers=None)
         assert cfg.min_workers == 4
         assert cfg.max_workers is None
+
+    def test_pressure_critical_below_saturation_is_rejected(self) -> None:
+        """CRITICAL must require a strictly larger pressure than SATURATED."""
+        with pytest.raises(ValueError, match="pressure_critical_threshold"):
+            SaturationAwareStageConfig(
+                pressure_critical_threshold=0.5,
+                pressure_saturation_threshold=1.0,
+            )
+
+    def test_pressure_critical_equals_saturation_is_rejected(self) -> None:
+        """The strict-inequality variant is enforced (no implicit hysteresis between gates)."""
+        with pytest.raises(ValueError, match="pressure_critical_threshold"):
+            SaturationAwareStageConfig(
+                pressure_critical_threshold=1.0,
+                pressure_saturation_threshold=1.0,
+            )
+
+    def test_pressure_saturation_below_normal_is_rejected(self) -> None:
+        """SATURATED must require strictly larger pressure than the OVER_PROVISIONED demotion gate."""
+        with pytest.raises(ValueError, match="pressure_saturation_threshold"):
+            SaturationAwareStageConfig(
+                pressure_saturation_threshold=0.2,
+                pressure_normal_threshold=0.3,
+            )
+
+    def test_pressure_critical_above_cap_is_rejected(self) -> None:
+        """A CRITICAL threshold above the backlog cap can never fire."""
+        with pytest.raises(ValueError, match="backlog cap"):
+            SaturationAwareStageConfig(pressure_critical_threshold=3.5)
 
 
 class TestSaturationAwareConfigClusterValidators:

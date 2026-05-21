@@ -39,6 +39,11 @@ from cosmos_xenna.pipelines.private.scheduling_py.decisions import (
     update_streak,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.growth_mode import compute_growth_mode_transition
+from cosmos_xenna.pipelines.private.scheduling_py.pressure import (
+    compute_backlog_time,
+    compute_pressure,
+    emit_pressure_signals,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.stabilization import (
     _RecommendationHistory,
     apply_stabilization_gate,
@@ -61,17 +66,19 @@ def run_per_stage_pipeline(
     current_workers: int,
     config: SaturationAwareStageConfig,
     recommendation_history: _RecommendationHistory | None = None,
+    observed_throughput_sample: float = 0.0,
+    pipeline_name: str = "",
 ) -> int:
     """Compute the per-stage scaling recommendation for one cycle.
 
     Mutates ``stage_state`` in place (classifier state, classifier
-    streak, EWMA cache, ``prev_workers``); returns the (possibly
-    stabilization-gated) recommended delta. The growth-mode state
-    machine is NOT advanced here. The caller is the only component
-    that knows what the planner actually executed; it must call
-    ``record_executed_delta`` after Phase C / Phase D commit so
-    HOLD / ACQUIRING / TRACKING timers observe the post-commit
-    delta rather than the pre-commit recommendation.
+    streak, EWMA cache, ``pressure_ewma``, ``prev_workers``); returns
+    the (possibly stabilization-gated) recommended delta. The
+    growth-mode state machine is NOT advanced here. The caller is the
+    only component that knows what the planner actually executed; it
+    must call ``record_executed_delta`` after Phase C / Phase D
+    commit so HOLD / ACQUIRING / TRACKING timers observe the
+    post-commit delta rather than the pre-commit recommendation.
 
     Args:
         stage_state: Per-stage runtime state. Mutated in place.
@@ -87,6 +94,17 @@ def run_per_stage_pipeline(
             this gates Phase C / Phase D against acting on a single
             noisy cycle. ``None`` (used by helper-direct tests) skips
             the stabilization layer entirely.
+        observed_throughput_sample: Per-cycle completed-task rate in
+            tasks/sec for this stage, derived by the scheduler from
+            ``update_with_measurements`` accumulators. ``0.0`` is the
+            cold-start signal (no prior delta available); the pressure
+            helper interprets it as "no progress this cycle" and uses
+            the cap-bounded normalised backlog. Defaults to ``0.0``
+            so direct callers (helper-style tests) keep working
+            without supplying a sample.
+        pipeline_name: Value of the ``pipeline`` Prometheus tag for
+            the SA-only pressure gauges. Empty string when no
+            job-level identifier is available.
 
     Returns:
         Signed recommendation delta: positive to add, negative to
@@ -124,12 +142,27 @@ def run_per_stage_pipeline(
         # holds for this cycle. The growth-mode transition is left to
         # the scheduler's post-Phase-D ``record_executed_delta`` call
         # which sees delta_executed=0 for a stage that took no action.
+        # Pressure is intentionally NOT updated here: without a slot
+        # signal we have no utilisation factor, so feeding the EWMA
+        # with stale data would corrupt the next valid cycle's
+        # demotion decision.
         stage_state.prev_workers = current_workers
         return 0
+
+    pressure_ewma = _resolve_pressure_signal(
+        stage_state=stage_state,
+        slots_empty_ratio_ewma=classifier_input,
+        input_queue_depth=input_queue_depth,
+        observed_throughput=observed_throughput_sample,
+        config=config,
+        stage_name=stage_state.stage_name,
+        pipeline_name=pipeline_name,
+    )
 
     new_classifier_state = classify(
         slots_empty_ratio_ewma=classifier_input,
         input_queue_depth=input_queue_depth,
+        pressure_ewma=pressure_ewma,
         prev_state=stage_state.classifier_state,
         saturation_threshold=stage_state.resolved_thresholds.saturation_threshold,
         activation_threshold=stage_state.resolved_thresholds.activation_threshold,
@@ -242,3 +275,69 @@ def _resolve_classifier_signal(
         return stage_state.last_valid_slots_empty_ratio_ewma
 
     return None
+
+
+def _resolve_pressure_signal(
+    *,
+    stage_state: _StageRuntimeState,
+    slots_empty_ratio_ewma: float,
+    input_queue_depth: int,
+    observed_throughput: float,
+    config: SaturationAwareStageConfig,
+    stage_name: str,
+    pipeline_name: str,
+) -> float:
+    """Compute the raw MFI pressure, smooth it, and emit the gauges.
+
+    Mutates ``stage_state.pressure_ewma`` in place with the updated
+    EWMA value. The smoothed value is also returned so the classifier
+    receives the canonical post-EWMA reading for this cycle (avoiding
+    a second ``stage_state`` read after potential mutation by future
+    callers).
+
+    Args:
+        stage_state: Per-stage runtime state; ``pressure_ewma`` is
+            mutated in place.
+        slots_empty_ratio_ewma: Smoothed empty-slot fraction in
+            ``[0, 1]``. Already resolved by ``_resolve_classifier_signal``
+            so callers know it is non-``None``.
+        input_queue_depth: Stage-level upstream queue depth.
+        observed_throughput: Per-cycle completed-task rate in
+            tasks/sec, derived by the scheduler from
+            ``update_with_measurements``.
+        config: Per-stage configuration; ``target_backlog_seconds``
+            and ``pressure_smoothing_level`` come from here.
+        stage_name: Stage label for the Prometheus gauges.
+        pipeline_name: Pipeline label for the Prometheus gauges.
+
+    Returns:
+        The post-EWMA pressure scalar in ``[0.0, BACKLOG_CAP]``.
+        Always finite; the cold-start path uses the cap-bounded
+        normalised backlog so no ``+inf`` arithmetic is involved.
+
+    """
+    raw_pressure = compute_pressure(
+        slots_empty_ratio_ewma=slots_empty_ratio_ewma,
+        input_queue_depth=input_queue_depth,
+        observed_throughput=observed_throughput,
+        target_backlog_seconds=config.target_backlog_seconds,
+    )
+    new_pressure_ewma = update_ewma(
+        stage_state.pressure_ewma,
+        raw_pressure,
+        config.pressure_smoothing_level,
+    )
+    stage_state.pressure_ewma = new_pressure_ewma
+    backlog_time = compute_backlog_time(
+        input_queue_depth=input_queue_depth,
+        observed_throughput=observed_throughput,
+        target_backlog_seconds=config.target_backlog_seconds,
+    )
+    emit_pressure_signals(
+        stage_name=stage_name,
+        pipeline_name=pipeline_name,
+        observed_throughput=observed_throughput,
+        backlog_time=backlog_time,
+        pressure_ewma=new_pressure_ewma,
+    )
+    return new_pressure_ewma

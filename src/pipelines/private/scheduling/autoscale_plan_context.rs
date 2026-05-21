@@ -62,16 +62,12 @@ use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 
-use super::autoscaling_algorithms::WorkerIdFactory;
+use super::autoscaling_algorithms::{
+    DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT, WorkerIdFactory, make_workload_from_state,
+};
 use super::data_structures as ds;
 use super::fragmentation_allocation_algorithms as frag;
 use super::resources as rds;
-
-/// Default fragmentation-equivalent reward for reusing a recently removed
-/// worker placement during FGD search. Matches the value used by
-/// `run_fragmentation_autoscaler` so the plan context keeps the same reuse
-/// preference when its mutation methods are implemented.
-const DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT: f32 = 10.0;
 
 /// Per-cycle autoscale planning context.
 ///
@@ -302,9 +298,10 @@ impl AutoscalePlanContext {
         }
 
         // Build the workload estimate FGD consumes when ranking candidate
-        // placements; uniform weighting when no stage has requested workers
-        // (matches the seed convention in run_fragmentation_autoscaler).
-        let workload_estimate = build_workload_estimate(problem, state);
+        // placements. Use the legacy autoscaler helper directly so both
+        // planning paths share the requested-worker/current-worker weighting
+        // contract.
+        let workload_estimate = make_workload_from_state(state, problem);
 
         // Snapshot the stage definitions so `try_add_worker(stage_index)`
         // can recover the stage name and worker shape without holding a
@@ -1080,55 +1077,6 @@ fn allocation_sets_match(left: &[rds::WorkerResources], right: &[rds::WorkerReso
     true
 }
 
-/// Build the workload estimate consumed by FGD when ranking candidate
-/// placements. Mirrors the equivalent helper in `autoscaling_algorithms.rs`
-/// (`make_workload_from_state`) so both code paths produce the same
-/// per-stage frequency weighting.
-///
-/// When no stage has any current workers and no manual `requested_num_workers`
-/// is set, the workload defaults to uniform weighting across stages so FGD
-/// has a non-degenerate weighting to progress on a cold cluster.
-fn build_workload_estimate(problem: &ds::Problem, state: &ds::ProblemState) -> frag::Workload {
-    let mut total_requested: usize = 0;
-    let mut per_stage_requested: Vec<usize> = Vec::with_capacity(problem.stages.len());
-    for (stage_problem, stage_state) in problem.stages.iter().zip(state.stages.iter()) {
-        let n = stage_state.num_workers();
-        let req = stage_problem.requested_num_workers.unwrap_or(n);
-        per_stage_requested.push(req);
-        total_requested += req;
-    }
-
-    if total_requested == 0 {
-        let freq = if problem.stages.is_empty() {
-            0.0
-        } else {
-            1.0 / (problem.stages.len() as f32)
-        };
-        return frag::Workload {
-            stages: problem
-                .stages
-                .iter()
-                .map(|s| frag::Stage {
-                    frequency: freq,
-                    shape: s.worker_shape.clone(),
-                })
-                .collect(),
-        };
-    }
-
-    frag::Workload {
-        stages: problem
-            .stages
-            .iter()
-            .zip(per_stage_requested)
-            .map(|(s, req)| frag::Stage {
-                frequency: (req as f32) / (total_requested as f32),
-                shape: s.worker_shape.clone(),
-            })
-            .collect(),
-    }
-}
-
 /// Module initialisation: register `AutoscalePlanContext` as a Python class
 /// under the scheduling submodule.
 pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1249,6 +1197,35 @@ mod tests {
             );
         }
         rds::ClusterResources { nodes }
+    }
+
+    fn assert_workload_matches_legacy_autoscaler(
+        actual: &frag::Workload,
+        problem: &ds::Problem,
+        state: &ds::ProblemState,
+    ) {
+        let legacy = super::super::autoscaling_algorithms::make_workload_from_state(state, problem);
+
+        assert_eq!(
+            actual.stages.len(),
+            legacy.stages.len(),
+            "plan context and legacy autoscaler must produce the same number of workload stages",
+        );
+        for (idx, (actual_stage, legacy_stage)) in
+            actual.stages.iter().zip(legacy.stages.iter()).enumerate()
+        {
+            assert!(
+                (actual_stage.frequency - legacy_stage.frequency).abs() < 1e-6,
+                "workload frequency mismatch at stage {idx}: context={} legacy={}",
+                actual_stage.frequency,
+                legacy_stage.frequency,
+            );
+            assert_eq!(
+                actual_stage.shape.to_pool(),
+                legacy_stage.shape.to_pool(),
+                "workload shape pool mismatch at stage {idx}",
+            );
+        }
     }
 
     #[test]
@@ -1551,7 +1528,7 @@ mod tests {
         // proportional to the current worker count.
         // Two current workers in stage_a, three in stage_b -> 2/(2+3) = 0.4
         // and 3/(2+3) = 0.6, locking down both the fallback and the
-        // normaliser used by `build_workload_estimate`.
+        // normaliser used by the shared workload helper.
         let problem = ds::Problem {
             cluster_resources: make_empty_cluster(1, 8.0),
             stages: vec![make_cpu_stage("stage_a"), make_cpu_stage("stage_b")],
@@ -1574,6 +1551,107 @@ mod tests {
         assert!(
             (f_b - 0.6).abs() < 1e-6,
             "stage_b frequency = 3/(2+3) = 0.6 (got {f_b})"
+        );
+    }
+
+    #[test]
+    fn workload_estimate_matches_legacy_autoscaler_for_mixed_requested_and_current_workers() {
+        // Parity contract: AutoscalePlanContext must weight stages exactly
+        // like run_fragmentation_autoscaler. Manual requests override the
+        // observed current-worker count for that stage; stages without a
+        // request fall back to their current worker count.
+        let mut stage_a = make_cpu_stage("stage_a");
+        stage_a.requested_num_workers = Some(4);
+        let stage_b = make_cpu_stage("stage_b");
+        let mut stage_c = make_cpu_stage("stage_c");
+        stage_c.requested_num_workers = Some(0);
+
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 10.0),
+            stages: vec![stage_a, stage_b, stage_c],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_cpu_stage_state_with_workers("stage_a", 1, "node0"),
+                make_cpu_stage_state_with_workers("stage_b", 2, "node0"),
+                make_cpu_stage_state_with_workers("stage_c", 3, "node0"),
+            ],
+        };
+
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        assert_workload_matches_legacy_autoscaler(&ctx.workload_estimate, &problem, &state);
+        let frequencies: Vec<f32> = ctx
+            .workload_estimate
+            .stages
+            .iter()
+            .map(|stage| stage.frequency)
+            .collect();
+        assert_eq!(frequencies.len(), 3);
+        assert!(
+            (frequencies[0] - (4.0 / 6.0)).abs() < 1e-6,
+            "stage_a uses requested_num_workers=4, not its one current worker",
+        );
+        assert!(
+            (frequencies[1] - (2.0 / 6.0)).abs() < 1e-6,
+            "stage_b falls back to its two current workers",
+        );
+        assert!(
+            frequencies[2].abs() < 1e-6,
+            "stage_c requested_num_workers=0 intentionally contributes no workload weight",
+        );
+    }
+
+    #[test]
+    fn workload_estimate_matches_legacy_autoscaler_for_cold_start_uniform_weights() {
+        // Cold start has no current workers and no manual requests. Both
+        // Rust planning paths must use the same uniform fallback so FGD
+        // starts from a non-degenerate workload vector.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(3, 4.0),
+            stages: vec![
+                make_cpu_stage("stage_a"),
+                make_cpu_stage("stage_b"),
+                make_cpu_stage("stage_c"),
+            ],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_empty_stage_state("stage_a"),
+                make_empty_stage_state("stage_b"),
+                make_empty_stage_state("stage_c"),
+            ],
+        };
+
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        assert_workload_matches_legacy_autoscaler(&ctx.workload_estimate, &problem, &state);
+        for stage in &ctx.workload_estimate.stages {
+            assert!(
+                (stage.frequency - (1.0 / 3.0)).abs() < 1e-6,
+                "cold-start workload should be uniform (got {})",
+                stage.frequency,
+            );
+        }
+    }
+
+    #[test]
+    fn worker_reuse_bonus_is_shared_with_legacy_autoscaler() {
+        // The context drives one-stage-at-a-time mutations but delegates
+        // placement scoring to the same FGD routine as the legacy
+        // autoscaler. Keep the reuse reward shared so a future tuning pass
+        // cannot make the two paths prefer different reuse/fresh choices.
+        let (problem, state) = one_stage_cpu_problem_and_state(1, 1.0);
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        assert_eq!(
+            ctx.worker_reuse_fragmentation_equivalent,
+            DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
+            "plan context and legacy autoscaler must use the same FGD reuse bonus",
+        );
+        assert!(
+            ctx.worker_reuse_fragmentation_equivalent > 0.0,
+            "positive reuse bonus is required to prefer cancelling a pending remove over fresh placement",
         );
     }
 

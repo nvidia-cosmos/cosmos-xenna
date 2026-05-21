@@ -36,11 +36,19 @@ Once the output is discrete, two failure modes appear:
 
 Adopt a **five-state classifier with per-zone asymmetric
 hysteresis**, implemented as a **pure function** of
-`(slots_empty_ratio_ewma, input_queue_depth, prev_state,
-saturation_threshold, activation_threshold, config)`. See
+`(slots_empty_ratio_ewma, input_queue_depth, pressure_ewma,
+prev_state, saturation_threshold, activation_threshold, config)`. See
 [`classifier.classify`](../../../cosmos_xenna/pipelines/private/scheduling_py/classifier.py)
 and the `StageState` enum in
 [`state.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/state.py).
+
+The classifier is **two-layer**: the slot-pin gate selects the
+candidate zone using slot-empty ratio thresholds, and the
+**pressure-demotion gate** then either confirms the zone or demotes it
+to `NORMAL`. Pressure (`utilisation * normalized_backlog`) is the
+smoothed compound signal documented in
+[06 — Backlog-time signal](06-backlog-time-signal.md); demotion encodes
+the AND-criterion as a single boolean per branch.
 
 ```
  empty-slot ratio (EWMA smoothed); 0.0 = every slot busy, 1.0 = every slot free
@@ -102,15 +110,30 @@ minimum cycle count — and the benefit is a reliable streak counter.
 ## How it works
 
 For each stage, the classifier evaluates the rules below in order
-and returns the first matching zone:
+and returns the first matching zone. Each slot-pin branch carries a
+**pressure-demotion gate**: when `enable_backlog_time_classifier=True`
+(default) the smoothed pressure scalar must clear the per-branch
+threshold for the slot-pin zone to be confirmed; otherwise the
+zone falls through to the next rule.
 
-| Test (in order)                                          | Result                            |
+| Test (in order)                                                                  | Result                            |
 |---|---|
-| `ratio < activation_threshold`                           | `SATURATED_CRITICAL`              |
-| `ratio < saturation_boundary`                            | `SATURATED`                       |
-| `ratio ≥ over_provisioned_boundary` and `queue == 0`    | `STARVED`                         |
-| `ratio ≥ over_provisioned_boundary` and `queue > 0`     | `OVER_PROVISIONED`                |
-| otherwise                                                | `NORMAL`                          |
+| `ratio < activation_threshold` AND `pressure_ewma > pressure_critical_threshold` | `SATURATED_CRITICAL`              |
+| `ratio < activation_threshold` (pressure low)                                    | fall through to next rule         |
+| `ratio < saturation_boundary` AND `pressure_ewma > pressure_saturation_threshold`| `SATURATED`                       |
+| `ratio < saturation_boundary` (pressure low)                                     | `NORMAL` (slot-pin demoted)       |
+| `ratio ≥ over_provisioned_boundary` and `queue == 0`                            | `STARVED`                         |
+| `ratio ≥ over_provisioned_boundary` and `queue > 0` AND `pressure_ewma > pressure_normal_threshold` | `NORMAL` (queue stuck downstream) |
+| `ratio ≥ over_provisioned_boundary` and `queue > 0` (pressure low)              | `OVER_PROVISIONED`                |
+| otherwise                                                                        | `NORMAL`                          |
+
+When `pressure_ewma is None` (no pressure value yet because the slot
+helper short-circuited), each `SATURATED_CRITICAL` / `SATURATED` row
+falls back to the legacy slot-only verdict (preserve the burst-response
+contract). The `OVER_PROVISIONED` row keeps its non-demoted result for
+the same reason. When `enable_backlog_time_classifier=False` the
+classifier reverts to slot-only and the demotion logic is bypassed
+entirely.
 
 The two boundaries depend on `prev_state`:
 
@@ -142,6 +165,8 @@ classifier itself never sees a raw per-cycle sample.
 All fields live on `SaturationAwareStageConfig` in
 [`specs.py`](../../../cosmos_xenna/pipelines/private/specs.py).
 
+Slot-pin gate (selects candidate zone):
+
 | Field                            | Default       | Role                                                                       |
 |---|---|---|
 | `saturation_threshold`           | `None` (auto) | Boundary between `SATURATED` and `NORMAL`                                  |
@@ -150,11 +175,28 @@ All fields live on `SaturationAwareStageConfig` in
 | `saturation_deadband_pct`        | `0.15`        | Width of the band held on exit from `SATURATED` / `SATURATED_CRITICAL`     |
 | `over_provisioned_deadband_pct`  | `0.30`        | Width of the band held on exit from `OVER_PROVISIONED`                     |
 
+Pressure-demotion gate (confirms or demotes the candidate zone):
+
+| Field                              | Default | Role                                                                                                                                |
+|---|---|---|
+| `pressure_critical_threshold`      | `2.0`   | Smoothed pressure required to **confirm** a slot-pin `SATURATED_CRITICAL`; otherwise fall through to the SATURATED rule.            |
+| `pressure_saturation_threshold`    | `1.0`   | Pressure required to **confirm** a slot-pin `SATURATED`; otherwise demote to `NORMAL`.                                              |
+| `pressure_normal_threshold`        | `0.3`   | Pressure above which a slot-pin `OVER_PROVISIONED` is **demoted** to `NORMAL` (queue stuck downstream; shrinking would worsen).     |
+| `enable_backlog_time_classifier`   | `True`  | Escape hatch: `False` disables the demotion gate so the classifier reverts to slot-only behaviour.                                  |
+| `target_backlog_seconds`           | `30.0`  | Operator-facing primary knob: queue drain-time at which `normalized_backlog == 1.0`. Indirectly drives the pressure scale.          |
+| `pressure_smoothing_level`         | `0.20`  | EWMA alpha applied to the composite pressure scalar inside the per-stage pipeline.                                                  |
+
 Operator-pinned thresholds must satisfy
 `activation < saturation < over_provisioned`. The cross-field
 validator on `SaturationAwareStageConfig.__attrs_post_init__`
 enforces the invariant at construction time, and the auto-threshold
 resolver re-checks it on the resolved values.
+
+The pressure-demotion gate must satisfy
+`pressure_critical_threshold > pressure_saturation_threshold >
+pressure_normal_threshold` and
+`pressure_critical_threshold ≤ BACKLOG_CAP` (3.0). Both invariants are
+enforced by the same cross-field validator.
 
 ## See also
 

@@ -100,8 +100,21 @@ def _problem(stage_names: list[str]) -> data_structures.Problem:
 
 def _problem_state_with_signals(
     stage_specs: list[tuple[str, int, int, int, int]],
+    *,
+    input_queue_depth: int = 0,
 ) -> data_structures.ProblemState:
-    """Build a ``ProblemState`` populating per-stage num_used_slots / num_empty_slots."""
+    """Build a ``ProblemState`` populating per-stage num_used_slots / num_empty_slots.
+
+    Args:
+        stage_specs: Per-stage tuples ``(name, num_workers, slots_per_worker,
+            num_used_slots, num_empty_slots)``.
+        input_queue_depth: Stage-level upstream queue depth applied to every
+            stage. Defaults to ``0`` so legacy tests that only exercise slot
+            signals stay unchanged. The MFI-pressure classifier (default-on)
+            requires queue depth > 0 for the slot-pin SATURATED gate to fire,
+            so trust-gate / wiring tests that expect a positive intent must
+            pass a non-zero value here.
+    """
     states = []
     for name, num_workers, slots, used, empty in stage_specs:
         worker_groups = [
@@ -119,6 +132,7 @@ def _problem_state_with_signals(
                 is_finished=False,
                 num_used_slots=used,
                 num_empty_slots=empty,
+                input_queue_depth=input_queue_depth,
             )
         )
     return data_structures.ProblemState(states)
@@ -201,7 +215,14 @@ class TestMinDataPointsTrustGate:
     """``min_data_points`` gates non-zero recommendations until enough samples accumulate."""
 
     def test_min_data_points_one_fires_on_first_valid_sample(self) -> None:
-        """With ``min_data_points=1`` the first valid sample produces a non-zero recommendation."""
+        """With ``min_data_points=1`` the first valid sample produces a non-zero recommendation.
+
+        The stage-level slot pin (``8/8`` used, ``0/8`` empty -> ratio ``0.0``)
+        plus the non-zero ``input_queue_depth`` yield a positive MFI pressure
+        so the SATURATED demotion gate is satisfied. Without an explicit queue
+        depth the test would inadvertently pin pressure to zero and the new
+        MFI classifier would correctly demote the slot pin to NORMAL.
+        """
         sat_cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(
                 min_data_points=1,
@@ -213,7 +234,7 @@ class TestMinDataPointsTrustGate:
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
 
-        ps = _problem_state_with_signals([("S", 1, 8, 8, 0)])
+        ps = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
         scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert scheduler._stage_states["S"].valid_signal_samples == 1
@@ -231,7 +252,7 @@ class TestMinDataPointsTrustGate:
         )
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
-        ps = _problem_state_with_signals([("S", 1, 8, 8, 0)])
+        ps = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
 
         scheduler.autoscale(time=0.0, problem_state=ps)
         assert scheduler._last_intent_deltas.get("S", 0) == 0
@@ -370,7 +391,10 @@ class TestStageOverridePrecedenceForMinDataPoints:
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["loud", "quiet"]))
 
-        ps = _problem_state_with_signals([("loud", 1, 8, 8, 0), ("quiet", 1, 8, 8, 0)])
+        ps = _problem_state_with_signals(
+            [("loud", 1, 8, 8, 0), ("quiet", 1, 8, 8, 0)],
+            input_queue_depth=100,
+        )
         scheduler.autoscale(time=0.0, problem_state=ps)
 
         # 'loud' has min_data_points=1, fires immediately. 'quiet' has =5 so trust gate clamps to 0.
@@ -470,6 +494,12 @@ class TestConfigWiringMetaCoverage:
         "max_workers",
         "max_workers_per_node",
         "setup_aware_max_queued",
+        "target_backlog_seconds",
+        "pressure_smoothing_level",
+        "pressure_critical_threshold",
+        "pressure_saturation_threshold",
+        "pressure_normal_threshold",
+        "enable_backlog_time_classifier",
     }
 
     _KNOWN_COVERAGE_GAPS_STAGE_OVERRIDE: ClassVar[set[str]] = _KNOWN_COVERAGE_GAPS_STAGE_BEHAVIOR | {

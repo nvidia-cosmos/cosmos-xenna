@@ -51,6 +51,7 @@ noisy probes. Operators tune the cap per stage on the
 """
 
 import math
+import threading
 import time
 import types
 from collections.abc import Iterator, Mapping
@@ -337,6 +338,26 @@ class SaturationAwareScheduler:
         # ``_RecommendationHistory`` instance across cycles so the buffer can
         # actually accumulate consensus.
         self._recommendation_histories: dict[str, _RecommendationHistory] = {}
+        # Throughput accumulator for the MFI-pressure compound signal
+        # (06-backlog-time-signal.md). ``streaming.Autoscaler.add_measurements``
+        # invokes ``update_with_measurements`` on every monitor tick (~ once
+        # per second by default) while ``autoscale`` runs every
+        # ``interval_s`` (default 10 s). Accumulating completed-task counts
+        # under a lock decouples the two cadences: each ``autoscale`` cycle
+        # consumes the delta against the previous consumed sample and emits
+        # one throughput value (``dcount / dt``) per stage. The lock is held
+        # only while reading or writing two integers per stage, so contention
+        # against the per-tick ``update_with_measurements`` call is
+        # negligible. ``_completed_counts`` carries the running total since
+        # ``setup()``; ``_last_throughput_sample`` is the last consumed
+        # ``(count, ts)`` per stage that ``autoscale`` snapshotted on the
+        # previous cycle. A missing entry on first read seeds with the
+        # current sample and yields ``observed_throughput_sample == 0.0``,
+        # which the pressure helper interprets as a cold-start branch
+        # (cap-bounded normalised backlog).
+        self._lock: threading.Lock = threading.Lock()
+        self._completed_counts: dict[str, int] = {}
+        self._last_throughput_sample: dict[str, tuple[int, float]] = {}
         # Per-instance streak ledger for the cluster heterogeneity ratio
         # warn log. Owned at the instance level (not module-level)
         # because the scheduler may be re-instantiated across tests;
@@ -378,6 +399,13 @@ class SaturationAwareScheduler:
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
+        # Throughput accumulator state is reset alongside the rest of the
+        # per-pipeline runtime state so a re-setup of the same scheduler
+        # instance starts cold (no carry-over from the prior pipeline's
+        # task counts or sample timestamps).
+        with self._lock:
+            self._completed_counts = {name: 0 for name in self._stage_names}
+            self._last_throughput_sample = {}
         # Build per-stage stabilization-window buffers from the resolved
         # effective config; both windows are config-time invariants
         # (cross-validated in ``SaturationAwareStageConfig.__attrs_post_init__``)
@@ -507,20 +535,84 @@ class SaturationAwareScheduler:
     ) -> None:
         """Ingest the latest measurement batch.
 
-        The fragmentation-based scheduler uses this to feed its
-        windowed throughput estimator. The saturation-aware scheduler
-        is signal-driven from ``ProblemState.actor_pool_state``
-        directly, so per-task measurements are not required for its
-        own decisions. They are still accepted and discarded so the
-        call sites in ``streaming.py`` need no special-case branch.
+        Accumulates per-stage completed-task counts so :meth:`autoscale`
+        can derive an ``observed_throughput`` sample without depending
+        on a separate throughput estimator. ``streaming.Autoscaler``
+        calls this on every monitor tick (cadence governed by the
+        streaming loop, typically much faster than ``interval_s``);
+        ``autoscale`` consumes the delta against the previously
+        snapshotted ``(count, ts)`` and emits one throughput value
+        per stage per cycle. The MFI-pressure EWMA in ``pipeline.py``
+        absorbs the cycle-to-cycle noise.
+
+        Counting policy: one tick per ``TaskMeasurement`` (i.e.
+        ``len(stage_measurements.task_measurements)``). The matching
+        drain-rate unit for ``input_queue_depth`` is "completed stage
+        tasks per second", not "produced output items per second",
+        so ``TaskMeasurement.num_returns`` is intentionally NOT
+        summed here (a ``flat_map``-style stage that returns ``N``
+        items per task should still count one queue drain per task).
 
         Args:
-            time: Current wall-clock time in seconds.
-            measurements: Per-stage measurement batch since the previous
-                cycle.
+            time: Current wall-clock time in seconds. Currently
+                unused -- the autoscale-cycle timestamp is the
+                canonical clock for the throughput delta. Accepted
+                so the protocol signature in ``streaming.py``
+                stays uniform across both scheduler kinds.
+            measurements: Per-stage measurement batch since the
+                previous tick. Iterated by position over
+                ``measurements.rust.stages`` zipped with
+                ``self._stage_names`` so the count attribution
+                follows pipeline-DAG order rather than relying on
+                stage-name hashing.
 
         """
-        del time, measurements
+        del time
+        rust_stages = measurements.rust.stages
+        with self._lock:
+            for stage_name, stage_measurements in zip(self._stage_names, rust_stages, strict=False):
+                count = len(stage_measurements.task_measurements)
+                if count == 0:
+                    continue
+                self._completed_counts[stage_name] = self._completed_counts.get(stage_name, 0) + count
+
+    def _consume_throughput_samples(self, now_ts: float) -> dict[str, float]:
+        """Consume the per-stage completed-count delta and emit throughput samples.
+
+        Called once per ``autoscale`` cycle. For each known stage, reads
+        the running completed-count under ``self._lock``, computes
+        ``dcount / dt`` against the previously snapshotted
+        ``(count, ts)``, updates the snapshot, and returns the
+        per-stage throughput sample. Stages that have never been
+        sampled before return ``0.0`` (cold-start: the next cycle is
+        the first sample with a valid ``dt``).
+
+        Args:
+            now_ts: Wall-clock seconds at the top of this autoscale
+                cycle; used as the second component of the new
+                ``(count, ts)`` snapshot.
+
+        Returns:
+            Mapping of stage name to ``observed_throughput_sample`` in
+            tasks per second. Always contains an entry for every name
+            in ``self._stage_names`` so the pipeline orchestrator can
+            look up by stage name without a missing-key fallback.
+
+        """
+        samples: dict[str, float] = {}
+        with self._lock:
+            for stage_name in self._stage_names:
+                now_count = self._completed_counts.get(stage_name, 0)
+                prev = self._last_throughput_sample.get(stage_name)
+                if prev is None:
+                    samples[stage_name] = 0.0
+                else:
+                    prev_count, prev_ts = prev
+                    dt = now_ts - prev_ts
+                    dcount = max(0, now_count - prev_count)
+                    samples[stage_name] = dcount / dt if dt > 0.0 else 0.0
+                self._last_throughput_sample[stage_name] = (now_count, now_ts)
+        return samples
 
     def autoscale(
         self,
@@ -689,7 +781,16 @@ class SaturationAwareScheduler:
             check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
         with self._phase_timer("intent"):
-            self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
+            # Sample throughput once per cycle BEFORE the intent loop so every
+            # stage observes the same per-cycle delta even when a stage's
+            # ``run_per_stage_pipeline`` raises (the lock is released first).
+            throughput_samples = self._consume_throughput_samples(now_ts=time)
+            self._last_intent_deltas = self._compute_intent_deltas(
+                ctx,
+                problem_state,
+                now=time,
+                throughput_samples=throughput_samples,
+            )
 
         # Capture pre-Phase-C worker counts so we can compute the post-commit
         # executed delta per stage and feed it to the growth-mode state machine
@@ -1098,6 +1199,7 @@ class SaturationAwareScheduler:
         problem_state: data_structures.ProblemState,
         *,
         now: float,
+        throughput_samples: dict[str, float],
     ) -> dict[str, int]:
         """Compute the per-stage signed worker-count intent for this cycle.
 
@@ -1260,6 +1362,8 @@ class SaturationAwareScheduler:
                 current_workers=current_workers,
                 config=stage_cfg,
                 recommendation_history=history,
+                observed_throughput_sample=throughput_samples.get(stage_name, 0.0),
+                pipeline_name=self._pipeline_name,
             )
             if stage_state.valid_signal_samples < stage_cfg.min_data_points and delta != 0:
                 logger.debug(

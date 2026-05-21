@@ -105,6 +105,39 @@ contribution and donor selection respectively. See
 |---|---|---|
 | `SaturationAwareConfig.interval_s` | `10.0 s` | Lower for tighter control on small clusters; raise on 10k-node clusters where the autoscaler's per-cycle work begins to compete with pipeline traffic. |
 
+### MFI pressure / backlog-time gate
+
+The classifier's compound pressure signal documented in
+[06 — Backlog-time signal](06-backlog-time-signal.md) has six per-stage
+knobs. Most pipelines run with the defaults; the only one operators
+typically tune is `target_backlog_seconds`.
+
+| Field | Default | When to adjust |
+|---|---|---|
+| `target_backlog_seconds` | `30.0 s` | **Operator-facing primary knob.** The acceptable queue drain-time at which `normalized_backlog == 1.0`. Increase for latency-tolerant pipelines that can absorb a longer backlog before scaling up; decrease for latency-critical stages where queue depth must drain inside `target_backlog_seconds`. |
+| `pressure_smoothing_level` | `0.20` | EWMA alpha on the composite pressure scalar. Increase toward `0.40` if the throughput sample is steady and the operator wants the pressure gauge to react faster; decrease toward `0.10` if `xenna_stage_pressure_ewma` shows cycle-to-cycle noise that masks the trend. |
+| `pressure_critical_threshold` | `2.0` | Operator-pinned override. Increase only if a stage produces high-pressure bursts that should not trigger the burst-response (`SATURATED_CRITICAL`) path. The hard cap is `BACKLOG_CAP=3.0`. |
+| `pressure_saturation_threshold` | `1.0` | Operator-pinned override. Lowering toward `0.6` makes the AND-criterion more permissive (slot pin still demoted if pressure is below `0.6`), which can be useful when measurements consistently underestimate true throughput. |
+| `pressure_normal_threshold` | `0.3` | Operator-pinned override. Decrease (toward `0.1`) when an idle stage with a consistently long downstream queue should NOT scale down. Increase (toward `0.6`) when the operator wants the demotion gate to ignore mild pressure and shrink the stage anyway. |
+| `enable_backlog_time_classifier` | `True` | **Escape hatch.** Set `False` per-stage to revert to legacy slot-only behaviour for workloads that were pre-tuned against the slot-ratio signal alone. Disabling globally re-introduces the false-positive scale-up failure mode the MFI gate was added to solve. |
+
+Tuning workflow:
+
+1. **Watch the gauges first.** [22 — Prometheus metrics](22-prometheus-metrics.md)
+   exposes `xenna_stage_observed_throughput`, `xenna_stage_backlog_time`,
+   and `xenna_stage_pressure_ewma`. If `pressure_ewma` consistently sits
+   in the `[1.5, 3.0]` band during steady-state operation but the
+   pipeline is meeting SLO, increase `target_backlog_seconds` so the
+   gauge's normal range shifts down.
+2. **Tune `target_backlog_seconds` before the thresholds.** All three
+   pressure thresholds scale against the normalised backlog; moving the
+   single primary knob is preferred over tuning three thresholds at
+   once.
+3. **Use per-stage overrides for outlier stages.** A stage with
+   variable batch sizes (Gaussian throughput) needs a higher
+   `pressure_smoothing_level` than a stage with steady inference
+   throughput.
+
 The effective response time is `interval_s * streak_min_cycles`.
 Lowering `interval_s` makes the autoscaler more reactive but also
 amplifies the cost of the per-cycle work. The watchdog
@@ -118,6 +151,9 @@ runtime visible.
 | Stages oscillate between adding and removing workers | Increase `over_provisioned_streak_min_cycles` (longer scale-down patience) | [07](07-streak-stabilization.md) |
 | Phase D shrinks a freshly-warmed worker | Increase `worker_warmup_measurement_grace_s` and `donor_warmup_grace_s` | [10](10-slow-start-mechanisms.md), [15](15-idle-first-scale-down.md) |
 | New stage takes minutes to ramp under sustained load | Increase `saturation_aggressiveness` (`0.30` → `0.45`); confirm `enable_dag_priority_growth=True` | [08](08-auto-derived-thresholds.md), [12](12-multi-target-dag-growth.md) |
+| Slot-pin SATURATED fires but no scale-up happens | Inspect `xenna_stage_pressure_ewma`; if `< pressure_saturation_threshold` (1.0) the demotion gate is correctly suppressing transient bursts. Decrease `target_backlog_seconds` if the pipeline truly is latency-critical and the queue drains too fast for the gate. | [06](06-backlog-time-signal.md), [22](22-prometheus-metrics.md) |
+| OVER_PROVISIONED stage refuses to scale down | Inspect `xenna_stage_pressure_ewma`; values `> pressure_normal_threshold` (0.3) are demoting to NORMAL because the queue is stuck downstream. Fix the downstream bottleneck first; only as a last resort raise `pressure_normal_threshold`. | [06](06-backlog-time-signal.md) |
+| `xenna_stage_pressure_ewma` is unexpectedly noisy | Lower `pressure_smoothing_level` (`0.20` → `0.10`); confirm `xenna_stage_observed_throughput` itself is not noisy first | [06](06-backlog-time-signal.md) |
 | Cluster-full pipeline never bootstraps a new stage | Confirm `floor_stuck_grace_cycles` is non-zero (default `6`); check Phase B donor logs | [13](13-cross-stage-donor.md) |
 | Cross-stage donor rotates the same worker every cycle | Increase `cross_stage_donor_anti_flap_cycles` (default `30`) | [13](13-cross-stage-donor.md) |
 | Regime detector enters / exits SUPER_HW every few cycles | Increase `regime_transition_streak_cycles` (default `3` → `5`) | [09](09-regime-aware-aggressiveness.md) |

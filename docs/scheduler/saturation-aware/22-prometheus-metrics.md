@@ -109,6 +109,9 @@ local question.
 | Cycle | `xenna_scheduler_cycle_phase_duration_seconds` | histogram | `pipeline`, `phase` | Which of `pre_phase_setup` / `phase_a` / `phase_b` / `intent` / `phase_c` / `phase_d` / `invariants` / `into_solution` dominated cycle time |
 | Per-stage state | `xenna_stage_bottleneck_score` | gauge | `pipeline`, `stage` | Forced-Flow-Law bottleneck — see [23](23-bottleneck-score-metric.md). **Currently NaN** until per-stage service-time data is threaded through `autoscale(...)`; tracked in the saturation-aware roadmap. |
 | Per-stage state | `xenna_scheduler_cluster_heterogeneity_ratio` | gauge | `pipeline` | `max_k D_k / min_k D_k` across stages with finite service demand. **Currently NaN** while service-time data is unwired; the gauge stays registered so a future PR can populate it without breaking existing dashboards. |
+| Per-stage state | `xenna_stage_observed_throughput` | gauge | `pipeline`, `stage` | **MFI pressure input.** Per-stage observed throughput sample in completed tasks/sec, computed inline by `SaturationAwareScheduler.autoscale()` from the per-cycle delta of `update_with_measurements` counters. Raw, not smoothed. |
+| Per-stage state | `xenna_stage_backlog_time` | gauge | `pipeline`, `stage` | **MFI pressure input.** Per-stage raw backlog-drain time in seconds (`input_queue_depth / observed_throughput`, Little's Law `W_q`). Bounded to `target_backlog_seconds * BACKLOG_CAP` when throughput collapses to zero with `queue > 0` (cold-start). Raw, not smoothed. |
+| Per-stage state | `xenna_stage_pressure_ewma` | gauge | `pipeline`, `stage` | **MFI pressure output.** Per-stage smoothed pressure signal (`utilisation * normalized_backlog`). The classifier reads this as the demotion gate inside the existing slot-ratio branches; surfacing it directly lets operators audit classifier decisions without re-running the math from logs. |
 | Per-stage state | `xenna_scheduler_stuck_plan_active` | gauge (0/1) | `pipeline`, `stage` | 1 when a stage's Phase C grow has been stuck above the detection threshold |
 | Per-stage state | `xenna_scheduler_stuck_plan_cycles_total` | counter | `pipeline`, `stage` | Total cycles a stage has been stuck above the detection threshold |
 | Safety | `xenna_scheduler_memory_pressure_active` | gauge (0/1) | `pipeline` | Memory-pressure gate engaged this cycle |
@@ -125,11 +128,24 @@ heterogeneity ratio fire at the end of every cycle from the
 [bottleneck score helper](23-bottleneck-score-metric.md);
 `stuck_plan_active` and `stuck_plan_cycles_total` update each time
 the per-stage `_stuck_plan_counters` mutates (driven by
-`_set_stuck_plan_counter` in `saturation_aware.py`). Safety metrics
-update opportunistically: the memory-pressure gauges refresh on
-every `is_pressure_active()` call (whether a cache hit or a fresh
-Ray poll), and the allocation-failures counter increments only on
-the absorbed-exception path of `_try_add_worker_with_defense`.
+`_set_stuck_plan_counter` in `saturation_aware.py`). The three
+**MFI pressure** gauges (`xenna_stage_observed_throughput`,
+`xenna_stage_backlog_time`, `xenna_stage_pressure_ewma`) are emitted
+together by `emit_pressure_signals()` in `scheduling_py/pressure.py`,
+called once per stage per cycle from `_resolve_pressure_signal()`
+inside `run_per_stage_pipeline`. The pipeline only calls the helper
+when the slot signal is available; cycles that short-circuit with no
+slot signal (zero ready actors, no prior valid EWMA) intentionally do
+not refresh these gauges so the next valid cycle's demotion decision
+sees a clean signal. The gauges are emitted on every cycle the pressure helper runs,
+regardless of the `enable_backlog_time_classifier` flag — when the
+flag is `False` the classifier ignores `pressure_ewma`, but the
+helper still computes it and updates the gauges so operators can keep
+auditing the demotion math even on legacy-mode stages. Safety metrics update
+opportunistically: the memory-pressure gauges refresh on every
+`is_pressure_active()` call (whether a cache hit or a fresh Ray poll),
+and the allocation-failures counter increments only on the
+absorbed-exception path of `_try_add_worker_with_defense`.
 
 ## Knobs
 

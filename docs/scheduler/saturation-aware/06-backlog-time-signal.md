@@ -1,31 +1,24 @@
-# 06 — Backlog-Time Signal (Compound AND-Criterion)
-
-> **Status: PLANNED, not yet wired.**
->
-> The classifier today consumes only the smoothed empty-slot ratio
-> and the integer `input_queue_depth`. There is no throughput
-> estimate threaded through `autoscale(...)`, so the
-> `backlog_time = input_queue_depth / observed_throughput` term
-> described below is not yet computed. Wiring this signal requires
-> extending the scheduler protocol; that work is tracked in the
-> saturation-aware roadmap and is intentionally out of scope for
-> the current MR. This document remains as the design target.
+# 06 — Backlog-Time Signal (MFI Pressure Hybrid)
 
 ## TL;DR
 
-Saturation is fired only when **both** observables agree: the smoothed
-empty-slot ratio is below `saturation_threshold` AND the smoothed
-backlog drain time is above `target_backlog_seconds`. A momentary
-slot fill is no longer enough — the queue must also be genuinely
-backlogged.
+Saturation is fired only when the slot pin AND the smoothed compound
+**pressure** scalar agree. The pressure factor combines the existing
+empty-slot ratio with a normalised backlog-drain time (Little's Law
+`W_q = queue / throughput` divided by `target_backlog_seconds`). The
+pressure scalar is consumed by the classifier inside the existing
+slot-ratio branches as a **demotion gate** — slot-pin SATURATED stays
+SATURATED only when pressure is high; slot-pin OVER_PROVISIONED is
+demoted to NORMAL when pressure is high (the queue is stuck elsewhere
+and shrinking would amplify the bottleneck).
 
 ## Problem
 
 The smoothed empty-slot ratio that
 [`classify`](../../../cosmos_xenna/pipelines/private/scheduling_py/classifier.py)
-already consumes is a single-axis observable. It answers "are the
-worker slots busy right now?" but says nothing about whether more
-workers would help. Two operational scenarios show why utilisation
+ consumed alone is a single-axis observable. It answers
+"are the worker slots busy right now?" but says nothing about whether
+more workers would help. Two operational scenarios show why utilisation
 alone is not enough:
 
 - **Transient input burst.** A short spike momentarily fills every
@@ -53,124 +46,185 @@ stories and either one alone misclassifies real workloads.
 
 ## Decision
 
-Use a compound AND-criterion on (utilisation, backlog-time) for the
-saturation zones. A stage is classified `SATURATED` only when both:
+Use the **MFI Pressure Hybrid** approach: the existing slot-ratio
+gate continues to select the classifier branch, and a single smoothed
+**pressure** scalar acts as a **demotion gate** inside each branch.
+Pressure is the multiplicative composition of the two observables:
 
 ```
-    slots_empty_ratio_ewma  <  saturation_threshold      (utilisation low)
-    AND
-    backlog_time            >  target_backlog_seconds   (queue not draining)
+    pressure = utilisation * normalized_backlog
+
+    where:
+      utilisation        = 1 - slots_empty_ratio_ewma
+      normalized_backlog = min(W_q / target_backlog_seconds, BACKLOG_CAP)
+      W_q                = input_queue_depth / observed_throughput
 ```
 
-with `backlog_time = input_queue_depth / observed_throughput` (the
-W_q observable of Little's Law, in seconds). `SATURATED_CRITICAL`
-mirrors the criterion at tighter thresholds; `OVER_PROVISIONED`
-mirrors it on the opposite side. `STARVED` keeps a separate
-empty-queue guard and is not part of the AND-criterion.
+`BACKLOG_CAP = 3.0` is an upper clamp that guarantees pressure stays
+finite (especially during cold-start when `observed_throughput == 0`
+and `queue > 0`). Pressure is smoothed by an EWMA before reaching the
+classifier so cycle-to-cycle noise on the throughput sample dampens.
+
+The hybrid name reflects two design choices: "MFI" — Multiplicative
+Factor Interaction — captures that pressure fires only when **both**
+factors are elevated; "Pressure" — the single scalar surfaces the
+AND-criterion as one value the classifier and dashboards can read
+directly.
 
 ```
-                              slots_empty_ratio_ewma
-                      < saturation_threshold      ≥ saturation_threshold
-                  ┌─────────────────────────────┬─────────────────────────────┐
-  backlog_time    │         SATURATED           │           NORMAL            │
-  >  target_      │   (scale up: both           │   (backpressured            │
-  backlog_seconds │    observables agree on     │    elsewhere — queue stuck  │
-                  │    pressure)                │    despite idle slots; this │
-                  │                             │    stage is NOT the         │
-                  │                             │    bottleneck and growing   │
-                  │                             │    it will not help)        │
-                  ├─────────────────────────────┼─────────────────────────────┤
-  backlog_time    │           NORMAL            │      NORMAL / STARVED       │
-  ≤  target_      │   (transient burst —        │   (genuine idle; STARVED    │
-  backlog_seconds │    queue is draining;       │    on a sustained empty-    │
-                  │    do not react)            │    queue streak)            │
-                  └─────────────────────────────┴─────────────────────────────┘
-
-         backlog_time = input_queue_depth / observed_throughput
-                       (Little's Law W_q observable, in seconds)
+                              utilisation
+                  low (idle slots)            high (busy slots)
+                ┌─────────────────────────┬──────────────────────────┐
+  normalized   │      pressure ≈ 0       │  pressure HIGH (real     │
+  backlog HIGH │  (queue stuck else-     │   saturation: both       │
+  (queue stuck)│   where; growing this   │   factors agree)         │
+                │   stage would not help) │                          │
+                ├─────────────────────────┼──────────────────────────┤
+  normalized   │      pressure ≈ 0       │  pressure ≈ 0           │
+  backlog LOW  │  (genuine idle —         │  (transient burst —     │
+  (queue       │   STARVED on empty       │   queue is draining;    │
+  draining)    │   queue streak)          │   warmup cost would      │
+                │                         │   dominate)              │
+                └─────────────────────────┴──────────────────────────┘
 ```
 
-The four quadrants decompose cleanly:
+## Two-layer classifier behaviour
 
-- **Both saturated** — utilisation low AND backlog growing →
-  `SATURATED` (genuine scale-up signal).
-- **Only utilisation** — slots momentarily full, queue still
-  draining → `NORMAL` (transient burst; warmup cost would dominate).
-- **Only backlog** — queue stuck despite idle slots → `NORMAL`
-  (placement / dispatch issue; the fix is at the bottlenecked
-  downstream stage — either growing it directly or routing a
-  worker to it through the cross-stage donor protocol; growing
-  *this* stage is the wrong response).
-- **Neither** — `NORMAL` (or `STARVED` once the empty-queue streak
-  reaches its threshold).
+The slot-pin gate decides which branch a cycle enters; the pressure
+gate then demotes that branch when the AND-criterion is not met.
+Each slot-pin branch has its own pressure threshold:
 
-**Trade-off.** The AND-criterion is strictly more conservative than
-utilisation alone: every cycle where the utilisation-only rule
+| Slot-pin branch | Pressure threshold | If pressure exceeds | Otherwise |
+|---|---|---|---|
+| `SATURATED_CRITICAL` (`slots_empty < activation`) | `pressure_critical_threshold` (default `2.0`) | stays `SATURATED_CRITICAL` | falls through to `SATURATED` gate |
+| `SATURATED` (`slots_empty < saturation`) | `pressure_saturation_threshold` (default `1.0`) | stays `SATURATED` | demoted to `NORMAL` |
+| `OVER_PROVISIONED` (`slots_empty ≥ over_provisioned`, `queue > 0`) | `pressure_normal_threshold` (default `0.3`) | demoted to `NORMAL` (queue stuck downstream) | stays `OVER_PROVISIONED` |
+| `STARVED` (`slots_empty ≥ over_provisioned`, `queue = 0`) | n/a | n/a | always `STARVED` (queue empty is structural) |
+
+`STARVED` is excluded because the queue is empty by construction; no
+backlog-time signal can change that diagnosis.
+
+The slot-pin gate continues to honour the existing **asymmetric
+deadband** for hysteresis (saturation deadband, over-provisioned
+deadband). The pressure gate carries no deadband because the EWMA
+already smooths the raw composite signal.
+
+**Trade-off.** The compound criterion is strictly more conservative
+than utilisation alone: every cycle where the utilisation-only rule
 would have fired `SATURATED` but the queue is draining (low
-backlog), the compound rule emits `NORMAL` instead. False-positive
+pressure), the compound rule emits `NORMAL` instead. False-positive
 scale-ups drop; true-positive scale-ups on sustained pressure are
 unchanged because sustained pressure builds queue depth by
-construction. The cost is one extra EWMA-smoothed signal
-(`observed_throughput`) and one new operator-facing knob
-(`target_backlog_seconds`).
+construction.
 
-## How it works
+## Throughput sample plumbing
 
-Per-cycle inside
-[`run_per_stage_pipeline`](../../../cosmos_xenna/pipelines/private/scheduling_py/pipeline.py):
+The MFI pressure signal needs a per-cycle `observed_throughput`
+sample. The streaming layer calls `update_with_measurements()` on
+every monitor tick (cadence governed by `streaming.Autoscaler`,
+typically much faster than `interval_s`); the SA scheduler accumulates
+**`len(task_measurements)` per stage** under a `threading.Lock` and
+the autoscale cycle consumes the per-cycle delta:
 
-- The empty-slot EWMA is refreshed by `_resolve_classifier_signal`
-  using the existing `slots_empty_ratio_smoothing_level` weight from
-  [`SaturationAwareStageConfig`](../../../cosmos_xenna/pipelines/private/specs.py).
-- A second EWMA tracks per-stage observed throughput. The weight is
-  `observed_throughput_smoothing_level`. The cold-start edge case
-  (no completed batches yet, `observed_throughput == 0`) maps
-  `backlog_time` to `+inf` when `input_queue_depth > 0`, which forces
-  the AND-criterion to fire `SATURATED_CRITICAL` on cycle 1 — the
-  "queue exists but no progress" pathology must not wait for a
-  throughput sample.
-- A final EWMA smooths the derived `backlog_time` itself with
-  `backlog_time_smoothing_level`. This dampens the noisy
-  (queue / throughput) ratio without losing structural pressure
-  signals.
-- The compound AND-criterion is evaluated inside
-  [`classify`](../../../cosmos_xenna/pipelines/private/scheduling_py/classifier.py)
-  using the smoothed slot ratio, `input_queue_depth`, and the
-  smoothed `backlog_time`. The output feeds the existing streak
-  counter and the
-  [`compute_delta`](../../../cosmos_xenna/pipelines/private/scheduling_py/decisions.py)
-  gate untouched — adding the backlog-time axis does not change the
-  action-firing steps that follow inside the per-stage decision
-  pipeline.
+```
+streaming.Autoscaler             SaturationAwareScheduler
+─────────────────────             ────────────────────────
+update_with_measurements ───►    self._completed_counts[stage] += len(...)
 
-The `SATURATED_CRITICAL` and `OVER_PROVISIONED` thresholds for
-`backlog_time` are derived from `target_backlog_seconds`
-(`> 3 * target_backlog_seconds` for critical pressure;
-`< 0.5 * target_backlog_seconds` for over-provisioned), so a single
-operator-facing knob captures the intent across all three zones.
+autoscale (per interval_s)  ───► _consume_throughput_samples(now_ts)
+                                   for each stage:
+                                     dcount = max(0, now - prev_count)
+                                     dt     = now_ts - prev_ts
+                                     sample = dcount / dt if dt > 0 else 0.0
+                                 ───► run_per_stage_pipeline(observed_throughput_sample=sample)
+```
+
+Counting policy is **`len(task_measurements)`** rather than summing
+`num_returns`. The matching drain-rate unit for `input_queue_depth`
+is "completed stage tasks per second" (one queue drain per task), not
+"produced output items per second" — a `flat_map`-style stage that
+returns `N` items per task should still count one queue drain per
+task to match the drain rate the queue depth is reported in.
+
+## Cold-start handling
+
+`compute_pressure` is a pure function with three branches:
+
+```
+queue == 0                              -> 0.0
+throughput <= 0 AND queue > 0           -> utilisation * BACKLOG_CAP
+throughput > 0  AND queue > 0           -> utilisation *
+                                           min(W_q / target, BACKLOG_CAP)
+```
+
+Cold-start (no measurements yet but the queue already has work) maps
+to the bounded `BACKLOG_CAP` rather than `+inf` arithmetic so the
+pressure stays a finite scalar. This ensures the first autoscale cycle
+after `setup()` still emits a SATURATED-eligible pressure when the
+queue is non-empty.
+
+When the slot signal itself is missing (zero ready actors, no prior
+valid EWMA), `_resolve_classifier_signal` returns `None` and
+`run_per_stage_pipeline` short-circuits **before** updating the
+pressure EWMA. This is intentional: feeding `compute_pressure` with
+a zero utilisation while the actual pool is in setup-phase quiescence
+would corrupt the next valid cycle's demotion decision.
+
+## Escape hatch — slot-only classifier
+
+The new MFI gate can be disabled per-stage:
+
+```python
+SaturationAwareStageConfig(
+    enable_backlog_time_classifier=False,  # default True
+)
+```
+
+When disabled the classifier reverts to the legacy slot-only behaviour
+(no demotion, no pressure refresh, no Prometheus pressure gauges
+emitted for the stage). Use this for stages that were pre-tuned
+against the slot-ratio signal alone and should not adopt the new
+demotion rule.
 
 ## Knobs
 
 All on
 [`SaturationAwareStageConfig`](../../../cosmos_xenna/pipelines/private/specs.py):
 
-| Knob | Effect |
-|---|---|
-| `target_backlog_seconds` | AND-threshold for `SATURATED`. Higher = more conservative (longer queue accepted before scale-up); lower = more aggressive. `SATURATED_CRITICAL` and `OVER_PROVISIONED` ratios scale from this value. |
-| `backlog_time_smoothing_level` | EWMA weight on the new `backlog_time` sample. Lower = smoother (filters noise); higher = more reactive to bursts. |
-| `observed_throughput_smoothing_level` | EWMA weight on the per-cycle throughput sample. Lower = smoother (queue-time noise dampens); higher = reacts faster to step changes in stage speed. |
+| Knob | Default | Effect |
+|---|---|---|
+| `target_backlog_seconds` | `30.0` | Operator-facing primary knob. Drain-time at which `normalized_backlog == 1.0`. Higher = more conservative; lower = more aggressive. |
+| `pressure_smoothing_level` | `0.20` | EWMA alpha on the composite pressure scalar. Lower = smoother (filters throughput noise); higher = more reactive. Bounded `(0.0, 1.0]`. |
+| `pressure_critical_threshold` | `2.0` | Pressure above which a slot-pin `SATURATED_CRITICAL` actually fires. Strictly larger than `pressure_saturation_threshold`. |
+| `pressure_saturation_threshold` | `1.0` | Pressure above which a slot-pin `SATURATED` actually fires. |
+| `pressure_normal_threshold` | `0.3` | Pressure above which a slot-pin `OVER_PROVISIONED` is demoted to `NORMAL` (queue is stuck elsewhere). |
+| `enable_backlog_time_classifier` | `True` | Escape hatch — disables the MFI gate and falls back to slot-only. |
+
+Cross-field invariants enforced at construction time:
+
+```
+pressure_critical_threshold > pressure_saturation_threshold > pressure_normal_threshold
+pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
+```
 
 ## See also
 
-- [00 — Per-cycle overview](00-overview.md) — where the compound
-  AND-criterion sits inside the intent compute stage.
+- [00 — Per-cycle overview](00-overview.md) — where the MFI pressure
+  gate sits inside the intent compute stage.
+- [02 — Configuration model](02-configuration-model.md) — every
+  per-stage knob including the six new pressure-gate fields.
 - [05 — State classifier](05-state-classifier.md) — the five-zone
-  decomposition that consumes the compound criterion.
+  decomposition with the slot-pin-then-pressure-demotion ordering.
 - [07 — Streak stabilization](07-streak-stabilization.md) — the
-  asymmetric streak counters that run after the AND-criterion fires.
+  asymmetric streak counters that run after the classifier fires.
+- [22 — Prometheus metrics](22-prometheus-metrics.md) — the three
+  pressure gauges (`xenna_stage_observed_throughput`,
+  `xenna_stage_backlog_time`, `xenna_stage_pressure_ewma`) operators
+  read to audit classifier decisions.
+- [tuning.md](tuning.md) — workload-class tuning advice including
+  `target_backlog_seconds` calibration.
 - [Little's Law](https://en.wikipedia.org/wiki/Little%27s_law) —
-  external reference for the queue-time observable used as the
-  second axis.
+  external reference for the queue-time observable.
 - [Cloud Dataflow Streaming Engine autoscaling](https://cloud.google.com/dataflow/docs/streaming-engine)
   — external reference for the original `backlog_time` autoscaler
   signal.
