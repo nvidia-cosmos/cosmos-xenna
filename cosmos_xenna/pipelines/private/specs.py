@@ -809,15 +809,16 @@ class SaturationAwareStageConfig:
                 "SATURATED needs a strictly larger pressure than the OVER_PROVISIONED demotion gate."
             )
             raise ValueError(msg)
-        # Pressure values are bounded above by the backlog cap (3.0); a
-        # threshold above the cap can never fire (utilisation in [0, 1]
-        # multiplied by normalized_backlog in [0, 3] cannot exceed 3.0).
-        # The cap lives in scheduling_py/pressure.py as ``BACKLOG_CAP``.
-        max_pressure = 3.0
-        if self.pressure_critical_threshold > max_pressure:
+        # Pressure values are bounded above by the backlog cap (utilisation
+        # in [0, 1] multiplied by normalized_backlog in [0, BACKLOG_CAP]
+        # cannot exceed BACKLOG_CAP). A threshold above the cap can never
+        # fire.
+        from cosmos_xenna.pipelines.private.scheduling_py.pressure import BACKLOG_CAP
+
+        if self.pressure_critical_threshold > BACKLOG_CAP:
             msg = (
                 f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be <= "
-                f"{max_pressure} (the backlog cap on the composite pressure signal); "
+                f"{BACKLOG_CAP} (the backlog cap on the composite pressure signal); "
                 "thresholds above the cap can never fire."
             )
             raise ValueError(msg)

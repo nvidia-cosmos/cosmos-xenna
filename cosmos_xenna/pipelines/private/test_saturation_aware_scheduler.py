@@ -30,6 +30,8 @@ Tests use real ``Problem`` and ``ProblemState`` objects (not mocks)
 so the Python -> Rust round-trips are exercised end-to-end.
 """
 
+import threading
+
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
@@ -677,8 +679,6 @@ class TestUpdateWithMeasurementsThreadSafety:
         on. This test pins the ``threading.Lock``-protected accumulator
         so a refactor that drops the lock immediately surfaces.
         """
-        import threading
-
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
 

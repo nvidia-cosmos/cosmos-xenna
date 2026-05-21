@@ -383,6 +383,17 @@ class SaturationAwareScheduler:
                 runtime state arriving in ``autoscale()``.
 
         """
+        # ``setup()`` runs pre-traffic on the same thread that constructs
+        # the scheduler, before the streaming executor wires the producer
+        # path (``update_with_measurements``) or the consumer path
+        # (``autoscale`` -> ``_consume_throughput_samples``). No other
+        # thread can observe the dicts mid-rebuild, so resetting
+        # ``_stage_states`` and friends without ``self._lock`` is safe by
+        # construction. Only the throughput-accumulator pair below is
+        # acquired under the lock because in some test fixtures the
+        # scheduler is re-``setup()``-ed mid-process to recycle a
+        # singleton instance, and the lock acquisition documents the
+        # invariant for readers without paying a runtime cost.
         self._problem = problem
         self._stage_names = [stage.name for stage in problem.rust.stages]
         self._stage_states = {name: _StageRuntimeState(stage_name=name) for name in self._stage_names}
@@ -402,7 +413,10 @@ class SaturationAwareScheduler:
         # Throughput accumulator state is reset alongside the rest of the
         # per-pipeline runtime state so a re-setup of the same scheduler
         # instance starts cold (no carry-over from the prior pipeline's
-        # task counts or sample timestamps).
+        # task counts or sample timestamps). The lock is held only over
+        # the two assignments that ``update_with_measurements`` and
+        # ``_consume_throughput_samples`` also acquire; the rest of the
+        # rebuild relies on the pre-traffic invariant documented above.
         with self._lock:
             self._completed_counts = {name: 0 for name in self._stage_names}
             self._last_throughput_sample = {}
@@ -1277,6 +1291,16 @@ class SaturationAwareScheduler:
                 threaded into the per-worker measurement grace
                 helper for elapsed-time comparisons against each
                 worker's first-seen-READY timestamp.
+            throughput_samples: Per-stage observed throughput in
+                completed tasks/sec for the current cycle, sourced
+                from :meth:`_consume_throughput_samples` and threaded
+                into ``run_per_stage_pipeline`` so the per-stage
+                MFI pressure helper can compute
+                ``utilisation * normalized_backlog`` against
+                ``input_queue_depth``. Stages absent from the map
+                are treated as cold-start (no measurements yet);
+                the pressure helper clamps to ``BACKLOG_CAP`` to
+                avoid ``+inf`` arithmetic on the first cycle.
 
         Returns:
             Mapping of stage name -> signed intent. Positive values

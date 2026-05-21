@@ -313,3 +313,85 @@ class TestPipelinePressureThreading:
             pipeline_name="test",
         )
         assert state.classifier_state == StageState.NORMAL
+
+
+class TestPressureGaugesAreFlagIndependent:
+    """The pressure gauges and the EWMA refresh are emitted regardless of
+    ``enable_backlog_time_classifier``.
+
+    The classifier flag is an escape hatch on the *consumer* side
+    (``classify()`` falls back to slot-only when False); the *producer*
+    side (``_resolve_pressure_signal``) always runs so operators retain
+    Grafana visibility into pressure even when the demotion gate is
+    disabled. This test pins that contract -- a regression would silence
+    the three pressure gauges for any stage that opted out of the
+    classifier, breaking the documented invariant in
+    ``docs/scheduler/saturation-aware/22-prometheus-metrics.md``.
+    """
+
+    def test_emit_pressure_signals_called_when_classifier_disabled(
+        self,
+        cfg: SaturationAwareStageConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``emit_pressure_signals`` runs even when the classifier reads slot-only.
+
+        Patches the gauge emitter at the import site (``pipeline``) so the
+        substitution is observed by ``_resolve_pressure_signal`` without
+        touching the canonical ``pressure`` module that the scheduler
+        relies on at runtime.
+        """
+        flag_off_cfg = SaturationAwareStageConfig(
+            saturation_threshold=cfg.saturation_threshold,
+            activation_threshold=cfg.activation_threshold,
+            target_backlog_seconds=cfg.target_backlog_seconds,
+            pressure_smoothing_level=cfg.pressure_smoothing_level,
+            pressure_critical_threshold=cfg.pressure_critical_threshold,
+            pressure_saturation_threshold=cfg.pressure_saturation_threshold,
+            pressure_normal_threshold=cfg.pressure_normal_threshold,
+            enable_backlog_time_classifier=False,
+        )
+        state = _fresh_state(flag_off_cfg)
+        # Each captured tuple records the labelled emission so the test
+        # can assert both the string tags (stage / pipeline) and the
+        # three float values without losing static-type precision.
+        captured: list[tuple[str, str, float, float, float]] = []
+
+        def _spy(
+            *,
+            stage_name: str,
+            pipeline_name: str,
+            observed_throughput: float,
+            backlog_time: float,
+            pressure_ewma: float,
+        ) -> None:
+            captured.append((stage_name, pipeline_name, observed_throughput, backlog_time, pressure_ewma))
+
+        monkeypatch.setattr(
+            "cosmos_xenna.pipelines.private.scheduling_py.pipeline.emit_pressure_signals",
+            _spy,
+        )
+
+        run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=2,
+            input_queue_depth=100,
+            current_workers=1,
+            config=flag_off_cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        assert len(captured) == 1, "emit_pressure_signals must run exactly once per cycle"
+        stage_name, pipeline_name, observed_throughput, backlog_time, pressure_ewma = captured[0]
+        assert stage_name == "TestStage"
+        assert pipeline_name == "test"
+        # Cold-start branch with the same inputs as the EWMA-init test:
+        # utilisation = 1 - 0.20 = 0.80; backlog_time = 100/1 = 100s; pressure = 0.80 * 3.0 = 2.40
+        assert math.isclose(observed_throughput, 1.0, rel_tol=1e-9)
+        assert math.isclose(backlog_time, 100.0, rel_tol=1e-9)
+        assert math.isclose(pressure_ewma, 0.80 * BACKLOG_CAP, rel_tol=1e-9)
+        # The state-level EWMA also moved -- producer side fully ran.
+        assert state.pressure_ewma is not None
+        assert math.isclose(state.pressure_ewma, 0.80 * BACKLOG_CAP, rel_tol=1e-9)
