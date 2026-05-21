@@ -388,7 +388,9 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
     """Return the autoscale cadence the streaming dispatcher must use.
 
     For ``SchedulerKind.SATURATION_AWARE`` the cadence comes from
-    ``mode_specific.saturation_aware.interval_s`` (default ``10.0`` s).
+    ``mode_specific.saturation_aware.interval_s`` (default ``10.0`` s),
+    obtained via ``materialized_saturation_aware()`` so the default
+    SA config is constructed lazily on this branch only.
     For ``SchedulerKind.FRAGMENTATION_BASED`` the cadence stays at
     ``mode_specific.autoscale_interval_s`` (default ``180.0`` s),
     which is the ``StreamingSpecificSpec`` field the dispatcher
@@ -422,7 +424,7 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
         raise RuntimeError(msg)
     kind = mode_specific.scheduler
     if kind == specs.SchedulerKind.SATURATION_AWARE:
-        interval = mode_specific.saturation_aware.interval_s
+        interval = mode_specific.materialized_saturation_aware().interval_s
         source = "mode_specific.saturation_aware.interval_s"
     else:
         interval = mode_specific.autoscale_interval_s
@@ -490,8 +492,11 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
 
             job_info = pipeline_spec.job_info
             pipeline_name = job_info.pipeline_type if job_info is not None else ""
+            # ``materialized_saturation_aware`` constructs the default
+            # ``SaturationAwareConfig`` here on first access for runs that
+            # opted into the SA scheduler without supplying their own.
             return SaturationAwareScheduler(
-                mode_specific.saturation_aware,
+                mode_specific.materialized_saturation_aware(),
                 stage_spec_overrides=_collect_saturation_aware_stage_overrides(pipeline_spec),
                 pipeline_name=pipeline_name,
             )

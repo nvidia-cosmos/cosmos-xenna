@@ -120,7 +120,10 @@ def resolve_setup_aware_max_queued_enabled(
         return False
     stage_spec = pipeline_spec.stages[stage_idx]
     assert isinstance(stage_spec, specs.StageSpec)
-    effective_cfg = mode_specific.saturation_aware.get_effective_stage_config(
+    # ``materialized_saturation_aware`` lazily constructs the SA config
+    # on the saturation-aware branch only; the field defaults to
+    # ``None`` so fragmentation-based pipelines never instantiate it.
+    effective_cfg = mode_specific.materialized_saturation_aware().get_effective_stage_config(
         stage_name,
         spec_override=stage_spec.saturation_aware,
     )

@@ -282,7 +282,12 @@ class TestEmitBottleneckScore:
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 1
-        pattern = re.compile(r"bottleneck stage: \w+ \(D = \d+\.\d{2}s, throughput bound = \d+\.\d{2} tasks/s\)")
+        # Stage names produced by ``StageSpec.name(index)`` contain spaces and
+        # punctuation (e.g. ``"Stage 00 - VllmAsyncStage"``), so the name token
+        # is matched non-greedily up to the first " (" rather than requiring a
+        # ``\w+`` identifier. The numeric format ``D = <float>s, throughput
+        # bound = <float> tasks/s`` is pinned exactly.
+        pattern = re.compile(r"bottleneck stage: .+? \(D = \d+\.\d{2}s, throughput bound = \d+\.\d{2} tasks/s\)")
         assert pattern.fullmatch(info_logs[0].message), (
             f"INFO log line did not match the pinned format: {info_logs[0].message!r}"
         )

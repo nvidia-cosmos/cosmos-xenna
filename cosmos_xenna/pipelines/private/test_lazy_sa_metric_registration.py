@@ -31,11 +31,20 @@ import pytest
 # Modules whose import would register saturation-aware Prometheus metric
 # series. Each constructs its own Histogram/Gauge at module load time,
 # so absence from ``sys.modules`` proves no metric was registered.
+#
+# ``pressure`` is included because it is pulled in transitively from
+# ``SaturationAwareStageConfig.__attrs_post_init__`` (needs the
+# ``BACKLOG_CAP`` constant for cross-field validation). Constructing a
+# default ``StreamingSpecificSpec()`` must NOT trigger this chain on the
+# fragmentation-based path; the field defaults to ``None`` and is
+# materialized lazily via ``materialized_saturation_aware()`` in the
+# saturation-aware branch only.
 _SA_METRIC_MODULES = (
     "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
     "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
     "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
     "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
+    "cosmos_xenna.pipelines.private.scheduling_py.pressure",
 )
 
 
@@ -68,6 +77,7 @@ class TestLazySaturationAwareMetricRegistration:
                 "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
                 "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
                 "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
             ]
             loaded = [m for m in sa_modules if m in sys.modules]
             print(",".join(loaded))
@@ -88,6 +98,7 @@ class TestLazySaturationAwareMetricRegistration:
                 "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
                 "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
                 "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
             ]
             loaded = [m for m in sa_modules if m in sys.modules]
             print(",".join(loaded))
@@ -97,6 +108,48 @@ class TestLazySaturationAwareMetricRegistration:
             f"Expected no SA metric modules in sys.modules after importing streaming; "
             f"got: {loaded!r}. The deferred import in _make_scheduler_algorithm has been broken."
         )
+
+    def test_default_streaming_spec_does_not_load_sa_modules(self) -> None:
+        """Constructing the default ``StreamingSpecificSpec()`` (FRAGMENTATION_BASED) leaves SA metric modules unloaded.
+
+        The ``saturation_aware`` field defaults to ``None`` so the
+        ``SaturationAwareConfig`` factory chain (which transitively
+        imports ``pressure`` for ``BACKLOG_CAP``) never fires on the
+        fragmentation-based path. Materialization happens lazily inside
+        ``materialized_saturation_aware()`` only when the SA branches in
+        ``streaming.py`` / ``streaming_backpressure.py`` request the
+        config.
+
+        Sentinel-prefixed prints (``LOADED:``, ``SA_NONE:``,
+        ``SCHEDULER:``) survive the ``str.strip()`` applied by
+        ``_run_in_subprocess`` even when the loaded-modules list is
+        empty (the desired success state for this test).
+        """
+        script = """
+            import sys
+            import cosmos_xenna.pipelines.private.specs as specs
+            spec = specs.StreamingSpecificSpec()
+            sa_modules = [
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
+                "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
+                "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
+            ]
+            loaded = [m for m in sa_modules if m in sys.modules]
+            print("LOADED:" + ",".join(loaded))
+            print("SA_NONE:", spec.saturation_aware is None)
+            print("SCHEDULER:", spec.scheduler.value)
+        """
+        out = _run_in_subprocess(script)
+        lines = dict(line.split(":", 1) for line in out.splitlines())
+        assert lines["LOADED"] == "", (
+            f"Expected no SA metric modules in sys.modules after constructing default "
+            f"StreamingSpecificSpec(); got: {lines['LOADED']!r}. The default factory must keep "
+            f"SaturationAwareConfig (and its pressure import) un-instantiated."
+        )
+        assert lines["SA_NONE"].strip() == "True", lines["SA_NONE"]
+        assert lines["SCHEDULER"].strip() == "fragmentation_based", lines["SCHEDULER"]
 
     @pytest.mark.parametrize("module_name", _SA_METRIC_MODULES)
     def test_explicit_sa_module_import_does_load_it(self, module_name: str) -> None:

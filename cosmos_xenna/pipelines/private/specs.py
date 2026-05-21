@@ -1143,9 +1143,40 @@ class StreamingSpecificSpec:
         default=SchedulerKind.FRAGMENTATION_BASED,
         converter=SchedulerKind,
     )
-    # Configuration for the saturation-aware scheduler. Has no effect when
-    # ``scheduler == SchedulerKind.FRAGMENTATION_BASED``.
-    saturation_aware: SaturationAwareConfig = attrs.field(factory=SaturationAwareConfig)
+    # Configuration for the saturation-aware scheduler. Defaults to
+    # ``None`` so a fragmentation-based pipeline never instantiates a
+    # ``SaturationAwareConfig``. The chained factories on
+    # ``SaturationAwareConfig.stage_defaults`` and
+    # ``SaturationAwareStageConfig.__attrs_post_init__`` import
+    # ``scheduling_py.pressure``, which registers Ray ``Gauge`` series
+    # at module load; constructing the SA config eagerly would defeat
+    # the lazy-registration guarantee for FRAGMENTATION_BASED runs.
+    # Callers reach a non-None instance via
+    # ``materialized_saturation_aware()`` from the SA-gated branches in
+    # ``streaming._make_scheduler_algorithm`` and
+    # ``streaming.effective_autoscale_interval``.
+    saturation_aware: SaturationAwareConfig | None = attrs.field(default=None)
+
+    def materialized_saturation_aware(self) -> SaturationAwareConfig:
+        """Return the saturation-aware config, materializing a default once when ``None``.
+
+        The ``saturation_aware`` field defaults to ``None`` to keep the
+        fragmentation-based path free of ``scheduling_py.pressure``
+        Ray ``Gauge`` registrations triggered transitively by the
+        ``SaturationAwareConfig`` factory chain. This helper is the
+        single point where the SA-aware code paths force materialization;
+        the resolved instance is cached on the spec so successive calls
+        return the same object (preserves identity for equality checks
+        and any consumer that captures the reference).
+
+        Returns:
+            The user-supplied ``SaturationAwareConfig`` if set, otherwise
+            a freshly-built ``SaturationAwareConfig()`` cached on
+            ``self.saturation_aware``.
+        """
+        if self.saturation_aware is None:
+            self.saturation_aware = SaturationAwareConfig()
+        return self.saturation_aware
 
 
 @attrs.define

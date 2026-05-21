@@ -488,6 +488,36 @@ class TestPhaseCCapClamp:
 
         assert solution.stages[0].new_workers == []
 
+    def test_cap_clamp_to_zero_headroom_resets_stuck_counter(
+        self,
+        make_scheduler: SchedulerFactory,
+        make_state: ProblemStateFactory,
+        autoscale_with_intents: AutoscaleFactory,
+    ) -> None:
+        """Hard cap clamping a positive intent to zero headroom clears the stuck counter.
+
+        Pins the per-stage loop reset branch in
+        ``_run_phase_c_grow``: when ``_compute_intent_deltas`` produces
+        a positive intent but the hard worker cap leaves zero headroom
+        (``current >= ceiling``), the clamp routes through the inner
+        ``if intent <= 0`` reset path and the per-stage stuck counter
+        clears. Without this reset, a stage that hits its operator-set
+        cap would carry a stale counter into the watchdog and
+        eventually promote a misleading "stuck plan" INFO line.
+        """
+        scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers=4))
+        # Seed at cap (4 workers) so the headroom is zero and the cap clamp fires.
+        state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
+        # Seed a prior-stuck history without rigging the cluster.
+        scheduler._stuck_plan_counters["A"] = 7
+
+        autoscale_with_intents(scheduler, state, {"A": 5})
+
+        assert scheduler._stuck_plan_counters["A"] == 0, (
+            "the hard-cap zero-headroom branch must reset the stuck counter so the watchdog "
+            "does not promote cap-bound stages to 'stuck plan' INFO lines."
+        )
+
     def test_current_above_cap_phase_c_does_not_shrink(
         self,
         make_scheduler: SchedulerFactory,
