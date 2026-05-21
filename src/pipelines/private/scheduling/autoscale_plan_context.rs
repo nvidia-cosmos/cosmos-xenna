@@ -3023,7 +3023,9 @@ mod tests {
         let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, Some(seed)).unwrap();
 
         let mut entries: Vec<(String, u64)> = ctx.worker_ages().into_iter().collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        // Descending sort by age (.1) via std::cmp::Reverse — equivalent to
+        // |a, b| b.1.cmp(&a.1) but lint-clean (clippy::unnecessary_sort_by).
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             ids,
@@ -3383,7 +3385,7 @@ mod tests {
         snapshot_a.insert("phantom".to_string(), 12345);
         let snapshot_b = ctx.worker_ages();
         assert_eq!(snapshot_b.get("stage_a_worker_0"), Some(&4u64));
-        assert!(snapshot_b.get("phantom").is_none());
+        assert!(!snapshot_b.contains_key("phantom"));
     }
 
     #[test]

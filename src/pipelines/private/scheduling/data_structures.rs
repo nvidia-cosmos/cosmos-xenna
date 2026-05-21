@@ -255,6 +255,13 @@ impl ProblemStageState {
         input_queue_depth = 0,
         num_pending_actors = 0,
     ))]
+    // The 8-argument signature is mandated by PyO3: the Rust `#[new]`
+    // constructor must mirror the `#[pyo3(signature = (...))]` Python
+    // keyword surface (4 required positional + 4 optional defaulted
+    // signal fields). Collapsing the optional fields into a config
+    // struct would change the Python API and break existing call
+    // sites that pass them positionally.
+    #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         stage_name: String,
         worker_groups: Vec<ProblemWorkerGroupState>,
