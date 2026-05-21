@@ -87,7 +87,7 @@ Treat one autoscale call as a **fixed four-phase pipeline** with
               │  ─ EWMA smoothing                            │
               │  ─ classify into 5 zones (with hysteresis)   │
               │  ─ asymmetric streak counters                │
-              │  ─ compound AND with backlog_time            │
+              │  ─ trust gate (min_data_points)              │
               │  ─ stabilization-window consensus            │
               │  ─ growth-mode state machine                 │
               └──────────────────────────────────────────────┘
@@ -143,7 +143,7 @@ feature docs.
 | Pre-flight | [auto-derived thresholds](08-auto-derived-thresholds.md), [regime-aware lift](09-regime-aware-aggressiveness.md) |
 | Phase A | none (operator intent only) |
 | Phase B | [hard caps and floors](16-hard-caps-and-floors.md), [cross-stage donor](13-cross-stage-donor.md) |
-| Intent compute | [state classifier](05-state-classifier.md), [backlog-time](06-backlog-time-signal.md), [streak stabilization](07-streak-stabilization.md), [slow-start](10-slow-start-mechanisms.md), [growth mode](11-growth-mode-state-machine.md) |
+| Intent compute | [state classifier](05-state-classifier.md), [backlog-time (PLANNED)](06-backlog-time-signal.md), [streak stabilization](07-streak-stabilization.md), [slow-start](10-slow-start-mechanisms.md), [growth mode](11-growth-mode-state-machine.md) |
 | Phase C | [multi-target DAG growth](12-multi-target-dag-growth.md), [cross-stage donor](13-cross-stage-donor.md), [worker age tracking](14-worker-age-tracking.md) |
 | Phase D | [idle-first scale-down](15-idle-first-scale-down.md) |
 | Invariants | [phase invariants](19-phase-invariants.md) |

@@ -107,8 +107,8 @@ local question.
 |---|---|---|---|---|
 | Cycle | `xenna_scheduler_cycle_duration_seconds` | histogram | `pipeline` | Cycle wall-clock distribution; tail tracks loop watchdog |
 | Cycle | `xenna_scheduler_cycle_phase_duration_seconds` | histogram | `pipeline`, `phase` | Which of `pre_phase_setup` / `phase_a` / `phase_b` / `intent` / `phase_c` / `phase_d` / `invariants` / `into_solution` dominated cycle time |
-| Per-stage state | `xenna_stage_bottleneck_score` | gauge | `pipeline`, `stage` | Forced-Flow-Law bottleneck — see [23](23-bottleneck-score-metric.md) |
-| Per-stage state | `xenna_scheduler_cluster_heterogeneity_ratio` | gauge | `pipeline` | `max_k D_k / min_k D_k` across stages with finite service demand |
+| Per-stage state | `xenna_stage_bottleneck_score` | gauge | `pipeline`, `stage` | Forced-Flow-Law bottleneck — see [23](23-bottleneck-score-metric.md). **Currently NaN** until per-stage service-time data is threaded through `autoscale(...)`; tracked in the saturation-aware roadmap. |
+| Per-stage state | `xenna_scheduler_cluster_heterogeneity_ratio` | gauge | `pipeline` | `max_k D_k / min_k D_k` across stages with finite service demand. **Currently NaN** while service-time data is unwired; the gauge stays registered so a future PR can populate it without breaking existing dashboards. |
 | Per-stage state | `xenna_scheduler_stuck_plan_active` | gauge (0/1) | `pipeline`, `stage` | 1 when a stage's Phase C grow has been stuck above the detection threshold |
 | Per-stage state | `xenna_scheduler_stuck_plan_cycles_total` | counter | `pipeline`, `stage` | Total cycles a stage has been stuck above the detection threshold |
 | Safety | `xenna_scheduler_memory_pressure_active` | gauge (0/1) | `pipeline` | Memory-pressure gate engaged this cycle |

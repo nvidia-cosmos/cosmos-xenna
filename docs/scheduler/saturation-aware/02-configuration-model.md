@@ -145,15 +145,54 @@ group is rationalised in a sibling document.
 
 | Class | Knob group | Sibling doc |
 |---|---|---|
-| ``SaturationAwareConfig`` | Cycle period | [00 — Per-cycle overview](00-overview.md) |
+| ``SaturationAwareConfig`` | Cycle period (``interval_s``) | [00 — Per-cycle overview](00-overview.md) |
 | ``SaturationAwareConfig`` | DAG priority + cross-stage donor anti-flap | [13 — Cross-stage donor](13-cross-stage-donor.md) |
 | ``SaturationAwareConfig`` | Regime detector | [09 — Regime-aware aggressiveness](09-regime-aware-aggressiveness.md) |
 | ``SaturationAwareConfig`` | Memory pressure gate | [20 — Memory pressure gate](20-memory-pressure-gate.md) |
 | ``SaturationAwareConfig`` | Loop / stuck-plan watchdog | [18 — Loop watchdog](18-loop-watchdog.md) |
+| ``SaturationAwareStageConfig`` | Trust gate (``min_data_points``) | [05 — State classifier](05-state-classifier.md) |
 | ``SaturationAwareStageConfig`` | Classifier thresholds | [05 — State classifier](05-state-classifier.md), [08 — Auto-derived thresholds](08-auto-derived-thresholds.md) |
 | ``SaturationAwareStageConfig`` | Streak counters | [07 — Streak stabilization](07-streak-stabilization.md) |
-| ``SaturationAwareStageConfig`` | Growth mode + slow-start | [10 — Slow-start mechanisms](10-slow-start-mechanisms.md), [11 — Growth-mode state machine](11-growth-mode-state-machine.md) |
+| ``SaturationAwareStageConfig`` | Growth mode + slow-start (``enable_growth_mode_state_machine``) | [10 — Slow-start mechanisms](10-slow-start-mechanisms.md), [11 — Growth-mode state machine](11-growth-mode-state-machine.md) |
 | ``SaturationAwareStageConfig`` | Per-stage caps and floors | [16 — Hard caps and floors](16-hard-caps-and-floors.md) |
+
+### Dispatcher cadence wiring
+
+``SaturationAwareConfig.interval_s`` (default ``10.0`` s) is now the
+single source of truth for the streaming dispatcher's autoscale
+cadence under ``SchedulerKind.SATURATION_AWARE``. The shared
+``effective_autoscale_interval(pipeline_spec)`` helper in
+``streaming.py`` branches on ``mode_specific.scheduler``:
+
+```
+SchedulerKind.SATURATION_AWARE   -> mode_specific.saturation_aware.interval_s
+SchedulerKind.FRAGMENTATION_BASED -> mode_specific.autoscale_interval_s (180 s)
+```
+
+The fragmentation-based path intentionally keeps the 180 s cadence
+because its Rust-backed solver is expensive; saturation-aware's
+watchdog and growth windows are sized for 10 s cycles. The helper
+emits one ``INFO`` log per pipeline naming the resolved cadence and
+the source field so deployment-time changes are auditable.
+
+### Trust gate and growth-mode kill switch
+
+Two per-stage knobs gate the classifier-driven action loop:
+
+- ``min_data_points`` (default ``5``) - the trust gate. The scheduler
+  keeps the EWMA and classifier history flowing, but clamps any
+  non-zero recommendation to ``0`` until the stage has accumulated
+  ``min_data_points`` consecutive valid samples. A "valid" sample is
+  one in which the warmup filter did not drop every contribution
+  (``num_used_slots + num_empty_slots > 0``). The gate cannot starve
+  a zero-worker stage because Phase B floor enforcement runs outside
+  the gate.
+- ``enable_growth_mode_state_machine`` (default ``True``) - the
+  growth-mode kill switch. When ``False``, ``compute_delta`` always
+  uses ``GrowthMode.TRACKING`` magnitudes (additive +1 / +2) and
+  ``record_executed_delta`` skips the state machine update, so the
+  per-stage runtime state stays frozen at its construction-time
+  defaults. Re-enabling the flag mid-run resumes from ACQUIRING.
 
 ## See also
 

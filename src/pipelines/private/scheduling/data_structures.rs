@@ -152,26 +152,53 @@ impl ProblemWorkerGroupState {
         }
     }
 
-    pub fn to_worker(&self, stage_name: String) -> resources::Worker {
-        if self.resources.len() > 1 {
-            panic!(
-                "Cannot convert ProblemWorkerGroupState to Worker if there are multiple allocations"
-            );
+    /// Convert this state into a single-allocation `Worker`.
+    ///
+    /// Returns `PyValueError` if `resources` does not have exactly
+    /// one allocation. The previous implementation panicked on
+    /// multi-allocation input, which propagated as a process-level
+    /// crash through PyO3 instead of a recoverable Python exception.
+    pub fn to_worker(&self, stage_name: String) -> PyResult<resources::Worker> {
+        if self.resources.len() != 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ProblemWorkerGroupState.to_worker: worker {} for stage {} \
+                 must have exactly one resource allocation, got {}",
+                self.id,
+                stage_name,
+                self.resources.len(),
+            )));
         }
-        resources::Worker {
+        Ok(resources::Worker {
             id: self.id.clone(),
             stage_name,
             allocation: self.resources[0].clone(),
-        }
+        })
     }
 
-    pub fn serialize(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    /// Serialize this state to a JSON string.
+    ///
+    /// Returns `PyRuntimeError` if the serializer fails. Serde rarely
+    /// fails on flat owned structs, but we surface any failure as a
+    /// Python exception instead of panicking through PyO3.
+    pub fn serialize(&self) -> PyResult<String> {
+        serde_json::to_string(self).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ProblemWorkerGroupState serialize failed: {err}"
+            ))
+        })
     }
 
+    /// Deserialize a JSON string into a `ProblemWorkerGroupState`.
+    ///
+    /// Returns `PyValueError` on malformed JSON instead of panicking
+    /// through PyO3.
     #[staticmethod]
-    pub fn deserialize(data: &str) -> Self {
-        serde_json::from_str(data).unwrap()
+    pub fn deserialize(data: &str) -> PyResult<Self> {
+        serde_json::from_str(data).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "ProblemWorkerGroupState deserialize failed: {err}"
+            ))
+        })
     }
 }
 
@@ -626,4 +653,123 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .add_class::<Measurements>()?
         .finish();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Boundary tests for the Python-facing data structures.
+    //!
+    //! These tests pin the PyO3 contract: malformed inputs must surface
+    //! as recoverable Python exceptions (returned as `Err(PyErr)`),
+    //! never as Rust panics propagated through PyO3 (which abort the
+    //! autoscaler thread). Tests check `is_err()` only; formatting the
+    //! `PyErr` value requires an initialized Python interpreter that
+    //! the Rust unit-test harness does not bring up.
+    use super::*;
+    use crate::pipelines::private::scheduling::resources as rds;
+
+    fn make_single_alloc(node: &str, cpus: f32) -> rds::WorkerResources {
+        rds::WorkerResources {
+            node: node.to_string(),
+            cpus: rds::FixedUtil::from_num(cpus),
+            gpus: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn to_worker_returns_err_for_multi_allocation_state() {
+        // ProblemWorkerGroupState built with two allocations represents
+        // an SPMD worker group; converting it to a flat single-allocation
+        // Worker would silently drop one allocation. Previously panicked
+        // through PyO3 and aborted the autoscaler thread; now must
+        // surface as a recoverable error.
+        let state = ProblemWorkerGroupState {
+            id: "w0".to_string(),
+            resources: vec![
+                make_single_alloc("node0", 1.0),
+                make_single_alloc("node1", 1.0),
+            ],
+            num_used_slots: 0,
+        };
+
+        assert!(
+            state.to_worker("stage_a".to_string()).is_err(),
+            "multi-allocation conversion must error, not panic"
+        );
+    }
+
+    #[test]
+    fn to_worker_returns_err_for_empty_allocation_state() {
+        // An empty resources vector previously triggered an out-of-bounds
+        // index panic on `self.resources[0]`. The new contract is a
+        // recoverable error.
+        let state = ProblemWorkerGroupState {
+            id: "w_empty".to_string(),
+            resources: Vec::new(),
+            num_used_slots: 0,
+        };
+
+        assert!(
+            state.to_worker("stage_a".to_string()).is_err(),
+            "empty-allocation conversion must error, not panic"
+        );
+    }
+
+    #[test]
+    fn to_worker_succeeds_for_single_allocation_state() {
+        // Happy path: a single allocation produces a single-allocation
+        // Worker carrying the same id/stage name/allocation.
+        let state = ProblemWorkerGroupState {
+            id: "w_solo".to_string(),
+            resources: vec![make_single_alloc("node0", 2.0)],
+            num_used_slots: 3,
+        };
+
+        let worker = state
+            .to_worker("stage_b".to_string())
+            .expect("single allocation must succeed");
+
+        assert_eq!(worker.id, "w_solo");
+        assert_eq!(worker.stage_name, "stage_b");
+        assert_eq!(worker.allocation.node, "node0");
+    }
+
+    #[test]
+    fn deserialize_returns_err_for_malformed_json() {
+        // Malformed JSON used to panic through
+        // `serde_json::from_str().unwrap()`; the new contract is a
+        // recoverable error.
+        assert!(
+            ProblemWorkerGroupState::deserialize("not-json").is_err(),
+            "malformed JSON must error, not panic"
+        );
+    }
+
+    #[test]
+    fn deserialize_returns_err_for_empty_string() {
+        assert!(
+            ProblemWorkerGroupState::deserialize("").is_err(),
+            "empty input must error, not panic"
+        );
+    }
+
+    #[test]
+    fn serialize_deserialize_round_trip() {
+        // Happy path covering the renamed PyResult signatures: serialize
+        // returns Ok(String) for a flat owned struct; deserialize round
+        // trips the value back to the original state.
+        let original = ProblemWorkerGroupState {
+            id: "w_round".to_string(),
+            resources: vec![make_single_alloc("node0", 1.5)],
+            num_used_slots: 7,
+        };
+
+        let serialized = original.serialize().expect("serialize must succeed");
+        let restored =
+            ProblemWorkerGroupState::deserialize(&serialized).expect("deserialize must succeed");
+
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.num_used_slots, original.num_used_slots);
+        assert_eq!(restored.resources.len(), original.resources.len());
+    }
 }

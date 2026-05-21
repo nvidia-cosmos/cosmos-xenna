@@ -55,13 +55,31 @@ The pure-function transition rule lives in
   emit `+1` on `SATURATED_CRITICAL` so a real burst is not
   ignored. A re-shrink while in `HOLD` restarts the timer.
 
-Crucially, transitions are evaluated against the **final
+Crucially, transitions are evaluated against the **post-commit
 executed delta** the cycle actually applied (see
 [07 — Streak stabilization](07-streak-stabilization.md)), not
-the classifier output alone. A recommended shrink that the
-stabilization gate suppressed does NOT enter `HOLD`; only the
-shrink the cluster actually experienced does. The mode stays
-consistent with what the workers saw.
+the classifier output and not the pre-commit recommendation. The
+scheduler computes the executed delta as
+`post_phase_d_count − pre_phase_c_count` for every stage that
+participated in the cycle's intent computation, then calls
+`record_executed_delta` once per stage. That separation matters
+in three places:
+
+1. **Stabilization gate suppression.** A recommended shrink that
+   the asymmetric gate refused never landed in the cluster, so
+   the executed delta is `0` and the stage stays in its current
+   mode.
+2. **Hard caps / fractional clamps.** A recommended `+5` that
+   the per-stage hard worker cap or `max_scale_down_fraction_per_cycle`
+   throttled to `+2` advances the timer by `+2`, not by the
+   recommended `+5`.
+3. **Allocation failures.** A recommended `+3` that aborted
+   after one successful add (with the rest of the cycle failing
+   the absorb path) reflects `+1` into the timer, not the full
+   `+3` recommendation.
+
+The mode therefore stays consistent with what the workers
+actually saw.
 
 Every growth path also runs through a hard
 `aggressive_growth_max_per_cycle` cap, so a multiplicative

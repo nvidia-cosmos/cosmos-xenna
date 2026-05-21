@@ -380,13 +380,17 @@ class StageSpec(typing.Generic[T, V]):
         return c
 
 
-class SchedulerKind(str, enum.Enum):
+class SchedulerKind(enum.StrEnum):
     """Streaming-mode autoscaler implementation.
 
     ``FRAGMENTATION_BASED`` (default) selects the Rust-backed
     ``FragmentationBasedAutoscaler``. ``SATURATION_AWARE`` selects the
     pure-Python saturation-aware scheduler. The flag is read once at
     ``Autoscaler.__init__`` and frozen for the lifetime of the run.
+
+    Inherits from ``enum.StrEnum`` (Python 3.11+); each member is a
+    string usable in JSON, YAML, and f-string interpolation without
+    ``.value`` access.
     """
 
     FRAGMENTATION_BASED = "fragmentation_based"

@@ -89,7 +89,10 @@ from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog import loop_watchdog
 from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryPressureMonitor
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
+from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
+    record_executed_delta,
+    run_per_stage_pipeline,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     EXIT_BAND_MULTIPLIER,
     Regime,
@@ -688,6 +691,20 @@ class SaturationAwareScheduler:
         with self._phase_timer("intent"):
             self._last_intent_deltas = self._compute_intent_deltas(ctx, problem_state, now=time)
 
+        # Capture pre-Phase-C worker counts so we can compute the post-commit
+        # executed delta per stage and feed it to the growth-mode state machine
+        # via ``record_executed_delta`` after Phase D finishes. Recording the
+        # post-commit delta (instead of the pre-Phase-C recommendation) means
+        # hard caps, the fractional shrink clamp, and allocation failures all
+        # reflect into the HOLD / ACQUIRING / TRACKING timers honestly.
+        #
+        # Keying by ``stage_name`` rather than the positional index keeps the
+        # contract robust to any future planner change that reorders stages
+        # between phases; ``stage_name`` is the canonical identifier already
+        # used by ``_last_intent_deltas`` and ``_stage_states`` everywhere
+        # else in the scheduler.
+        pre_phase_c_worker_counts = self._worker_counts_by_stage_name(ctx, problem_state)
+
         # Memory-pressure gate semantics: when ``_run_phase_c_grow``
         # returns early because the cluster-wide pressure monitor is
         # active, the timer STILL records a (near-zero) duration. The
@@ -727,6 +744,12 @@ class SaturationAwareScheduler:
                 stage_floors=stage_floors,
                 pre_phase_d_worker_counts=pre_phase_d_worker_counts,
             )
+
+        self._record_post_commit_executed_deltas(
+            ctx=ctx,
+            problem_state=problem_state,
+            pre_phase_c_worker_counts=pre_phase_c_worker_counts,
+        )
 
         with self._phase_timer("invariants"):
             # Filter ``curr_counters`` to only the stages Phase C touched
@@ -998,6 +1021,77 @@ class SaturationAwareScheduler:
                     excluded.add(worker_id)
         return frozenset(excluded)
 
+    def _worker_counts_by_stage_name(
+        self,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+    ) -> dict[str, int]:
+        """Return ``{stage_name: live_worker_count}`` from the planner snapshot.
+
+        Pairs ``ctx.worker_ids_by_stage()`` (positional list ordered by
+        ``Problem.stages``) with ``problem_state.rust.stages`` (the same
+        ordering at construction time) to produce a name-keyed map. Used
+        for pre/post snapshots so the executed-delta computation does
+        not depend on stages staying in positional sync across phases.
+
+        Args:
+            ctx: Planner context whose live worker accessor we read.
+            problem_state: Pipeline state whose ``stage_name`` field
+                provides the canonical key.
+
+        Returns:
+            ``{stage_name: int}`` with one entry per stage in the
+            current problem. Stages with no live workers map to ``0``.
+        """
+        worker_ids_by_index = ctx.worker_ids_by_stage()
+        return {
+            runtime_stage.stage_name: len(worker_ids)
+            for runtime_stage, worker_ids in zip(problem_state.rust.stages, worker_ids_by_index, strict=True)
+        }
+
+    def _record_post_commit_executed_deltas(
+        self,
+        *,
+        ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
+        pre_phase_c_worker_counts: dict[str, int],
+    ) -> None:
+        """Advance the growth-mode state machine using the post-commit delta.
+
+        Called once per cycle, after Phase C (grow) and Phase D (shrink)
+        commit their planner mutations. For every stage that
+        participated in the intent computation, computes
+        ``executed_delta = post_phase_d_count - pre_phase_c_count`` and
+        calls :func:`record_executed_delta`. This pins the contract
+        that the HOLD / ACQUIRING / TRACKING timers observe the
+        post-commit delta, not the pre-commit recommendation, so a
+        recommendation throttled by hard caps, the fractional shrink
+        clamp, or an allocation failure cannot push the state machine
+        toward ACQUIRING based on growth that never landed.
+
+        Stages skipped by ``_compute_intent_deltas`` (finished or in
+        cold-start quiescence) carry no entry in
+        ``_last_intent_deltas`` and are intentionally not recorded
+        here. Both ``pre_phase_c_worker_counts`` and the post-Phase-D
+        snapshot are keyed by ``stage_name`` (the canonical identifier
+        used by the rest of the scheduler), so the lookup is immune to
+        any positional reordering that a future planner change might
+        introduce.
+        """
+        post_counts = self._worker_counts_by_stage_name(ctx, problem_state)
+        for stage_name in self._last_intent_deltas:
+            stage_state = self._stage_states.get(stage_name)
+            if stage_state is None:
+                continue
+            stage_cfg = self._stage_cfg(stage_name)
+            pre = pre_phase_c_worker_counts.get(stage_name, 0)
+            post = post_counts.get(stage_name, 0)
+            record_executed_delta(
+                stage_state=stage_state,
+                delta_executed=post - pre,
+                config=stage_cfg,
+            )
+
     def _compute_intent_deltas(
         self,
         ctx: data_structures.AutoscalePlanContext,
@@ -1141,6 +1235,23 @@ class SaturationAwareScheduler:
                 stage_cfg=stage_cfg,
                 now=now,
             )
+            # Trust gate accounting: ``min_data_points`` defines how many
+            # consecutive warmup-excluded valid samples the classifier
+            # output must accumulate before its non-zero recommendations
+            # may drive Phase C/D. A sample is "valid" iff at least one
+            # ready actor contributed (num_used_slots + num_empty_slots > 0).
+            # Cycles where every ready actor was still within
+            # ``worker_warmup_measurement_grace_s`` produce zeroed signals;
+            # those do not advance the counter so the gate is gated on
+            # *real* observations, not on actor existence. Phase B floor
+            # and manual provisioning are evaluated outside this function,
+            # so this gate cannot starve a zero-worker stage. The call to
+            # ``run_per_stage_pipeline`` still runs even when the gate is
+            # closed so the EWMA cache, classifier state, and stabilization
+            # history keep tracking reality; only the returned delta is
+            # clamped to zero while the gate is closed.
+            if num_used_slots + num_empty_slots > 0:
+                stage_state.valid_signal_samples = min(stage_state.valid_signal_samples + 1, stage_cfg.min_data_points)
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
                 num_used_slots=num_used_slots,
@@ -1150,6 +1261,13 @@ class SaturationAwareScheduler:
                 config=stage_cfg,
                 recommendation_history=history,
             )
+            if stage_state.valid_signal_samples < stage_cfg.min_data_points and delta != 0:
+                logger.debug(
+                    f"saturation-aware: stage {stage_name!r} valid samples "
+                    f"{stage_state.valid_signal_samples}/{stage_cfg.min_data_points} - "
+                    f"trust gate clamping recommendation {delta} to 0."
+                )
+                delta = 0
             if quiescence_active and delta > 0:
                 # Hot-pending: ready actors observe real saturation, but a
                 # prior scale-up has not finished setup yet. Suppress the
@@ -1164,8 +1282,52 @@ class SaturationAwareScheduler:
                     f"clamping Phase C intent +{delta} -> 0."
                 )
                 delta = 0
+            self._maybe_emit_starved_warning(
+                stage_state=stage_state,
+                stage_name=stage_name,
+                stage_cfg=stage_cfg,
+                input_queue_depth=runtime_stage.input_queue_depth,
+            )
             intents[stage_name] = delta
         return intents
+
+    def _maybe_emit_starved_warning(
+        self,
+        *,
+        stage_state: _StageRuntimeState,
+        stage_name: str,
+        stage_cfg: SaturationAwareStageConfig,
+        input_queue_depth: int,
+    ) -> None:
+        """Emit one INFO log when STARVED sustains for ``starved_streak_min_cycles``.
+
+        STARVED is a no-scale classifier output: ``compute_delta`` always
+        returns 0, so there is no autoscaler-side action to take. The
+        operator-visible signal is that an upstream stage is failing to
+        feed this stage. Logging once per streak (when the streak ticks
+        exactly up to ``starved_streak_min_cycles``) gives the operator
+        actionability without log-flooding while the bottleneck
+        persists. Re-entering STARVED later in the run logs again.
+
+        Args:
+            stage_state: Per-stage runtime state; only the classifier
+                fields are read.
+            stage_name: Stage name for log output.
+            stage_cfg: Per-stage configuration; ``starved_streak_min_cycles``
+                controls the gate.
+            input_queue_depth: Tasks waiting upstream of this stage.
+        """
+        if (
+            stage_state.classifier_state is not StageState.STARVED
+            or stage_state.classifier_streak != stage_cfg.starved_streak_min_cycles
+        ):
+            return
+        logger.info(
+            f"saturation-aware: stage {stage_name!r} classifier STARVED for "
+            f"{stage_state.classifier_streak} consecutive cycles "
+            f"(threshold={stage_cfg.starved_streak_min_cycles}); upstream queue depth "
+            f"{input_queue_depth} - investigate the producing stage for an upstream bottleneck."
+        )
 
     def _set_stuck_plan_counter(self, stage_name: str, value: int, *, last_intent: int) -> None:
         """Update ``_stuck_plan_counters[stage_name]`` and notify the detector."""
@@ -1186,7 +1348,13 @@ class SaturationAwareScheduler:
     ) -> data_structures.ProblemWorkerGroupState | None:
         """Call ``ctx.try_add_worker`` with the allocation-failure defense layer.
 
-        Absorbed exceptions return ``None`` and set
+        Catches only ``AllocationError`` so scheduler bugs surfacing as
+        ``SchedulerInvariantError``, ``KeyError``, ``IndexError``, etc.
+        propagate to the autoscaler thread instead of being silently
+        re-routed through the absorb path (which would mask the real
+        defect).
+
+        On absorbed allocation failures returns ``None`` and sets
         ``self._phase_c_allocation_failure`` so the caller aborts the
         Phase C loop. Re-raises when ``skip_cycle_on_allocation_error``
         is False.
@@ -1196,13 +1364,12 @@ class SaturationAwareScheduler:
         except resources.AllocationError as exc:
             self._absorb_allocation_failure(stage_name=stage_name, exc=exc)
             return None
-        except Exception as exc:  # noqa: BLE001 - defense-in-depth catches non-AllocationError raises
-            self._absorb_allocation_failure(stage_name=stage_name, exc=exc)
-            return None
 
     def _absorb_allocation_failure(self, *, stage_name: str, exc: BaseException) -> None:
         """Log the fragmentation snapshot, bump the counter, and raise or set the skip flag."""
-        assert self._problem is not None
+        if self._problem is None:
+            msg = "_absorb_allocation_failure called before setup()"
+            raise RuntimeError(msg)
         emit_allocation_failure(
             stage_name=stage_name,
             pipeline_name=self._pipeline_name,
@@ -1353,15 +1520,36 @@ class SaturationAwareScheduler:
                 if self._try_add_worker_with_defense(ctx, stage_index, stage_name) is None:
                     if self._phase_c_allocation_failure:
                         return
+                    # The donor was already removed by ctx.try_remove_worker in
+                    # _attempt_cross_stage_donation. The post-donation retry
+                    # returning None means the freed placement did not match
+                    # the receiver shape, so we are about to leave the cluster
+                    # with one-sided shrink (donor gone, receiver did not
+                    # grow). Per the documented invariant on
+                    # ``floor_stuck_grace_cycles`` ("post-donation retry
+                    # failures raise immediately because the donor removal
+                    # cannot be rolled back safely"), surface this as a
+                    # synthetic allocation failure so the absorb path emits
+                    # the standard log and either raises or sets the
+                    # phase-C allocation-failure flag (under
+                    # ``skip_cycle_on_allocation_error``). Aborting Phase C
+                    # for the rest of the cycle prevents the next stage from
+                    # consuming the freed placement and stops the donation
+                    # bookkeeping from being updated for a donation that did
+                    # not complete end-to-end.
                     deficit = intent - added
-                    logger.warning(
-                        f"saturation-aware scale-up: stage {stage_name!r} intent "
-                        f"{intent} workers; cross-stage donation freed a slot but "
-                        f"the post-donation retry returned no placement after "
-                        f"{added} (deficit={deficit}); request remains partially "
-                        "satisfied this cycle."
+                    msg = (
+                        f"donor-retry-failed: stage {stage_name!r} intent {intent} "
+                        f"workers; donor stage {donor_stage_name!r} released a "
+                        f"placement but the receiver retry returned no placement "
+                        f"after {added} adds (deficit={deficit}); one-sided shrink "
+                        "rolled into a phase-C allocation failure."
                     )
-                    break
+                    self._absorb_allocation_failure(
+                        stage_name=stage_name,
+                        exc=RuntimeError(msg),
+                    )
+                    return
                 self._record_donation_success(
                     donor_stage_name=donor_stage_name,
                     receiver_stage_name=stage_name,

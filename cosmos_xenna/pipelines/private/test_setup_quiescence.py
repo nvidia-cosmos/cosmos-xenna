@@ -201,6 +201,7 @@ def _scheduler_with_stage(
             stabilization_window_cycles_down=stabilization_window_cycles_down,
             worker_warmup_measurement_grace_s=0.0,
             donor_warmup_grace_s=0.0,
+            min_data_points=1,
         ),
     )
     scheduler = SaturationAwareScheduler(cfg)
@@ -499,6 +500,7 @@ class TestMixedQuiescenceAcrossStages:
                 setup_phase_quiescence_enabled=True,
                 worker_warmup_measurement_grace_s=0.0,
                 donor_warmup_grace_s=0.0,
+                min_data_points=1,
             ),
         )
         scheduler = SaturationAwareScheduler(cfg)

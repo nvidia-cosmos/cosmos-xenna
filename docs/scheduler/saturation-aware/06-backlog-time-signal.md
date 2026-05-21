@@ -1,5 +1,16 @@
 # 06 — Backlog-Time Signal (Compound AND-Criterion)
 
+> **Status: PLANNED, not yet wired.**
+>
+> The classifier today consumes only the smoothed empty-slot ratio
+> and the integer `input_queue_depth`. There is no throughput
+> estimate threaded through `autoscale(...)`, so the
+> `backlog_time = input_queue_depth / observed_throughput` term
+> described below is not yet computed. Wiring this signal requires
+> extending the scheduler protocol; that work is tracked in the
+> saturation-aware roadmap and is intentionally out of scope for
+> the current MR. This document remains as the design target.
+
 ## TL;DR
 
 Saturation is fired only when **both** observables agree: the smoothed

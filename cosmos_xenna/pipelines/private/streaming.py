@@ -384,6 +384,55 @@ def _collect_saturation_aware_stage_overrides(
     }
 
 
+def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
+    """Return the autoscale cadence the streaming dispatcher must use.
+
+    For ``SchedulerKind.SATURATION_AWARE`` the cadence comes from
+    ``mode_specific.saturation_aware.interval_s`` (default ``10.0`` s).
+    For ``SchedulerKind.FRAGMENTATION_BASED`` the cadence stays at
+    ``mode_specific.autoscale_interval_s`` (default ``180.0`` s),
+    which is the ``StreamingSpecificSpec`` field the dispatcher
+    has always read. Selecting the source by scheduler kind keeps the
+    saturation-aware loop responsive (its watchdog and growth windows
+    are sized for 10s cycles) without changing fragmentation-based
+    pipelines (which intentionally run slower because their solver is
+    expensive).
+
+    Emits one INFO log per call naming the cadence and the source
+    field so deployment changes are auditable. ``run_pipeline``
+    invokes this exactly once during startup, so in production the
+    log fires once per pipeline run; tests that call it repeatedly
+    will see repeated lines, which is intentional - the function is
+    stateless.
+
+    Args:
+        pipeline_spec: Full pipeline spec; only ``config.mode_specific``
+            is inspected.
+
+    Returns:
+        Cycle interval in seconds.
+
+    Raises:
+        RuntimeError: ``pipeline_spec.config.mode_specific`` is ``None``
+            (a programmer error - streaming mode requires it).
+    """
+    mode_specific = pipeline_spec.config.mode_specific
+    if mode_specific is None:
+        msg = "effective_autoscale_interval requires StreamingSpecificSpec; got mode_specific=None"
+        raise RuntimeError(msg)
+    kind = mode_specific.scheduler
+    if kind is specs.SchedulerKind.SATURATION_AWARE:
+        interval = mode_specific.saturation_aware.interval_s
+        source = "mode_specific.saturation_aware.interval_s"
+    else:
+        interval = mode_specific.autoscale_interval_s
+        source = "mode_specific.autoscale_interval_s"
+    logger.info(
+        f"Streaming dispatcher autoscale cadence resolved: scheduler={kind} interval_s={interval} source={source}"
+    )
+    return interval
+
+
 def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAlgorithm:
     """Construct the algorithm for ``Autoscaler._algorithm`` based on the spec.
 
@@ -436,10 +485,7 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
                 mode_specific.autoscale_speed_estimation_min_data_points,
             )
         case specs.SchedulerKind.SATURATION_AWARE:
-            # Deferred import: the saturation-aware scheduler module
-            # constructs Prometheus metric handles at import time, so
-            # only loading it here keeps the fragmentation-based path
-            # free of metric series it never observes.
+            # Deferred import keeps the fragmentation-based path free of metric series it never observes.
             from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 
             job_info = pipeline_spec.job_info
@@ -1154,7 +1200,7 @@ def run_pipeline(
         typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
     ]
 
-    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
+    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / effective_autoscale_interval(pipeline_spec))
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
     logger.debug("Starting main loop")

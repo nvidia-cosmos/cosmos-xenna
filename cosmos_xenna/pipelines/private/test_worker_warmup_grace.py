@@ -222,6 +222,7 @@ def _scheduler_with_warmup_grace(
             over_provisioned_streak_min_cycles=over_provisioned_streak_min_cycles,
             stabilization_window_cycles_up=stabilization_window_cycles_up,
             stabilization_window_cycles_down=stabilization_window_cycles_down,
+            min_data_points=1,
         ),
     )
     scheduler = SaturationAwareScheduler(cfg)

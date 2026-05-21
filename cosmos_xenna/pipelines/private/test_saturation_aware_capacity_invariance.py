@@ -53,6 +53,7 @@ from cosmos_xenna.pipelines.private.scheduling_py import pipeline as pipeline_mo
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
     _resolve_classifier_signal,
+    record_executed_delta,
     run_per_stage_pipeline,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.state import (
@@ -497,7 +498,14 @@ class TestZeroActorColdStartPath:
         self,
         make_runtime_state: RuntimeStateFactory,
     ) -> None:
-        """Cold-start with zero slots returns delta=0 and growth-mode timer advances."""
+        """Cold-start with zero slots returns delta=0 and growth-mode timer advances.
+
+        Cold-start is handled by the scheduler in two steps:
+        ``run_per_stage_pipeline`` returns 0 and leaves the growth-mode
+        state untouched; then the scheduler calls ``record_executed_delta``
+        with the post-commit delta (also 0 in cold-start) which is what
+        advances the growth-mode timer. The test simulates both steps.
+        """
         cfg = _explicit_threshold_config()
         state = make_runtime_state()
 
@@ -509,6 +517,7 @@ class TestZeroActorColdStartPath:
             current_workers=0,
             config=cfg,
         )
+        record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
         assert delta == 0
         # Classifier untouched: state and streak remain at defaults.
         assert state.classifier_state is StageState.NORMAL

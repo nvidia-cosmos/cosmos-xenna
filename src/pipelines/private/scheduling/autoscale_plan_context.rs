@@ -205,7 +205,9 @@ impl AutoscalePlanContext {
 
         // Initialise per-stage staged-adds/removes and current-worker maps
         // with one entry per pipeline stage so planning methods can index by
-        // stage name without a None-check.
+        // stage name without a None-check. Stage names must be unique across
+        // the problem; duplicates would silently collapse into a single
+        // HashMap entry and corrupt subsequent planning.
         let mut pending_adds: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
         let mut pending_removes: HashMap<String, Vec<ds::ProblemWorkerGroupState>> = HashMap::new();
         let mut current_workers: HashMap<String, HashMap<String, ds::ProblemWorkerGroupState>> =
@@ -215,7 +217,14 @@ impl AutoscalePlanContext {
             HashMap<String, ds::ProblemWorkerGroupState>,
         > = HashMap::new();
         let mut reserved_worker_ids: HashSet<String> = HashSet::new();
+        let mut seen_stage_names: HashSet<&str> = HashSet::new();
         for stage in &problem.stages {
+            if !seen_stage_names.insert(stage.name.as_str()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "AutoscalePlanContext: duplicate stage name {} in problem.stages",
+                    stage.name,
+                )));
+            }
             pending_adds.insert(stage.name.clone(), Vec::new());
             pending_removes.insert(stage.name.clone(), Vec::new());
             current_workers.insert(stage.name.clone(), HashMap::new());
@@ -239,7 +248,12 @@ impl AutoscalePlanContext {
             }
 
             for w in &stage_state.worker_groups {
-                reserved_worker_ids.insert(w.id.clone());
+                if !reserved_worker_ids.insert(w.id.clone()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "AutoscalePlanContext: duplicate worker id {} in seed for stage {}",
+                        w.id, stage.name,
+                    )));
+                }
                 match &stage.worker_shape {
                     rds::WorkerShape::SpmdNodeMultiple(_) => {
                         validate_seed_resources(&cluster, &stage.name, w, None)?;
@@ -264,7 +278,7 @@ impl AutoscalePlanContext {
                     }
                     _ => {
                         validate_seed_resources(&cluster, &stage.name, w, Some(1))?;
-                        let worker = w.to_worker(stage.name.clone());
+                        let worker = w.to_worker(stage.name.clone())?;
                         cluster.allocate(&worker.allocation).map_err(|e| {
                             pyo3::exceptions::PyRuntimeError::new_err(format!(
                                 "AutoscalePlanContext: failed to seed cluster with \
@@ -488,15 +502,16 @@ impl AutoscalePlanContext {
                 // O(R) where R = pending removes for this stage; small
                 // by construction (one removed worker per scale-down
                 // event).
-                let reuse_map: HashMap<String, rds::Worker> = self
+                let reuse_map: HashMap<String, rds::Worker> = match self
                     .pending_removes
                     .get(&stage_name)
-                    .map(|list| {
-                        list.iter()
-                            .map(|p| (p.id.clone(), p.to_worker(stage_name.clone())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                {
+                    Some(list) => list
+                        .iter()
+                        .map(|p| p.to_worker(stage_name.clone()).map(|w| (p.id.clone(), w)))
+                        .collect::<PyResult<HashMap<_, _>>>()?,
+                    None => HashMap::new(),
+                };
 
                 let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
                     &self.cluster,
@@ -546,7 +561,7 @@ impl AutoscalePlanContext {
                             )?;
                             removes.remove(pos)
                         };
-                    let worker = reused.to_worker(stage_name.clone());
+                    let worker = reused.to_worker(stage_name.clone())?;
                     match self.cluster.allocate(&worker.allocation) {
                         Ok(()) => {
                             self.current_workers
@@ -3521,6 +3536,111 @@ mod tests {
                 vec!["spmd_group_0".to_string()],
                 vec!["stage_cpu_worker_0".to_string()],
             ]
+        );
+    }
+
+    /// Helper: stage state with a single CPU worker on the given node
+    /// whose id is supplied by the caller, so callers can construct
+    /// collisions on demand.
+    fn make_stage_state_with_named_workers(
+        stage_name: &str,
+        worker_ids: &[&str],
+        node_id: &str,
+    ) -> ds::ProblemStageState {
+        let worker_groups = worker_ids
+            .iter()
+            .map(|id| ds::ProblemWorkerGroupState {
+                id: id.to_string(),
+                resources: vec![rds::WorkerResources {
+                    node: node_id.to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: Vec::new(),
+                }],
+                num_used_slots: 0,
+            })
+            .collect();
+        ds::ProblemStageState {
+            stage_name: stage_name.to_string(),
+            worker_groups,
+            slots_per_worker: 1,
+            is_finished: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_problem_state_rejects_duplicate_stage_names() {
+        // Two stages sharing the same name would silently collapse into
+        // a single HashMap entry for pending_adds / pending_removes /
+        // current_workers / current_worker_groups, corrupting all
+        // subsequent planning. The constructor must reject the input.
+        // Asserting `is_err()` (not the formatted message) keeps the
+        // test free of the Python GIL initialization that
+        // `PyErr::Display` requires.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("dup_stage"), make_cpu_stage("dup_stage")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_empty_stage_state("dup_stage"),
+                make_empty_stage_state("dup_stage"),
+            ],
+        };
+
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
+        assert!(
+            result.is_err(),
+            "duplicate stage name must be rejected before seeding"
+        );
+    }
+
+    #[test]
+    fn from_problem_state_rejects_duplicate_worker_ids_within_stage() {
+        // Two workers in the same stage sharing one id previously
+        // silently overwrote each other in `current_workers`, leaving
+        // the cluster snapshot double-allocated. Constructor must
+        // reject before any cluster allocation runs.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_stage_state_with_named_workers(
+                "stage_a",
+                &["dup_w", "dup_w"],
+                "node0",
+            )],
+        };
+
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
+        assert!(
+            result.is_err(),
+            "duplicate worker id within a stage must be rejected"
+        );
+    }
+
+    #[test]
+    fn from_problem_state_rejects_duplicate_worker_ids_across_stages() {
+        // Worker ids must be globally unique within a planning cycle.
+        // A collision across stages would let one stage's worker
+        // accidentally satisfy another stage's lookup and corrupt the
+        // reuse path.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 4.0),
+            stages: vec![make_cpu_stage("stage_a"), make_cpu_stage("stage_b")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                make_stage_state_with_named_workers("stage_a", &["shared_id"], "node0"),
+                make_stage_state_with_named_workers("stage_b", &["shared_id"], "node0"),
+            ],
+        };
+
+        let result = AutoscalePlanContext::from_problem_state(&problem, &state, None);
+        assert!(
+            result.is_err(),
+            "duplicate worker id across stages must be rejected"
         );
     }
 }

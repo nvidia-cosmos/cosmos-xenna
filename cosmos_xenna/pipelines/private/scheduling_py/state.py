@@ -114,6 +114,14 @@ class _StageRuntimeState:
             ``setup()`` and the first ``autoscale()``; the per-stage
             decision pipeline raises ``RuntimeError`` if it observes
             an unresolved state at run time.
+        valid_signal_samples: Count of consecutive cycles in which the
+            stage produced a non-empty slot signal that excluded warmup
+            workers. Used by the scheduler to gate
+            :func:`run_per_stage_pipeline` until
+            ``SaturationAwareStageConfig.min_data_points`` valid samples
+            have been observed; this prevents acting on classifier
+            output computed from one or two stale or warmup-only
+            samples.
 
     """
 
@@ -126,6 +134,7 @@ class _StageRuntimeState:
     growth_streak: int = 0
     prev_workers: int = 0
     resolved_thresholds: ResolvedThresholds | None = None
+    valid_signal_samples: int = 0
 
 
 def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> float:

@@ -19,13 +19,17 @@ Per-cycle flow::
 
     snapshot -> resolve classifier signal -> classify -> update streak
              -> fire-gate -> compute intent delta -> stabilization gate
-             -> update growth mode -> return delta
+             -> return recommendation
 
-The returned delta is the algorithm's intent. Cluster-wide
-feasibility (per-stage min/max, per-node caps, capacity, memory
-pressure gate) is applied by the scheduler's main loop after this
-function returns, so the growth-mode transition observes the
-post-stabilization-gate intent delta produced here.
+The returned delta is the algorithm's recommendation only. The
+growth-mode state machine is advanced separately by
+``record_executed_delta`` after the planner has committed Phase C
+(grow) and Phase D (shrink); the executed delta passed in is the
+net post-commit worker change for the stage. Splitting the
+recommendation from the execution recording lets hard worker caps,
+fraction clamps, and allocation failures shrink the planner's
+output below the recommendation without the growth-mode timer
+observing a delta that never landed in the cluster.
 """
 
 from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
@@ -40,6 +44,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.stabilization import (
     apply_stabilization_gate,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.state import (
+    GrowthMode,
     _StageRuntimeState,
     compute_slots_empty_ratio,
     update_ewma,
@@ -57,10 +62,16 @@ def run_per_stage_pipeline(
     config: SaturationAwareStageConfig,
     recommendation_history: _RecommendationHistory | None = None,
 ) -> int:
-    """Run the per-cycle decision pipeline for one stage.
+    """Compute the per-stage scaling recommendation for one cycle.
 
-    Mutates ``stage_state`` in place; returns the (possibly
-    stabilization-gated) delta.
+    Mutates ``stage_state`` in place (classifier state, classifier
+    streak, EWMA cache, ``prev_workers``); returns the (possibly
+    stabilization-gated) recommended delta. The growth-mode state
+    machine is NOT advanced here. The caller is the only component
+    that knows what the planner actually executed; it must call
+    ``record_executed_delta`` after Phase C / Phase D commit so
+    HOLD / ACQUIRING / TRACKING timers observe the post-commit
+    delta rather than the pre-commit recommendation.
 
     Args:
         stage_state: Per-stage runtime state. Mutated in place.
@@ -74,15 +85,15 @@ def run_per_stage_pipeline(
             buffer and replaced with ``0`` if the buffer cannot yet
             confirm a sustained recommendation in the same direction;
             this gates Phase C / Phase D against acting on a single
-            noisy cycle. The growth-mode transition observes the
-            post-gate delta so HOLD timers advance during gated cycles
-            instead of resetting on every suppressed shrink. ``None``
-            (the legacy contract used by helper-direct tests) skips
+            noisy cycle. ``None`` (used by helper-direct tests) skips
             the stabilization layer entirely.
 
     Returns:
-        Signed delta: positive to add, negative to remove, zero for
-        no action.
+        Signed recommendation delta: positive to add, negative to
+        remove, zero for no action. The scheduler must pass the
+        executed post-commit delta to ``record_executed_delta`` for
+        every stage that participated in this cycle's intent
+        computation, including stages that recommended zero.
 
     Raises:
         RuntimeError: If ``stage_state.resolved_thresholds`` is
@@ -110,13 +121,9 @@ def run_per_stage_pipeline(
     if classifier_input is None:
         # Zero ready actors, no prior valid EWMA. The structural
         # worker-floor step independently bootstraps; the classifier
-        # holds and the growth-mode timer continues to tick.
-        stage_state.growth_mode, stage_state.growth_streak = compute_growth_mode_transition(
-            prev_mode=stage_state.growth_mode,
-            prev_streak=stage_state.growth_streak,
-            delta_executed=0,
-            config=config,
-        )
+        # holds for this cycle. The growth-mode transition is left to
+        # the scheduler's post-Phase-D ``record_executed_delta`` call
+        # which sees delta_executed=0 for a stage that took no action.
         stage_state.prev_workers = current_workers
         return 0
 
@@ -135,10 +142,18 @@ def run_per_stage_pipeline(
     )
     stage_state.classifier_state = new_classifier_state
 
+    # Growth-mode kill switch: when the state machine is disabled, force
+    # the magnitude calculation to use ``TRACKING`` (additive +1 / +2) so
+    # ACQUIRING multiplicative growth and HOLD post-shrink suppression do
+    # not influence the per-cycle decision. ``record_executed_delta`` is
+    # still called by the scheduler, but with the kill switch off it
+    # short-circuits to a no-op (see that function's body).
+    effective_growth_mode = stage_state.growth_mode if config.enable_growth_mode_state_machine else GrowthMode.TRACKING
+
     if should_fire_action(new_classifier_state, stage_state.classifier_streak, config):
         delta = compute_delta(
             new_classifier_state,
-            stage_state.growth_mode,
+            effective_growth_mode,
             current_workers,
             config,
         )
@@ -149,19 +164,50 @@ def run_per_stage_pipeline(
         # Record-then-gate is encapsulated in ``apply_stabilization_gate`` so
         # callers cannot accidentally gate without recording, which would
         # leave the buffer one cycle behind reality and weaken every future
-        # gate decision. The growth-mode transition below sees the gated
-        # delta so HOLD-after-shrink timers advance correctly when the
-        # stabilization window suppresses a recommended action.
+        # gate decision.
         delta = apply_stabilization_gate(recommendation_history, delta)
 
+    stage_state.prev_workers = current_workers
+    return delta
+
+
+def record_executed_delta(
+    *,
+    stage_state: _StageRuntimeState,
+    delta_executed: int,
+    config: SaturationAwareStageConfig,
+) -> None:
+    """Advance the growth-mode state machine with the post-commit delta.
+
+    Called by the scheduler exactly once per stage per cycle, after
+    Phase C (grow) and Phase D (shrink) have committed their planner
+    mutations. ``delta_executed`` is the net worker change for the
+    stage (``post_phase_d_count - pre_phase_c_count``); it can be
+    smaller in magnitude than the recommendation if hard caps,
+    fractional clamps, or allocation failures throttled the planner.
+
+    When ``config.enable_growth_mode_state_machine`` is ``False`` the
+    state machine is short-circuited - neither ``growth_mode`` nor
+    ``growth_streak`` is mutated. ``run_per_stage_pipeline`` already
+    forces ``TRACKING`` magnitudes in that mode, so leaving the runtime
+    state frozen at its construction-time defaults keeps the per-stage
+    history clean and re-enabling the flag mid-run resumes from the
+    original ACQUIRING entry point rather than from a stale HOLD/etc.
+
+    Args:
+        stage_state: Per-stage runtime state. Only
+            ``growth_mode`` and ``growth_streak`` are mutated.
+        delta_executed: Signed post-commit delta.
+        config: Per-stage configuration.
+    """
+    if not config.enable_growth_mode_state_machine:
+        return
     stage_state.growth_mode, stage_state.growth_streak = compute_growth_mode_transition(
         prev_mode=stage_state.growth_mode,
         prev_streak=stage_state.growth_streak,
-        delta_executed=delta,
+        delta_executed=delta_executed,
         config=config,
     )
-    stage_state.prev_workers = current_workers
-    return delta
 
 
 def _resolve_classifier_signal(

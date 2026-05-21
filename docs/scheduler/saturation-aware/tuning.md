@@ -118,7 +118,7 @@ runtime visible.
 | Stages oscillate between adding and removing workers | Increase `over_provisioned_streak_min_cycles` (longer scale-down patience) | [07](07-streak-stabilization.md) |
 | Phase D shrinks a freshly-warmed worker | Increase `worker_warmup_measurement_grace_s` and `donor_warmup_grace_s` | [10](10-slow-start-mechanisms.md), [15](15-idle-first-scale-down.md) |
 | New stage takes minutes to ramp under sustained load | Increase `saturation_aggressiveness` (`0.30` → `0.45`); confirm `enable_dag_priority_growth=True` | [08](08-auto-derived-thresholds.md), [12](12-multi-target-dag-growth.md) |
-| Cluster-full pipeline never bootstraps a new stage | Confirm `floor_stuck_grace_cycles` is non-zero (default `60`); check Phase B donor logs | [13](13-cross-stage-donor.md) |
+| Cluster-full pipeline never bootstraps a new stage | Confirm `floor_stuck_grace_cycles` is non-zero (default `6`); check Phase B donor logs | [13](13-cross-stage-donor.md) |
 | Cross-stage donor rotates the same worker every cycle | Increase `cross_stage_donor_anti_flap_cycles` (default `30`) | [13](13-cross-stage-donor.md) |
 | Regime detector enters / exits SUPER_HW every few cycles | Increase `regime_transition_streak_cycles` (default `3` → `5`) | [09](09-regime-aware-aggressiveness.md) |
 | Cycle p95 exceeds the watchdog WARN line | Profile first; tune `interval_s` only after profiling rules out an algorithmic issue | [18](18-loop-watchdog.md) |

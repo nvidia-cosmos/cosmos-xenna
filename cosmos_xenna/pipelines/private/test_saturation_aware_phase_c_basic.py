@@ -145,6 +145,7 @@ def _scheduler(stage_specs: list[tuple[str, int | None]]) -> SaturationAwareSche
             min_workers=1,
             worker_warmup_measurement_grace_s=0.0,
             donor_warmup_grace_s=0.0,
+            min_data_points=1,
         ),
     )
     scheduler = SaturationAwareScheduler(cfg)

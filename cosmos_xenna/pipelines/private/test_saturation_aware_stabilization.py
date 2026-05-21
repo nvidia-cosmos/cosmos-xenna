@@ -35,7 +35,10 @@ import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
+from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
+    record_executed_delta,
+    run_per_stage_pipeline,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.regime import Regime
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.stabilization import (
@@ -418,9 +421,10 @@ class TestPipelineStabilizationGate:
         Without this guarantee, a gated shrink cycle would still flip the
         growth mode to HOLD with ``streak = 1``, and every subsequent
         gated cycle would reset that timer. The observable contract:
-        when the gate suppresses a shrink, the growth-mode transition
-        sees ``delta_executed = 0`` and the stage stays in its current
-        mode with an incrementing streak.
+        when the gate suppresses a shrink, the scheduler records
+        ``delta_executed = 0`` (because Phase D had nothing to execute)
+        and the stage stays in its current mode with an incrementing
+        streak.
         """
         cfg = _cfg(
             window_up=1,
@@ -431,9 +435,12 @@ class TestPipelineStabilizationGate:
         state = _stage_state(cfg)
         history = _RecommendationHistory(window_up=1, window_down=10)
         # Two cycles so the over-provisioned streak fires on cycle 2; the
-        # gate refuses both cycles because the down window is 10.
+        # gate refuses both cycles because the down window is 10. The
+        # second call to ``record_executed_delta`` models the scheduler
+        # advancing the growth-mode timer for stages that participated
+        # in the cycle.
         for _ in range(2):
-            run_per_stage_pipeline(
+            delta = run_per_stage_pipeline(
                 stage_state=state,
                 num_used_slots=0,
                 num_empty_slots=10,
@@ -442,6 +449,7 @@ class TestPipelineStabilizationGate:
                 config=cfg,
                 recommendation_history=history,
             )
+            record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
         # On a gated shrink cycle the growth mode must NOT have transitioned
         # to HOLD (which only happens on an executed shrink). The streak
         # advances because the cycle was effectively a no-op.

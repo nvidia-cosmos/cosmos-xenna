@@ -684,3 +684,104 @@ class TestRegimeAwareAggressiveness:
             runtime.resolved_thresholds.saturation_aggressiveness
             > SaturationAwareConfig().stage_defaults.saturation_aggressiveness
         )
+
+
+class TestExecutedDeltaRecording:
+    """Pin the post-commit executed-delta wiring contract.
+
+    Background:
+        ``run_per_stage_pipeline`` produces the per-stage scaling
+        recommendation. Phase C / Phase D commit that recommendation
+        with hard worker caps, the fractional shrink clamp, and
+        allocation failures all able to throttle the executed delta
+        below the recommendation magnitude.
+
+    Contract (post-fix):
+        ``record_executed_delta`` is invoked exactly once per stage
+        that participated in the cycle's intent computation, with the
+        post-Phase-D minus pre-Phase-C net worker count. The
+        growth-mode state machine therefore observes the committed
+        delta rather than the recommendation, so HOLD / ACQUIRING /
+        TRACKING timers reflect what actually landed in the cluster.
+    """
+
+    def test_record_executed_delta_called_for_each_intent_stage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The scheduler invokes ``record_executed_delta`` once per stage with an intent."""
+        from unittest.mock import patch as _patch
+
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+        ps = _problem_state([("A", 1, 1), ("B", 1, 1)])
+
+        captured: list[tuple[str, int]] = []
+
+        def _capture(*, stage_state: _StageRuntimeState, delta_executed: int, config: object) -> None:
+            captured.append((stage_state.stage_name, delta_executed))
+
+        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 0, "B": 0}):
+            with _patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.record_executed_delta",
+                side_effect=_capture,
+            ):
+                scheduler.autoscale(time=0.0, problem_state=ps)
+
+        recorded_stages = sorted(name for name, _delta in captured)
+        assert recorded_stages == ["A", "B"], (
+            "record_executed_delta must fire once per stage that participated in the intent computation; "
+            f"got {recorded_stages}"
+        )
+        for _name, delta in captured:
+            assert delta == 0, "No Phase C/D mutation occurred; executed delta must be 0 for both stages"
+
+    def test_record_executed_delta_reflects_phase_c_throttling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When Phase C executes fewer adds than the recommendation, the recorded delta matches the commit."""
+        from unittest.mock import patch as _patch
+
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state([("A", 1, 1)])
+
+        captured: list[int] = []
+
+        def _capture(*, stage_state: _StageRuntimeState, delta_executed: int, config: object) -> None:
+            captured.append(delta_executed)
+
+        # Recommendation is +3 but the first try_add_worker returns None
+        # (cluster exhausted) so Phase C executes 0 adds. Recorded delta
+        # must be 0, NOT the recommendation.
+        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 3}):
+            with _patch(
+                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+                return_value=None,
+            ):
+                with _patch(
+                    "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.record_executed_delta",
+                    side_effect=_capture,
+                ):
+                    scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert captured == [0], (
+            "Phase C executed zero adds despite a +3 recommendation; the recorded delta must mirror "
+            f"the commit, not the recommendation; got {captured}"
+        )
+
+
+class TestInvariantPropagation:
+    """Non-AllocationError raises propagate; the narrow defense-in-depth scope does not bury them."""
+
+    def test_scheduler_invariant_error_propagates_out_of_autoscale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A planner bug surfacing as ``RuntimeError`` propagates instead of being absorbed."""
+        from unittest.mock import patch as _patch
+
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        ps = _problem_state([("A", 1, 1)])
+
+        err = RuntimeError("synthetic scheduler invariant violation")
+        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 1}):
+            with _patch(
+                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+                side_effect=err,
+            ):
+                with pytest.raises(RuntimeError, match="synthetic scheduler invariant violation"):
+                    scheduler.autoscale(time=0.0, problem_state=ps)

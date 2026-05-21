@@ -19,19 +19,64 @@ The seven primitives (``compute_slots_empty_ratio``, ``update_ewma``,
 ``classify``, ``update_streak``, ``should_fire_action``,
 ``compute_delta``, ``compute_growth_mode_transition``) each have
 dedicated unit tests covering every branch. These tests verify that
-``run_per_stage_pipeline`` composes them correctly: the right primitive
-fires in the right order, state mutations are consistent, the
-zero-actors edge cases route through the carry-forward logic, and
-multi-cycle traces produce the expected sequence of decisions.
+``run_per_stage_pipeline`` + ``record_executed_delta`` compose them
+correctly: the right primitive fires in the right order, state
+mutations are consistent, the zero-actors edge cases route through
+the carry-forward logic, and multi-cycle traces produce the expected
+sequence of decisions.
+
+The two-step API mirrors the scheduler's behavior at runtime:
+``run_per_stage_pipeline`` produces a recommendation, and
+``record_executed_delta`` is called with the post-Phase-C/D executed
+delta so the growth-mode state machine observes the committed result.
+Each test that asserts on ``growth_mode`` / ``growth_streak`` uses
+the ``_advance_cycle`` helper, which models the scheduler executing
+exactly the recommendation.
 """
 
 import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
+from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
+    record_executed_delta,
+    run_per_stage_pipeline,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.stabilization import _RecommendationHistory
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
+
+
+def _advance_cycle(
+    stage_state: _StageRuntimeState,
+    *,
+    num_used_slots: int,
+    num_empty_slots: int,
+    input_queue_depth: int,
+    current_workers: int,
+    config: SaturationAwareStageConfig,
+    recommendation_history: _RecommendationHistory | None = None,
+) -> int:
+    """Test helper: run the recommendation, then record the executed delta.
+
+    Mirrors the scheduler's call pattern (``run_per_stage_pipeline``
+    in ``_compute_intent_deltas`` plus ``record_executed_delta`` in
+    ``_record_post_commit_executed_deltas``) for tests that assert on
+    the growth-mode state machine. Tests that only inspect the
+    returned delta or other recommendation-side state continue to
+    call ``run_per_stage_pipeline`` directly.
+    """
+    delta = run_per_stage_pipeline(
+        stage_state=stage_state,
+        num_used_slots=num_used_slots,
+        num_empty_slots=num_empty_slots,
+        input_queue_depth=input_queue_depth,
+        current_workers=current_workers,
+        config=config,
+        recommendation_history=recommendation_history,
+    )
+    record_executed_delta(stage_state=stage_state, delta_executed=delta, config=config)
+    return delta
 
 
 @pytest.fixture
@@ -79,8 +124,8 @@ class TestNoActionPath:
         """Mid-band ratio (strictly between sat=0.15 and op=0.50) -> NORMAL -> delta=0."""
         # ratio = 2 / (3 + 2) = 0.4 -- in the NORMAL band (sat 0.15 < 0.4 < op 0.50).
         state = _fresh_state(cfg)
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        delta = _advance_cycle(
+            state,
             num_used_slots=3,
             num_empty_slots=2,
             input_queue_depth=10,
@@ -106,8 +151,8 @@ class TestCriticalScaleUpPath:
         ACQUIRING + CRITICAL: ceil(0.5 * 4) = 2; cap=4 doesn't bite.
         """
         state = _fresh_state(cfg)
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        delta = _advance_cycle(
+            state,
             num_used_slots=4,
             num_empty_slots=0,
             input_queue_depth=10,
@@ -173,8 +218,8 @@ class TestOverProvisionedShrinkPath:
         state = _fresh_state(cfg)
         # Walk through 29 OVER_PROVISIONED cycles -> no fire yet.
         for _ in range(29):
-            delta = run_per_stage_pipeline(
-                stage_state=state,
+            delta = _advance_cycle(
+                state,
                 num_used_slots=1,
                 num_empty_slots=9,
                 input_queue_depth=10,
@@ -183,8 +228,8 @@ class TestOverProvisionedShrinkPath:
             )
             assert delta == 0
         # 30th cycle: streak hits threshold, shrink fires.
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        delta = _advance_cycle(
+            state,
             num_used_slots=1,
             num_empty_slots=9,
             input_queue_depth=10,
@@ -223,8 +268,8 @@ class TestZeroActorsColdStart:
     def test_cold_start_with_zero_actors_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
         """First cycle with zero actors -> no signal -> hold; the worker-floor step bootstraps elsewhere."""
         state = _fresh_state(cfg)
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        delta = _advance_cycle(
+            state,
             num_used_slots=0,
             num_empty_slots=0,
             input_queue_depth=10,
@@ -237,7 +282,9 @@ class TestZeroActorsColdStart:
         assert state.classifier_streak == 0
         assert state.slots_empty_ratio_ewma is None
         assert state.last_valid_slots_empty_ratio_ewma is None
-        # Growth-mode timer ticks regardless.
+        # Growth-mode timer ticks regardless (the scheduler always calls
+        # ``record_executed_delta`` for every stage that participated in
+        # the cycle, including cold-start no-action stages).
         assert state.growth_mode is GrowthMode.ACQUIRING
         assert state.growth_streak == 1
 
@@ -320,8 +367,8 @@ class TestFullLifecycleTrace:
         state = _fresh_state(cfg)
         # 29 cycles of OVER_PROVISIONED with streak < 30 -- no shrink yet.
         for _ in range(29):
-            delta = run_per_stage_pipeline(
-                stage_state=state,
+            delta = _advance_cycle(
+                state,
                 num_used_slots=1,
                 num_empty_slots=9,
                 input_queue_depth=10,
@@ -332,8 +379,8 @@ class TestFullLifecycleTrace:
             assert state.classifier_state is StageState.OVER_PROVISIONED
 
         # 30th cycle: streak hits threshold, shrink fires, mode flips.
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        delta = _advance_cycle(
+            state,
             num_used_slots=1,
             num_empty_slots=9,
             input_queue_depth=10,
@@ -362,10 +409,12 @@ class TestColdStartZeroActorsDoesNotResetGrowthMode:
             growth_streak=cfg.stabilization_window_cycles_down,
             last_valid_slots_empty_ratio_ewma=None,
         )
-        # Zero actors + no prior EWMA: cold-start short-circuit, but the growth-mode
-        # timer must still tick.
-        delta = run_per_stage_pipeline(
-            stage_state=state,
+        # Zero actors + no prior EWMA: cold-start short-circuit, but the
+        # growth-mode timer must still tick. The scheduler models this by
+        # calling ``record_executed_delta(0)`` for every stage that
+        # participated in the cycle, including cold-start no-action stages.
+        delta = _advance_cycle(
+            state,
             num_used_slots=0,
             num_empty_slots=0,
             input_queue_depth=10,

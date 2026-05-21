@@ -367,12 +367,26 @@ enum WorkerOrWorkerGroup {
     WorkerGroup(rds::WorkerGroup),
 }
 
+/// Build the seed list for `run_fragmentation_autoscaler` from the
+/// caller-supplied `Problem` + `ProblemState`.
+///
+/// Returns `PyValueError` when the input is structurally malformed
+/// (stage count mismatch, or a non-SPMD worker carrying more than
+/// one resource allocation). Previously this function panicked on
+/// such inputs, which propagated as a hard PyO3 abort.
 fn make_workers_from_problem_state(
     problem: &ds::Problem,
     state: &ds::ProblemState,
-) -> Vec<WorkerOrWorkerGroup> {
+) -> PyResult<Vec<WorkerOrWorkerGroup>> {
+    if problem.stages.len() != state.stages.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "make_workers_from_problem_state: stage count mismatch - \
+             problem has {} stages, state has {}",
+            problem.stages.len(),
+            state.stages.len(),
+        )));
+    }
     let mut out = Vec::new();
-    assert_eq!(problem.stages.len(), state.stages.len());
     for (stage, stage_state) in std::iter::zip(&problem.stages, &state.stages) {
         for w in &stage_state.worker_groups {
             if let rds::WorkerShape::SpmdNodeMultiple(_) = &stage.worker_shape {
@@ -380,11 +394,11 @@ fn make_workers_from_problem_state(
                     w.to_worker_group(stage.name.clone()),
                 ));
             } else {
-                out.push(WorkerOrWorkerGroup::Worker(w.to_worker(stage.name.clone())));
+                out.push(WorkerOrWorkerGroup::Worker(w.to_worker(stage.name.clone())?));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn calculate_input_samples_per_sample(
@@ -940,7 +954,7 @@ pub fn run_fragmentation_autoscaler(
             .or_default();
     }
     // Seed with existing workers
-    for w in make_workers_from_problem_state(problem, state) {
+    for w in make_workers_from_problem_state(problem, state)? {
         match w {
             WorkerOrWorkerGroup::WorkerGroup(w) => {
                 cluster

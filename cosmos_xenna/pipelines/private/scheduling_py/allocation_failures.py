@@ -53,11 +53,13 @@ def emit_allocation_failure(
         exc: The absorbed exception.
     """
     _ALLOCATION_FAILURES_COUNTER.inc(tags={"stage": stage_name, "pipeline": pipeline_name})
-    snapshot = _format_gpu_fragmentation(cluster_resources)
+    gpu_snapshot = _format_gpu_fragmentation(cluster_resources)
+    cpu_snapshot = _format_cpu_fragmentation(cluster_resources)
     logger.error(
         f"saturation-aware allocation failure: stage {stage_name!r} "
         f"raised {type(exc).__name__}: {exc!r}. "
-        f"Per-GPU fragmentation snapshot: {snapshot}"
+        f"Per-GPU fragmentation snapshot: {gpu_snapshot}. "
+        f"Per-node CPU snapshot: {cpu_snapshot}"
     )
 
 
@@ -79,6 +81,45 @@ def _format_gpu_fragmentation(cluster_resources: Any) -> list[dict[str, object]]
                     "free_fraction": round(max(0.0, 1.0 - gpu.used_fraction), 4),
                 }
             )
+    return rows
+
+
+def _node_cpu_totals(node: Any) -> tuple[float, float]:
+    """Return ``(used_cpus, total_cpus)`` for both Python and Rust ``NodeResources``.
+
+    The Python attrs ``NodeResources`` exposes ``used_cpus`` /
+    ``total_cpus`` as plain attributes. The Rust binding does not
+    publish those fields directly; ``used_pool()`` / ``total_pool()``
+    are the supported accessors. This helper picks the right path so
+    the snapshot works against either object without runtime type
+    checks leaking into the caller.
+    """
+    if hasattr(node, "total_cpus"):
+        return float(node.used_cpus), float(node.total_cpus)
+    return float(node.used_pool().cpus), float(node.total_pool().cpus)
+
+
+def _format_cpu_fragmentation(cluster_resources: Any) -> list[dict[str, object]]:
+    """Return ``(node, cpu_used, cpu_total, cpu_free_fraction)`` for every node.
+
+    Adds a CPU view alongside the per-GPU snapshot so CPU-only stages
+    whose ``try_add_worker`` fails surface in the log with actionable
+    capacity data. Stable-ordered by ``node_id`` to match the GPU
+    snapshot's deterministic-string contract.
+    """
+    rows: list[dict[str, object]] = []
+    for node_id in sorted(cluster_resources.nodes):
+        node = cluster_resources.nodes[node_id]
+        used, total = _node_cpu_totals(node)
+        free_fraction = (total - used) / total if total > 0.0 else 0.0
+        rows.append(
+            {
+                "node": node_id,
+                "cpu_used": round(used, 4),
+                "cpu_total": round(total, 4),
+                "cpu_free_fraction": round(max(0.0, free_fraction), 4),
+            }
+        )
     return rows
 
 

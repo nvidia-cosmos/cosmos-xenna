@@ -76,11 +76,32 @@ recovers without a pipeline restart and without operator action.
 DAG-depth-descending order. For each stage it calls
 `ctx.try_add_worker(stage_index)` up to `intent` times. On the first
 `None` return the saturation-mode cross-stage donor fallback
-(`_attempt_cross_stage_donation`) is attempted; on donor failure or
-post-donation retry failure the inner loop breaks and the cycle
-moves on to the next stage. The single per-stage WARNING is emitted
-at the break point so operators retain visibility without
-log-flooding.
+(`_attempt_cross_stage_donation`) is attempted; on donor selection
+failure the inner loop breaks and the cycle moves on to the next
+stage with a single per-stage WARNING.
+
+Post-donation retry failure is treated differently. The donor was
+already removed from the planner snapshot via `ctx.try_remove_worker`
+before the receiver retry runs, and that removal cannot be rolled
+back safely (the cluster snapshot, FGD reuse map, and worker-age
+map all already reflect the removal). A `None` retry response would
+otherwise leave the cluster with one-sided shrink (donor gone,
+receiver did not grow). The scheduler therefore surfaces the failure
+as a synthetic `RuntimeError("donor-retry-failed: ...")` and routes
+it through `_absorb_allocation_failure`, which:
+
+- increments the standard allocation-failure Counter so the
+  one-sided shrink is operator-visible alongside other Phase C
+  allocation failures;
+- emits the per-GPU fragmentation snapshot at ERROR level, naming
+  both the receiver and the donor stage;
+- aborts the rest of Phase C for the cycle (under the default
+  `skip_cycle_on_allocation_error=True`) or re-raises (when the
+  kill switch is off);
+- leaves `_record_donation_success` un-called, so donor cooldown
+  and the per-cycle receiver counter remain at their pre-donation
+  values; the donor stage stays eligible to be revisited next
+  cycle without penalty.
 
 At the bottom of the per-stage loop the counter is updated in one of
 three ways:
@@ -127,11 +148,15 @@ empty queue" feedback that arrives one or two cycles later.
 
 The default Phase C path consumes the documented `None` return
 contract directly. As a second line of defense for any future
-planner-internal raise (named `AllocationError` or otherwise
-unexpected), `_run_phase_c_grow` calls `try_add_worker` through
-`_try_add_worker_with_defense`. Both `except AllocationError` and
-`except Exception` clauses route through `_absorb_allocation_failure`,
-which:
+planner-internal raise of `AllocationError`,
+`_run_phase_c_grow` calls `try_add_worker` through
+`_try_add_worker_with_defense`. The defense layer catches
+`AllocationError` only; any other exception (e.g.
+`SchedulerInvariantError`, `KeyError`, `IndexError` from a planner
+bug) propagates out of `autoscale()` so the operator sees the
+real defect instead of having it silently re-classified as a
+transient allocation failure. The absorbed `AllocationError`
+branch routes through `_absorb_allocation_failure`, which:
 
 - emits an ERROR log carrying a per-GPU fragmentation snapshot
   (`(node, gpu_index, used_fraction, free_fraction)` for every GPU

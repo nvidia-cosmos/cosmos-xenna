@@ -45,16 +45,16 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, Saturati
 
 
 def _no_warmup_grace_config(**overrides: object) -> SaturationAwareConfig:
-    """Build a ``SaturationAwareConfig`` with both warmup graces disabled.
+    """Build a ``SaturationAwareConfig`` with both warmup graces and trust gate disabled.
 
     These tests focus on intent-shape, classifier convergence, and
-    Phase C orchestration -- mechanisms orthogonal to warmup grace.
-    Disabling ``worker_warmup_measurement_grace_s`` and
-    ``donor_warmup_grace_s`` keeps the legacy "absorb signal
-    immediately" behaviour the tests were originally written
-    against. Tests that exercise warmup behaviour live in
-    ``test_worker_warmup_grace.py`` and configure those fields
-    explicitly.
+    Phase C orchestration -- mechanisms orthogonal to warmup grace
+    and the ``min_data_points`` trust gate. Disabling
+    ``worker_warmup_measurement_grace_s`` and ``donor_warmup_grace_s``
+    keeps the original "absorb signal immediately" behaviour the tests
+    were written against. ``min_data_points=1`` keeps the same
+    contract for first-cycle firing; trust-gate behaviour is covered
+    by ``test_saturation_aware_config_wiring.py``.
 
     Args:
         **overrides: Optional field overrides forwarded to
@@ -65,6 +65,7 @@ def _no_warmup_grace_config(**overrides: object) -> SaturationAwareConfig:
     stage_defaults = SaturationAwareStageConfig(
         worker_warmup_measurement_grace_s=0.0,
         donor_warmup_grace_s=0.0,
+        min_data_points=1,
         **overrides,  # type: ignore[arg-type]
     )
     return SaturationAwareConfig(stage_defaults=stage_defaults)
