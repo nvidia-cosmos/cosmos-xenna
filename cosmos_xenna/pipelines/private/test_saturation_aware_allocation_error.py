@@ -220,7 +220,11 @@ class TestAllocationErrorDefense:
         error_records = [r for r in loguru_caplog.records if r.levelno >= logging.ERROR]
         assert len(error_records) == 1
         assert "saturation-aware allocation failure" in error_records[0].message
-        assert "Per-GPU fragmentation snapshot" in error_records[0].message
+        # ``_scheduler()`` runs against the CPU-only ``_cluster()`` fixture, so
+        # the operator-actionable snapshot is the per-node CPU table. The
+        # per-GPU snapshot is still emitted but is empty for this cluster
+        # shape, so asserting on it would not validate any cluster signal.
+        assert "Per-node CPU snapshot" in error_records[0].message
 
     def test_unexpected_exception_propagates_and_does_not_increment_counter(
         self,

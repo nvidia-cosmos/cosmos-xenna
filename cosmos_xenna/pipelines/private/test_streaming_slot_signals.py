@@ -139,7 +139,11 @@ def _real_actor_pool(
     ``ActorPool`` properties read; ``num_pending_actors`` aggregates
     across ``_pending_actors``, ``_pending_node_actors`` and
     ``_actors_waiting_for_node_setup`` so each container must exist
-    even when the test only exercises the ready-actor path.
+    (as empty containers) even when the test only exercises the
+    ready-actor path. Seeding the containers empty makes the default
+    ``num_pending_actors`` zero, matching the test's "no pending
+    actors" semantics; individual tests that need to verify pending-
+    aware behaviour can populate them explicitly.
     """
     pool = actor_pool.ActorPool.__new__(actor_pool.ActorPool)
     pool._name = name
@@ -148,7 +152,7 @@ def _real_actor_pool(
         actor_id: _ready_actor(used_slots=used_slots, empty_slots=empty_slots)
         for actor_id, used_slots, empty_slots in ready_slots
     }
-    pool._pending_actors = cast(Any, collections.OrderedDict({"pending": object()}))
+    pool._pending_actors = cast(Any, collections.OrderedDict())
     pool._pending_node_actors = cast(Any, collections.OrderedDict())
     pool._actors_waiting_for_node_setup = cast(Any, {})
     pool._task_queue = cast(Any, collections.deque(object() for _ in range(queued_tasks)))

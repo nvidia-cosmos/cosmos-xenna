@@ -31,6 +31,8 @@ integration tests use the existing helpers from sibling test modules
 to stay aligned with the project's fixture conventions.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
@@ -533,19 +535,22 @@ class TestSchedulerIntegration:
             history.record(-1)
         assert len(history) == 8
 
-        # Simulate the regime detector flipping by mutating its internal state
-        # and forcing the scheduler-side handler. This avoids constructing a
-        # full multi-stage signal and keeps the test focused on the cleanup
-        # side effect.
+        # Drive the production transition handler with a forced
+        # ``update_regime_state`` return so the test exercises the real cleanup
+        # branch in ``_update_regime_aware_aggressiveness``. Patching the
+        # hysteresis function (instead of constructing a multi-stage signal
+        # that aggregates into a transitioning regime) keeps the test focused
+        # on the cleanup side effect that is the actual contract being pinned,
+        # while still walking the production code path that owns the clear.
         scheduler._regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
         for runtime in scheduler._stage_states.values():
             runtime.classifier_streak = 5
-        # Trigger the same cleanup path the production handler runs by calling
-        # the post-transition loop directly. A real transition would also
-        # touch ``resolved_thresholds`` and the classifier; this test scopes
-        # the assertion to the recommendation-history side effect.
-        for buffer in scheduler._recommendation_histories.values():
-            buffer.clear()
+        empty_state = data_structures.ProblemState([])
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.update_regime_state",
+            return_value=True,
+        ):
+            scheduler._update_regime_aware_aggressiveness(empty_state)
         assert len(scheduler._recommendation_histories["only"]) == 0
 
 

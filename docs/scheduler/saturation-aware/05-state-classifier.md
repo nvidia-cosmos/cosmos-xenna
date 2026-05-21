@@ -80,18 +80,24 @@ Key properties:
   count cycles against. A continuous controller would re-classify
   every cycle and oscillate around the decision boundary.
 - **Per-zone asymmetric hysteresis.** Hysteresis is applied **only
-  on exit from a state**, not on entry. From `SATURATED` /
-  `SATURATED_CRITICAL` the saturation boundary is inflated by
-  `saturation_deadband_pct`; from `OVER_PROVISIONED` the
+  on exit from a state**, not on entry. When the previous state is
+  `SATURATED` or `SATURATED_CRITICAL` the saturation boundary is
+  inflated by `saturation_deadband_pct`, so an exiting stage falls
+  back to `NORMAL` only after the slot-busy signal eases past the
+  inflated bound; when the previous state is `OVER_PROVISIONED` the
   over-provisioned boundary is deflated by
-  `over_provisioned_deadband_pct`. The over-provisioned band is
-  conventionally wider than the saturation-side band so scale-down
-  requires stronger evidence than scale-up.
-- **No hysteresis on `SATURATED_CRITICAL` or `STARVED`.**
-  `CRITICAL` is a burst signal that must respond on the cycle it
-  fires; `STARVED` is driven by `input_queue_depth == 0`, which is
-  a discrete predicate that can legitimately flip every cycle as
-  the upstream stage's production rate ebbs and flows.
+  `over_provisioned_deadband_pct`. The activation threshold that
+  gates entry into `SATURATED_CRITICAL` is NOT inflated, so a burst
+  can flip the stage into `CRITICAL` on the cycle it fires. The
+  over-provisioned band is conventionally wider than the
+  saturation-side band so scale-down requires stronger evidence
+  than scale-up.
+- **No hysteresis on `STARVED`.** `STARVED` is driven by
+  `input_queue_depth == 0`, which is a discrete predicate that can
+  legitimately flip every cycle as the upstream stage's production
+  rate ebbs and flows. Neither `saturation_deadband_pct` nor
+  `over_provisioned_deadband_pct` participates in `STARVED`
+  selection.
 - **Queue-depth tiebreaker.** Above the over-provisioned boundary,
   `input_queue_depth == 0` routes to `STARVED` (no local scale
   action helps — the upstream stage is the bottleneck), while a

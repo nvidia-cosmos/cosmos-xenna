@@ -283,7 +283,7 @@ class TestEmitBottleneckScore:
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 1
         # Stage names produced by ``StageSpec.name(index)`` contain spaces and
-        # punctuation (e.g. ``"Stage 00 - VllmAsyncStage"``), so the name token
+        # punctuation (e.g. ``"Stage 00 - ExampleStage"``), so the name token
         # is matched non-greedily up to the first " (" rather than requiring a
         # ``\w+`` identifier. The numeric format ``D = <float>s, throughput
         # bound = <float> tasks/s`` is pinned exactly.
