@@ -565,7 +565,11 @@ class TestMaybeLogBottleneckEngagement:
         """The very first persistent state seeds last_announced without logging."""
         state = bottleneck.BottleneckEngagementState()
         identity = bottleneck.BottleneckIdentity(
-            engaged=True, stage_name="caption", max_d_k=2.0, median_d_k=0.5, heterogeneity_ratio=4.0,
+            engaged=True,
+            stage_name="caption",
+            max_d_k=2.0,
+            median_d_k=0.5,
+            heterogeneity_ratio=4.0,
         )
 
         for _ in range(2):
@@ -587,7 +591,11 @@ class TestMaybeLogBottleneckEngagement:
         """After seeding engaged, two consecutive disengaged cycles fire one INFO log."""
         state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
         disengaged = bottleneck.BottleneckIdentity(
-            engaged=False, stage_name=None, max_d_k=math.nan, median_d_k=math.nan, heterogeneity_ratio=math.nan,
+            engaged=False,
+            stage_name=None,
+            max_d_k=math.nan,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
         )
 
         for _ in range(2):
@@ -609,10 +617,18 @@ class TestMaybeLogBottleneckEngagement:
         """A single off-state cycle inside an engaged streak does not fire the log."""
         state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
         engaged = bottleneck.BottleneckIdentity(
-            engaged=True, stage_name="caption", max_d_k=2.0, median_d_k=0.5, heterogeneity_ratio=4.0,
+            engaged=True,
+            stage_name="caption",
+            max_d_k=2.0,
+            median_d_k=0.5,
+            heterogeneity_ratio=4.0,
         )
         disengaged = bottleneck.BottleneckIdentity(
-            engaged=False, stage_name=None, max_d_k=math.nan, median_d_k=math.nan, heterogeneity_ratio=math.nan,
+            engaged=False,
+            stage_name=None,
+            max_d_k=math.nan,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
         )
 
         bottleneck.maybe_log_bottleneck_engagement(

@@ -1730,28 +1730,28 @@ class TestPhaseCDDefensiveAssertion:
 
     def test_phase_c_raises_on_unpopulated_meta(self) -> None:
         """Calling ``_run_phase_c_grow`` directly with a None meta raises a clear ``RuntimeError``."""
-        scheduler, _problem_obj = _problem(
+        scheduler, problem_obj = _problem(
             [("A", None)],
             cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
             total_cpus=8,
         )
         scheduler._last_bottleneck_meta = None
         ps = _problem_state([("A", ["A-w0"], False)])
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(scheduler._problem, ps)
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem_obj, ps)
 
         with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase C"):
             scheduler._run_phase_c_grow(ctx, ps)
 
     def test_phase_d_raises_on_unpopulated_meta(self) -> None:
         """Calling ``_run_phase_d_shrink`` directly with a None meta raises a clear ``RuntimeError``."""
-        scheduler, _problem_obj = _problem(
+        scheduler, problem_obj = _problem(
             [("A", None)],
             cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
             total_cpus=8,
         )
         scheduler._last_bottleneck_meta = None
         ps = _problem_state([("A", ["A-w0"], False)])
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(scheduler._problem, ps)
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem_obj, ps)
 
         with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase D"):
             scheduler._run_phase_d_shrink(ctx, ps)
@@ -1762,8 +1762,8 @@ class TestBottleneckEngagementLogToggleGate:
 
     The bottleneck calc block keeps running to maintain warm
     ``_d_k_ewma`` state for re-enable; only the operator-facing log
-    is gated. The gate ensures a rollback to legacy behaviour (both
-    toggles ``False``) does not introduce a new INFO line.
+    is gated. Disabling both toggles must not introduce a new INFO
+    line.
     """
 
     @staticmethod
@@ -1810,7 +1810,7 @@ class TestBottleneckEngagementLogToggleGate:
         self,
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A rollback with both toggles disabled must not introduce a new operator log."""
+        """Disabling both decision toggles must not introduce a new operator log."""
         scheduler, _problem_obj = _problem(
             [("download", None), ("caption", None), ("write", None)],
             cfg=SaturationAwareConfig(
@@ -1835,7 +1835,7 @@ class TestBottleneckEngagementLogToggleGate:
         self,
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A rollback that re-enables only one toggle still surfaces the engagement log."""
+        """Enabling only one decision toggle still surfaces the engagement log."""
         scheduler, _problem_obj = _problem(
             [("download", None), ("caption", None), ("write", None)],
             cfg=SaturationAwareConfig(

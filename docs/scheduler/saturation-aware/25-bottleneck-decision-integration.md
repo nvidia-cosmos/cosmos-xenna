@@ -9,24 +9,23 @@ first-class scheduler input. Each cycle the autoscaler computes an
 EWMA-smoothed `D_k_ewma[k]`, asks
 [`identify_bottleneck`](../../../cosmos_xenna/pipelines/private/scheduling_py/bottleneck.py)
 whether the cluster is heterogeneous enough to commit to a single
-bottleneck stage (`max / median` for `n >= 3` stages, `max / min` for
+bottleneck stage (`max / median` for `n ≥ 3` stages, `max / min` for
 `n = 2`, threshold `bottleneck_heterogeneity_threshold`), and feeds the
 result into two decisions:
 
-1. **Phase C grow priority** -- when engaged, stages are walked in
-   `D_k_ewma` descending order so a scarce placement slot lands on the
-   true bottleneck regardless of DAG depth (Option C).
-2. **Phase D shrink protection** -- when engaged, the bottleneck stage
-   is **never shrunk** by negative intent alone; only a hard-cap
-   ceiling overflow can remove its workers (Option B).
+1. **Phase C grow priority.** When the gate is engaged, stages are
+   walked in `D_k_ewma` descending order so a scarce placement slot
+   lands on the true bottleneck regardless of DAG depth.
+2. **Phase D shrink protection.** When the gate is engaged, the
+   bottleneck stage is **never shrunk** by negative intent alone; only
+   a hard-cap ceiling overflow can remove its workers.
 
 Both behaviours are gated by individual config toggles
 (`enable_bottleneck_priority_growth`, `enable_bottleneck_shrink_protection`,
-both default `True`) so they can be reverted to the legacy
-DAG-only / unconditional-shrink behaviour without a redeploy.
-A debounced INFO log fires when the engagement state persists past
-`bottleneck_engagement_persistence_cycles` cycles, so operators see the
-gate flip at most once per sustained transition.
+both default `True`) so they can be turned off independently without a
+redeploy. A debounced INFO log fires when the engagement state persists
+past `bottleneck_engagement_persistence_cycles` cycles, so operators see
+the gate flip at most once per sustained transition.
 
 ## Problem
 
@@ -38,13 +37,13 @@ but the autoscaler did not consume it. Two failure modes survived:
   C's downstream-first DAG-depth ordering
   ([12 — Multi-target DAG growth](12-multi-target-dag-growth.md))
   matches the steady-state intuition "scale the tail first", but in
-  pipelines where the bottleneck is **mid-DAG** (e.g. a captioning
-  stage between cheap download and cheap upload) the deepest stage
-  is not the slowest. When the cluster runs out of placement slots
-  during a multi-saturated burst, the contended slot lands on
-  whichever stage happens to be deepest -- not the one whose
-  `D_k_ewma` actually bounds throughput. The pipeline's `1 / max_k D_k`
-  ceiling does not move, even though Phase C "did the work".
+  pipelines where the bottleneck is **mid-DAG** (for example a
+  captioning stage between cheap download and cheap upload) the deepest
+  stage is not the slowest. When the cluster runs out of placement
+  slots during a multi-saturated burst, the contended slot lands on
+  whichever stage happens to be deepest, not the one whose `D_k_ewma`
+  actually bounds throughput. The pipeline's `1 / max_k D_k` ceiling
+  does not move, even though Phase C "did the work".
 - **Mid-task shrink of the bottleneck on transient idle.** The
   five-zone classifier classifies a stage `OVER_PROVISIONED` once the
   smoothed slots-empty ratio exceeds the over-provisioned threshold
@@ -56,8 +55,8 @@ but the autoscaler did not consume it. Two failure modes survived:
   costs a full `worker_warmup_measurement_grace_s` window
   (`60 s` default), capping pipeline throughput for the entire warmup.
 
-The fix is to feed `D_k_ewma` -- the same metric the operator already
-trusts on the dashboard -- back into Phase C and Phase D so the
+The solution is to feed `D_k_ewma`, the same metric the operator
+already trusts on the dashboard, back into Phase C and Phase D so the
 scheduler's decisions match the operator's mental model.
 
 ## Decision
@@ -65,54 +64,53 @@ scheduler's decisions match the operator's mental model.
 Promote `D_k_ewma` from a pure-observability gauge to a first-class
 scheduler input by adding two narrow consumption points and one
 shared identification helper. The toggles default to `True`, so the
-upgrade is on for every pipeline; setting either to `False` reverts
-the matching phase to its pre-integration behaviour.
+behaviour is on for every pipeline; setting either to `False` disables
+the matching phase's bottleneck awareness.
 
 ```
                        autoscale() cycle (ordered)
-                                  |
-                                  v
-                  +---------------------------------+
-                  |  Phase A : pre-flight           |
-                  +---------------------------------+
-                                  |
-                                  v
-                  +---------------------------------+
-                  |  Phase B : floor enforcement    |
-                  +---------------------------------+
-                                  |
-                                  v
-                  +---------------------------------+
-                  |  bottleneck calculation         |
-                  |  ---------------------------    |
-                  |  service_times_s = consume()    |
-                  |  _update_d_k_ewma(samples)      |
-                  |  meta = identify_bottleneck(    |
-                  |      d_k_ewma=_d_k_ewma,        |
-                  |      heterogeneity_threshold=H) |
-                  |  maybe_log_engagement(meta)     |
-                  |                                 |
-                  |  meta.engaged is the gate that  |
-                  |  Phase C and Phase D consult.   |
-                  +---------------------------------+
-                          |                |
-                Option C  v                v  Option B
-              +-----------------+  +-----------------+
-              |   Phase C grow  |  |  Phase D shrink |
-              |   priority      |  |   protection    |
-              +-----------------+  +-----------------+
-              |                 |  |                 |
-              | engaged ?       |  | engaged ?       |
-              |   yes -> sort   |  |   yes ->        |
-              |     by D_k desc |  |     skip stage  |
-              |     (DAG depth  |  |     when stage  |
-              |      tie-break) |  |     == argmax_k |
-              |   no  -> DAG    |  |     and intent<0|
-              |     depth desc  |  |     and ceiling |
-              |     (or problem |  |     excess == 0 |
-              |     order if    |  |   no  ->        |
-              |     toggle off) |  |     unchanged   |
-              +-----------------+  +-----------------+
+                                  │
+                                  ▼
+                  ┌─────────────────────────────────┐
+                  │  Phase A : pre-flight           │
+                  └─────────────────────────────────┘
+                                  │
+                                  ▼
+                  ┌─────────────────────────────────┐
+                  │  Phase B : floor enforcement    │
+                  └─────────────────────────────────┘
+                                  │
+                                  ▼
+                  ┌─────────────────────────────────┐
+                  │  bottleneck calculation         │
+                  │  ───────────────────────────    │
+                  │  service_times_s = consume()    │
+                  │  _update_d_k_ewma(samples)      │
+                  │  meta = identify_bottleneck(    │
+                  │      d_k_ewma=_d_k_ewma,        │
+                  │      heterogeneity_threshold=H) │
+                  │  maybe_log_engagement(meta)     │
+                  │                                 │
+                  │  meta.engaged is the gate that  │
+                  │  Phase C and Phase D consult.   │
+                  └─────────────────────────────────┘
+                          │                │
+                          ▼                ▼
+              ┌─────────────────┐  ┌─────────────────┐
+              │   Phase C grow  │  │  Phase D shrink │
+              │   priority      │  │   protection    │
+              ├─────────────────┤  ├─────────────────┤
+              │ engaged ?       │  │ engaged ?       │
+              │   yes → sort    │  │   yes →         │
+              │     by D_k desc │  │     skip stage  │
+              │     (DAG depth  │  │     when stage  │
+              │      tie-break) │  │     == argmax_k │
+              │   no  → DAG     │  │     and intent<0│
+              │     depth desc  │  │     and ceiling │
+              │     (or problem │  │     excess == 0 │
+              │     order if    │  │   no  →         │
+              │     toggle off) │  │     unchanged   │
+              └─────────────────┘  └─────────────────┘
 ```
 
 - **`identify_bottleneck` is a pure helper.** It reads a
@@ -138,10 +136,10 @@ the matching phase to its pre-integration behaviour.
   short-lived flips during regime transitions are silent.
 - **Ceiling overflow always wins.** Bottleneck shrink protection
   protects a stage from negative intent only. A hard-cap ceiling
-  overflow (`ceiling_excess > 0`) -- because the operator just
-  lowered `max_workers` or the per-node cap binds -- always shrinks,
-  even on the bottleneck. The protection is for transient idle, not
-  for operator-driven contraction.
+  overflow (`ceiling_excess > 0`), because the operator just lowered
+  `max_workers` or the per-node cap binds, always shrinks even on
+  the bottleneck. The protection is for transient idle, not for
+  operator-driven contraction.
 
 **Trade-off.** Two new decision dependencies on `D_k_ewma` and one
 new mutable scheduler attribute (`_d_k_ewma`). Each lives entirely
@@ -166,79 +164,78 @@ the reorder happens inside `autoscale()` so Phase C and Phase D
 both observe **fresh** bottleneck data for the current cycle.
 
 ```
-      +------------------------------------------------------------+
-      |  bottleneck.py                                             |
-      |                                                            |
-      |  @attrs.define(frozen=True)                                |
-      |  class BottleneckIdentity:                                 |
-      |      engaged:              bool                            |
-      |      stage_name:           str | None                      |
-      |      max_d_k:              float                           |
-      |      median_d_k:           float                           |
-      |      heterogeneity_ratio:  float                           |
-      |                                                            |
-      |  identify_bottleneck(                                      |
-      |      d_k_ewma:              Mapping[str, float],           |
-      |      heterogeneity_threshold: float,                       |
-      |  ) -> BottleneckIdentity                                   |
-      |                                                            |
-      |  -- ratio = max / median  if n >= 3                        |
-      |  -- ratio = max / min     if n == 2                        |
-      |  -- engaged = (n >= 2) and ratio >= threshold              |
-      |  -- argmax tie-break: lexicographic stage_name             |
-      |                                                            |
-      |  maybe_log_bottleneck_engagement(                          |
-      |      identity, state, persistence_cycles, pipeline_name,   |
-      |  )                                                         |
-      |  -- streak update + INFO once per persistent transition    |
-      +------------------------------------------------------------+
+      ┌────────────────────────────────────────────────────────────┐
+      │  bottleneck.py                                             │
+      │                                                            │
+      │  @attrs.define(frozen=True)                                │
+      │  class BottleneckIdentity:                                 │
+      │      engaged:              bool                            │
+      │      stage_name:           str | None                      │
+      │      max_d_k:              float                           │
+      │      median_d_k:           float                           │
+      │      heterogeneity_ratio:  float                           │
+      │                                                            │
+      │  identify_bottleneck(                                      │
+      │      d_k_ewma:              Mapping[str, float],           │
+      │      heterogeneity_threshold: float,                       │
+      │  ) → BottleneckIdentity                                    │
+      │                                                            │
+      │  • ratio = max / median   if n ≥ 3                         │
+      │  • ratio = max / min      if n == 2                        │
+      │  • engaged = (n ≥ 2) and ratio ≥ threshold                 │
+      │  • argmax tie-break: lexicographic stage_name              │
+      │                                                            │
+      │  maybe_log_bottleneck_engagement(                          │
+      │      identity, state, persistence_cycles, pipeline_name,   │
+      │  )                                                         │
+      │  • streak update + INFO once per persistent transition     │
+      └────────────────────────────────────────────────────────────┘
 
-      +------------------------------------------------------------+
-      |  saturation_aware.py  (single-threaded autoscale() body)   |
-      |                                                            |
-      |  _d_k_ewma:               dict[str, float]                 |
-      |  _last_bottleneck_meta:   BottleneckIdentity | None        |
-      |  _bottleneck_engagement_state: BottleneckEngagementState   |
-      |                                                            |
-      |  setup() seeds _d_k_ewma to {name: math.nan} for every     |
-      |  stage and resets engagement state.                        |
-      |                                                            |
-      |  autoscale() runs (in this order):                         |
-      |     Phase A pre-flight                                     |
-      |     Phase B floor enforcement                              |
-      |                                                            |
-      |     # bottleneck calculation -- ONCE per cycle, BEFORE C/D |
-      |     service_times_s = self._consume_service_time_samples() |
-      |     self._update_d_k_ewma(service_times_s)                 |
-      |     self._last_bottleneck_meta = identify_bottleneck(...)  |
-      |     maybe_log_bottleneck_engagement(...)                   |
-      |                                                            |
-      |     Phase C grow  -- consults _last_bottleneck_meta        |
-      |     Phase D shrink -- consults _last_bottleneck_meta       |
-      +------------------------------------------------------------+
+      ┌────────────────────────────────────────────────────────────┐
+      │  saturation_aware.py  (single-threaded autoscale() body)   │
+      │                                                            │
+      │  _d_k_ewma:               dict[str, float]                 │
+      │  _last_bottleneck_meta:   BottleneckIdentity | None        │
+      │  _bottleneck_engagement_state: BottleneckEngagementState   │
+      │                                                            │
+      │  setup() seeds _d_k_ewma to {name: math.nan} for every     │
+      │  stage and resets engagement state.                        │
+      │                                                            │
+      │  autoscale() runs (in this order):                         │
+      │     Phase A pre-flight                                     │
+      │     Phase B floor enforcement                              │
+      │                                                            │
+      │     # bottleneck calculation: ONCE per cycle, BEFORE C/D   │
+      │     service_times_s = self._consume_service_time_samples() │
+      │     self._update_d_k_ewma(service_times_s)                 │
+      │     self._last_bottleneck_meta = identify_bottleneck(...)  │
+      │     maybe_log_bottleneck_engagement(...)                   │
+      │                                                            │
+      │     Phase C grow   → consults _last_bottleneck_meta        │
+      │     Phase D shrink → consults _last_bottleneck_meta        │
+      └────────────────────────────────────────────────────────────┘
 ```
 
 ### Phase C: grow-priority ordering
 
-The legacy DAG-priority helper `compute_dag_depth_order` is replaced
-by a unified
+A unified
 [`compute_grow_priority_order`](../../../cosmos_xenna/pipelines/private/scheduling_py/dag_priority.py)
-that implements a three-level hierarchy:
+implements a three-level hierarchy:
 
 ```
    bottleneck_engaged ?
-     |
-     +-- yes --> sort by D_k_ewma DESC (NaN last);
-     |          tie-break by topological depth DESC;
-     |          final tie-break by problem index ASC.
-     |
-     +-- no
-            |
-            +-- enable_dag_priority_growth ?
-                  |
-                  +-- yes --> sort by topological depth DESC.
-                  |
-                  +-- no  --> use problem (upstream-first) order.
+     │
+     ├── yes → sort by D_k_ewma DESC (NaN last);
+     │         tie-break by topological depth DESC;
+     │         final tie-break by problem index ASC.
+     │
+     └── no
+            │
+            └── enable_dag_priority_growth ?
+                  │
+                  ├── yes → sort by topological depth DESC.
+                  │
+                  └── no  → use problem (upstream-first) order.
 ```
 
 The bottleneck path keeps the existing DAG-depth tiebreaker so two
@@ -248,9 +245,9 @@ stages with identical `D_k_ewma` retain the
 contended slot before they have observed a single completed task.
 
 When the toggle `enable_bottleneck_priority_growth` is `False`,
-Phase C falls through directly to the DAG-depth path, regardless
-of engagement -- this is the legacy [12](12-multi-target-dag-growth.md)
-behaviour, preserved verbatim for rollback.
+Phase C falls through directly to the DAG-depth path regardless of
+engagement, matching the [12](12-multi-target-dag-growth.md) ordering
+exactly so the toggle is a clean rollback knob.
 
 ### Phase D: bottleneck shrink protection
 
@@ -288,15 +285,15 @@ The skip is per-cycle and per-stage; the next cycle re-evaluates
 both the bottleneck identity and the intent, so a stage that
 **stops** being the bottleneck (its `D_k_ewma` drops below another
 stage's) will shrink as expected one cycle later. The classifier
-state and streak counters are unchanged by the skip -- they keep
+state and streak counters are unchanged by the skip; they keep
 ticking, so re-entering the OVER_PROVISIONED state on the same
 stage still requires a fresh `over_provisioned_streak_min_cycles`
 streak after the bottleneck moves away.
 
 Ceiling overflow always wins. If the operator lowered `max_workers`
-mid-run, the contraction proceeds even on the bottleneck stage --
-the goal of shrink protection is to absorb transient classifier
-noise, not to override operator-driven configuration.
+mid-run, the contraction proceeds even on the bottleneck stage; the
+goal of shrink protection is to absorb transient classifier noise,
+not to override operator-driven configuration.
 
 ## Knobs
 
@@ -308,19 +305,19 @@ property, so per-stage overrides for these fields would be confusing
 
 | Field | Default | Range | Effect |
 |---|---|---|---|
-| `enable_bottleneck_priority_growth` | `True` | bool | Phase C ordering. `True` engages the bottleneck-first sort when the gate engages; `False` reverts to legacy [12](12-multi-target-dag-growth.md) DAG-depth ordering. |
-| `enable_bottleneck_shrink_protection` | `True` | bool | Phase D protection. `True` skips negative intent on the argmax `D_k` stage when engaged; `False` reverts to legacy unconditional shrink. Ceiling overflow always shrinks. |
+| `enable_bottleneck_priority_growth` | `True` | bool | Phase C ordering. `True` engages the bottleneck-first sort when the gate engages; `False` uses [12](12-multi-target-dag-growth.md) DAG-depth ordering exactly. |
+| `enable_bottleneck_shrink_protection` | `True` | bool | Phase D protection. `True` skips negative intent on the argmax `D_k` stage when engaged; `False` shrinks unconditionally. Ceiling overflow always shrinks. |
 | `bottleneck_d_k_smoothing_level` | `0.20` | `(0.0, 1.0]` | EWMA alpha applied to per-cycle `D_k` samples. Lower smooths more (slower bottleneck moves); higher reacts faster. `1.0` disables smoothing (raw passthrough). |
 | `bottleneck_heterogeneity_threshold` | `2.0` | `> 1.0` | Engagement floor. The cluster engages the gate only when the heterogeneity ratio is at least this value. `2.0` means "the bottleneck is at least twice the median (or twice the min in 2-stage pipelines)". Lower values engage on milder asymmetry; raise toward `4.0` for very long pipelines where the median is naturally pulled down by cheap I/O stages. |
-| `bottleneck_engagement_persistence_cycles` | `2` | `>= 1` | Streak gate for the engagement INFO log. The log fires only after the engagement flag has held its new value for this many consecutive cycles, so a single-cycle flip during regime transitions is silent. Does not affect the gate itself; the gate is per-cycle. |
+| `bottleneck_engagement_persistence_cycles` | `2` | `≥ 1` | Streak gate for the engagement INFO log. The log fires only after the engagement flag has held its new value for this many consecutive cycles, so a single-cycle flip during regime transitions is silent. Does not affect the gate itself; the gate is per-cycle. |
 
 ## See also
 
 - [00 — Per-cycle overview](00-overview.md) — where the bottleneck
   calculation block sits in the four-phase cycle.
 - [12 — Multi-target DAG growth](12-multi-target-dag-growth.md) —
-  the DAG-depth ordering that Phase C falls back to when the
-  bottleneck gate is disengaged or the toggle is `False`.
+  the DAG-depth ordering Phase C uses when the bottleneck gate is
+  disengaged or its toggle is `False`.
 - [15 — Idle-first scale-down](15-idle-first-scale-down.md) — the
   per-worker victim selection that runs after Phase D's per-stage
   protection decides which stages may shrink.

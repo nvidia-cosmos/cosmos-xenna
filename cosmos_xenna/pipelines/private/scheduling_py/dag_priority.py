@@ -29,7 +29,7 @@ encodes this hierarchy in a single function:
   1. Bottleneck-aware (D_k descending, depth descending tiebreak)
      when the bottleneck gate is engaged for the cycle.
   2. DAG-depth descending (downstream-first) when the engaged path
-     is unavailable but the legacy DAG toggle is on.
+     is unavailable and the DAG-depth toggle is on.
   3. Problem order otherwise.
 """
 
@@ -50,11 +50,11 @@ def compute_grow_priority_order(
 
     The hierarchy is intentionally explicit so callers do not have to
     re-implement it: bottleneck-engaged ordering wins when available;
-    otherwise the legacy DAG-depth toggle decides; otherwise problem
-    order. ``d_k_by_stage`` is consulted only when
-    ``bottleneck_engaged`` is True. Stages without a finite ``D_k``
-    sort last (depth-descending among themselves) so cold-start
-    stages never preempt the bottleneck.
+    otherwise the DAG-depth toggle decides; otherwise problem order.
+    ``d_k_by_stage`` is consulted only when ``bottleneck_engaged`` is
+    True. Stages without a finite ``D_k`` sort last (depth-descending
+    among themselves) so cold-start stages never preempt the
+    bottleneck.
 
     Args:
         problem: The frozen pipeline problem. An empty stage list
@@ -66,8 +66,8 @@ def compute_grow_priority_order(
         d_k_by_stage: Mapping from stage name to EWMA-smoothed
             ``D_k`` in seconds. Missing entries and non-finite
             values are treated as cold-start (sort last).
-        enable_dag_priority: Legacy DAG-depth toggle; only consulted
-            when ``bottleneck_engaged`` is False.
+        enable_dag_priority: DAG-depth toggle; consulted only when
+            ``bottleneck_engaged`` is False.
 
     Returns:
         Stage indices in priority order. Each index is a valid

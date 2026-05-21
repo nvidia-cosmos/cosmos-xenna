@@ -452,22 +452,18 @@ def compute_heterogeneity_ratio(
 class BottleneckIdentity:
     """Per-cycle bottleneck identification.
 
-    Produced by :func:`identify_bottleneck` from EWMA-smoothed ``D_k``
-    samples. Consumers gate on ``engaged``: when False the cluster is
-    homogeneous or in cold-start; when True, ``stage_name`` is the
-    bottleneck argmax (highest ``D_k``).
+    Produced by :func:`identify_bottleneck`. Consumers gate on
+    ``engaged``; ``stage_name`` is the argmax stage when engaged.
 
     Attributes:
-        engaged: True when the cycle has at least two finite ``D_k``
-            samples and the heterogeneity ratio reaches the configured
-            threshold.
+        engaged: True if at least two finite ``D_k`` samples exist
+            and the heterogeneity ratio reaches the threshold.
         stage_name: Bottleneck stage when ``engaged``; otherwise None.
-        max_d_k: Maximum finite ``D_k`` this cycle, or NaN when no
-            stage has a finite sample.
-        median_d_k: Median (n>=3) or arithmetic mean (n=2) of finite
-            ``D_k`` values; NaN when fewer than two stages contribute.
-        heterogeneity_ratio: ``max_d_k / median_d_k`` for n>=3, or
-            ``max_d_k / min_d_k`` for n=2; NaN otherwise.
+        max_d_k: Maximum finite ``D_k`` this cycle; NaN if none.
+        median_d_k: Median (n>=3) or mean (n=2) of finite samples;
+            NaN if fewer than two stages contribute.
+        heterogeneity_ratio: ``max / median`` for n>=3, ``max / min``
+            for n=2; NaN otherwise.
     """
 
     engaged: bool
@@ -479,17 +475,13 @@ class BottleneckIdentity:
 
 @attrs.define
 class BottleneckEngagementState:
-    """Streak ledger for the bottleneck-engagement INFO log.
-
-    Lives as a per-instance attribute on the scheduler so a re-setup
-    starts from a clean ledger; the helper logs once on each
-    persistent flip (engaged for >= persistence cycles, then off, ...).
+    """Streak ledger for debouncing the bottleneck-engagement INFO log.
 
     Attributes:
-        last_announced: Engagement state most recently announced via
-            INFO log; None until the first announcement.
-        candidate_streak: Consecutive cycles in a state different from
-            ``last_announced``; resets on any return-to-announced cycle.
+        last_announced: Last engagement state announced via INFO log;
+            None until the first announcement.
+        candidate_streak: Consecutive cycles whose engagement differs
+            from ``last_announced``; resets on any agreement cycle.
     """
 
     last_announced: bool | None = None
@@ -507,26 +499,19 @@ def identify_bottleneck(
     heterogeneity_threshold: float,
     near_tie_tolerance: float = 0.05,
 ) -> BottleneckIdentity:
-    """Identify the engaged bottleneck stage from EWMA-smoothed ``D_k`` samples.
+    """Identify the engaged bottleneck stage from EWMA-smoothed ``D_k``.
 
-    The cycle is engaged when at least two stages have a finite,
-    strictly-positive ``D_k`` and the cluster heterogeneity reaches
-    ``heterogeneity_threshold``. ``max / median`` is used for n>=3
-    (robust against a single very-fast outlier); ``max / min`` is
-    used for n=2 because ``max / median`` is mathematically capped
-    at 2.0 for two samples.
-
-    Among stages within ``D >= max * (1 - near_tie_tolerance)`` of the
-    leader, the lexicographically smallest stage name wins so the
-    bottleneck identity is stable cycle-to-cycle for near-ties.
+    The ratio is ``max / median`` for n>=3 and ``max / min`` for n=2.
+    Engagement requires at least two finite, positive samples and a
+    ratio that reaches ``heterogeneity_threshold``. Near-ties (within
+    ``near_tie_tolerance`` of the leader) are resolved by
+    lexicographic ``stage_name`` for cycle-to-cycle stability.
 
     Args:
-        d_k_ewma: Mapping from stage name to its EWMA-smoothed ``D_k``
-            in seconds; cold-start stages contribute ``math.nan``.
-        heterogeneity_threshold: Minimum heterogeneity ratio for the
-            cycle to be engaged. Must be strictly greater than 1.0.
-        near_tie_tolerance: Fractional band within which stages are
-            treated as tied; 0.0 means strict argmax.
+        d_k_ewma: Per-stage EWMA-smoothed ``D_k`` in seconds;
+            cold-start stages contribute ``math.nan``.
+        heterogeneity_threshold: Engagement floor. Must be > 1.0.
+        near_tie_tolerance: Fractional tie band; 0.0 = strict argmax.
 
     Returns:
         ``BottleneckIdentity`` describing the cycle.
@@ -591,16 +576,15 @@ def maybe_log_bottleneck_engagement(
     persistence_cycles: int,
     pipeline_name: str,
 ) -> None:
-    """Emit one INFO log when the engagement state has flipped persistently.
+    """Emit one INFO log when engagement has flipped persistently.
 
-    Pure observability helper. Mutates ``state`` to debounce flap-spam
-    at the heterogeneity gate boundary; never touches scheduler state.
+    Mutates ``state`` to debounce log spam at the gate boundary.
 
     Args:
         identity: This cycle's bottleneck identification.
         state: Mutable streak ledger owned by the scheduler.
-        persistence_cycles: Cycles a candidate state must hold before
-            it is announced. Must be >= 1.
+        persistence_cycles: Cycles a candidate state must hold
+            before announcement. Must be >= 1.
         pipeline_name: Pipeline identifier for the log line.
     """
     if state.last_announced is None:

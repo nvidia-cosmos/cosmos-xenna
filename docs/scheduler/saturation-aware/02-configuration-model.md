@@ -231,8 +231,8 @@ gate, so per-stage overrides for these fields would be confusing.
 
 | Knob | Default | Effect |
 |---|---|---|
-| ``enable_bottleneck_priority_growth`` | ``True`` | Phase C ordering. ``True`` engages bottleneck-first sort when the gate engages; ``False`` reverts to legacy DAG-depth ordering ([12](12-multi-target-dag-growth.md)). |
-| ``enable_bottleneck_shrink_protection`` | ``True`` | Phase D protection. ``True`` skips negative intent on the argmax `D_k` stage when engaged; ``False`` reverts to legacy unconditional shrink. Hard-cap ceiling overflow always shrinks regardless. |
+| ``enable_bottleneck_priority_growth`` | ``True`` | Phase C ordering. ``True`` engages bottleneck-first sort when the gate engages; ``False`` uses DAG-depth ordering exactly as in [12](12-multi-target-dag-growth.md), ignoring `D_k`. |
+| ``enable_bottleneck_shrink_protection`` | ``True`` | Phase D protection. ``True`` skips negative intent on the argmax `D_k` stage when engaged; ``False`` shrinks unconditionally on negative intent. Hard-cap ceiling overflow always shrinks regardless. |
 | ``bottleneck_d_k_smoothing_level`` | ``0.20`` | EWMA alpha applied to per-cycle `D_k` samples. Bounded ``(0.0, 1.0]``. Lower smooths more (slower bottleneck moves); higher reacts faster. |
 | ``bottleneck_heterogeneity_threshold`` | ``2.0`` | Engagement floor (``> 1.0``). The gate engages only when the cluster heterogeneity ratio is at least this value (``max/median`` for ``n >= 3`` finite-`D_k` stages, ``max/min`` for ``n == 2``). |
 | ``bottleneck_engagement_persistence_cycles`` | ``2`` | Streak gate (``>= 1``) for the engagement INFO log. Does not affect the gate itself. |

@@ -461,6 +461,11 @@ class TestConfigWiringMetaCoverage:
         "cluster_heterogeneity_warn_streak",
         "stage_defaults",
         "per_stage_overrides",
+        "enable_bottleneck_priority_growth",
+        "enable_bottleneck_shrink_protection",
+        "bottleneck_d_k_smoothing_level",
+        "bottleneck_heterogeneity_threshold",
+        "bottleneck_engagement_persistence_cycles",
     }
 
     _KNOWN_COVERAGE_GAPS_STAGE_BEHAVIOR: ClassVar[set[str]] = {

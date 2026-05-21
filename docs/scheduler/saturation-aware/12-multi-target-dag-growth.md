@@ -137,7 +137,7 @@ on a scarce slot.
 | Field | Where | Effect |
 |---|---|---|
 | `enable_dag_priority_growth` | `SaturationAwareConfig` | `True` (default) walks stages downstream-first via `compute_grow_priority_order` when the bottleneck gate is disengaged; `False` walks them in problem order. Multi-target growth itself is always on; the toggle controls *order* only. |
-| `enable_bottleneck_priority_growth` | `SaturationAwareConfig` | `True` (default) lets [25 — bottleneck decision integration](25-bottleneck-decision-integration.md) override DAG depth with `D_k` descending order when the heterogeneity gate engages; `False` reverts to the legacy DAG-depth-only ordering. |
+| `enable_bottleneck_priority_growth` | `SaturationAwareConfig` | `True` (default) lets [25 — bottleneck decision integration](25-bottleneck-decision-integration.md) override DAG depth with `D_k` descending order when the heterogeneity gate engages; `False` keeps the DAG-depth-only ordering described above regardless of `D_k`. |
 | `max_workers` | `SaturationAwareStageConfig` | Per-stage worker ceiling. Clamps positive intent before any `try_add_worker` call; see [16 — hard caps and floors](16-hard-caps-and-floors.md). |
 | `max_workers_per_node` | `SaturationAwareStageConfig` | Combined with the cluster's node count to compute the effective per-stage cap that clamps the request. |
 

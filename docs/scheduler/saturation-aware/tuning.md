@@ -115,8 +115,8 @@ on homogeneous clusters; most pipelines never need to tune these.
 
 | Field | Default | When to adjust |
 |---|---|---|
-| `enable_bottleneck_priority_growth` | `True` | **Escape hatch.** Set `False` to revert Phase C to legacy DAG-depth-only ordering when the bottleneck gate's grow-priority override produces a worse outcome than DAG depth (rare; usually a sign that `D_k` samples are too noisy). |
-| `enable_bottleneck_shrink_protection` | `True` | **Escape hatch.** Set `False` to revert Phase D to unconditional shrink when an operator-driven mid-run capacity reduction must shrink the bottleneck stage. Hard-cap ceiling overflow always shrinks regardless of this toggle. |
+| `enable_bottleneck_priority_growth` | `True` | **Escape hatch.** Set `False` to keep Phase C on DAG-depth-only ordering when the bottleneck gate's grow-priority override produces a worse outcome than DAG depth (rare; usually a sign that `D_k` samples are too noisy). |
+| `enable_bottleneck_shrink_protection` | `True` | **Escape hatch.** Set `False` to allow Phase D to shrink unconditionally when an operator-driven mid-run capacity reduction must shrink the bottleneck stage. Hard-cap ceiling overflow always shrinks regardless of this toggle. |
 | `bottleneck_d_k_smoothing_level` | `0.20` | Lower toward `0.10` if `xenna_stage_bottleneck_score` is noisy and the gate's bottleneck identity flips between cycles. Raise toward `0.40` for short pipeline runs where the EWMA's warmup is itself the dominant effect. |
 | `bottleneck_heterogeneity_threshold` | `2.0` | Raise toward `4.0` for very long pipelines where the median `D_k` is naturally pulled down by cheap I/O stages, so a `2.0` ratio is the steady state rather than a true bottleneck. Lower toward `1.5` only when the gate fails to engage on a known bottleneck (verify `D_k` panels first). |
 | `bottleneck_engagement_persistence_cycles` | `2` | Raise toward `4` if the engagement INFO log fires noisily during regime transitions. Does not affect the gate's per-cycle decisions, only the log debouncer. |

@@ -931,13 +931,11 @@ class SaturationAwareScheduler:
                 heterogeneity_threshold=self._config.bottleneck_heterogeneity_threshold,
             )
             # Engagement log is silenced when both decision toggles are off:
-            # a rollback to legacy behaviour must not introduce a new operator
-            # log line. The EWMA state and meta snapshot are still updated
-            # so re-enabling either toggle gets warm data on the first cycle.
-            if (
-                self._config.enable_bottleneck_priority_growth
-                or self._config.enable_bottleneck_shrink_protection
-            ):
+            # disabling both decision paths must not introduce a new
+            # operator log line. The EWMA state and meta snapshot are
+            # still updated so re-enabling either toggle gets warm data
+            # on the first cycle.
+            if self._config.enable_bottleneck_priority_growth or self._config.enable_bottleneck_shrink_protection:
                 maybe_log_bottleneck_engagement(
                     identity=self._last_bottleneck_meta,
                     state=self._bottleneck_engagement_state,
@@ -1665,10 +1663,10 @@ class SaturationAwareScheduler:
         is engaged for the cycle (``BottleneckIdentity.engaged`` AND
         ``config.enable_bottleneck_priority_growth``), stages sort by
         ``D_k`` descending with depth descending as the tiebreak.
-        Otherwise the legacy ``config.enable_dag_priority_growth``
-        toggle decides between depth-descending and problem order.
-        Every stage with a positive intent is attempted regardless
-        of any earlier capacity exhaustion.
+        Otherwise ``config.enable_dag_priority_growth`` decides between
+        depth-descending and problem order. Every stage with a positive
+        intent is attempted regardless of any earlier capacity
+        exhaustion.
 
         Updates :attr:`_stuck_plan_counters` (per-stage count of
         consecutive cycles where ``added < intent``; ``0`` when the
@@ -1969,14 +1967,12 @@ class SaturationAwareScheduler:
         ``requested_num_workers`` consistently with any configured
         ``max_workers``.
 
-        Bottleneck shrink protection (when
-        ``config.enable_bottleneck_shrink_protection`` AND the cycle's
-        ``BottleneckIdentity`` is engaged): the engaged bottleneck
-        stage with negative intent and no ceiling overflow is skipped
-        on the cycle. Re-growing the bottleneck after a transient
-        upstream stall costs 60-90s of worker warmup; the protection
-        keeps capacity in place so throughput recovers immediately.
-        Ceiling overflow always bypasses the gate.
+        Bottleneck shrink protection: when
+        ``config.enable_bottleneck_shrink_protection`` is True and the
+        cycle's ``BottleneckIdentity`` is engaged, the engaged bottleneck
+        stage with negative intent and no ceiling overflow is skipped on
+        the cycle. Ceiling overflow always bypasses the gate. See
+        ``docs/scheduler/saturation-aware/25-bottleneck-decision-integration.md``.
 
         Selection key is
         ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
@@ -2055,10 +2051,11 @@ class SaturationAwareScheduler:
             # Bottleneck shrink protection: an engaged bottleneck stage
             # whose intent is negative (transient idle from an upstream
             # stall, brief slot drop, or model reload) is NOT shrunk on
-            # this cycle because re-growing it after recovery costs
-            # 60-90s of worker warmup, capping pipeline throughput
-            # during the ramp. Ceiling overflow (``ceiling_excess > 0``)
-            # always bypasses the gate; operator-driven shrink via
+            # this cycle because re-growing it after recovery would pay
+            # the full ``worker_warmup_measurement_grace_s`` window of
+            # warmup, capping pipeline throughput during the ramp.
+            # Ceiling overflow (``ceiling_excess > 0``) always bypasses
+            # the gate; operator-driven shrink via
             # ``requested_num_workers`` is filtered out higher up.
             if (
                 self._config.enable_bottleneck_shrink_protection
@@ -2067,11 +2064,10 @@ class SaturationAwareScheduler:
                 and intent < 0
                 and ceiling_excess == 0
             ):
-                # Once-per-streak: log only on the cycle the stage transitions
-                # into the protection set. Steady-state heterogeneous
-                # workloads see one INFO line per protection event, not one
-                # line per cycle (review feedback: avoid log-spam at
-                # ``interval_s`` cadence on sustained protection).
+                # Log only on the cycle the stage transitions into the
+                # protection set so steady-state heterogeneous workloads
+                # see one INFO line per protection event, not one per
+                # cycle.
                 if stage_name not in prev_protected_logged:
                     logger.info(
                         f"phase D bottleneck shrink protected: stage {stage_name!r} "
