@@ -55,6 +55,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.state import (
     update_ewma,
 )
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
+from cosmos_xenna.utils import python_log as logger
 
 
 def run_per_stage_pipeline(
@@ -151,6 +152,7 @@ def run_per_stage_pipeline(
         pipeline_name=pipeline_name,
     )
 
+    prev_classifier_state = stage_state.classifier_state
     new_classifier_state = classify(
         slots_empty_ratio_ewma=classifier_input,
         input_queue_depth=input_queue_depth,
@@ -175,7 +177,8 @@ def run_per_stage_pipeline(
     # short-circuits to a no-op (see that function's body).
     effective_growth_mode = stage_state.growth_mode if config.enable_growth_mode_state_machine else GrowthMode.TRACKING
 
-    if should_fire_action(new_classifier_state, stage_state.classifier_streak, config):
+    should_fire = should_fire_action(new_classifier_state, stage_state.classifier_streak, config)
+    if should_fire:
         delta = compute_delta(
             new_classifier_state,
             effective_growth_mode,
@@ -191,6 +194,25 @@ def run_per_stage_pipeline(
         # leave the buffer one cycle behind reality and weaken every future
         # gate decision.
         delta = apply_stabilization_gate(recommendation_history, delta)
+
+    logger.debug(
+        f"classifier trace: stage={stage_state.stage_name!r} "
+        f"slots_empty_ratio_ewma={classifier_input:.3f} "
+        f"input_queue_depth={input_queue_depth} "
+        f"pressure_ewma={pressure_ewma:.3f} "
+        f"prev_state={prev_classifier_state.name} "
+        f"new_state={new_classifier_state.name} "
+        f"streak={stage_state.classifier_streak} "
+        f"should_fire={should_fire} "
+        f"delta={delta}"
+    )
+    if prev_classifier_state != new_classifier_state:
+        logger.info(
+            f"classifier transition: stage={stage_state.stage_name!r} "
+            f"{prev_classifier_state.name} -> {new_classifier_state.name} "
+            f"(pressure_ewma={pressure_ewma:.3f}, slots_empty_ratio_ewma={classifier_input:.3f}, "
+            f"queue={input_queue_depth}, streak={stage_state.classifier_streak}, delta={delta})"
+        )
 
     stage_state.prev_workers = current_workers
     return delta

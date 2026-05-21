@@ -441,3 +441,188 @@ class TestAutoscaleServiceTimeWiring:
         assert "bottleneck stage: hot" in info_logs[0].message
         assert "D = 0.40s" in info_logs[0].message
         assert "throughput bound = 2.50 tasks/s" in info_logs[0].message
+
+
+class TestIdentifyBottleneck:
+    """Pin the engagement gate, argmax selection, and near-tie tolerance."""
+
+    def test_balanced_three_stages_returns_disengaged(self) -> None:
+        """A homogeneous pipeline must NOT engage the bottleneck gate."""
+        identity = bottleneck.identify_bottleneck(
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is False
+        assert identity.stage_name is None
+        assert identity.heterogeneity_ratio == pytest.approx(1.0)
+
+    def test_heterogeneous_three_stages_engages_with_argmax(self) -> None:
+        """A clearly heterogeneous pipeline engages and names argmax_k D_k."""
+        identity = bottleneck.identify_bottleneck(
+            {"download": 0.05, "caption": 2.0, "embed": 0.10},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is True
+        assert identity.stage_name == "caption"
+        assert identity.max_d_k == pytest.approx(2.0)
+
+    def test_all_nan_returns_disengaged_with_nan_fields(self) -> None:
+        """Cold-start cluster (all NaN) keeps the gate disengaged."""
+        identity = bottleneck.identify_bottleneck(
+            {"a": math.nan, "b": math.nan, "c": math.nan},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is False
+        assert identity.stage_name is None
+        assert math.isnan(identity.max_d_k)
+        assert math.isnan(identity.heterogeneity_ratio)
+
+    def test_single_finite_stage_returns_disengaged(self) -> None:
+        """A pipeline with only one finite D_k cannot engage the gate."""
+        identity = bottleneck.identify_bottleneck(
+            {"hot": 1.5, "cold1": math.nan, "cold2": math.nan},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is False
+        assert identity.max_d_k == pytest.approx(1.5)
+        assert math.isnan(identity.median_d_k)
+
+    def test_two_stage_uses_max_over_min_for_ratio(self) -> None:
+        """For n=2 the ratio is max/min, not max/median (capped at 2.0)."""
+        identity = bottleneck.identify_bottleneck(
+            {"fast": 0.5, "slow": 4.0},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is True
+        assert identity.stage_name == "slow"
+        assert identity.heterogeneity_ratio == pytest.approx(8.0)
+
+    def test_near_tie_uses_lex_smallest_for_stability(self) -> None:
+        """Within near_tie_tolerance of max, the lex-smallest name wins."""
+        identity = bottleneck.identify_bottleneck(
+            {"alpha": 3.95, "beta": 4.0, "gamma": 0.5, "delta": 0.5, "epsilon": 0.5},
+            heterogeneity_threshold=2.0,
+            near_tie_tolerance=0.05,
+        )
+
+        assert identity.engaged is True
+        assert identity.stage_name == "alpha"
+
+    def test_strict_argmax_when_tolerance_zero(self) -> None:
+        """Tolerance 0.0 means strict max; ties only count when D_k is exactly equal."""
+        identity = bottleneck.identify_bottleneck(
+            {"alpha": 3.95, "beta": 4.0, "gamma": 0.5, "delta": 0.5, "epsilon": 0.5},
+            heterogeneity_threshold=2.0,
+            near_tie_tolerance=0.0,
+        )
+
+        assert identity.engaged is True
+        assert identity.stage_name == "beta"
+
+    def test_zero_or_negative_d_k_treated_as_cold_start(self) -> None:
+        """Non-positive D_k inputs are excluded from finite_scores."""
+        identity = bottleneck.identify_bottleneck(
+            {"hot": 2.0, "broken": 0.0, "negative": -0.5},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is False
+        assert identity.max_d_k == pytest.approx(2.0)
+        assert math.isnan(identity.median_d_k)
+
+    def test_ratio_just_below_threshold_is_disengaged(self) -> None:
+        """``ratio < threshold`` keeps the gate off."""
+        identity = bottleneck.identify_bottleneck(
+            {"a": 1.0, "b": 1.0, "c": 1.99},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is False
+
+    def test_ratio_at_threshold_is_engaged(self) -> None:
+        """``ratio >= threshold`` engages the gate at the boundary."""
+        identity = bottleneck.identify_bottleneck(
+            {"a": 1.0, "b": 1.0, "c": 2.0},
+            heterogeneity_threshold=2.0,
+        )
+
+        assert identity.engaged is True
+        assert identity.stage_name == "c"
+
+
+class TestMaybeLogBottleneckEngagement:
+    """Pin the persistence-gated engagement INFO log."""
+
+    def test_initial_engaged_state_silenced_after_persistence(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The very first persistent state seeds last_announced without logging."""
+        state = bottleneck.BottleneckEngagementState()
+        identity = bottleneck.BottleneckIdentity(
+            engaged=True, stage_name="caption", max_d_k=2.0, median_d_k=0.5, heterogeneity_ratio=4.0,
+        )
+
+        for _ in range(2):
+            bottleneck.maybe_log_bottleneck_engagement(
+                identity=identity,
+                state=state,
+                persistence_cycles=2,
+                pipeline_name="p1",
+            )
+
+        assert state.last_announced is True
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+
+    def test_persistent_flip_to_disengaged_logs_once(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """After seeding engaged, two consecutive disengaged cycles fire one INFO log."""
+        state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
+        disengaged = bottleneck.BottleneckIdentity(
+            engaged=False, stage_name=None, max_d_k=math.nan, median_d_k=math.nan, heterogeneity_ratio=math.nan,
+        )
+
+        for _ in range(2):
+            bottleneck.maybe_log_bottleneck_engagement(
+                identity=disengaged,
+                state=state,
+                persistence_cycles=2,
+                pipeline_name="p1",
+            )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1
+        assert "disengaged" in info_logs[0].message
+
+    def test_short_flip_does_not_log(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A single off-state cycle inside an engaged streak does not fire the log."""
+        state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
+        engaged = bottleneck.BottleneckIdentity(
+            engaged=True, stage_name="caption", max_d_k=2.0, median_d_k=0.5, heterogeneity_ratio=4.0,
+        )
+        disengaged = bottleneck.BottleneckIdentity(
+            engaged=False, stage_name=None, max_d_k=math.nan, median_d_k=math.nan, heterogeneity_ratio=math.nan,
+        )
+
+        bottleneck.maybe_log_bottleneck_engagement(
+            identity=disengaged, state=state, persistence_cycles=2, pipeline_name="p1"
+        )
+        bottleneck.maybe_log_bottleneck_engagement(
+            identity=engaged, state=state, persistence_cycles=2, pipeline_name="p1"
+        )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+        assert state.last_announced is True
+        assert state.candidate_streak == 0

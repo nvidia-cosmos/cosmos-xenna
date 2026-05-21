@@ -98,8 +98,21 @@ Treat one autoscale call as a **fixed four-phase pipeline** with
                                      │
                                      ▼
               ┌──────────────────────────────────────────────┐
+              │  Bottleneck calculation                      │
+              │  ─ consume per-cycle service-time samples    │
+              │  ─ update D_k EWMA per stage                 │
+              │  ─ identify_bottleneck (max/median ratio)    │
+              │  ─ debounced engagement INFO log             │
+              │  ─ feeds Phase C grow priority + Phase D     │
+              │    shrink protection (see doc 25)            │
+              └──────────────────────────────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
               │  Phase C — Saturation-driven grow            │
-              │  ─ DAG-priority loop over positive intents   │
+              │  ─ grow-priority loop over positive intents  │
+              │    (D_k descending when bottleneck engaged;  │
+              │    DAG depth descending otherwise)           │
               │  ─ saturation-mode cross-stage donor when    │
               │    cluster is full but a downstream stage    │
               │    needs to grow                             │
@@ -110,6 +123,8 @@ Treat one autoscale call as a **fixed four-phase pipeline** with
               ┌──────────────────────────────────────────────┐
               │  Phase D — Saturation-driven shrink          │
               │  ─ apply negative intents                    │
+              │  ─ skip bottleneck stage when engaged and    │
+              │    no ceiling overflow (see doc 25)          │
               │  ─ idle-first + GPU-consolidation ordering   │
               │  ─ skip workers inside donor-warmup grace    │
               │  ─ never drop below per-stage / per-node     │
@@ -148,8 +163,9 @@ feature docs.
 | Phase A | none (operator intent only) |
 | Phase B | [hard caps and floors](16-hard-caps-and-floors.md), [cross-stage donor](13-cross-stage-donor.md) |
 | Intent compute | [state classifier](05-state-classifier.md), [backlog-time (PLANNED)](06-backlog-time-signal.md), [streak stabilization](07-streak-stabilization.md), [slow-start](10-slow-start-mechanisms.md), [growth mode](11-growth-mode-state-machine.md) |
-| Phase C | [multi-target DAG growth](12-multi-target-dag-growth.md), [cross-stage donor](13-cross-stage-donor.md), [worker age tracking](14-worker-age-tracking.md) |
-| Phase D | [idle-first scale-down](15-idle-first-scale-down.md) |
+| Bottleneck calc | [bottleneck score metric](23-bottleneck-score-metric.md), [bottleneck decision integration](25-bottleneck-decision-integration.md) |
+| Phase C | [multi-target DAG growth](12-multi-target-dag-growth.md), [cross-stage donor](13-cross-stage-donor.md), [worker age tracking](14-worker-age-tracking.md), [bottleneck decision integration](25-bottleneck-decision-integration.md) |
+| Phase D | [idle-first scale-down](15-idle-first-scale-down.md), [bottleneck decision integration](25-bottleneck-decision-integration.md) |
 | Invariants | [phase invariants](19-phase-invariants.md) |
 | Cycle | [loop watchdog](18-loop-watchdog.md), [memory-pressure gate](20-memory-pressure-gate.md), [allocation-error tolerance](21-allocation-error-tolerance.md) |
 

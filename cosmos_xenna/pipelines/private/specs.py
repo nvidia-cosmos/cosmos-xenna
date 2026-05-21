@@ -954,6 +954,38 @@ class SaturationAwareConfig:
         validator=attrs_utils.validate_positive_int,
     )
 
+    # When True, Phase C grow ordering uses the bottleneck argmax (D_k
+    # descending) instead of the legacy DAG-depth fallback. Effective
+    # only when the bottleneck gate is engaged for the cycle; cold-start
+    # and homogeneous clusters fall back automatically.
+    enable_bottleneck_priority_growth: bool = True
+    # When True, Phase D refuses to shrink the engaged bottleneck stage
+    # on transient idle (intent < 0 with no ceiling overflow). Operator
+    # ``requested_num_workers`` and ceiling overflow always bypass.
+    enable_bottleneck_shrink_protection: bool = True
+    # EWMA smoothing factor (alpha) for per-stage D_k. ``0.0`` would
+    # freeze the EWMA forever; ``1.0`` would skip smoothing. Range
+    # ``(0.0, 1.0]``.
+    bottleneck_d_k_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Heterogeneity ratio threshold above which the bottleneck gate
+    # engages. ``max(D_k) / median(D_k)`` for n>=3 stages with finite
+    # D_k; ``max / min`` for n=2 (median is mathematically capped at
+    # 2.0 for two samples). Must be strictly greater than 1.0.
+    bottleneck_heterogeneity_threshold: float = attrs.field(
+        default=2.0,
+        validator=attrs.validators.gt(1.0),
+    )
+    # Consecutive cycles the engagement state must hold before the
+    # transition INFO log fires. Debounces flap-spam at the
+    # heterogeneity gate boundary.
+    bottleneck_engagement_persistence_cycles: int = attrs.field(
+        default=2,
+        validator=attrs_utils.validate_positive_int,
+    )
+
     # Default ``SaturationAwareStageConfig`` applied to every stage that has
     # no more specific override.
     stage_defaults: SaturationAwareStageConfig = attrs.field(factory=SaturationAwareStageConfig)

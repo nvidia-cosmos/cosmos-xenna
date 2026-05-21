@@ -386,6 +386,56 @@ class TestSaturationAwareConfigBoundedFractionValidators:
             SaturationAwareConfig(cluster_heterogeneity_warn_threshold=1.0)
 
 
+class TestBottleneckDecisionFields:
+    """Pin defaults and validators for the four bottleneck-decision knobs."""
+
+    def test_defaults_enable_both_decision_paths(self) -> None:
+        """Aggressive rollout: both Phase C and Phase D bottleneck gates default on."""
+        cfg = SaturationAwareConfig()
+        assert cfg.enable_bottleneck_priority_growth is True
+        assert cfg.enable_bottleneck_shrink_protection is True
+
+    def test_default_smoothing_level_is_within_open_unit_interval(self) -> None:
+        """Default EWMA alpha is a sensible 0.20 (slow enough to ignore single-cycle noise)."""
+        cfg = SaturationAwareConfig()
+        assert cfg.bottleneck_d_k_smoothing_level == pytest.approx(0.20)
+
+    def test_default_heterogeneity_threshold_is_2x(self) -> None:
+        """Default heterogeneity threshold matches the design doc."""
+        cfg = SaturationAwareConfig()
+        assert cfg.bottleneck_heterogeneity_threshold == pytest.approx(2.0)
+
+    def test_default_engagement_persistence_is_two_cycles(self) -> None:
+        """Default debounces a single noisy cycle from flipping the engagement log."""
+        cfg = SaturationAwareConfig()
+        assert cfg.bottleneck_engagement_persistence_cycles == 2
+
+    def test_smoothing_level_zero_is_rejected(self) -> None:
+        """``alpha=0`` would freeze the EWMA forever -- not allowed."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(bottleneck_d_k_smoothing_level=0.0)
+
+    def test_smoothing_level_above_one_is_rejected(self) -> None:
+        """``alpha>1`` is geometrically nonsensical for an EWMA."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(bottleneck_d_k_smoothing_level=1.01)
+
+    def test_smoothing_level_at_one_is_allowed(self) -> None:
+        """``alpha=1`` (no smoothing) is the upper bound of the valid range."""
+        cfg = SaturationAwareConfig(bottleneck_d_k_smoothing_level=1.0)
+        assert cfg.bottleneck_d_k_smoothing_level == pytest.approx(1.0)
+
+    def test_heterogeneity_threshold_at_one_is_rejected(self) -> None:
+        """A homogeneous cluster has ratio 1.0; the threshold must be strictly greater."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(bottleneck_heterogeneity_threshold=1.0)
+
+    def test_engagement_persistence_zero_is_rejected(self) -> None:
+        """Persistence must be a positive int (zero would log on every flip)."""
+        with pytest.raises(ValueError):
+            SaturationAwareConfig(bottleneck_engagement_persistence_cycles=0)
+
+
 class TestThreeTierResolver:
     """``get_effective_stage_config`` resolves overrides by precedence.
 

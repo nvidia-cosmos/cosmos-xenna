@@ -69,11 +69,15 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     _resolve_auto_thresholds,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+    BottleneckEngagementState,
+    BottleneckIdentity,
     HeterogeneityWarnState,
     compute_heterogeneity_ratio,
     emit_bottleneck_score,
+    identify_bottleneck,
+    maybe_log_bottleneck_engagement,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_dag_depth_order
+from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_grow_priority_order
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
     DonorCandidate,
     find_saturation_donor,
@@ -365,6 +369,25 @@ class SaturationAwareScheduler:
         # into a fresh scheduler. ``setup()`` calls ``.reset()`` so a
         # re-setup of the scheduler starts from a clean ledger.
         self._heterogeneity_state: HeterogeneityWarnState = HeterogeneityWarnState()
+        # Bottleneck-decision integration state. All three are written
+        # and read only from inside ``autoscale()`` running on the
+        # streaming executor's single background thread, so no lock is
+        # needed (verified call-graph: ``add_measurements`` -> main
+        # thread; ``autoscale`` -> background ThreadPoolExecutor).
+        # ``setup()`` resets these without acquiring the existing
+        # ``self._lock`` because no consumer can be running at re-setup
+        # time, mirroring the heterogeneity_state pattern above.
+        self._d_k_ewma: dict[str, float] = {}
+        self._last_bottleneck_meta: BottleneckIdentity | None = None
+        self._bottleneck_engagement_state: BottleneckEngagementState = BottleneckEngagementState()
+        # Per-stage latch for the Phase D bottleneck-protection INFO log.
+        # The set holds the stage names that hit the protection branch on the
+        # PREVIOUS cycle; on the current cycle, a stage logs only when it
+        # transitions into the set (matches the once-per-streak pattern from
+        # ``HeterogeneityWarnState.has_fired``). Cleared in ``_run_phase_d_shrink``
+        # for any stage that is no longer protected this cycle, so a future
+        # re-entry into protection re-arms a fresh INFO log.
+        self._bottleneck_protected_stages_logged: set[str] = set()
 
     def _stage_cfg(self, stage_name: str) -> SaturationAwareStageConfig:
         """Resolve the effective stage config including ``StageSpec`` overrides."""
@@ -401,6 +424,13 @@ class SaturationAwareScheduler:
         self._memory_pressure_monitor.reset()
         self._heterogeneity_state.reset()
         self._stuck_plan_detector.reset()
+        # Bottleneck-decision state: NaN-seed every stage so the first
+        # finite per-stage sample replaces (does not blend with) the
+        # seed. ``setup()`` is pre-traffic so no lock is needed.
+        self._d_k_ewma = {name: math.nan for name in self._stage_names}
+        self._last_bottleneck_meta = None
+        self._bottleneck_engagement_state.reset()
+        self._bottleneck_protected_stages_logged = set()
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
@@ -683,6 +713,32 @@ class SaturationAwareScheduler:
                 self._last_service_time_sample[stage_name] = (now_count, now_sum)
         return samples
 
+    def _update_d_k_ewma(self, service_times_s: Mapping[str, float]) -> None:
+        """Apply one EWMA step to per-stage ``D_k`` from this cycle's service times.
+
+        Args:
+            service_times_s: Per-stage mean per-task service time
+                produced by :meth:`_consume_service_time_samples`.
+                ``math.nan`` means the stage produced no completed
+                tasks this cycle.
+        """
+        alpha = self._config.bottleneck_d_k_smoothing_level
+        for stage_name in self._stage_names:
+            latest = service_times_s.get(stage_name, math.nan)
+            prev = self._d_k_ewma.get(stage_name, math.nan)
+            if not math.isfinite(latest) or latest <= 0.0:
+                # Missed sample: preserve previous value (or seed NaN).
+                if stage_name not in self._d_k_ewma:
+                    self._d_k_ewma[stage_name] = math.nan
+                continue
+            if not math.isfinite(prev):
+                # First-ever finite sample: replace the seed without
+                # blending; otherwise alpha=0.2 would slow convergence
+                # by ~5x for no benefit.
+                self._d_k_ewma[stage_name] = latest
+            else:
+                self._d_k_ewma[stage_name] = prev * (1.0 - alpha) + latest * alpha
+
     def autoscale(
         self,
         time: float,
@@ -861,6 +917,34 @@ class SaturationAwareScheduler:
                 throughput_samples=throughput_samples,
             )
 
+        # Bottleneck calculation block: must run BEFORE Phase C / Phase D so
+        # both phases see fresh ``_last_bottleneck_meta`` / ``_d_k_ewma`` for
+        # the current cycle. The block is wrapped in its own phase timer so
+        # the per-phase Prometheus histogram accounts for its share of the
+        # cycle duration; without the timer, ``loop_watchdog``'s wall-clock
+        # measurement would diverge from the sum of per-phase histograms.
+        with self._phase_timer("bottleneck"):
+            service_times_s = self._consume_service_time_samples()
+            self._update_d_k_ewma(service_times_s)
+            self._last_bottleneck_meta = identify_bottleneck(
+                self._d_k_ewma,
+                heterogeneity_threshold=self._config.bottleneck_heterogeneity_threshold,
+            )
+            # Engagement log is silenced when both decision toggles are off:
+            # a rollback to legacy behaviour must not introduce a new operator
+            # log line. The EWMA state and meta snapshot are still updated
+            # so re-enabling either toggle gets warm data on the first cycle.
+            if (
+                self._config.enable_bottleneck_priority_growth
+                or self._config.enable_bottleneck_shrink_protection
+            ):
+                maybe_log_bottleneck_engagement(
+                    identity=self._last_bottleneck_meta,
+                    state=self._bottleneck_engagement_state,
+                    persistence_cycles=self._config.bottleneck_engagement_persistence_cycles,
+                    pipeline_name=self._pipeline_name,
+                )
+
         # Capture pre-Phase-C worker counts so we can compute the post-commit
         # executed delta per stage and feed it to the growth-mode state machine
         # via ``record_executed_delta`` after Phase D finishes. Recording the
@@ -940,17 +1024,13 @@ class SaturationAwareScheduler:
         # per-phase wrappers above so the wrapper boundaries stay aligned
         # with the canonical phase labels in
         # docs/scheduler/saturation-aware/22-prometheus-metrics.md. Both
-        # calls are sub-millisecond pure observability.
-        #
-        # ``service_times_s`` is consumed here from the same accumulator
-        # path as ``throughput_samples`` - both feed off
-        # ``update_with_measurements`` ticks. The mean per-stage
-        # service time over the autoscale window is the Forced-Flow
-        # ``S_k`` (and ``D_k = V_k * S_k = S_k`` for Xenna's linear DAG).
-        # Cold-start stages observe ``math.nan`` so the helpers preserve
-        # gauge cardinality and skip the ``argmax_k`` / log line for
-        # any stage that has not produced a completed-task sample yet.
-        service_times_s = self._consume_service_time_samples()
+        # calls are sub-millisecond pure observability and reuse the
+        # ``service_times_s`` snapshot consumed once per cycle before
+        # Phase C so a single consume covers both decisions and
+        # metrics. Cold-start stages observe ``math.nan`` so the
+        # helpers preserve gauge cardinality and skip the
+        # ``argmax_k`` / log line for any stage that has not produced
+        # a completed-task sample yet.
         emit_bottleneck_score(service_times_s=service_times_s, pipeline_name=self._pipeline_name)
         compute_heterogeneity_ratio(
             service_times_s=service_times_s,
@@ -1580,12 +1660,15 @@ class SaturationAwareScheduler:
         zero intent (NORMAL, STARVED, OVER_PROVISIONED) is a no-op
         here; saturation-driven scale-down lands as Phase D.
 
-        Iteration order is determined by
-        :func:`compute_dag_depth_order` when
-        ``config.enable_dag_priority_growth`` is True (the default);
-        otherwise stages are walked in problem order. Every stage
-        with a positive intent is attempted regardless of any
-        earlier capacity exhaustion.
+        Iteration order is delegated to
+        :func:`compute_grow_priority_order`. When the bottleneck gate
+        is engaged for the cycle (``BottleneckIdentity.engaged`` AND
+        ``config.enable_bottleneck_priority_growth``), stages sort by
+        ``D_k`` descending with depth descending as the tiebreak.
+        Otherwise the legacy ``config.enable_dag_priority_growth``
+        toggle decides between depth-descending and problem order.
+        Every stage with a positive intent is attempted regardless
+        of any earlier capacity exhaustion.
 
         Updates :attr:`_stuck_plan_counters` (per-stage count of
         consecutive cycles where ``added < intent``; ``0`` when the
@@ -1626,10 +1709,22 @@ class SaturationAwareScheduler:
                     self._set_stuck_plan_counter(runtime_stage.stage_name, 0, last_intent=0)
             return
 
-        if self._config.enable_dag_priority_growth:
-            stage_order = compute_dag_depth_order(self._problem)
-        else:
-            stage_order = list(range(len(problem_state.rust.stages)))
+        # Defensive: the bottleneck calculation block in ``autoscale()`` is
+        # required to populate ``_last_bottleneck_meta`` before Phase C
+        # runs. A future reorder that drops the calculation block would
+        # leave Phase C reading stale prior-cycle data; raise a loud
+        # ``RuntimeError`` instead of silently making the wrong decision.
+        if self._last_bottleneck_meta is None:
+            msg = "_last_bottleneck_meta is None; bottleneck calc block must run before phase C"
+            raise RuntimeError(msg)
+        bottleneck_meta = self._last_bottleneck_meta
+        bottleneck_engaged = self._config.enable_bottleneck_priority_growth and bottleneck_meta.engaged
+        stage_order = compute_grow_priority_order(
+            self._problem,
+            bottleneck_engaged=bottleneck_engaged,
+            d_k_by_stage=self._d_k_ewma,
+            enable_dag_priority=self._config.enable_dag_priority_growth,
+        )
 
         num_nodes = len(self._problem.rust.cluster_resources.nodes)
         stage_ceilings = self._compute_stage_ceilings(num_nodes)
@@ -1874,6 +1969,15 @@ class SaturationAwareScheduler:
         ``requested_num_workers`` consistently with any configured
         ``max_workers``.
 
+        Bottleneck shrink protection (when
+        ``config.enable_bottleneck_shrink_protection`` AND the cycle's
+        ``BottleneckIdentity`` is engaged): the engaged bottleneck
+        stage with negative intent and no ceiling overflow is skipped
+        on the cycle. Re-growing the bottleneck after a transient
+        upstream stall costs 60-90s of worker warmup; the protection
+        keeps capacity in place so throughput recovers immediately.
+        Ceiling overflow always bypasses the gate.
+
         Selection key is
         ``(host_gpu_used_fraction ASC, idle DESC, age DESC, worker_id ASC)``
         where ``host_gpu_used_fraction`` is the total used fraction
@@ -1911,12 +2015,31 @@ class SaturationAwareScheduler:
             msg = "_run_phase_d_shrink called before setup()"
             raise RuntimeError(msg)
 
+        # Defensive: the bottleneck calculation block in ``autoscale()`` is
+        # required to populate ``_last_bottleneck_meta`` before Phase D
+        # runs. A future reorder that drops the calculation block would
+        # leave Phase D reading stale prior-cycle data; raise a loud
+        # ``RuntimeError`` instead of silently making the wrong decision.
+        if self._last_bottleneck_meta is None:
+            msg = "_last_bottleneck_meta is None; bottleneck calc block must run before phase D"
+            raise RuntimeError(msg)
+        bottleneck_meta = self._last_bottleneck_meta
+
         num_nodes = len(self._problem.rust.cluster_resources.nodes)
         stage_floors = self._compute_stage_floors(num_nodes)
         stage_ceilings = self._compute_stage_ceilings(num_nodes)
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
         host_gpu_used_fractions = self._compute_host_gpu_used_fractions(problem_state)
+
+        # Once-per-streak debounce ledger for the Phase D bottleneck-protection
+        # INFO log. The previous-cycle snapshot tells us which stages were
+        # already protected; a stage transitions into the set only on the
+        # first cycle it enters protection (the log fires there). Any stage
+        # that is no longer protected this cycle drops out of the new set,
+        # so a future re-entry will re-arm a fresh INFO log.
+        prev_protected_logged = self._bottleneck_protected_stages_logged
+        currently_protected: set[str] = set()
 
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
             if problem_stage.requested_num_workers is not None:
@@ -1929,6 +2052,35 @@ class SaturationAwareScheduler:
             current = len(worker_ids_by_stage[stage_index])
             ceiling = stage_ceilings[stage_index]
             ceiling_excess = max(0, current - ceiling) if ceiling is not None else 0
+            # Bottleneck shrink protection: an engaged bottleneck stage
+            # whose intent is negative (transient idle from an upstream
+            # stall, brief slot drop, or model reload) is NOT shrunk on
+            # this cycle because re-growing it after recovery costs
+            # 60-90s of worker warmup, capping pipeline throughput
+            # during the ramp. Ceiling overflow (``ceiling_excess > 0``)
+            # always bypasses the gate; operator-driven shrink via
+            # ``requested_num_workers`` is filtered out higher up.
+            if (
+                self._config.enable_bottleneck_shrink_protection
+                and bottleneck_meta.engaged
+                and stage_name == bottleneck_meta.stage_name
+                and intent < 0
+                and ceiling_excess == 0
+            ):
+                # Once-per-streak: log only on the cycle the stage transitions
+                # into the protection set. Steady-state heterogeneous
+                # workloads see one INFO line per protection event, not one
+                # line per cycle (review feedback: avoid log-spam at
+                # ``interval_s`` cadence on sustained protection).
+                if stage_name not in prev_protected_logged:
+                    logger.info(
+                        f"phase D bottleneck shrink protected: stage {stage_name!r} "
+                        f"intent={intent} but D_k={bottleneck_meta.max_d_k:.2f}s is "
+                        f"argmax (ratio={bottleneck_meta.heterogeneity_ratio:.2f}); "
+                        "skipping shrink to preserve throughput across transient idle"
+                    )
+                currently_protected.add(stage_name)
+                continue
             # Combine the two shrink drivers: negative intent and
             # hard-cap overflow. The cap dominates non-negative intent
             # (forced shrink); negative intent dominates a smaller cap
@@ -2016,6 +2168,11 @@ class SaturationAwareScheduler:
                 allowed_by_floor=allowed_by_floor,
                 max_scale_down_fraction_per_cycle=stage_cfg.max_scale_down_fraction_per_cycle,
             )
+
+        # Replace the previous-cycle protection ledger with this cycle's
+        # snapshot so a stage that drops out of protection on the next
+        # cycle and later re-enters re-arms the once-per-streak INFO log.
+        self._bottleneck_protected_stages_logged = currently_protected
 
     @staticmethod
     def _log_phase_d_shrink_outcome(

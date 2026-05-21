@@ -125,10 +125,28 @@ fails. The methods live in
 │   degrades: WARNING on partial progress (some adds succeeded;      │
 │             stuck counter reset because forward progress was made) │
 ├────────────────────────────────────────────────────────────────────┤
+│ Bottleneck calc — feeds Phase C / D decisions (see doc 25)         │
+│   reads:    _consume_service_time_samples() (per-stage S_k),       │
+│             config.bottleneck_d_k_smoothing_level,                 │
+│             config.bottleneck_heterogeneity_threshold,             │
+│             config.bottleneck_engagement_persistence_cycles        │
+│   mutates:  _d_k_ewma (per-stage EWMA-smoothed D_k),               │
+│             _last_bottleneck_meta (BottleneckIdentity for cycle),  │
+│             _bottleneck_engagement_state (debounced log streak)    │
+│   gate:     none (pure decision-input computation)                 │
+│   raises:   never                                                  │
+│   degrades: never; cold-start stages with no completed task yet    │
+│             observe NaN D_k and are excluded from argmax + ratio   │
+├────────────────────────────────────────────────────────────────────┤
 │ Phase C — saturation-driven grow                                   │
 │   reads:    _last_intent_deltas (positive entries),                │
-│             compute_dag_depth_order() (when                        │
-│             enable_dag_priority_growth=True),                      │
+│             compute_grow_priority_order() three-tier sort:         │
+│               1. bottleneck argmax D_k DESC (when engaged AND      │
+│                  enable_bottleneck_priority_growth=True)           │
+│               2. DAG depth DESC (when                              │
+│                  enable_dag_priority_growth=True)                  │
+│               3. problem (upstream-first) order (fallback),        │
+│             _last_bottleneck_meta (engagement flag), _d_k_ewma,    │
 │             _compute_stage_ceilings()                              │
 │   mutates:  ctx.try_add_worker (receiver) and ctx.try_remove_worker│
 │             (saturation-mode cross-stage donor via                 │
@@ -142,13 +160,18 @@ fails. The methods live in
 ├────────────────────────────────────────────────────────────────────┤
 │ Phase D — saturation-driven shrink                                 │
 │   reads:    _last_intent_deltas (negative entries),                │
+│             _last_bottleneck_meta (engagement + argmax stage),     │
 │             _compute_stage_floors(), _compute_stage_ceilings(),    │
 │             stage_cfg.max_scale_down_fraction_per_cycle,           │
 │             _compute_host_gpu_used_fractions(),                    │
-│             _donor_warmup_excluded_ids                             │
+│             _donor_warmup_excluded_ids,                            │
+│             _bottleneck_protected_stages_logged (debounce ledger)  │
 │   mutates:  ctx.try_remove_worker via                              │
 │             select_workers_to_remove_oldest_first                  │
-│             (idle-first + GPU-consolidation), non-manual stages    │
+│             (idle-first + GPU-consolidation), non-manual stages;   │
+│             skips engaged bottleneck on intent<0 / no ceiling      │
+│             excess (when enable_bottleneck_shrink_protection=True);│
+│             refreshes _bottleneck_protected_stages_logged          │
 │   gate:     check_invariants_after_phase(PHASE_D) +                │
 │             check_floor_after_phase_d +                            │
 │             check_stuck_plan_monotonicity                          │
@@ -196,6 +219,17 @@ fails. The methods live in
   the donor cooldown is advanced only on a complete donate+retry
   cycle so a failed retry leaves the donor eligible next cycle.
 
+- **Bottleneck calc** runs between Phase B and Phase C and is a
+  pure decision-input block: it consumes the per-cycle service-time
+  samples accumulated by `update_with_measurements`, refreshes the
+  EWMA-smoothed `D_k` per stage, computes the cycle's bottleneck
+  identity (argmax `D_k`, heterogeneity ratio, engagement flag), and
+  emits a debounced INFO log on engagement transitions. Phase C and
+  Phase D both consume the resulting `_last_bottleneck_meta` /
+  `_d_k_ewma` snapshot; both phases assert the snapshot is populated
+  on entry to fail loudly if a future reorder ever drops this block.
+  See [25 — bottleneck decision integration](25-bottleneck-decision-integration.md).
+
 - **Phase D** combines two shrink drivers — negative classifier
   intent and hard-cap overflow — and applies three independent
   clamps (per-stage floor, per-cycle fraction cap, classifier
@@ -203,7 +237,14 @@ fails. The methods live in
   GPU-consolidation-aware (see
   [15 — idle-first scale-down](15-idle-first-scale-down.md))
   and skips workers inside the donor warmup grace
-  (`_donor_warmup_excluded_ids`). The post-phase
+  (`_donor_warmup_excluded_ids`). When the cycle's bottleneck
+  identity is engaged, the bottleneck stage is skipped on negative
+  intent without ceiling overflow (see
+  [25 — bottleneck decision integration](25-bottleneck-decision-integration.md));
+  the protection log is debounced via
+  `_bottleneck_protected_stages_logged` so steady-state heterogeneous
+  workloads emit one INFO line per protection event, not per cycle.
+  Ceiling overflow always shrinks. The post-phase
   `check_floor_after_phase_d` distinguishes "Phase D reduced below
   floor" (a defect — raise) from "Phase B left the stage below
   floor" (a grace-window scenario — accepted) using the

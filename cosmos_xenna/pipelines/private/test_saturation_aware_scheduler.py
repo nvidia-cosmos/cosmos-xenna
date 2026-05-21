@@ -715,6 +715,80 @@ class TestConsumeServiceTimeSamples:
         assert samples["A"] == pytest.approx(2.0)
 
 
+class TestDKEwmaState:
+    """Pin the bottleneck D_k EWMA state and its NaN-safe behaviour."""
+
+    def test_setup_seeds_every_stage_with_nan(self) -> None:
+        """Pre-traffic, every stage's D_k EWMA is NaN until a finite sample lands."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+
+        assert set(scheduler._d_k_ewma) == {"A", "B"}
+        assert all(math.isnan(v) for v in scheduler._d_k_ewma.values())
+
+    def test_first_finite_sample_replaces_nan_seed_without_blending(self) -> None:
+        """Cold-start: first finite D_k for a stage is taken as-is (no alpha blend)."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(bottleneck_d_k_smoothing_level=0.20),
+        )
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+
+        scheduler._update_d_k_ewma({"A": 1.5, "B": math.nan})
+
+        assert scheduler._d_k_ewma["A"] == pytest.approx(1.5)
+        assert math.isnan(scheduler._d_k_ewma["B"])
+
+    def test_warm_step_applies_ewma_blend(self) -> None:
+        """Subsequent finite samples blend with the prior value via alpha."""
+        cfg = SaturationAwareConfig(bottleneck_d_k_smoothing_level=0.25)
+        scheduler = SaturationAwareScheduler(cfg)
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        scheduler._update_d_k_ewma({"A": 1.0})
+        scheduler._update_d_k_ewma({"A": 5.0})
+
+        # 1.0 * 0.75 + 5.0 * 0.25 = 0.75 + 1.25 = 2.0
+        assert scheduler._d_k_ewma["A"] == pytest.approx(2.0)
+
+    def test_missed_sample_preserves_previous_value(self) -> None:
+        """A NaN sample must not corrupt or zero out the prior EWMA."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(bottleneck_d_k_smoothing_level=0.30),
+        )
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        scheduler._update_d_k_ewma({"A": 2.5})
+        scheduler._update_d_k_ewma({"A": math.nan})
+
+        assert scheduler._d_k_ewma["A"] == pytest.approx(2.5)
+
+    def test_reset_on_setup_drops_prior_state(self) -> None:
+        """Re-setup of a recycled scheduler clears the EWMA and bottleneck meta."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+        scheduler._update_d_k_ewma({"A": 1.5})
+        assert math.isfinite(scheduler._d_k_ewma["A"])
+
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+
+        assert all(math.isnan(v) for v in scheduler._d_k_ewma.values())
+        assert scheduler._last_bottleneck_meta is None
+        assert scheduler._bottleneck_engagement_state.last_announced is None
+
+    def test_zero_or_negative_sample_treated_as_missed(self) -> None:
+        """``D_k <= 0`` is bogus and never replaces a finite EWMA."""
+        scheduler = SaturationAwareScheduler(
+            SaturationAwareConfig(bottleneck_d_k_smoothing_level=0.30),
+        )
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        scheduler._update_d_k_ewma({"A": 1.0})
+        scheduler._update_d_k_ewma({"A": 0.0})
+        scheduler._update_d_k_ewma({"A": -0.5})
+
+        assert scheduler._d_k_ewma["A"] == pytest.approx(1.0)
+
+
 class TestPressureEndToEnd:
     """End-to-end smoke: measurements -> autoscale updates ``pressure_ewma``."""
 

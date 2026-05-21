@@ -150,6 +150,7 @@ group is rationalised in a sibling document.
 | ``SaturationAwareConfig`` | Regime detector | [09 — Regime-aware aggressiveness](09-regime-aware-aggressiveness.md) |
 | ``SaturationAwareConfig`` | Memory pressure gate | [20 — Memory pressure gate](20-memory-pressure-gate.md) |
 | ``SaturationAwareConfig`` | Loop / stuck-plan watchdog | [18 — Loop watchdog](18-loop-watchdog.md) |
+| ``SaturationAwareConfig`` | Bottleneck decision integration (5 knobs) | [25 — Bottleneck decision integration](25-bottleneck-decision-integration.md) |
 | ``SaturationAwareStageConfig`` | Trust gate (``min_data_points``) | [05 — State classifier](05-state-classifier.md) |
 | ``SaturationAwareStageConfig`` | Classifier thresholds | [05 — State classifier](05-state-classifier.md), [08 — Auto-derived thresholds](08-auto-derived-thresholds.md) |
 | ``SaturationAwareStageConfig`` | Backlog-time pressure gate (6 knobs) | [06 — Backlog-time pressure signal](06-backlog-time-signal.md) |
@@ -218,6 +219,23 @@ Cross-field invariants enforced at construction time:
 pressure_critical_threshold > pressure_saturation_threshold > pressure_normal_threshold
 pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
 ```
+
+### Bottleneck decision integration
+
+Five cluster-wide knobs gate the Forced-Flow-Law `D_k`-driven Phase C
+growth priority and Phase D shrink protection introduced in
+[25 — Bottleneck decision integration](25-bottleneck-decision-integration.md).
+All live on ``SaturationAwareConfig`` because bottleneck identity is
+a cluster-level property: every stage observes the same engagement
+gate, so per-stage overrides for these fields would be confusing.
+
+| Knob | Default | Effect |
+|---|---|---|
+| ``enable_bottleneck_priority_growth`` | ``True`` | Phase C ordering. ``True`` engages bottleneck-first sort when the gate engages; ``False`` reverts to legacy DAG-depth ordering ([12](12-multi-target-dag-growth.md)). |
+| ``enable_bottleneck_shrink_protection`` | ``True`` | Phase D protection. ``True`` skips negative intent on the argmax `D_k` stage when engaged; ``False`` reverts to legacy unconditional shrink. Hard-cap ceiling overflow always shrinks regardless. |
+| ``bottleneck_d_k_smoothing_level`` | ``0.20`` | EWMA alpha applied to per-cycle `D_k` samples. Bounded ``(0.0, 1.0]``. Lower smooths more (slower bottleneck moves); higher reacts faster. |
+| ``bottleneck_heterogeneity_threshold`` | ``2.0`` | Engagement floor (``> 1.0``). The gate engages only when the cluster heterogeneity ratio is at least this value (``max/median`` for ``n >= 3`` finite-`D_k` stages, ``max/min`` for ``n == 2``). |
+| ``bottleneck_engagement_persistence_cycles`` | ``2`` | Streak gate (``>= 1``) for the engagement INFO log. Does not affect the gate itself. |
 
 ## See also
 

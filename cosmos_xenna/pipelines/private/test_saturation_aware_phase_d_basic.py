@@ -1458,3 +1458,400 @@ class TestPhaseDConsolidationEdgeCases:
         assert cycle2_deleted == []
         # Cycle 3: negative intent again, but floor=1 prevents any further deletion.
         assert cycle3_deleted == []
+
+
+class TestBottleneckShrinkProtection:
+    """Phase D refuses to shrink the engaged bottleneck on transient idle."""
+
+    @staticmethod
+    def _heterogeneous_three_stage_state() -> data_structures.ProblemState:
+        """3 stages, 4 workers each: caption is the bottleneck (D=4s)."""
+        return _problem_state(
+            [
+                ("download", ["dl-w0", "dl-w1", "dl-w2", "dl-w3"], False),
+                ("caption", ["cap-w0", "cap-w1", "cap-w2", "cap-w3"], False),
+                ("write", ["wr-w0", "wr-w1", "wr-w2", "wr-w3"], False),
+            ]
+        )
+
+    @staticmethod
+    def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
+        """Pre-populate D_k EWMA so identify_bottleneck engages with caption as argmax."""
+        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+
+    def test_engaged_bottleneck_with_negative_intent_is_not_shrunk(self) -> None:
+        """Toggle ON, engaged, intent<0, no ceiling overflow -> stage NOT shrunk."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=True,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        self._engage_bottleneck(scheduler)
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": -2, "write": 0},
+        )
+
+        caption_stage_index = scheduler._stage_names.index("caption")
+        deleted = [w.id for w in solution.stages[caption_stage_index].deleted_workers]
+        assert deleted == [], "engaged bottleneck must not shrink on transient idle"
+
+    def test_non_bottleneck_stage_still_shrinks_in_same_cycle(self) -> None:
+        """The protection does not block other OVER_PROVISIONED stages from shrinking."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=True,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        self._engage_bottleneck(scheduler)
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": -2, "caption": -2, "write": 0},
+        )
+
+        download_stage_index = scheduler._stage_names.index("download")
+        download_deleted = solution.stages[download_stage_index].deleted_workers
+        assert len(download_deleted) == 2, "non-bottleneck stage should still shrink"
+
+    def test_disabled_toggle_allows_bottleneck_shrink(self) -> None:
+        """``enable_bottleneck_shrink_protection=False`` -> bottleneck stage is shrunk."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=False,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        self._engage_bottleneck(scheduler)
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": -2, "write": 0},
+        )
+
+        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_deleted = solution.stages[caption_stage_index].deleted_workers
+        assert len(caption_deleted) == 2, "toggle off -> protection skipped, shrink applied"
+
+    def test_ceiling_overflow_bypasses_protection(self) -> None:
+        """``ceiling_excess > 0`` (operator just lowered max_workers) bypasses the gate."""
+        # max_workers=2 forces ceiling_excess = 4 - 2 = 2 for caption.
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=True,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_workers=2,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        self._engage_bottleneck(scheduler)
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": 0, "write": 0},
+        )
+
+        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_deleted = solution.stages[caption_stage_index].deleted_workers
+        assert len(caption_deleted) == 2, "ceiling overflow forces shrink even on bottleneck"
+
+    def test_cold_start_disengaged_allows_shrink(self) -> None:
+        """No D_k data (cold start) -> bottleneck identity disengaged -> shrink proceeds."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=True,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        # No call to _engage_bottleneck() -> default NaN seed -> not engaged.
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": -2, "write": 0},
+        )
+
+        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_deleted = solution.stages[caption_stage_index].deleted_workers
+        assert len(caption_deleted) == 2, "cold-start disengaged -> shrink proceeds"
+
+
+class TestBottleneckShrinkProtectionLogDebounce:
+    """Phase D bottleneck-protection INFO log fires once per protection event.
+
+    Steady-state heterogeneous workloads keep the bottleneck stage in
+    sustained protection across many consecutive cycles. Logging the
+    skip on every cycle would spam operator logs at the autoscale
+    cadence (one line per ``interval_s``); the contract is to log on
+    entry into the protection set and stay silent until the stage
+    leaves and re-enters the set on a future cycle.
+    """
+
+    @staticmethod
+    def _heterogeneous_three_stage_state() -> data_structures.ProblemState:
+        """3 stages, 4 workers each: caption is the bottleneck (D=4s)."""
+        return _problem_state(
+            [
+                ("download", ["dl-w0", "dl-w1", "dl-w2", "dl-w3"], False),
+                ("caption", ["cap-w0", "cap-w1", "cap-w2", "cap-w3"], False),
+                ("write", ["wr-w0", "wr-w1", "wr-w2", "wr-w3"], False),
+            ]
+        )
+
+    @staticmethod
+    def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
+        """Pre-populate D_k EWMA so identify_bottleneck engages with caption as argmax."""
+        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+
+    def _scheduler_with_protection_on(self) -> SaturationAwareScheduler:
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_shrink_protection=True,
+                stage_defaults=_test_stage_config(
+                    min_workers=1,
+                    max_scale_down_fraction_per_cycle=1.0,
+                ),
+            ),
+            total_cpus=16,
+        )
+        return scheduler
+
+    def test_sustained_protection_logs_only_once_across_many_cycles(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """5 consecutive protected cycles emit exactly 1 INFO log."""
+        scheduler = self._scheduler_with_protection_on()
+        self._engage_bottleneck(scheduler)
+
+        for _ in range(5):
+            self._engage_bottleneck(scheduler)
+            _autoscale_with_intents(
+                scheduler,
+                self._heterogeneous_three_stage_state(),
+                {"download": 0, "caption": -2, "write": 0},
+            )
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        protection_logs = [m for m in infos if "phase D bottleneck shrink protected" in m]
+        assert len(protection_logs) == 1, (
+            f"expected exactly one protection log across 5 sustained cycles; got: {protection_logs}"
+        )
+
+    def test_re_entry_after_disengagement_re_arms_log(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Protected -> not protected -> protected fires the INFO log twice (once per entry)."""
+        scheduler = self._scheduler_with_protection_on()
+
+        self._engage_bottleneck(scheduler)
+        _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": -2, "write": 0},
+        )
+
+        # Disengage: bottleneck identity engaged but intent flips to 0 ->
+        # protection branch does NOT fire; ledger drops 'caption'.
+        self._engage_bottleneck(scheduler)
+        _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": 0, "write": 0},
+        )
+
+        # Re-engage: intent negative again -> ledger re-arms the log.
+        self._engage_bottleneck(scheduler)
+        _autoscale_with_intents(
+            scheduler,
+            self._heterogeneous_three_stage_state(),
+            {"download": 0, "caption": -2, "write": 0},
+        )
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        protection_logs = [m for m in infos if "phase D bottleneck shrink protected" in m]
+        assert len(protection_logs) == 2, (
+            f"expected exactly two protection logs across two protection events; got: {protection_logs}"
+        )
+
+    def test_setup_resets_protection_ledger(self) -> None:
+        """``setup()`` clears ``_bottleneck_protected_stages_logged``."""
+        scheduler = self._scheduler_with_protection_on()
+        scheduler._bottleneck_protected_stages_logged = {"caption", "stale_stage"}
+
+        scheduler.setup(scheduler._problem)  # type: ignore[arg-type]
+
+        assert scheduler._bottleneck_protected_stages_logged == set(), (
+            "setup() must clear the protection ledger so a recycled scheduler emits a fresh log"
+        )
+
+
+class TestPhaseCDDefensiveAssertion:
+    """Phase C / Phase D refuse to run before the bottleneck calc block populates ``_last_bottleneck_meta``."""
+
+    def test_phase_c_raises_on_unpopulated_meta(self) -> None:
+        """Calling ``_run_phase_c_grow`` directly with a None meta raises a clear ``RuntimeError``."""
+        scheduler, _problem_obj = _problem(
+            [("A", None)],
+            cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
+            total_cpus=8,
+        )
+        scheduler._last_bottleneck_meta = None
+        ps = _problem_state([("A", ["A-w0"], False)])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(scheduler._problem, ps)
+
+        with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase C"):
+            scheduler._run_phase_c_grow(ctx, ps)
+
+    def test_phase_d_raises_on_unpopulated_meta(self) -> None:
+        """Calling ``_run_phase_d_shrink`` directly with a None meta raises a clear ``RuntimeError``."""
+        scheduler, _problem_obj = _problem(
+            [("A", None)],
+            cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
+            total_cpus=8,
+        )
+        scheduler._last_bottleneck_meta = None
+        ps = _problem_state([("A", ["A-w0"], False)])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(scheduler._problem, ps)
+
+        with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase D"):
+            scheduler._run_phase_d_shrink(ctx, ps)
+
+
+class TestBottleneckEngagementLogToggleGate:
+    """Engagement INFO log is silenced when both decision toggles are disabled.
+
+    The bottleneck calc block keeps running to maintain warm
+    ``_d_k_ewma`` state for re-enable; only the operator-facing log
+    is gated. The gate ensures a rollback to legacy behaviour (both
+    toggles ``False``) does not introduce a new INFO line.
+    """
+
+    @staticmethod
+    def _three_stage_state() -> data_structures.ProblemState:
+        return _problem_state(
+            [
+                ("download", ["dl-w0", "dl-w1"], False),
+                ("caption", ["cap-w0", "cap-w1"], False),
+                ("write", ["wr-w0", "wr-w1"], False),
+            ]
+        )
+
+    @staticmethod
+    def _set_disengaged_homogeneous(scheduler: SaturationAwareScheduler) -> None:
+        scheduler._d_k_ewma = {"download": 1.0, "caption": 1.0, "write": 1.0}
+
+    @staticmethod
+    def _set_engaged_heterogeneous(scheduler: SaturationAwareScheduler) -> None:
+        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+
+    def _drive_engagement_transition(self, scheduler: SaturationAwareScheduler) -> None:
+        """Run two cycles: cycle 1 disengaged, cycle 2 engaged.
+
+        With ``persistence_cycles=1`` the helper would log on cycle 2
+        if it were called, because that is a genuine ``False -> True``
+        flip on the post-seed path.
+        """
+        # Cycle 1: homogeneous D_k -> identity disengaged. Seeds last_announced=False.
+        self._set_disengaged_homogeneous(scheduler)
+        _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"download": 0, "caption": 0, "write": 0},
+        )
+        # Cycle 2: heterogeneous D_k -> identity engaged. Post-seed flip would log.
+        self._set_engaged_heterogeneous(scheduler)
+        _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"download": 0, "caption": 0, "write": 0},
+        )
+
+    def test_both_toggles_off_silences_engagement_log(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rollback with both toggles disabled must not introduce a new operator log."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_priority_growth=False,
+                enable_bottleneck_shrink_protection=False,
+                bottleneck_engagement_persistence_cycles=1,
+                stage_defaults=_test_stage_config(min_workers=1),
+            ),
+            total_cpus=8,
+        )
+
+        self._drive_engagement_transition(scheduler)
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        engagement_logs = [m for m in infos if "bottleneck-priority decisions" in m]
+        assert engagement_logs == [], (
+            f"engagement log must be silent when both decision toggles are off; got: {engagement_logs}"
+        )
+
+    def test_one_toggle_on_keeps_engagement_log(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rollback that re-enables only one toggle still surfaces the engagement log."""
+        scheduler, _problem_obj = _problem(
+            [("download", None), ("caption", None), ("write", None)],
+            cfg=SaturationAwareConfig(
+                floor_stuck_grace_cycles=0,
+                enable_bottleneck_priority_growth=True,
+                enable_bottleneck_shrink_protection=False,
+                bottleneck_engagement_persistence_cycles=1,
+                stage_defaults=_test_stage_config(min_workers=1),
+            ),
+            total_cpus=8,
+        )
+
+        self._drive_engagement_transition(scheduler)
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        engagement_logs = [m for m in infos if "bottleneck-priority decisions engaged" in m]
+        assert len(engagement_logs) == 1, (
+            f"engagement log must fire once when at least one decision toggle is on; got: {engagement_logs}"
+        )

@@ -80,15 +80,18 @@ naming the argmax stage make the Forced-Flow framing explicit, so
 an operator does not need to know the queueing-theory derivation
 to read the dashboard.
 
-**Trade-off.** Pure observability — the autoscaler does not
-consume `D_k` for any decision today. The cost is one extra
-Prometheus gauge whose cardinality is bounded by the (static)
-stage list per pipeline. The benefit is a single number per stage
-that ranks stages by bottleneck candidacy and prevents the "scale
-the busy-looking stage" mistake. The same gauge is the diagnostic
-substrate for a future Dominant Resource Fairness donor-selection
-pass (Ghodsi, Zaharia, Hindman, Konwinski, Shenker, Stoica 2011,
-NSDI) — the cardinality envelope is paid once and reused.
+**Trade-off.** The cost is one extra Prometheus gauge whose
+cardinality is bounded by the (static) stage list per pipeline. The
+benefit is a single number per stage that ranks stages by
+bottleneck candidacy and prevents the "scale the busy-looking
+stage" mistake. The same gauge is the diagnostic substrate for two
+scheduler decisions consumed in
+[25 — Bottleneck decision integration](25-bottleneck-decision-integration.md):
+Phase C grow-priority ordering and Phase D shrink protection. The
+metric remains the operator's diagnostic of record; the autoscaler
+just feeds the same EWMA-smoothed value back into its own decisions
+so the dashboard and the scheduler share one truth. The cardinality
+envelope is paid once and reused.
 
 ## How it works
 
@@ -165,10 +168,14 @@ promise.
 - [22 — Prometheus metrics catalogue](22-prometheus-metrics.md) —
   the full set of `xenna_*` and `pipeline_*` gauges, their label
   cardinality, and the sampling cycle they share.
+- [25 — Bottleneck decision integration](25-bottleneck-decision-integration.md) —
+  how the EWMA-smoothed `D_k` value drives Phase C grow-priority
+  ordering and Phase D shrink protection.
 - [12 — Multi-target DAG growth](12-multi-target-dag-growth.md) —
-  Phase C grows stages **downstream-first** so a scarce placement
-  slot lands at the bottleneck end first; the Forced-Flow framing
-  in this doc is the formal justification for that ordering.
+  Phase C falls back to downstream-first DAG-depth ordering when
+  the bottleneck gate is disengaged; the Forced-Flow framing in
+  this doc is the formal justification for the bottleneck-first
+  override on top of that ordering.
 - Lazowska, Zahorjan, Graham, Sevcik (1984), *Quantitative System
   Performance: Computer System Analysis Using Queueing Network
   Models*, Chapter 3 — the original Forced Flow Law and the

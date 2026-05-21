@@ -34,7 +34,9 @@ cycle (`A → B → C → D`) the scheduler runs every tick:
   allocation-error tolerance. These run *around* every phase and
   are why a corrupted decision never reaches workers.
 - **Observability (teal)** — Prometheus metrics, the Forced-Flow-Law
-  bottleneck score, and per-decision structured logging.
+  bottleneck score (now also a scheduler input that prioritises
+  Phase C growth and protects the bottleneck from Phase D shrink),
+  and per-decision structured logging.
 
 Open the matching doc in the index below to see the rationale,
 trade-offs, and knobs for any box on the diagram.
@@ -124,6 +126,7 @@ adjust a knob in production, jump to:
 | [22-prometheus-metrics.md](22-prometheus-metrics.md) | The full metrics catalogue |
 | [23-bottleneck-score-metric.md](23-bottleneck-score-metric.md) | Forced-Flow-Law bottleneck gauge |
 | [24-structured-logging.md](24-structured-logging.md) | Per-decision INFO logging contract |
+| [25-bottleneck-decision-integration.md](25-bottleneck-decision-integration.md) | EWMA-smoothed `D_k` driving Phase C grow priority and Phase D shrink protection |
 
 ## Conventions used in these docs
 

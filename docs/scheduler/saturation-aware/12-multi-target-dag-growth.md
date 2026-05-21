@@ -85,13 +85,24 @@ stages, not the number of workers added.
 ## How it works
 
 [`_run_phase_c_grow`](../../../cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py)
-walks stages in the order returned by
-[`compute_dag_depth_order`](../../../cosmos_xenna/pipelines/private/scheduling_py/dag_priority.py)
-when `enable_dag_priority_growth` is `True` (the default). Xenna
-pipelines are linear streaming chains, so DAG depth equals the
-stage's position in `problem.rust.stages`; downstream-first
-order is just the reversed stage list. When the toggle is
-`False`, stages are walked in problem (upstream-first) order.
+walks stages in the order returned by the unified
+[`compute_grow_priority_order`](../../../cosmos_xenna/pipelines/private/scheduling_py/dag_priority.py)
+helper. The helper implements a three-level hierarchy whose first
+non-trivial branch wins:
+
+1. **Bottleneck-engaged path** (when the
+   [25 — bottleneck-decision gate](25-bottleneck-decision-integration.md)
+   has engaged and `enable_bottleneck_priority_growth=True`): order
+   stages by EWMA-smoothed `D_k` descending, with topological depth
+   descending as the tiebreaker.
+2. **DAG-priority path** (default fallback): order stages by
+   topological depth descending. Xenna pipelines are linear
+   streaming chains, so DAG depth equals the stage's position in
+   `problem.rust.stages`; downstream-first order is just the
+   reversed stage list.
+3. **Problem order** (when `enable_dag_priority_growth=False` and
+   the bottleneck gate is disengaged): walk stages in problem
+   (upstream-first) order.
 
 For every non-finished stage in that order:
 
@@ -125,7 +136,8 @@ on a scarce slot.
 
 | Field | Where | Effect |
 |---|---|---|
-| `enable_dag_priority_growth` | `SaturationAwareConfig` | `True` (default) walks stages downstream-first via `compute_dag_depth_order`; `False` walks them in problem order. Multi-target growth itself is always on; the toggle controls *order* only. |
+| `enable_dag_priority_growth` | `SaturationAwareConfig` | `True` (default) walks stages downstream-first via `compute_grow_priority_order` when the bottleneck gate is disengaged; `False` walks them in problem order. Multi-target growth itself is always on; the toggle controls *order* only. |
+| `enable_bottleneck_priority_growth` | `SaturationAwareConfig` | `True` (default) lets [25 — bottleneck decision integration](25-bottleneck-decision-integration.md) override DAG depth with `D_k` descending order when the heterogeneity gate engages; `False` reverts to the legacy DAG-depth-only ordering. |
 | `max_workers` | `SaturationAwareStageConfig` | Per-stage worker ceiling. Clamps positive intent before any `try_add_worker` call; see [16 — hard caps and floors](16-hard-caps-and-floors.md). |
 | `max_workers_per_node` | `SaturationAwareStageConfig` | Combined with the cluster's node count to compute the effective per-stage cap that clamps the request. |
 
@@ -147,3 +159,6 @@ five-layer anti-flap protocol that gates donor selection.
 - [16 — Hard caps and floors](16-hard-caps-and-floors.md) —
   the per-stage ceiling that clamps intent before growth is
   attempted.
+- [25 — Bottleneck decision integration](25-bottleneck-decision-integration.md)
+  — the Forced-Flow-Law `D_k`-driven override on top of this
+  ordering and the matching Phase D shrink protection.

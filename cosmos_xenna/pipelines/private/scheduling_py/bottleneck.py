@@ -131,6 +131,7 @@ metric cardinality without any new operator-relevant signal.
 """
 
 import math
+import statistics
 from collections.abc import Mapping
 
 import attrs
@@ -445,3 +446,188 @@ def compute_heterogeneity_ratio(
         f"to give it more recovery margin"
     )
     state.has_fired = True
+
+
+@attrs.define(frozen=True)
+class BottleneckIdentity:
+    """Per-cycle bottleneck identification.
+
+    Produced by :func:`identify_bottleneck` from EWMA-smoothed ``D_k``
+    samples. Consumers gate on ``engaged``: when False the cluster is
+    homogeneous or in cold-start; when True, ``stage_name`` is the
+    bottleneck argmax (highest ``D_k``).
+
+    Attributes:
+        engaged: True when the cycle has at least two finite ``D_k``
+            samples and the heterogeneity ratio reaches the configured
+            threshold.
+        stage_name: Bottleneck stage when ``engaged``; otherwise None.
+        max_d_k: Maximum finite ``D_k`` this cycle, or NaN when no
+            stage has a finite sample.
+        median_d_k: Median (n>=3) or arithmetic mean (n=2) of finite
+            ``D_k`` values; NaN when fewer than two stages contribute.
+        heterogeneity_ratio: ``max_d_k / median_d_k`` for n>=3, or
+            ``max_d_k / min_d_k`` for n=2; NaN otherwise.
+    """
+
+    engaged: bool
+    stage_name: str | None
+    max_d_k: float
+    median_d_k: float
+    heterogeneity_ratio: float
+
+
+@attrs.define
+class BottleneckEngagementState:
+    """Streak ledger for the bottleneck-engagement INFO log.
+
+    Lives as a per-instance attribute on the scheduler so a re-setup
+    starts from a clean ledger; the helper logs once on each
+    persistent flip (engaged for >= persistence cycles, then off, ...).
+
+    Attributes:
+        last_announced: Engagement state most recently announced via
+            INFO log; None until the first announcement.
+        candidate_streak: Consecutive cycles in a state different from
+            ``last_announced``; resets on any return-to-announced cycle.
+    """
+
+    last_announced: bool | None = None
+    candidate_streak: int = 0
+
+    def reset(self) -> None:
+        """Reset to a fresh ledger."""
+        self.last_announced = None
+        self.candidate_streak = 0
+
+
+def identify_bottleneck(
+    d_k_ewma: Mapping[str, float],
+    *,
+    heterogeneity_threshold: float,
+    near_tie_tolerance: float = 0.05,
+) -> BottleneckIdentity:
+    """Identify the engaged bottleneck stage from EWMA-smoothed ``D_k`` samples.
+
+    The cycle is engaged when at least two stages have a finite,
+    strictly-positive ``D_k`` and the cluster heterogeneity reaches
+    ``heterogeneity_threshold``. ``max / median`` is used for n>=3
+    (robust against a single very-fast outlier); ``max / min`` is
+    used for n=2 because ``max / median`` is mathematically capped
+    at 2.0 for two samples.
+
+    Among stages within ``D >= max * (1 - near_tie_tolerance)`` of the
+    leader, the lexicographically smallest stage name wins so the
+    bottleneck identity is stable cycle-to-cycle for near-ties.
+
+    Args:
+        d_k_ewma: Mapping from stage name to its EWMA-smoothed ``D_k``
+            in seconds; cold-start stages contribute ``math.nan``.
+        heterogeneity_threshold: Minimum heterogeneity ratio for the
+            cycle to be engaged. Must be strictly greater than 1.0.
+        near_tie_tolerance: Fractional band within which stages are
+            treated as tied; 0.0 means strict argmax.
+
+    Returns:
+        ``BottleneckIdentity`` describing the cycle.
+    """
+    finite_scores: dict[str, float] = {}
+    for name, d_k in d_k_ewma.items():
+        score = _service_time_to_score(d_k)
+        if math.isfinite(score):
+            finite_scores[name] = score
+
+    if not finite_scores:
+        return BottleneckIdentity(
+            engaged=False,
+            stage_name=None,
+            max_d_k=math.nan,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
+        )
+
+    max_d = max(finite_scores.values())
+    if len(finite_scores) < 2:
+        return BottleneckIdentity(
+            engaged=False,
+            stage_name=None,
+            max_d_k=max_d,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
+        )
+
+    if len(finite_scores) == 2:
+        min_d = min(finite_scores.values())
+        median_d = (max_d + min_d) / 2.0
+        ratio = max_d / min_d
+    else:
+        median_d = statistics.median(finite_scores.values())
+        ratio = max_d / median_d if median_d > 0.0 else math.nan
+
+    if not math.isfinite(ratio) or ratio < heterogeneity_threshold:
+        return BottleneckIdentity(
+            engaged=False,
+            stage_name=None,
+            max_d_k=max_d,
+            median_d_k=median_d,
+            heterogeneity_ratio=ratio,
+        )
+
+    near_tie_floor = max_d * (1.0 - near_tie_tolerance)
+    tied = sorted(name for name, d in finite_scores.items() if d >= near_tie_floor)
+    return BottleneckIdentity(
+        engaged=True,
+        stage_name=tied[0],
+        max_d_k=max_d,
+        median_d_k=median_d,
+        heterogeneity_ratio=ratio,
+    )
+
+
+def maybe_log_bottleneck_engagement(
+    *,
+    identity: BottleneckIdentity,
+    state: BottleneckEngagementState,
+    persistence_cycles: int,
+    pipeline_name: str,
+) -> None:
+    """Emit one INFO log when the engagement state has flipped persistently.
+
+    Pure observability helper. Mutates ``state`` to debounce flap-spam
+    at the heterogeneity gate boundary; never touches scheduler state.
+
+    Args:
+        identity: This cycle's bottleneck identification.
+        state: Mutable streak ledger owned by the scheduler.
+        persistence_cycles: Cycles a candidate state must hold before
+            it is announced. Must be >= 1.
+        pipeline_name: Pipeline identifier for the log line.
+    """
+    if state.last_announced is None:
+        state.candidate_streak += 1
+        if state.candidate_streak >= persistence_cycles:
+            state.last_announced = identity.engaged
+            state.candidate_streak = 0
+        return
+
+    if identity.engaged == state.last_announced:
+        state.candidate_streak = 0
+        return
+
+    state.candidate_streak += 1
+    if state.candidate_streak < persistence_cycles:
+        return
+
+    if identity.engaged:
+        logger.info(
+            f"bottleneck-priority decisions engaged for pipeline {pipeline_name!r}: "
+            f"argmax stage {identity.stage_name!r} (D={identity.max_d_k:.2f}s, "
+            f"heterogeneity_ratio={identity.heterogeneity_ratio:.2f})"
+        )
+    else:
+        logger.info(
+            f"bottleneck-priority decisions disengaged for pipeline {pipeline_name!r} "
+            "(cluster homogeneous or cold-start)"
+        )
+    state.last_announced = identity.engaged
+    state.candidate_streak = 0

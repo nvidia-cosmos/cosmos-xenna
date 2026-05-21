@@ -60,6 +60,7 @@ EXPECTED_PHASE_LABELS = frozenset(
         "phase_a",
         "phase_b",
         "intent",
+        "bottleneck",
         "phase_c",
         "phase_d",
         "invariants",
@@ -173,7 +174,7 @@ class TestPhaseDurationHistogram:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """One ``autoscale()`` call observes exactly the 8 canonical phase labels, each once."""
+        """One ``autoscale()`` call observes exactly the 9 canonical phase labels, each once."""
         fake_histogram = _FakeHistogram()
         monkeypatch.setattr(saturation_aware, "_PHASE_DURATION_HISTOGRAM", fake_histogram)
 
@@ -184,8 +185,8 @@ class TestPhaseDurationHistogram:
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         observed_labels = [tags["phase"] for _value, tags in fake_histogram.observations]
-        assert len(observed_labels) == 8, (
-            f"Expected exactly 8 observations (one per phase label), got {len(observed_labels)}: {observed_labels}"
+        assert len(observed_labels) == 9, (
+            f"Expected exactly 9 observations (one per phase label), got {len(observed_labels)}: {observed_labels}"
         )
         assert set(observed_labels) == EXPECTED_PHASE_LABELS, (
             f"Observed labels {set(observed_labels)} != expected {EXPECTED_PHASE_LABELS}"
@@ -197,6 +198,7 @@ class TestPhaseDurationHistogram:
             "phase_a",
             "phase_b",
             "intent",
+            "bottleneck",
             "phase_c",
             "phase_d",
             "invariants",
@@ -209,8 +211,8 @@ class TestPhaseDurationHistogram:
     ) -> None:
         """Sum of all observed phase durations equals the wall-clock span across the cycle.
 
-        Uses a deterministic fake clock with 16 ascending samples (one
-        ``start`` + one ``finally`` per phase, 8 phases) where each
+        Uses a deterministic fake clock with 18 ascending samples (one
+        ``start`` + one ``finally`` per phase, 9 phases) where each
         phase's ``finally`` value equals the next phase's ``start``
         (no gap between phases, matching how the wrappers are wired
         contiguously). The sum then telescopes to ``last - first``
@@ -219,7 +221,7 @@ class TestPhaseDurationHistogram:
         fake_histogram = _FakeHistogram()
         monkeypatch.setattr(saturation_aware, "_PHASE_DURATION_HISTOGRAM", fake_histogram)
 
-        # 16 deterministic clock samples: pairs of (start_i, finally_i)
+        # 18 deterministic clock samples: pairs of (start_i, finally_i)
         # where finally_i == start_{i+1}. Each phase delta = 0.001 s.
         delta_per_phase_s = 0.001
         clock_samples: list[float] = []

@@ -29,9 +29,12 @@ that ``run_per_stage_pipeline`` threads the resulting pressure into
 ``classify()`` so an EWMA refresh changes the classifier's verdict.
 """
 
+import logging
 import math
+from collections.abc import Iterator
 
 import pytest
+from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
@@ -42,6 +45,20 @@ from cosmos_xenna.pipelines.private.scheduling_py.pressure import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
+
+
+@pytest.fixture
+def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Bridge loguru records into pytest's stdlib-based ``caplog`` fixture."""
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").log(msg.record["level"].no, msg.record["message"]),
+        format="{message}",
+    )
+    caplog.set_level(logging.DEBUG, logger="loguru")
+    try:
+        yield caplog
+    finally:
+        loguru_logger.remove(handler_id)
 
 
 @pytest.fixture
@@ -375,3 +392,140 @@ class TestPressureGaugesAreFlagIndependent:
         # The state-level EWMA also moved -- producer side fully ran.
         assert state.pressure_ewma is not None
         assert math.isclose(state.pressure_ewma, 0.80 * BACKLOG_CAP, rel_tol=1e-9)
+
+
+class TestClassifierTraceLogging:
+    """Per-cycle DEBUG trace and on-transition INFO log emitted by ``run_per_stage_pipeline``.
+
+    The classifier trace is the operator-side replay tool for the
+    saturation-aware scheduler. Two contracts are pinned here:
+
+    1.  Every cycle emits exactly one DEBUG record carrying the inputs
+        the classifier saw (``slots_empty_ratio_ewma``,
+        ``input_queue_depth``, ``pressure_ewma``), the previous and new
+        states, the streak, the ``should_fire`` flag, and the resulting
+        ``delta``. This lets operators reconstruct any decision off-line.
+    2.  An INFO record is emitted only on a state transition. Steady-state
+        cycles must stay silent at INFO so production logs do not flood.
+    """
+
+    def test_debug_trace_contains_classifier_inputs_and_outputs(
+        self,
+        cfg: SaturationAwareStageConfig,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Single cycle emits one DEBUG record with all expected key=value fields."""
+        state = _fresh_state(cfg)
+
+        delta = run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=2,
+            input_queue_depth=100,
+            current_workers=1,
+            config=cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        debug = [r.getMessage() for r in loguru_caplog.records if r.levelname == "DEBUG"]
+        traces = [m for m in debug if m.startswith("classifier trace:")]
+        assert len(traces) == 1, f"expected exactly one classifier trace per cycle; got: {traces}"
+        msg = traces[0]
+        assert "stage='TestStage'" in msg
+        assert "input_queue_depth=100" in msg
+        assert "prev_state=NORMAL" in msg
+        assert "new_state=" in msg
+        assert "streak=" in msg
+        assert "should_fire=" in msg
+        assert f"delta={delta}" in msg
+        assert "pressure_ewma=" in msg
+        assert "slots_empty_ratio_ewma=" in msg
+
+    def test_state_transition_emits_info_log(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``NORMAL -> SATURATED_CRITICAL`` transition surfaces an INFO record once.
+
+        The smoothing_level is pinned to ``1.0`` so the EWMA becomes a
+        pass-through and the second cycle drives the classifier across
+        the activation threshold deterministically.
+        """
+        cfg = SaturationAwareStageConfig(
+            saturation_threshold=0.15,
+            activation_threshold=0.05,
+            target_backlog_seconds=30.0,
+            slots_empty_ratio_smoothing_level=1.0,
+            pressure_smoothing_level=1.0,
+            pressure_critical_threshold=2.0,
+            pressure_saturation_threshold=1.0,
+            pressure_normal_threshold=0.3,
+        )
+        state = _fresh_state(cfg)
+        run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=2,
+            input_queue_depth=100,
+            current_workers=1,
+            config=cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        loguru_caplog.clear()
+        run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=0,
+            input_queue_depth=200,
+            current_workers=1,
+            config=cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        transitions = [m for m in infos if m.startswith("classifier transition:")]
+        assert len(transitions) == 1, f"expected one transition INFO; got: {transitions}"
+        msg = transitions[0]
+        assert "stage='TestStage'" in msg
+        assert "NORMAL ->" in msg, "transition log must record the prev->new arrow"
+
+    def test_steady_state_does_not_log_info(
+        self,
+        cfg: SaturationAwareStageConfig,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Repeating the same inputs holds the state and silences INFO logs."""
+        state = _fresh_state(cfg)
+        run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=2,
+            input_queue_depth=100,
+            current_workers=1,
+            config=cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        loguru_caplog.clear()
+        run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=8,
+            num_empty_slots=2,
+            input_queue_depth=100,
+            current_workers=1,
+            config=cfg,
+            observed_throughput_sample=1.0,
+            pipeline_name="test",
+        )
+
+        infos = [r.getMessage() for r in loguru_caplog.records if r.levelname == "INFO"]
+        transitions = [m for m in infos if m.startswith("classifier transition:")]
+        assert transitions == [], "steady-state cycle must not emit a transition INFO"
+        debug = [r.getMessage() for r in loguru_caplog.records if r.levelname == "DEBUG"]
+        traces = [m for m in debug if m.startswith("classifier trace:")]
+        assert len(traces) == 1, "DEBUG trace still fires once per cycle even in steady state"

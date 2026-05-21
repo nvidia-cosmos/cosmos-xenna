@@ -29,8 +29,9 @@ feeds the later watchdog. The contract under test:
     * ``_stuck_plan_counters`` tracks consecutive partial-grow cycles
       per stage: increments by 1 when ``added < intent``; resets to
       ``0`` when ``added == intent`` OR ``intent <= 0``.
-    * ``compute_dag_depth_order`` returns indices deepest-first for
-      the linear streaming-pipeline model.
+    * Iteration ordering is delegated to ``compute_grow_priority_order``;
+      this file pins behaviour that depends on the ordering being
+      downstream-first when the legacy DAG toggle is enabled.
 
 Tests inject the intent dict via
 ``patch.object(scheduler, "_compute_intent_deltas", ...)`` so each
@@ -46,7 +47,6 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_dag_depth_order
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
@@ -130,11 +130,13 @@ def _scheduler(
     *,
     cluster: resources.ClusterResources | None = None,
     enable_dag_priority_growth: bool = True,
+    enable_bottleneck_priority_growth: bool = True,
 ) -> SaturationAwareScheduler:
     """Build a setup-completed scheduler. ``cluster`` defaults to ``_cluster()``."""
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
         enable_dag_priority_growth=enable_dag_priority_growth,
+        enable_bottleneck_priority_growth=enable_bottleneck_priority_growth,
         stage_defaults=SaturationAwareStageConfig(min_workers=1),
     )
     scheduler = SaturationAwareScheduler(cfg)
@@ -154,22 +156,6 @@ def _autoscale_with_intents(
 
     with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):
         return scheduler.autoscale(time=0.0, problem_state=state)
-
-
-class TestComputeDagDepthOrder:
-    """The pure helper returns stage indices deepest-first for linear pipelines."""
-
-    def test_zero_stage_problem_returns_empty_list(self) -> None:
-        """A problem with no stages produces an empty order, no exception."""
-        assert compute_dag_depth_order(_problem([])) == []
-
-    def test_single_stage_problem_returns_one_index(self) -> None:
-        """Single-stage pipeline: only valid index is 0."""
-        assert compute_dag_depth_order(_problem([("only", None)])) == [0]
-
-    def test_three_stage_problem_returns_deepest_first(self) -> None:
-        """Three stages [A, B, C] -> DAG order [2, 1, 0]."""
-        assert compute_dag_depth_order(_problem([("A", None), ("B", None), ("C", None)])) == [2, 1, 0]
 
 
 class TestDagPriorityCanonical:
@@ -390,3 +376,91 @@ class TestDagPriorityScale:
         assert sum(len(s.new_workers) for s in solution.stages[:99]) == 0
         assert scheduler._stuck_plan_counters[stage_names[99]] == 0
         assert all(scheduler._stuck_plan_counters[n] == 1 for n in stage_names[:99])
+
+
+class TestBottleneckPriorityGrowth:
+    """Phase C uses argmax_k D_k for grow ordering when the gate engages."""
+
+    @staticmethod
+    def _three_stage_state() -> data_structures.ProblemState:
+        """Three stages, 1 worker each. Pair with a 4-CPU cluster -> 1 CPU free."""
+        return _problem_state(
+            [
+                ("s0", 1, 1, False),
+                ("s1", 1, 1, False),
+                ("s2", 1, 1, False),
+            ]
+        )
+
+    def test_engaged_bottleneck_routes_contended_slot_to_argmax_not_deepest(self) -> None:
+        """The middle stage with largest D_k wins the slot; deepest is bypassed."""
+        scheduler = _scheduler(
+            [("s0", None), ("s1", None), ("s2", None)],
+            cluster=_cluster(total_cpus_per_node=4),
+            enable_bottleneck_priority_growth=True,
+        )
+        # Pre-populate the EWMA so identify_bottleneck returns engaged with s1 as argmax.
+        scheduler._d_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"s0": 1, "s1": 1, "s2": 1},
+        )
+
+        assert len(solution.stages[1].new_workers) == 1, "argmax should win the contended slot"
+        assert solution.stages[2].new_workers == [], "deepest stage loses to argmax"
+        assert solution.stages[0].new_workers == [], "shallowest stage loses to argmax"
+
+    def test_disabled_toggle_falls_back_to_dag_depth_even_with_clear_bottleneck(self) -> None:
+        """``enable_bottleneck_priority_growth=False`` -> deepest wins despite D_k argmax."""
+        scheduler = _scheduler(
+            [("s0", None), ("s1", None), ("s2", None)],
+            cluster=_cluster(total_cpus_per_node=4),
+            enable_bottleneck_priority_growth=False,
+        )
+        scheduler._d_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"s0": 1, "s1": 1, "s2": 1},
+        )
+
+        assert len(solution.stages[2].new_workers) == 1, "deepest wins when toggle off"
+        assert solution.stages[1].new_workers == [], "argmax does NOT win when toggle off"
+
+    def test_homogeneous_cluster_falls_back_to_dag_depth(self) -> None:
+        """Toggle on, but ratio<threshold -> identify_bottleneck disengages -> DAG depth."""
+        scheduler = _scheduler(
+            [("s0", None), ("s1", None), ("s2", None)],
+            cluster=_cluster(total_cpus_per_node=4),
+            enable_bottleneck_priority_growth=True,
+        )
+        # Balanced D_k -> ratio=1.0 < 2.0 -> not engaged.
+        scheduler._d_k_ewma = {"s0": 1.0, "s1": 1.0, "s2": 1.0}
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"s0": 1, "s1": 1, "s2": 1},
+        )
+
+        assert len(solution.stages[2].new_workers) == 1, "deepest wins when bottleneck disengaged"
+
+    def test_cold_start_with_no_d_k_data_falls_back_to_dag_depth(self) -> None:
+        """All NaN D_k EWMA -> not engaged -> DAG-depth fallback."""
+        scheduler = _scheduler(
+            [("s0", None), ("s1", None), ("s2", None)],
+            cluster=_cluster(total_cpus_per_node=4),
+            enable_bottleneck_priority_growth=True,
+        )
+        # Default after setup() is all NaN (cold start).
+
+        solution = _autoscale_with_intents(
+            scheduler,
+            self._three_stage_state(),
+            {"s0": 1, "s1": 1, "s2": 1},
+        )
+
+        assert len(solution.stages[2].new_workers) == 1, "deepest wins when cold-start"

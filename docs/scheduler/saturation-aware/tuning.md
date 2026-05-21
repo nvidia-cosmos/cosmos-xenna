@@ -105,6 +105,22 @@ contribution and donor selection respectively. See
 |---|---|---|
 | `SaturationAwareConfig.interval_s` | `10.0 s` | Lower for tighter control on small clusters; raise on 10k-node clusters where the autoscaler's per-cycle work begins to compete with pipeline traffic. |
 
+### Bottleneck decision integration
+
+The Forced-Flow-Law `D_k`-driven Phase C grow priority and Phase D
+shrink protection (see
+[25 — Bottleneck decision integration](25-bottleneck-decision-integration.md))
+add five cluster-wide knobs. Defaults are set so the gate self-disables
+on homogeneous clusters; most pipelines never need to tune these.
+
+| Field | Default | When to adjust |
+|---|---|---|
+| `enable_bottleneck_priority_growth` | `True` | **Escape hatch.** Set `False` to revert Phase C to legacy DAG-depth-only ordering when the bottleneck gate's grow-priority override produces a worse outcome than DAG depth (rare; usually a sign that `D_k` samples are too noisy). |
+| `enable_bottleneck_shrink_protection` | `True` | **Escape hatch.** Set `False` to revert Phase D to unconditional shrink when an operator-driven mid-run capacity reduction must shrink the bottleneck stage. Hard-cap ceiling overflow always shrinks regardless of this toggle. |
+| `bottleneck_d_k_smoothing_level` | `0.20` | Lower toward `0.10` if `xenna_stage_bottleneck_score` is noisy and the gate's bottleneck identity flips between cycles. Raise toward `0.40` for short pipeline runs where the EWMA's warmup is itself the dominant effect. |
+| `bottleneck_heterogeneity_threshold` | `2.0` | Raise toward `4.0` for very long pipelines where the median `D_k` is naturally pulled down by cheap I/O stages, so a `2.0` ratio is the steady state rather than a true bottleneck. Lower toward `1.5` only when the gate fails to engage on a known bottleneck (verify `D_k` panels first). |
+| `bottleneck_engagement_persistence_cycles` | `2` | Raise toward `4` if the engagement INFO log fires noisily during regime transitions. Does not affect the gate's per-cycle decisions, only the log debouncer. |
+
 ### Backlog-time pressure gate
 
 The classifier's compound pressure signal documented in
@@ -151,6 +167,8 @@ runtime visible.
 | Stages oscillate between adding and removing workers | Increase `over_provisioned_streak_min_cycles` (longer scale-down patience) | [07](07-streak-stabilization.md) |
 | Phase D shrinks a freshly-warmed worker | Increase `worker_warmup_measurement_grace_s` and `donor_warmup_grace_s` | [10](10-slow-start-mechanisms.md), [15](15-idle-first-scale-down.md) |
 | New stage takes minutes to ramp under sustained load | Increase `saturation_aggressiveness` (`0.30` → `0.45`); confirm `enable_dag_priority_growth=True` | [08](08-auto-derived-thresholds.md), [12](12-multi-target-dag-growth.md) |
+| Mid-DAG bottleneck stays last in the grow order | Confirm `enable_bottleneck_priority_growth=True` and inspect `xenna_stage_bottleneck_score`: if the gate is silent, the heterogeneity ratio is below `bottleneck_heterogeneity_threshold` (default `2.0`); raise the metric (or lower the threshold toward `1.5`) so the gate engages | [25](25-bottleneck-decision-integration.md) |
+| Bottleneck stage shrinks during transient idle | Confirm `enable_bottleneck_shrink_protection=True`; inspect Phase D INFO logs for `bottleneck shrink protected`. If absent, the gate is disengaged (cluster too homogeneous, see threshold guidance above) | [25](25-bottleneck-decision-integration.md) |
 | Slot-pin SATURATED fires but no scale-up happens | Inspect `xenna_stage_pressure_ewma`; if `< pressure_saturation_threshold` (1.0) the demotion gate is correctly suppressing transient bursts. Decrease `target_backlog_seconds` if the pipeline truly is latency-critical and the queue drains too fast for the gate. | [06](06-backlog-time-signal.md), [22](22-prometheus-metrics.md) |
 | OVER_PROVISIONED stage refuses to scale down | Inspect `xenna_stage_pressure_ewma`; values `> pressure_normal_threshold` (0.3) are demoting to NORMAL because the queue is stuck downstream. Fix the downstream bottleneck first; only as a last resort raise `pressure_normal_threshold`. | [06](06-backlog-time-signal.md) |
 | `xenna_stage_pressure_ewma` is unexpectedly noisy | Lower `pressure_smoothing_level` (`0.20` → `0.10`); confirm `xenna_stage_observed_throughput` itself is not noisy first | [06](06-backlog-time-signal.md) |
