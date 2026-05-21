@@ -109,9 +109,9 @@ local question.
 | Cycle | `xenna_scheduler_cycle_phase_duration_seconds` | histogram | `pipeline`, `phase` | Which of `pre_phase_setup` / `phase_a` / `phase_b` / `intent` / `phase_c` / `phase_d` / `invariants` / `into_solution` dominated cycle time |
 | Per-stage state | `xenna_stage_bottleneck_score` | gauge | `pipeline`, `stage` | Forced-Flow-Law bottleneck — see [23](23-bottleneck-score-metric.md). **Currently NaN** until per-stage service-time data is threaded through `autoscale(...)`; tracked in the saturation-aware roadmap. |
 | Per-stage state | `xenna_scheduler_cluster_heterogeneity_ratio` | gauge | `pipeline` | `max_k D_k / min_k D_k` across stages with finite service demand. **Currently NaN** while service-time data is unwired; the gauge stays registered so a future PR can populate it without breaking existing dashboards. |
-| Per-stage state | `xenna_stage_observed_throughput` | gauge | `pipeline`, `stage` | **MFI pressure input.** Per-stage observed throughput sample in completed tasks/sec, computed inline by `SaturationAwareScheduler.autoscale()` from the per-cycle delta of `update_with_measurements` counters. Raw, not smoothed. |
-| Per-stage state | `xenna_stage_backlog_time` | gauge | `pipeline`, `stage` | **MFI pressure input.** Per-stage raw backlog-drain time in seconds (`input_queue_depth / observed_throughput`, Little's Law `W_q`). Bounded to `target_backlog_seconds * BACKLOG_CAP` when throughput collapses to zero with `queue > 0` (cold-start). Raw, not smoothed. |
-| Per-stage state | `xenna_stage_pressure_ewma` | gauge | `pipeline`, `stage` | **MFI pressure output.** Per-stage smoothed pressure signal (`utilisation * normalized_backlog`). The classifier reads this as the demotion gate inside the existing slot-ratio branches; surfacing it directly lets operators audit classifier decisions without re-running the math from logs. |
+| Per-stage state | `xenna_stage_observed_throughput` | gauge | `pipeline`, `stage` | **Pressure input.** Per-stage observed throughput sample in completed tasks/sec, computed inline by `SaturationAwareScheduler.autoscale()` from the per-cycle delta of `update_with_measurements` counters. Raw, not smoothed. |
+| Per-stage state | `xenna_stage_backlog_time` | gauge | `pipeline`, `stage` | **Pressure input.** Per-stage raw backlog-drain time in seconds (`input_queue_depth / observed_throughput`, Little's Law `W_q`). Bounded to `target_backlog_seconds * BACKLOG_CAP` when throughput collapses to zero with `queue > 0` (cold-start). Raw, not smoothed. |
+| Per-stage state | `xenna_stage_pressure_ewma` | gauge | `pipeline`, `stage` | **Pressure output.** Per-stage smoothed backlog-time pressure (`utilisation * normalized_backlog`). The classifier reads this as the demotion gate inside the existing slot-ratio branches; surfacing it directly lets operators audit classifier decisions without re-running the math from logs. |
 | Per-stage state | `xenna_scheduler_stuck_plan_active` | gauge (0/1) | `pipeline`, `stage` | 1 when a stage's Phase C grow has been stuck above the detection threshold |
 | Per-stage state | `xenna_scheduler_stuck_plan_cycles_total` | counter | `pipeline`, `stage` | Total cycles a stage has been stuck above the detection threshold |
 | Safety | `xenna_scheduler_memory_pressure_active` | gauge (0/1) | `pipeline` | Memory-pressure gate engaged this cycle |
@@ -129,7 +129,7 @@ heterogeneity ratio fire at the end of every cycle from the
 `stuck_plan_active` and `stuck_plan_cycles_total` update each time
 the per-stage `_stuck_plan_counters` mutates (driven by
 `_set_stuck_plan_counter` in `saturation_aware.py`). The three
-**MFI pressure** gauges (`xenna_stage_observed_throughput`,
+**Backlog-time pressure** gauges (`xenna_stage_observed_throughput`,
 `xenna_stage_backlog_time`, `xenna_stage_pressure_ewma`) are emitted
 together by `emit_pressure_signals()` in `scheduling_py/pressure.py`,
 called once per stage per cycle from `_resolve_pressure_signal()`

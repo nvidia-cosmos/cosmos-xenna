@@ -110,10 +110,10 @@ def _problem_state_with_signals(
             num_used_slots, num_empty_slots)``.
         input_queue_depth: Stage-level upstream queue depth applied to every
             stage. Defaults to ``0`` so legacy tests that only exercise slot
-            signals stay unchanged. The MFI-pressure classifier (default-on)
-            requires queue depth > 0 for the slot-pin SATURATED gate to fire,
-            so trust-gate / wiring tests that expect a positive intent must
-            pass a non-zero value here.
+            signals stay unchanged. The backlog-time pressure classifier
+            (default-on) requires queue depth > 0 for the slot-pin SATURATED
+            gate to fire, so trust-gate / wiring tests that expect a
+            positive intent must pass a non-zero value here.
     """
     states = []
     for name, num_workers, slots, used, empty in stage_specs:
@@ -218,10 +218,11 @@ class TestMinDataPointsTrustGate:
         """With ``min_data_points=1`` the first valid sample produces a non-zero recommendation.
 
         The stage-level slot pin (``8/8`` used, ``0/8`` empty -> ratio ``0.0``)
-        plus the non-zero ``input_queue_depth`` yield a positive MFI pressure
-        so the SATURATED demotion gate is satisfied. Without an explicit queue
-        depth the test would inadvertently pin pressure to zero and the new
-        MFI classifier would correctly demote the slot pin to NORMAL.
+        plus the non-zero ``input_queue_depth`` yield a positive backlog-time
+        pressure so the SATURATED demotion gate is satisfied. Without an
+        explicit queue depth the test would inadvertently pin pressure to
+        zero and the pressure classifier would correctly demote the slot
+        pin to NORMAL.
         """
         sat_cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(

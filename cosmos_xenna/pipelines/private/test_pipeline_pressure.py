@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MFI-pressure helpers and pipeline integration.
+"""Backlog-time pressure helpers and pipeline integration.
 
 The classifier consumes a smoothed pressure scalar that the per-stage
 pipeline derives from three primitives:
@@ -316,31 +316,14 @@ class TestPipelinePressureThreading:
 
 
 class TestPressureGaugesAreFlagIndependent:
-    """The pressure gauges and the EWMA refresh are emitted regardless of
-    ``enable_backlog_time_classifier``.
-
-    The classifier flag is an escape hatch on the *consumer* side
-    (``classify()`` falls back to slot-only when False); the *producer*
-    side (``_resolve_pressure_signal``) always runs so operators retain
-    Grafana visibility into pressure even when the demotion gate is
-    disabled. This test pins that contract -- a regression would silence
-    the three pressure gauges for any stage that opted out of the
-    classifier, breaking the documented invariant in
-    ``docs/scheduler/saturation-aware/22-prometheus-metrics.md``.
-    """
+    """Pressure gauges fire regardless of ``enable_backlog_time_classifier``."""
 
     def test_emit_pressure_signals_called_when_classifier_disabled(
         self,
         cfg: SaturationAwareStageConfig,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """``emit_pressure_signals`` runs even when the classifier reads slot-only.
-
-        Patches the gauge emitter at the import site (``pipeline``) so the
-        substitution is observed by ``_resolve_pressure_signal`` without
-        touching the canonical ``pressure`` module that the scheduler
-        relies on at runtime.
-        """
+        """``emit_pressure_signals`` runs even when the classifier reads slot-only."""
         flag_off_cfg = SaturationAwareStageConfig(
             saturation_threshold=cfg.saturation_threshold,
             activation_threshold=cfg.activation_threshold,
@@ -352,9 +335,6 @@ class TestPressureGaugesAreFlagIndependent:
             enable_backlog_time_classifier=False,
         )
         state = _fresh_state(flag_off_cfg)
-        # Each captured tuple records the labelled emission so the test
-        # can assert both the string tags (stage / pipeline) and the
-        # three float values without losing static-type precision.
         captured: list[tuple[str, str, float, float, float]] = []
 
         def _spy(

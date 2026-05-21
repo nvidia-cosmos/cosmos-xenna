@@ -117,14 +117,7 @@ class TestSaturationAwareStageConfigFieldValidators:
 
 
 class TestPressureFieldValidators:
-    """Single-field validators for the MFI-pressure compound classifier knobs.
-
-    The 5 numeric knobs (``target_backlog_seconds``,
-    ``pressure_smoothing_level``, and the three pressure thresholds) and
-    the boolean escape-hatch flag are gated by attrs validators so a
-    misconfigured stage cannot reach the classifier with values that
-    would silently disable the demotion gate or freeze the pressure EWMA.
-    """
+    """Single-field validators for the backlog-time pressure classifier knobs."""
 
     @pytest.fixture(
         params=[
@@ -167,7 +160,7 @@ class TestPressureFieldValidators:
             SaturationAwareStageConfig(pressure_smoothing_level=1.01)
 
     def test_enable_backlog_time_classifier_default_is_true(self) -> None:
-        """The MFI-pressure classifier is enabled by default."""
+        """The backlog-time pressure classifier is enabled by default."""
         cfg = SaturationAwareStageConfig()
         assert cfg.enable_backlog_time_classifier is True
 
@@ -178,12 +171,7 @@ class TestPressureFieldValidators:
 
 
 class TestSaturationAwareStageConfigCrossFieldValidators:
-    """Cross-field invariants enforced in __attrs_post_init__.
-
-    Each test verifies one mutually-inconsistent combination raises
-    ``ValueError``. Cross-field invariants only fire after every field
-    has individually passed its own validator.
-    """
+    """Cross-field invariants enforced in __attrs_post_init__."""
 
     def test_threshold_ordering_violation_is_rejected(self) -> None:
         """activation < saturation < over_provisioned must hold."""

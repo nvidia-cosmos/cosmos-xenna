@@ -105,12 +105,12 @@ contribution and donor selection respectively. See
 |---|---|---|
 | `SaturationAwareConfig.interval_s` | `10.0 s` | Lower for tighter control on small clusters; raise on 10k-node clusters where the autoscaler's per-cycle work begins to compete with pipeline traffic. |
 
-### MFI pressure / backlog-time gate
+### Backlog-time pressure gate
 
 The classifier's compound pressure signal documented in
-[06 — Backlog-time signal](06-backlog-time-signal.md) has six per-stage
-knobs. Most pipelines run with the defaults; the only one operators
-typically tune is `target_backlog_seconds`.
+[06 — Backlog-time pressure signal](06-backlog-time-signal.md) has six
+per-stage knobs. Most pipelines run with the defaults; the only one
+operators typically tune is `target_backlog_seconds`.
 
 | Field | Default | When to adjust |
 |---|---|---|
@@ -119,7 +119,7 @@ typically tune is `target_backlog_seconds`.
 | `pressure_critical_threshold` | `2.0` | Operator-pinned override. Increase only if a stage produces high-pressure bursts that should not trigger the burst-response (`SATURATED_CRITICAL`) path. The hard cap is `BACKLOG_CAP=3.0`. |
 | `pressure_saturation_threshold` | `1.0` | Operator-pinned override. Lowering toward `0.6` makes the AND-criterion more permissive (slot pin still demoted if pressure is below `0.6`), which can be useful when measurements consistently underestimate true throughput. |
 | `pressure_normal_threshold` | `0.3` | Operator-pinned override. Decrease (toward `0.1`) when an idle stage with a consistently long downstream queue should NOT scale down. Increase (toward `0.6`) when the operator wants the demotion gate to ignore mild pressure and shrink the stage anyway. |
-| `enable_backlog_time_classifier` | `True` | **Escape hatch.** Set `False` per-stage to revert to legacy slot-only behaviour for workloads that were pre-tuned against the slot-ratio signal alone. Disabling globally re-introduces the false-positive scale-up failure mode the MFI gate was added to solve. |
+| `enable_backlog_time_classifier` | `True` | **Escape hatch.** Set `False` per-stage to revert to legacy slot-only behaviour for workloads that were pre-tuned against the slot-ratio signal alone. Disabling globally re-introduces the false-positive scale-up failure mode the pressure gate was added to solve. |
 
 Tuning workflow:
 

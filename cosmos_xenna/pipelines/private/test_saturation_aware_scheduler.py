@@ -352,16 +352,7 @@ class TestAutoscaleEdgeCases:
 
 
 class TestUpdateWithMeasurementsAccumulator:
-    """``update_with_measurements`` accumulates per-stage completion counts under the lock.
-
-    The MFI-pressure signal needs a ``observed_throughput`` sample once
-    per autoscale cycle, but ``streaming.Autoscaler`` calls
-    ``update_with_measurements`` on every monitor tick. The scheduler
-    therefore accumulates ``len(task_measurements)`` per stage into
-    ``_completed_counts`` under ``self._lock`` and lets
-    ``_consume_throughput_samples`` produce ``dcount/dt`` once per cycle.
-    These tests pin that contract.
-    """
+    """``update_with_measurements`` accumulates per-stage completion counts under the lock."""
 
     def test_empty_measurements_do_not_touch_counts(self) -> None:
         """Empty measurements leave both ``_completed_counts`` and ``_stage_states`` unchanged."""
@@ -551,20 +542,7 @@ class TestConsumeThroughputSamples:
 
 
 class TestPressureEndToEnd:
-    """End-to-end smoke: ``update_with_measurements`` -> ``autoscale`` updates ``pressure_ewma``.
-
-    Pins the wiring between the three integration points:
-
-    *   ``update_with_measurements`` accumulates the per-stage count.
-    *   ``autoscale`` consumes the count delta into a tasks/sec sample.
-    *   ``run_per_stage_pipeline`` smooths it with the slot-empty
-        utilisation EWMA into ``stage_state.pressure_ewma``.
-
-    A single cycle is enough to prove the contract -- the underlying
-    primitives (compute_pressure, update_ewma, classify) each have
-    dedicated unit tests, so this smoke test only verifies that the
-    sample is threaded through the integration boundary.
-    """
+    """End-to-end smoke: measurements -> autoscale updates ``pressure_ewma``."""
 
     def _problem_state_with_queue(
         self,
@@ -671,14 +649,7 @@ class TestUpdateWithMeasurementsThreadSafety:
     """Concurrent ``update_with_measurements`` callers do not lose or double-count tasks."""
 
     def test_concurrent_calls_aggregate_correctly(self) -> None:
-        """Hammering the accumulator from multiple threads preserves the running total.
-
-        ``streaming.Autoscaler`` only calls ``update_with_measurements``
-        from a single monitor thread today, but the lock contract is
-        the integration point any future multi-producer path will rely
-        on. This test pins the ``threading.Lock``-protected accumulator
-        so a refactor that drops the lock immediately surfaces.
-        """
+        """Hammering the accumulator from multiple threads preserves the running total."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
 

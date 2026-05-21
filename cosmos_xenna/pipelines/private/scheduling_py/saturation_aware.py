@@ -338,23 +338,9 @@ class SaturationAwareScheduler:
         # ``_RecommendationHistory`` instance across cycles so the buffer can
         # actually accumulate consensus.
         self._recommendation_histories: dict[str, _RecommendationHistory] = {}
-        # Throughput accumulator for the MFI-pressure compound signal
-        # (06-backlog-time-signal.md). ``streaming.Autoscaler.add_measurements``
-        # invokes ``update_with_measurements`` on every monitor tick (~ once
-        # per second by default) while ``autoscale`` runs every
-        # ``interval_s`` (default 10 s). Accumulating completed-task counts
-        # under a lock decouples the two cadences: each ``autoscale`` cycle
-        # consumes the delta against the previous consumed sample and emits
-        # one throughput value (``dcount / dt``) per stage. The lock is held
-        # only while reading or writing two integers per stage, so contention
-        # against the per-tick ``update_with_measurements`` call is
-        # negligible. ``_completed_counts`` carries the running total since
-        # ``setup()``; ``_last_throughput_sample`` is the last consumed
-        # ``(count, ts)`` per stage that ``autoscale`` snapshotted on the
-        # previous cycle. A missing entry on first read seeds with the
-        # current sample and yields ``observed_throughput_sample == 0.0``,
-        # which the pressure helper interprets as a cold-start branch
-        # (cap-bounded normalised backlog).
+        # Throughput accumulator: ``update_with_measurements`` adds per
+        # monitor tick, ``_consume_throughput_samples`` snapshots once per
+        # autoscale cycle. The lock decouples the two cadences.
         self._lock: threading.Lock = threading.Lock()
         self._completed_counts: dict[str, int] = {}
         self._last_throughput_sample: dict[str, tuple[int, float]] = {}
@@ -383,17 +369,11 @@ class SaturationAwareScheduler:
                 runtime state arriving in ``autoscale()``.
 
         """
-        # ``setup()`` runs pre-traffic on the same thread that constructs
-        # the scheduler, before the streaming executor wires the producer
-        # path (``update_with_measurements``) or the consumer path
-        # (``autoscale`` -> ``_consume_throughput_samples``). No other
-        # thread can observe the dicts mid-rebuild, so resetting
-        # ``_stage_states`` and friends without ``self._lock`` is safe by
-        # construction. Only the throughput-accumulator pair below is
-        # acquired under the lock because in some test fixtures the
-        # scheduler is re-``setup()``-ed mid-process to recycle a
-        # singleton instance, and the lock acquisition documents the
-        # invariant for readers without paying a runtime cost.
+        # ``setup()`` is pre-traffic: the streaming executor has not yet
+        # wired ``update_with_measurements`` or ``autoscale``, so resetting
+        # without ``self._lock`` is safe. The accumulator pair below is
+        # still locked because re-``setup()`` of a recycled scheduler can
+        # race the accumulator path in test fixtures.
         self._problem = problem
         self._stage_names = [stage.name for stage in problem.rust.stages]
         self._stage_states = {name: _StageRuntimeState(stage_name=name) for name in self._stage_names}
@@ -410,13 +390,9 @@ class SaturationAwareScheduler:
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
-        # Throughput accumulator state is reset alongside the rest of the
-        # per-pipeline runtime state so a re-setup of the same scheduler
-        # instance starts cold (no carry-over from the prior pipeline's
-        # task counts or sample timestamps). The lock is held only over
-        # the two assignments that ``update_with_measurements`` and
-        # ``_consume_throughput_samples`` also acquire; the rest of the
-        # rebuild relies on the pre-traffic invariant documented above.
+        # Throughput accumulator reset; locked because
+        # ``update_with_measurements`` and ``_consume_throughput_samples``
+        # also acquire ``self._lock``.
         with self._lock:
             self._completed_counts = {name: 0 for name in self._stage_names}
             self._last_throughput_sample = {}
@@ -556,8 +532,8 @@ class SaturationAwareScheduler:
         streaming loop, typically much faster than ``interval_s``);
         ``autoscale`` consumes the delta against the previously
         snapshotted ``(count, ts)`` and emits one throughput value
-        per stage per cycle. The MFI-pressure EWMA in ``pipeline.py``
-        absorbs the cycle-to-cycle noise.
+        per stage per cycle. The backlog-time pressure EWMA in
+        ``pipeline.py`` absorbs the cycle-to-cycle noise.
 
         Counting policy: one tick per ``TaskMeasurement`` (i.e.
         ``len(stage_measurements.task_measurements)``). The matching
@@ -1291,16 +1267,9 @@ class SaturationAwareScheduler:
                 threaded into the per-worker measurement grace
                 helper for elapsed-time comparisons against each
                 worker's first-seen-READY timestamp.
-            throughput_samples: Per-stage observed throughput in
-                completed tasks/sec for the current cycle, sourced
-                from :meth:`_consume_throughput_samples` and threaded
-                into ``run_per_stage_pipeline`` so the per-stage
-                MFI pressure helper can compute
-                ``utilisation * normalized_backlog`` against
-                ``input_queue_depth``. Stages absent from the map
-                are treated as cold-start (no measurements yet);
-                the pressure helper clamps to ``BACKLOG_CAP`` to
-                avoid ``+inf`` arithmetic on the first cycle.
+            throughput_samples: Per-stage tasks/sec from
+                :meth:`_consume_throughput_samples`. Missing entries
+                are treated as cold-start.
 
         Returns:
             Mapping of stage name -> signed intent. Positive values

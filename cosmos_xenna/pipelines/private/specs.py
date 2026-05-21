@@ -788,13 +788,7 @@ class SaturationAwareStageConfig:
             )
             raise ValueError(msg)
 
-        # Pressure-threshold ordering - the demotion semantics require
-        # ``critical > saturation > normal``. ``critical`` gates SATURATED
-        # _CRITICAL upward; ``saturation`` gates SATURATED upward; ``normal``
-        # gates OVER_PROVISIONED demotion. Reversing any pair would either
-        # make the SATURATED branch impossible to reach via pressure, or
-        # turn the OVER_PROVISIONED demotion into a hair-trigger that
-        # demotes on every elevated cycle.
+        # Pressure-threshold ordering: ``critical > saturation > normal``.
         if not (self.pressure_critical_threshold > self.pressure_saturation_threshold):
             msg = (
                 f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be > "
@@ -809,10 +803,8 @@ class SaturationAwareStageConfig:
                 "SATURATED needs a strictly larger pressure than the OVER_PROVISIONED demotion gate."
             )
             raise ValueError(msg)
-        # Pressure values are bounded above by the backlog cap (utilisation
-        # in [0, 1] multiplied by normalized_backlog in [0, BACKLOG_CAP]
-        # cannot exceed BACKLOG_CAP). A threshold above the cap can never
-        # fire.
+        # Local import keeps ``pressure.py``'s gauge registration SA-only;
+        # a top-level import would trigger it from every non-SA pipeline.
         from cosmos_xenna.pipelines.private.scheduling_py.pressure import BACKLOG_CAP
 
         if self.pressure_critical_threshold > BACKLOG_CAP:

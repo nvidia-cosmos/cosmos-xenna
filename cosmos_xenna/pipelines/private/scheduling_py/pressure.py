@@ -14,14 +14,12 @@
 # limitations under the License.
 
 
-"""MFI-style compound pressure signal for the saturation-aware classifier.
+"""Backlog-time pressure signal for the saturation-aware classifier.
 
-Combines the existing slots-empty utilisation EWMA with a normalised
-backlog time (Little's Law ``W_q = queue / throughput`` divided by an
-operator-facing ``target_backlog_seconds``) into a single product. Both
-factors must be elevated for pressure to fire; either factor near zero
-collapses the product. The classifier consumes the smoothed pressure as
-a demotion gate inside the existing slot-ratio branches:
+Pressure is ``utilisation * normalized_backlog`` (Little's Law
+``W_q = queue / throughput`` divided by ``target_backlog_seconds``);
+either factor near zero collapses the product. The classifier reads it
+as a demotion gate inside the existing slot-ratio branches:
 
 ::
 
@@ -37,11 +35,8 @@ a demotion gate inside the existing slot-ratio branches:
                  | downstream)|                     |
                   +-----------+---------------------+
 
-The Prometheus gauges in this module surface the raw inputs and the
-smoothed output so operators can audit classifier decisions without
-re-running the math from logs. The metrics are SA-only; importing this
-module from a fragmentation-based pipeline pays the import-time
-registration cost but no observations are ever recorded.
+The Prometheus gauges below expose the raw inputs and the smoothed
+output for operator audit.
 """
 
 from ray.util.metrics import Gauge
@@ -52,10 +47,8 @@ PRESSURE_OBSERVED_THROUGHPUT_METRIC = "xenna_stage_observed_throughput"
 PRESSURE_BACKLOG_TIME_METRIC = "xenna_stage_backlog_time"
 PRESSURE_EWMA_METRIC = "xenna_stage_pressure_ewma"
 
-# Upper clamp on the normalised backlog factor. Bounds the composite
-# pressure signal even when ``observed_throughput`` collapses to zero
-# while the queue is non-empty (cold-start). Matches the cap-based
-# cross-field validator on ``SaturationAwareStageConfig`` thresholds.
+# Upper clamp on the normalised backlog factor; keeps the cold-start
+# branch finite when throughput is zero with a non-empty queue.
 BACKLOG_CAP: float = 3.0
 
 _OBSERVED_THROUGHPUT_GAUGE = Gauge(
@@ -98,49 +91,24 @@ def compute_pressure(
     target_backlog_seconds: float,
     backlog_cap: float = BACKLOG_CAP,
 ) -> float:
-    """Compute the MFI-style compound pressure for one cycle.
+    """Compute the backlog-time pressure for one cycle.
 
-    Pressure is the product ``utilisation * normalized_backlog`` where
-    utilisation is ``1 - slots_empty_ratio_ewma`` and normalized_backlog
-    is ``W_q / target_backlog_seconds`` clamped to ``[0, backlog_cap]``.
-    The product captures the AND-criterion as a single multiplication:
-    either factor near zero kills the output.
+    ``utilisation * normalized_backlog`` clamped to ``backlog_cap``;
+    either factor near zero collapses the product. ``observed_throughput
+    <= 0`` with a non-empty queue is the cold-start branch and clamps
+    to ``backlog_cap`` rather than dividing by zero.
 
     Args:
-        slots_empty_ratio_ewma: Smoothed empty-slot fraction in
-            ``[0.0, 1.0]``. Sourced from the existing utilisation EWMA
-            consumed by the slot-ratio classifier.
-        input_queue_depth: Tasks waiting upstream of the stage. Zero
-            means the queue is empty and pressure collapses to ``0.0``
-            regardless of throughput.
-        observed_throughput: Completed stage tasks per second since
-            the previous autoscale cycle. ``0.0`` (or negative) is
-            treated as "no progress this cycle"; combined with a
-            non-empty queue this produces a ``backlog_cap``-bounded
-            normalised backlog so cold-start cycles still fire the
-            CRITICAL/SATURATED branches.
-        target_backlog_seconds: Operator-facing primary knob. The
-            queue drain time at which ``normalized_backlog == 1.0``.
-        backlog_cap: Upper clamp on ``normalized_backlog``. Defaults to
-            ``BACKLOG_CAP`` (``3.0``); kept as a parameter so unit
-            tests can pin the clamp without mutating the module
-            constant.
+        slots_empty_ratio_ewma: Smoothed empty-slot fraction in ``[0, 1]``.
+        input_queue_depth: Tasks waiting upstream; ``0`` collapses the
+            output to ``0.0``.
+        observed_throughput: Completed tasks/sec since the last cycle.
+        target_backlog_seconds: Drain time at which
+            ``normalized_backlog == 1.0``.
+        backlog_cap: Upper clamp on ``normalized_backlog``.
 
     Returns:
-        Pressure scalar in ``[0.0, backlog_cap]``. The classifier
-        applies threshold gates against this value; values close to
-        zero are demoted to ``NORMAL``, values above
-        ``pressure_critical_threshold`` fire ``SATURATED_CRITICAL``.
-
-    Cold-start contract::
-
-       queue == 0                              -> 0.0
-       throughput <= 0 AND queue > 0           -> utilisation * backlog_cap
-       throughput > 0  AND queue > 0           -> utilisation *
-                                                  min(W_q / target, cap)
-
-    The cold-start branch deliberately uses ``backlog_cap`` instead of
-    ``+inf`` arithmetic so the pressure stays a finite scalar.
+        Pressure scalar in ``[0.0, backlog_cap]``.
 
     """
     utilisation = 1.0 - slots_empty_ratio_ewma
@@ -164,20 +132,12 @@ def emit_pressure_signals(
 ) -> None:
     """Record the three pressure gauges for one stage in one cycle.
 
-    Called from the per-stage decision pipeline after pressure has been
-    computed and the EWMA refreshed. Tags are normalised to
-    ``{"stage": stage_name, "pipeline": pipeline_name}`` so the Grafana
-    dashboard can join all three series on the same key set.
-
     Args:
-        stage_name: Stage being reported on.
-        pipeline_name: Value of the ``pipeline`` Prometheus tag.
+        stage_name: Stage label.
+        pipeline_name: Pipeline label.
         observed_throughput: Raw throughput sample (tasks/sec).
-        backlog_time: Raw backlog-drain time (seconds), bounded to
-            ``target_backlog_seconds * BACKLOG_CAP`` when throughput
-            is zero with queue > 0.
-        pressure_ewma: Smoothed composite pressure consumed by the
-            classifier this cycle.
+        backlog_time: Raw backlog-drain time (seconds).
+        pressure_ewma: Smoothed composite pressure consumed by the classifier.
     """
     tags = {"stage": stage_name, "pipeline": pipeline_name}
     _OBSERVED_THROUGHPUT_GAUGE.set(float(observed_throughput), tags=tags)
@@ -200,23 +160,18 @@ def compute_backlog_time(
 ) -> float:
     """Compute the raw backlog-drain time for the Prometheus gauge.
 
-    The classifier consumes ``compute_pressure``'s product directly;
-    this helper exists so the gauge series surfaces the underlying
-    Little's Law value (rather than the product) without divide-by-zero
-    arithmetic in the caller. Returns ``0.0`` for an empty queue and
+    Returns ``0.0`` for an empty queue and
     ``target_backlog_seconds * backlog_cap`` for the cold-start branch
-    (zero throughput with non-empty queue) so the displayed value never
-    overflows or NaN-poisons downstream aggregation.
+    (zero throughput with non-empty queue).
 
     Args:
-        input_queue_depth: Same as for ``compute_pressure``.
-        observed_throughput: Same as for ``compute_pressure``.
-        target_backlog_seconds: Same as for ``compute_pressure``.
-        backlog_cap: Same as for ``compute_pressure``.
+        input_queue_depth: Tasks waiting upstream.
+        observed_throughput: Tasks/sec since the last cycle.
+        target_backlog_seconds: Operator-facing target.
+        backlog_cap: Upper clamp on the displayed value.
 
     Returns:
-        Backlog-drain time in seconds, bounded to
-        ``target_backlog_seconds * backlog_cap``.
+        Backlog-drain time in seconds.
 
     """
     if input_queue_depth <= 0:

@@ -1,4 +1,4 @@
-# 06 — Backlog-Time Signal (MFI Pressure Hybrid)
+# 06 — Backlog-Time Pressure Signal
 
 ## TL;DR
 
@@ -46,7 +46,7 @@ stories and either one alone misclassifies real workloads.
 
 ## Decision
 
-Use the **MFI Pressure Hybrid** approach: the existing slot-ratio
+Use the **backlog-time pressure** approach: the existing slot-ratio
 gate continues to select the classifier branch, and a single smoothed
 **pressure** scalar acts as a **demotion gate** inside each branch.
 Pressure is the multiplicative composition of the two observables:
@@ -65,11 +65,11 @@ finite (especially during cold-start when `observed_throughput == 0`
 and `queue > 0`). Pressure is smoothed by an EWMA before reaching the
 classifier so cycle-to-cycle noise on the throughput sample dampens.
 
-The hybrid name reflects two design choices: "MFI" — Multiplicative
-Factor Interaction — captures that pressure fires only when **both**
-factors are elevated; "Pressure" — the single scalar surfaces the
-AND-criterion as one value the classifier and dashboards can read
-directly.
+The signal fires only when **both** factors are elevated: the
+multiplication collapses the product to ≈0 whenever either utilisation
+is low (idle slots) or normalised backlog is low (queue draining). The
+single scalar surfaces this AND-criterion as one value the classifier
+and dashboards can read directly.
 
 ```
                               utilisation
@@ -119,7 +119,7 @@ construction.
 
 ## Throughput sample plumbing
 
-The MFI pressure signal needs a per-cycle `observed_throughput`
+The backlog-time pressure signal needs a per-cycle `observed_throughput`
 sample. The streaming layer calls `update_with_measurements()` on
 every monitor tick (cadence governed by `streaming.Autoscaler`,
 typically much faster than `interval_s`); the SA scheduler accumulates
@@ -172,7 +172,7 @@ would corrupt the next valid cycle's demotion decision.
 
 ## Escape hatch — slot-only classifier
 
-The new MFI gate can be disabled per-stage:
+The pressure gate can be disabled per-stage:
 
 ```python
 SaturationAwareStageConfig(
@@ -198,7 +198,7 @@ All on
 | `pressure_critical_threshold` | `2.0` | Pressure above which a slot-pin `SATURATED_CRITICAL` actually fires. Strictly larger than `pressure_saturation_threshold`. |
 | `pressure_saturation_threshold` | `1.0` | Pressure above which a slot-pin `SATURATED` actually fires. |
 | `pressure_normal_threshold` | `0.3` | Pressure above which a slot-pin `OVER_PROVISIONED` is demoted to `NORMAL` (queue is stuck elsewhere). |
-| `enable_backlog_time_classifier` | `True` | Escape hatch — disables the MFI gate and falls back to slot-only. |
+| `enable_backlog_time_classifier` | `True` | Escape hatch — disables the pressure gate and falls back to slot-only. |
 
 Cross-field invariants enforced at construction time:
 
@@ -209,7 +209,7 @@ pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
 
 ## See also
 
-- [00 — Per-cycle overview](00-overview.md) — where the MFI pressure
+- [00 — Per-cycle overview](00-overview.md) — where the pressure
   gate sits inside the intent compute stage.
 - [02 — Configuration model](02-configuration-model.md) — every
   per-stage knob including the six new pressure-gate fields.

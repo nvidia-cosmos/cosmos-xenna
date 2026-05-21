@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MFI-pressure demotion behaviour for the saturation-aware classifier.
+"""Backlog-time pressure demotion behaviour for the saturation-aware classifier.
 
 These tests pin the slot-pin-gate-then-pressure-demotion contract that
 ``classify()`` introduces alongside the existing slot-ratio thresholds.
@@ -214,7 +214,7 @@ class TestEnableFlagOff:
 
     @pytest.fixture
     def cfg_disabled(self) -> SaturationAwareStageConfig:
-        """Same thresholds as the active fixture but with the MFI gate disabled."""
+        """Same thresholds as the active fixture but with the pressure gate disabled."""
         return SaturationAwareStageConfig(
             saturation_threshold=0.15,
             activation_threshold=0.05,

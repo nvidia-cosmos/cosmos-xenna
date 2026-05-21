@@ -94,17 +94,9 @@ def run_per_stage_pipeline(
             this gates Phase C / Phase D against acting on a single
             noisy cycle. ``None`` (used by helper-direct tests) skips
             the stabilization layer entirely.
-        observed_throughput_sample: Per-cycle completed-task rate in
-            tasks/sec for this stage, derived by the scheduler from
-            ``update_with_measurements`` accumulators. ``0.0`` is the
-            cold-start signal (no prior delta available); the pressure
-            helper interprets it as "no progress this cycle" and uses
-            the cap-bounded normalised backlog. Defaults to ``0.0``
-            so direct callers (helper-style tests) keep working
-            without supplying a sample.
-        pipeline_name: Value of the ``pipeline`` Prometheus tag for
-            the SA-only pressure gauges. Empty string when no
-            job-level identifier is available.
+        observed_throughput_sample: Per-cycle completed-task rate
+            (tasks/sec). ``0.0`` is the cold-start signal.
+        pipeline_name: ``pipeline`` Prometheus tag for the pressure gauges.
 
     Returns:
         Signed recommendation delta: positive to add, negative to
@@ -287,33 +279,19 @@ def _resolve_pressure_signal(
     stage_name: str,
     pipeline_name: str,
 ) -> float:
-    """Compute the raw MFI pressure, smooth it, and emit the gauges.
-
-    Mutates ``stage_state.pressure_ewma`` in place with the updated
-    EWMA value. The smoothed value is also returned so the classifier
-    receives the canonical post-EWMA reading for this cycle (avoiding
-    a second ``stage_state`` read after potential mutation by future
-    callers).
+    """Compute pressure, refresh ``stage_state.pressure_ewma``, emit the gauges.
 
     Args:
-        stage_state: Per-stage runtime state; ``pressure_ewma`` is
-            mutated in place.
-        slots_empty_ratio_ewma: Smoothed empty-slot fraction in
-            ``[0, 1]``. Already resolved by ``_resolve_classifier_signal``
-            so callers know it is non-``None``.
-        input_queue_depth: Stage-level upstream queue depth.
-        observed_throughput: Per-cycle completed-task rate in
-            tasks/sec, derived by the scheduler from
-            ``update_with_measurements``.
-        config: Per-stage configuration; ``target_backlog_seconds``
-            and ``pressure_smoothing_level`` come from here.
-        stage_name: Stage label for the Prometheus gauges.
-        pipeline_name: Pipeline label for the Prometheus gauges.
+        stage_state: Per-stage runtime state; ``pressure_ewma`` is mutated.
+        slots_empty_ratio_ewma: Smoothed empty-slot fraction in ``[0, 1]``.
+        input_queue_depth: Upstream queue depth.
+        observed_throughput: Tasks/sec since the last cycle.
+        config: Per-stage configuration.
+        stage_name: Stage label for the gauges.
+        pipeline_name: Pipeline label for the gauges.
 
     Returns:
-        The post-EWMA pressure scalar in ``[0.0, BACKLOG_CAP]``.
-        Always finite; the cold-start path uses the cap-bounded
-        normalised backlog so no ``+inf`` arithmetic is involved.
+        Post-EWMA pressure scalar in ``[0.0, BACKLOG_CAP]``.
 
     """
     raw_pressure = compute_pressure(

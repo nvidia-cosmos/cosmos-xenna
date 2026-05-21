@@ -29,7 +29,7 @@ Two-layer decision (06-backlog-time-signal.md):
     asymmetric deadband for hysteresis.
 
 2.  **Pressure demotion**: once a slot-pin branch is selected, the
-    smoothed MFI pressure
+    smoothed backlog-time pressure
     (``utilisation * normalized_backlog``) acts as a demotion gate:
 
     *   ``SATURATED_CRITICAL`` requires ``pressure_ewma > pressure_critical_threshold``;
@@ -73,15 +73,11 @@ def classify(
             ``[0, 1]``.
         input_queue_depth: Tasks waiting upstream of this stage;
             disambiguates ``OVER_PROVISIONED`` from ``STARVED``.
-        pressure_ewma: Smoothed MFI pressure scalar in
+        pressure_ewma: Smoothed backlog-time pressure scalar in
             ``[0.0, BACKLOG_CAP]`` or ``None``. ``None`` means no
-            pressure value is available yet (``run_per_stage_pipeline``
-            short-circuited before computing it because the slot
-            signal was unavailable, or the helper-direct test path
-            chose to skip the helper). The classifier preserves
-            slot-only behaviour in the missing-pressure case so a
-            transient signal gap cannot suppress a saturation
-            response.
+            pressure value is available yet; the classifier
+            preserves slot-only behaviour so a transient signal gap
+            cannot suppress a saturation response.
         prev_state: The previous cycle's zone (drives the slot-pin
             hysteresis bands).
         saturation_threshold: Empty-slot fraction below which the
@@ -166,7 +162,7 @@ def _classify_slot_only(
 ) -> StageState:
     """Legacy utilisation-only classifier for the escape-hatch path.
 
-    Reproduces the pre-MFI behaviour exactly. Used when
+    Reproduces the pre-pressure-gate behaviour exactly. Used when
     ``config.enable_backlog_time_classifier`` is ``False`` to preserve
     a stable contract for workloads that were pre-tuned against the
     slot-ratio signal alone.

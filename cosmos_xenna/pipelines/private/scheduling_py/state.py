@@ -122,16 +122,11 @@ class _StageRuntimeState:
             have been observed; this prevents acting on classifier
             output computed from one or two stale or warmup-only
             samples.
-        pressure_ewma: EWMA-smoothed MFI pressure signal
+        pressure_ewma: EWMA-smoothed backlog-time pressure
             (``utilisation * normalized_backlog``). ``None`` until the
-            first cycle where ``_resolve_pressure_signal`` runs (which
-            requires both a valid slot EWMA and an observed throughput
-            sample, even ``0.0`` for cold-start). When the slot EWMA is
-            unavailable (zero ready actors, no carry-forward),
-            ``run_per_stage_pipeline`` short-circuits before computing
-            pressure, so this field is left untouched and the classifier
-            never reads stale data. Consumed by ``classify()`` when
-            ``enable_backlog_time_classifier`` is ``True``.
+            first cycle with a valid slot signal; left untouched when
+            ``run_per_stage_pipeline`` short-circuits, so the classifier
+            never reads stale data.
 
     """
 
