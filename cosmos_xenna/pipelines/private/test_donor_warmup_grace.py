@@ -125,8 +125,8 @@ class TestPhaseDShrinkVictimFilter:
 
         assert victims == []
 
-    def test_none_excluded_set_preserves_legacy_behavior(self) -> None:
-        """``excluded_worker_ids=None`` keeps the prior contract."""
+    def test_none_excluded_set_includes_all_workers(self) -> None:
+        """``excluded_worker_ids=None`` means no filtering; every worker is eligible."""
         victims = select_workers_to_remove_oldest_first(
             worker_ids=["a-w0", "a-w1", "a-w2"],
             worker_ages={"a-w0": 100, "a-w1": 50, "a-w2": 1},
@@ -136,8 +136,8 @@ class TestPhaseDShrinkVictimFilter:
 
         assert set(victims) == {"a-w0", "a-w1", "a-w2"}
 
-    def test_empty_excluded_set_preserves_legacy_behavior(self) -> None:
-        """An empty frozenset is equivalent to ``None``."""
+    def test_empty_excluded_set_includes_all_workers(self) -> None:
+        """An empty frozenset is equivalent to ``None``: every worker is eligible."""
         victims = select_workers_to_remove_oldest_first(
             worker_ids=["a-w0", "a-w1"],
             worker_ages={"a-w0": 100, "a-w1": 50},
@@ -242,8 +242,8 @@ class TestSaturationDonorWarmupFilter:
 
         assert result is None
 
-    def test_none_excluded_set_preserves_legacy_behavior(self, base_kwargs: dict[str, Any]) -> None:
-        """``excluded_worker_ids=None`` matches the prior unfiltered contract."""
+    def test_none_excluded_set_includes_all_workers(self, base_kwargs: dict[str, Any]) -> None:
+        """``excluded_worker_ids=None`` matches the unfiltered contract; every worker is eligible."""
         result = find_saturation_donor(
             worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
             excluded_worker_ids=None,

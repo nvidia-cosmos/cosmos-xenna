@@ -14,7 +14,26 @@
 # limitations under the License.
 
 
-"""Stuck-plan detector for the saturation-aware Phase C grow path."""
+"""WARN-to-INFO promotion + Prometheus instrumentation for the Phase C ``_stuck_plan_counters``.
+
+Phase C ticks ``_stuck_plan_counters[stage]`` every cycle that a
+positive-intent grow request goes partly unsatisfied (cluster
+fragmentation, donor selection failure, hard-cap clamp). The raw
+counter is fed through ``_set_stuck_plan_counter`` into this
+module on every mutation; :class:`StuckPlanDetector` translates
+the counter into two operator-facing signals:
+
+  * one INFO log per stuck episode (the cycle the counter first
+    crosses ``stuck_plan_detection_cycles`` and the cycle it
+    recovers), replacing the per-cycle WARN that drowns operators;
+  * the ``xenna_scheduler_stuck_plan_active`` gauge and
+    ``xenna_scheduler_stuck_plan_cycles_total`` counter, tagged by
+    ``(stage, pipeline)``, so dashboards and alerts target a
+    specific stuck stage without scraping logs.
+
+See ``docs/scheduler/saturation-aware/26-stuck-plan-detector.md``
+for the full design rationale.
+"""
 
 import attrs
 from ray.util.metrics import Counter, Gauge
@@ -40,10 +59,12 @@ _STUCK_PLAN_CYCLES_COUNTER = Counter(
 class StuckPlanDetector:
     """Per-stage latch promoting the stuck-plan WARN to a one-shot INFO."""
 
-    _fired: dict[str, bool] = attrs.Factory(dict)
+    _fired: dict[tuple[str, str], bool] = attrs.Factory(dict)
 
     def reset(self) -> None:
-        """Drop the latch state."""
+        """Drop the latch state and clear every gauge label this detector raised."""
+        for stage_name, pipeline_name in self._fired:
+            _STUCK_PLAN_ACTIVE_GAUGE.set(0.0, tags={"stage": stage_name, "pipeline": pipeline_name})
         self._fired.clear()
 
     def update(
@@ -65,8 +86,9 @@ class StuckPlanDetector:
             pipeline_name: Value for the ``pipeline`` Prometheus tag.
         """
         tags = {"stage": stage_name, "pipeline": pipeline_name}
+        key = (stage_name, pipeline_name)
         is_stuck = stuck_cycles >= threshold_cycles
-        was_fired = self._fired.get(stage_name, False)
+        was_fired = self._fired.get(key, False)
 
         if is_stuck:
             _STUCK_PLAN_ACTIVE_GAUGE.set(1.0, tags=tags)
@@ -78,13 +100,13 @@ class StuckPlanDetector:
                     f"last_intent={last_intent}); growth blocked by cluster "
                     "placement and donor selection."
                 )
-                self._fired[stage_name] = True
+                self._fired[key] = True
             return
 
         _STUCK_PLAN_ACTIVE_GAUGE.set(0.0, tags=tags)
         if was_fired and stuck_cycles == 0:
             logger.info(f"saturation-aware stuck plan: stage {stage_name!r} recovered; growth is no longer blocked.")
-            self._fired[stage_name] = False
+            self._fired[key] = False
 
 
 __all__ = [

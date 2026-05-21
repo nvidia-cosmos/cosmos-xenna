@@ -6,8 +6,8 @@ Scheduler observability is organised as a stable **Prometheus
 catalogue with five families** — **cycle**, **per-stage state**,
 **decision counters**, **safety**, and **configuration**. Every
 metric is keyed by a small, bounded label set (`pipeline`, `stage`,
-`kind`) so a 100-stage pipeline produces a few hundred series, not
-tens of thousands. The **metric names are the contract**: dashboards
+`phase`, `kind`) so a 100-stage pipeline produces a few hundred
+series, not tens of thousands. The **metric names are the contract**: dashboards
 and alerts bind to the names and labels, the scheduler is free to
 re-implement the decision logic behind them.
 
@@ -45,7 +45,10 @@ label cardinality and a name-stability contract.
   family without cross-referencing.
 - **Bounded label set.** Every metric uses at most three labels
   from a closed vocabulary: `pipeline` (one per running job),
-  `stage` (one per pipeline stage), `kind` (a small enum, e.g.
+  `stage` (one per pipeline stage), `phase` (a small enum naming
+  one autoscale-cycle phase: `pre_phase_setup | phase_a |
+  phase_b | intent | phase_c | phase_d | invariants |
+  into_solution`), `kind` (a small enum, e.g.
   `acq | trk | hold` for growth mode, `sat | act | over` for
   thresholds). No free-form `reason`, no per-worker label, no
   per-cycle label. Per-stage gauges add `O(num_stages)` series per

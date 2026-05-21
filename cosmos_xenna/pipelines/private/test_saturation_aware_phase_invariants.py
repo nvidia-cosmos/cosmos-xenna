@@ -644,6 +644,24 @@ class TestCheckNoNanInClassifierState:
                 stage_runtime_states=states,
             )
 
+    def test_nan_pressure_ewma_raises_with_stage_name(self) -> None:
+        """``NaN`` in ``pressure_ewma`` surfaces the stage name and field."""
+        states = {
+            "A": _StageRuntimeState(stage_name="A"),
+            "B": _StageRuntimeState(
+                stage_name="B",
+                pressure_ewma=float("nan"),
+            ),
+        }
+        with pytest.raises(
+            SchedulerInvariantError,
+            match=r"stage 'B'.*pressure_ewma=nan",
+        ):
+            check_no_nan_in_classifier_state(
+                phase_name=PhaseBoundary.PHASE_C,
+                stage_runtime_states=states,
+            )
+
     def test_stage_name_with_newline_is_repr_escaped(self) -> None:
         """Stage names containing newlines are ``!r``-escaped to prevent log forging."""
         states = {

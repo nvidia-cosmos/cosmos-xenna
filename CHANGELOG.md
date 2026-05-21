@@ -17,7 +17,7 @@
 
 ### Changed
 
-- `ProblemWorkerGroupState` gained `num_used_slots` + worker-age fields (backwards-compatible).
+- `ProblemWorkerGroupState` gained `num_used_slots` + worker-age fields (additive; existing call sites unchanged).
 
 ## [0.4.2]
 

@@ -199,6 +199,9 @@ All fields live in
   monotonicity invariant on `_stuck_plan_counters`.
 - [22 — Prometheus metrics](22-prometheus-metrics.md) — operator
   visibility into stuck-plan counter timeseries.
+- [26 — Stuck-plan detector](26-stuck-plan-detector.md) — the
+  WARN-to-INFO latch and gauge / counter instrumentation that
+  this doc's counter feeds into.
 - [`saturation_aware.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/saturation_aware.py)
   — `_run_phase_c_grow`, `_run_phase_b_floor`,
   `_attempt_cross_stage_donation`, `_record_donation_success`.

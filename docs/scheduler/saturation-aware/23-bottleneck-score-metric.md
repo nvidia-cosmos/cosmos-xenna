@@ -166,8 +166,8 @@ promise.
 ## See also
 
 - [22 — Prometheus metrics catalogue](22-prometheus-metrics.md) —
-  the full set of `xenna_*` and `pipeline_*` gauges, their label
-  cardinality, and the sampling cycle they share.
+  the full set of `xenna_scheduler_*` and `xenna_stage_*` gauges,
+  their label cardinality, and the sampling cycle they share.
 - [25 — Bottleneck decision integration](25-bottleneck-decision-integration.md) —
   how the EWMA-smoothed `D_k` value drives Phase C grow-priority
   ordering and Phase D shrink protection.

@@ -162,3 +162,43 @@ class TestStuckPlanDetector:
 
         info_records = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert sum("stuck for" in r.message for r in info_records) == 2
+
+    def test_reset_clears_active_gauge_for_every_raised_label(
+        self,
+        fake_metrics: tuple[_FakeGauge, _FakeCounter],
+    ) -> None:
+        """``reset()`` emits gauge=0 for every (stage, pipeline) it ever raised to 1."""
+        gauge, _counter = fake_metrics
+        detector = StuckPlanDetector()
+
+        detector.update(stage_name="s1", stuck_cycles=3, threshold_cycles=3, last_intent=1, pipeline_name="p")
+        detector.update(stage_name="s2", stuck_cycles=3, threshold_cycles=3, last_intent=1, pipeline_name="p")
+        prefix_len = len(gauge.values)
+        detector.reset()
+        clearing_calls = gauge.values[prefix_len:]
+
+        # ``_fired`` preserves insertion order, so ``reset()`` clears
+        # in the same order the latch entries were created.
+        assert clearing_calls == [
+            (0.0, {"stage": "s1", "pipeline": "p"}),
+            (0.0, {"stage": "s2", "pipeline": "p"}),
+        ]
+
+    def test_reset_clears_gauges_across_multiple_pipeline_tags(
+        self,
+        fake_metrics: tuple[_FakeGauge, _FakeCounter],
+    ) -> None:
+        """Composite-key storage keeps per-pipeline gauges distinct under reset()."""
+        gauge, _counter = fake_metrics
+        detector = StuckPlanDetector()
+
+        detector.update(stage_name="s", stuck_cycles=3, threshold_cycles=3, last_intent=1, pipeline_name="p1")
+        detector.update(stage_name="s", stuck_cycles=3, threshold_cycles=3, last_intent=1, pipeline_name="p2")
+        prefix_len = len(gauge.values)
+        detector.reset()
+        clearing_calls = gauge.values[prefix_len:]
+
+        assert clearing_calls == [
+            (0.0, {"stage": "s", "pipeline": "p1"}),
+            (0.0, {"stage": "s", "pipeline": "p2"}),
+        ]

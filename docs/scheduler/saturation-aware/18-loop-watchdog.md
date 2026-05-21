@@ -181,12 +181,10 @@ Both knobs live on `SaturationAwareConfig` in
 | `cycle_time_warn_threshold` | `0.5` | Fraction of `interval_s` above which a cycle's wall-clock duration triggers the WARN log. Range `(0.0, 1.0]` enforced by an `attrs` validator. Higher = quieter logs; lower = earlier warnings. |
 | `interval_s` | `10.0` | Cluster-wide cycle interval (seconds). Sets the absolute watchdog budget via `cycle_time_warn_threshold * interval_s` (default budget = 5 s). Changing `interval_s` rescales the watchdog budget automatically. |
 
-The watchdog has no separate `enable_watchdog: bool` flag. To
-silence the WARN line without disabling the histogram, set
-`cycle_time_warn_threshold = 1.0`: the threshold can never be
-crossed because the validator clamps the field to `(0.0, 1.0]` and
-the cycle cannot use more than 100% of its own interval before the
-next tick is already overdue.
+The watchdog has no separate `enable_watchdog: bool` flag. To make
+WARN logging less sensitive without disabling the histogram, set
+`cycle_time_warn_threshold = 1.0`: WARN then fires only when a cycle
+exceeds the full interval (`duration_s > interval_s`).
 
 ## See also
 

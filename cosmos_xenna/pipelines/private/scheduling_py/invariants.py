@@ -162,9 +162,9 @@ def check_no_nan_in_classifier_state(
 ) -> None:
     """Reject any per-stage EWMA value that is ``NaN`` or ``+/-Inf``.
 
-    Validates ``slots_empty_ratio_ewma`` and
-    ``last_valid_slots_empty_ratio_ewma`` on each entry; ``None``
-    is treated as a valid cold-start sentinel.
+    Validates ``slots_empty_ratio_ewma``,
+    ``last_valid_slots_empty_ratio_ewma``, and ``pressure_ewma`` on
+    each entry; ``None`` is treated as a valid cold-start sentinel.
 
     Args:
         phase_name: Identifier for the boundary, included in the
@@ -182,6 +182,7 @@ def check_no_nan_in_classifier_state(
         for field_name, value in (
             ("slots_empty_ratio_ewma", runtime.slots_empty_ratio_ewma),
             ("last_valid_slots_empty_ratio_ewma", runtime.last_valid_slots_empty_ratio_ewma),
+            ("pressure_ewma", runtime.pressure_ewma),
         ):
             if value is None:
                 continue

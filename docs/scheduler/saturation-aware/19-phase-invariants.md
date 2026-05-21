@@ -93,6 +93,7 @@ cannot drop the diagnostic.
                 │  check_no_nan_in_classifier_state(PHASE_C)  │    │
                 │    slots_empty_ratio_ewma   is finite       │ ───┤
                 │    last_valid_slots_empty_ratio_ewma finite │    │
+                │    pressure_ewma            is finite       │    │
                 └─────────────────────────────────────────────┘    │
                                     │ pass                         │
                                     ▼                              │
@@ -146,7 +147,7 @@ caller as
 |---|---|---|
 | (before PHASE_A) | `_check_problem_state_shape_before_phase_a` | `problem.stages` and `problem_state.stages` agree on count and name-at-index |
 | PHASE_A, PHASE_B, PHASE_C, PHASE_D | `check_invariants_after_phase` | `ctx.num_stages() == len(problem.stages)`; every stage's `pending_add_count` and `pending_remove_count` is `≥ 0` |
-| PHASE_C | `check_no_nan_in_classifier_state` | every stage's `slots_empty_ratio_ewma` and `last_valid_slots_empty_ratio_ewma` is finite (`None` is honoured as a cold-start sentinel) |
+| PHASE_C | `check_no_nan_in_classifier_state` | every stage's `slots_empty_ratio_ewma`, `last_valid_slots_empty_ratio_ewma`, and `pressure_ewma` is finite (`None` is honoured as a cold-start sentinel) |
 | PHASE_D | `check_floor_after_phase_d` | every non-manual non-finished stage `i` satisfies `min(pre_phase_d_worker_counts[i], stage_floors[i]) ≤ current ≤ pre_phase_d_worker_counts[i]` |
 | PHASE_D | `check_stuck_plan_monotonicity` | per-stage stuck-plan counter transition is `curr == 0` (reset) or `curr == prev + 1` (strict increment); no other transition is legal |
 | INTO_SOLUTION | `check_solution_shape` | `len(solution.stages) == len(problem.stages)` — callers consume the `Solution` positionally |

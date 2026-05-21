@@ -600,11 +600,38 @@ class SaturationAwareScheduler:
                 ``measurements.rust.stages`` zipped with
                 ``self._stage_names`` so the count attribution
                 follows pipeline-DAG order rather than relying on
-                stage-name hashing.
+                stage-name hashing. Either empty (no measurements
+                this tick, accepted as a no-op) or one entry per
+                stage in DAG order.
+
+        Raises:
+            ValueError: ``measurements.rust.stages`` is non-empty
+                and disagrees in length with ``self._stage_names``;
+                a partial update would silently corrupt the
+                bottleneck and throughput aggregates.
 
         """
         del time
         rust_stages = measurements.rust.stages
+        # Shape validation runs BEFORE the lock so a corrupted
+        # measurement batch cannot leave ``_completed_counts`` or
+        # ``_completed_service_time_sums`` half-updated. An empty
+        # ``rust_stages`` is the legitimate "no measurements this
+        # tick" signal and is a no-op (the inner zip yields nothing).
+        # Any non-empty list whose length disagrees with the
+        # setup-time stage count is a Rust <-> Python boundary
+        # violation: silent truncation here would corrupt the
+        # bottleneck and throughput aggregates for every subsequent
+        # cycle, so we fail loud with the same shape-mismatch
+        # convention used by ``_resolve_thresholds``.
+        if rust_stages and len(rust_stages) != len(self._stage_names):
+            msg = (
+                f"update_with_measurements shape mismatch: "
+                f"measurements.rust.stages has {len(rust_stages)} entries but "
+                f"setup() captured {len(self._stage_names)} stage names "
+                f"(known: {sorted(self._stage_names)})"
+            )
+            raise ValueError(msg)
         with self._lock:
             for stage_name, stage_measurements in zip(self._stage_names, rust_stages, strict=False):
                 task_measurements = stage_measurements.task_measurements

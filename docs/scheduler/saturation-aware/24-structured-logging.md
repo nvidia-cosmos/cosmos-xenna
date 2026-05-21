@@ -8,11 +8,14 @@ failure — emits a structured `INFO` log line with a **stable field
 schema** (`stage`, `cycle`, `intent`, `current`, `ceiling`, `floor`,
 `deficit`, `donor_stage`, `donor_worker_id`, `donor_age`,
 `threshold`, `effective_aggressiveness`, ...). Recovery and
-capacity-exhaustion paths upgrade to `WARNING`. Per-cycle internals
-that fire on every stage every cycle (cold-start quiescent skips,
-hot-pending intent clamps) stay at `DEBUG`. The level ladder is
-gated by the project-wide `PYTHON_LOG` environment variable; the
-per-decision logging itself is fixed in source.
+capacity-exhaustion paths upgrade to `WARNING`. Operational /
+system failures and absorbed exceptions (allocation failures,
+scheduler invariant violations) upgrade further to `ERROR`.
+Per-cycle internals that fire on every stage every cycle
+(cold-start quiescent skips, hot-pending intent clamps) stay at
+`DEBUG`. The level ladder is gated by the project-wide
+`PYTHON_LOG` environment variable; the per-decision logging
+itself is fixed in source.
 
 ## Problem
 
@@ -48,15 +51,21 @@ stable across scheduler refactors; the underlying decision can
 change behind them, but `stage`, `cycle`, `intent`, `current`,
 `ceiling`, `floor`, `donor_stage`, `donor_worker_id`, `donor_age`,
 `threshold`, and `effective_aggressiveness` keep their meanings.
-Three levels divide the noise:
+Four levels divide the noise:
 
 ```
 ┌──────────┬───────────────────────────────────────────────────────┐
 │  INFO    │  every algorithmic decision and every regime /        │
 │          │  threshold change; safe for production logs           │
 ├──────────┼───────────────────────────────────────────────────────┤
-│  WARNING │  allocation failure approaching grace, stuck floor,   │
-│          │  donor refused, watchdog over-budget                  │
+│  WARNING │  capacity-exhaustion and recovery paths: stuck floor, │
+│          │  donor refused, manual / Phase C placement exhausted, │
+│          │  memory-pressure gate engaged, watchdog over-budget   │
+├──────────┼───────────────────────────────────────────────────────┤
+│  ERROR   │  operational / system failures and absorbed           │
+│          │  exceptions: Phase C allocation failures, scheduler   │
+│          │  invariant violations -- require operator attention   │
+│          │  but do not halt the pipeline                         │
 ├──────────┼───────────────────────────────────────────────────────┤
 │  DEBUG   │  per-cycle internals (cold-start quiescent skip,      │
 │          │  hot-pending intent clamp, EWMA / streak detail);     │
@@ -68,10 +77,11 @@ Three levels divide the noise:
 per-cycle signal would be richer but would drown the operator on a
 real-sized pipeline. A single `ERROR`-only stream would be quieter
 but would force re-running the pipeline whenever a benign decision
-needs to be reconstructed. The three-level ladder splits the cost:
-production sees only decisions (and warnings about decisions that
-could not complete), and adding `DEBUG` for an incident is a one-line
-environment-variable change rather than a redeploy.
+needs to be reconstructed. The four-level ladder splits the cost:
+production sees decisions (`INFO`), capacity-exhaustion warnings
+(`WARNING`), and absorbed failures that need attention (`ERROR`),
+while adding `DEBUG` for an incident is a one-line environment-
+variable change rather than a redeploy.
 
 ## How it works
 
@@ -123,6 +133,7 @@ and redeploying:
 | Floor stuck, approaching grace          | `WARNING` | `[scheduler] 'caption': minimum-worker floor stuck (3/5 grace cycles); target_min=4, achieved=2, no eligible cross-stage donor; will raise after 2 more consecutive failed cycles.` |
 | Loop watchdog over budget               | `WARNING` | `saturation-aware loop watchdog: autoscale cycle took 6.40s (threshold=5.00s = 0.5 * interval_s=10.0)` |
 | Allocation failure absorbed             | `ERROR`   | `saturation-aware allocation failure: stage 'caption' raised AllocationError: ...; Per-GPU fragmentation snapshot: [{...}, {...}, ...]` |
+| Scheduler invariant violation           | `ERROR`   | `scheduler invariant violation: phase=phase_c stage='caption' planner_workers=12 snapshot_workers=10; aborting cycle.` |
 | Per-cycle summary                       | `DEBUG`   | `saturation-aware cycle 47 summary: regime=SUB_HALFIN_WHITT, heterogeneity_streak=0, heterogeneity_fired=False, phase_c_allocation_failure=False` |
 | Cold-start / hot-pending intent skip    | `DEBUG`   | `saturation-aware: stage 'caption' cold-start quiescent (pending=2, ready=0); skipping intent pipeline.` |
 

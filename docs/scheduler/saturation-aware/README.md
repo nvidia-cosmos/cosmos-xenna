@@ -127,6 +127,7 @@ adjust a knob in production, jump to:
 | [23-bottleneck-score-metric.md](23-bottleneck-score-metric.md) | Forced-Flow-Law bottleneck gauge |
 | [24-structured-logging.md](24-structured-logging.md) | Per-decision INFO logging contract |
 | [25-bottleneck-decision-integration.md](25-bottleneck-decision-integration.md) | EWMA-smoothed `D_k` driving Phase C grow priority and Phase D shrink protection |
+| [26-stuck-plan-detector.md](26-stuck-plan-detector.md) | Per-stage WARN-to-INFO latch + Prometheus instrumentation for `_stuck_plan_counters` |
 
 ## Conventions used in these docs
 
