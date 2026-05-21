@@ -22,6 +22,7 @@ Gauges as a side effect even for fragmentation-based pipelines that
 never observe them.
 """
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -120,12 +121,14 @@ class TestLazySaturationAwareMetricRegistration:
         ``streaming.py`` / ``streaming_backpressure.py`` request the
         config.
 
-        Sentinel-prefixed prints (``LOADED:``, ``SA_NONE:``,
-        ``SCHEDULER:``) survive the ``str.strip()`` applied by
-        ``_run_in_subprocess`` even when the loaded-modules list is
-        empty (the desired success state for this test).
+        The subprocess emits a single ``json.dumps(...)`` blob so the
+        parent test parses with ``json.loads`` rather than ad-hoc string
+        splitting; an unrelated stray ``print`` from any imported module
+        surfaces as a clean ``json.JSONDecodeError`` instead of a
+        misleading ``ValueError`` from a key/value split.
         """
         script = """
+            import json
             import sys
             import cosmos_xenna.pipelines.private.specs as specs
             spec = specs.StreamingSpecificSpec()
@@ -136,20 +139,20 @@ class TestLazySaturationAwareMetricRegistration:
                 "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
                 "cosmos_xenna.pipelines.private.scheduling_py.pressure",
             ]
-            loaded = [m for m in sa_modules if m in sys.modules]
-            print("LOADED:" + ",".join(loaded))
-            print("SA_NONE:", spec.saturation_aware is None)
-            print("SCHEDULER:", spec.scheduler.value)
+            print(json.dumps({
+                "loaded": [m for m in sa_modules if m in sys.modules],
+                "sa_none": spec.saturation_aware is None,
+                "scheduler": spec.scheduler.value,
+            }))
         """
-        out = _run_in_subprocess(script)
-        lines = dict(line.split(":", 1) for line in out.splitlines())
-        assert lines["LOADED"] == "", (
+        data = json.loads(_run_in_subprocess(script))
+        assert data["loaded"] == [], (
             f"Expected no SA metric modules in sys.modules after constructing default "
-            f"StreamingSpecificSpec(); got: {lines['LOADED']!r}. The default factory must keep "
+            f"StreamingSpecificSpec(); got: {data['loaded']!r}. The default factory must keep "
             f"SaturationAwareConfig (and its pressure import) un-instantiated."
         )
-        assert lines["SA_NONE"].strip() == "True", lines["SA_NONE"]
-        assert lines["SCHEDULER"].strip() == "fragmentation_based", lines["SCHEDULER"]
+        assert data["sa_none"] is True, data["sa_none"]
+        assert data["scheduler"] == "fragmentation_based", data["scheduler"]
 
     @pytest.mark.parametrize("module_name", _SA_METRIC_MODULES)
     def test_explicit_sa_module_import_does_load_it(self, module_name: str) -> None:

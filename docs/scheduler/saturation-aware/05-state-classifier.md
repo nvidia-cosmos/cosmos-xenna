@@ -95,9 +95,12 @@ Key properties:
 - **No hysteresis on `STARVED`.** `STARVED` is driven by
   `input_queue_depth == 0`, which is a discrete predicate that can
   legitimately flip every cycle as the upstream stage's production
-  rate ebbs and flows. Neither `saturation_deadband_pct` nor
-  `over_provisioned_deadband_pct` participates in `STARVED`
-  selection.
+  rate ebbs and flows. Once above `over_provisioned_boundary`, the
+  `STARVED` vs `OVER_PROVISIONED` choice depends purely on queue
+  depth; `saturation_deadband_pct` plays no role here, and
+  `over_provisioned_deadband_pct` affects only the shared
+  upper-region boundary (inherited from the `OVER_PROVISIONED`
+  exit-hysteresis logic), never the `STARVED` label itself.
 - **Queue-depth tiebreaker.** Above the over-provisioned boundary,
   `input_queue_depth == 0` routes to `STARVED` (no local scale
   action helps — the upstream stage is the bottleneck), while a

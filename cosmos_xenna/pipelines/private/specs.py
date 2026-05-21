@@ -1151,10 +1151,8 @@ class StreamingSpecificSpec:
     # ``scheduling_py.pressure``, which registers Ray ``Gauge`` series
     # at module load; constructing the SA config eagerly would defeat
     # the lazy-registration guarantee for FRAGMENTATION_BASED runs.
-    # Callers reach a non-None instance via
-    # ``materialized_saturation_aware()`` from the SA-gated branches in
-    # ``streaming._make_scheduler_algorithm`` and
-    # ``streaming.effective_autoscale_interval``.
+    # Callers running on the saturation-aware path reach a non-None
+    # instance via ``materialized_saturation_aware()``.
     saturation_aware: SaturationAwareConfig | None = attrs.field(default=None)
 
     def materialized_saturation_aware(self) -> SaturationAwareConfig:
@@ -1168,6 +1166,12 @@ class StreamingSpecificSpec:
         the resolved instance is cached on the spec so successive calls
         return the same object (preserves identity for equality checks
         and any consumer that captures the reference).
+
+        Not thread-safe: the read-then-write on ``self.saturation_aware``
+        is unsynchronized. All current consumers run on the streaming
+        main thread (the autoscaler's background thread never touches
+        ``mode_specific``); a future concurrent caller must take an
+        external lock or this method must be hardened with one.
 
         Returns:
             The user-supplied ``SaturationAwareConfig`` if set, otherwise
