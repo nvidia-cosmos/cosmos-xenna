@@ -12,6 +12,33 @@ reference manual — the source-file docstrings carry the contracts.
 Every doc is written from the shipped code in
 [`cosmos-xenna/cosmos_xenna/pipelines/private/scheduling_py/`](../../../cosmos_xenna/pipelines/private/scheduling_py/).
 
+## At a glance
+
+![Saturation-Aware Scheduler — Feature Map](feature-map.png)
+
+The diagram above is a one-page summary of every feature documented
+in this folder, grouped by category and anchored to the four-phase
+cycle (`A → B → C → D`) the scheduler runs every tick:
+
+- **Pre-flight (blue)** — regime detector, auto-derived thresholds,
+  EWMA smoothing, and the Rust ⇄ Python planning context bridge.
+- **Classification (purple)** — the five operational zones, asymmetric
+  hysteresis, the backlog-time pressure signal, and the streak
+  counters that gate every decision.
+- **Growth & Scale (green)** — the `ACQUIRING → TRACKING → HOLD`
+  growth-mode state machine, three-layer slow-start, multi-target
+  DAG growth, the five-layer anti-flap cross-stage donor, and
+  youngest-first / idle-first victim selection.
+- **Safeguards (red)** — hard caps and floors, phase invariants,
+  loop watchdog, cluster-wide memory-pressure gate, and
+  allocation-error tolerance. These run *around* every phase and
+  are why a corrupted decision never reaches workers.
+- **Observability (teal)** — Prometheus metrics, the Forced-Flow-Law
+  bottleneck score, and per-decision structured logging.
+
+Open the matching doc in the index below to see the rationale,
+trade-offs, and knobs for any box on the diagram.
+
 ## What this folder is and is not
 
 - **Is**: decision-rationale + diagrams for the saturation-aware

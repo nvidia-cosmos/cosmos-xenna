@@ -8,6 +8,10 @@ Every autoscale cycle the scheduler runs four phases —
 context, then freezes the staged plan into a `Solution` after
 crossing structural invariant checks between phases.
 
+> Looking for the big picture across *all* features (classifier,
+> growth, donor, safeguards, observability)? See the
+> [Feature Map](README.md#at-a-glance) on the index page.
+
 ## Problem
 
 A streaming autoscaler that simply emits "current best worker
