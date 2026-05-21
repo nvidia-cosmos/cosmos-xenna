@@ -142,15 +142,35 @@ def run_per_stage_pipeline(
         stage_state.prev_workers = current_workers
         return 0
 
-    pressure_ewma = _resolve_pressure_signal(
-        stage_state=stage_state,
-        slots_empty_ratio_ewma=classifier_input,
-        input_queue_depth=input_queue_depth,
-        observed_throughput=observed_throughput_sample,
-        config=config,
-        stage_name=stage_state.stage_name,
-        pipeline_name=pipeline_name,
-    )
+    # Cycle freshness: distinguish "fresh sample carries the classifier
+    # signal" from "carry-forward EWMA from a prior valid cycle". When
+    # the current cycle observed zero warmup-filtered ready actors,
+    # ``_resolve_classifier_signal`` returned the carry-forward EWMA so
+    # the classifier state machine keeps tracking (pinned by
+    # ``test_carry_forward_preserves_classifier_state_across_zero_actor_moment``).
+    # Pressure, however, MUST NOT refresh on carry-forward: refreshing
+    # would blend a stale utilisation factor with a fresh queue depth
+    # and corrupt the next valid cycle's classification. The scheduler
+    # also clamps the returned delta to ``0`` for the same reason via
+    # its trust-gate freshness check, so a carry-forward cycle is
+    # always a no-action cycle on Phase C / Phase D.
+    cycle_has_fresh_sample = (num_used_slots + num_empty_slots) > 0
+    if cycle_has_fresh_sample:
+        pressure_ewma = _resolve_pressure_signal(
+            stage_state=stage_state,
+            slots_empty_ratio_ewma=classifier_input,
+            input_queue_depth=input_queue_depth,
+            observed_throughput=observed_throughput_sample,
+            config=config,
+            stage_name=stage_state.stage_name,
+            pipeline_name=pipeline_name,
+        )
+    else:
+        # Carry-forward path: reuse the prior pressure EWMA. ``None``
+        # collapses to ``0.0`` for the classifier (no-pressure means
+        # the slot-only branch decides), matching the cold-start
+        # invariant.
+        pressure_ewma = stage_state.pressure_ewma if stage_state.pressure_ewma is not None else 0.0
 
     prev_classifier_state = stage_state.classifier_state
     new_classifier_state = classify(

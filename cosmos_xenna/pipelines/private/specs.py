@@ -1139,7 +1139,10 @@ class StreamingSpecificSpec:
     # uses the Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python
     # saturation-aware scheduler. The flag is read once at
     # ``Autoscaler.__init__`` and frozen for the lifetime of the run.
-    scheduler: SchedulerKind = SchedulerKind.FRAGMENTATION_BASED
+    scheduler: SchedulerKind = attrs.field(
+        default=SchedulerKind.FRAGMENTATION_BASED,
+        converter=SchedulerKind,
+    )
     # Configuration for the saturation-aware scheduler. Has no effect when
     # ``scheduler == SchedulerKind.FRAGMENTATION_BASED``.
     saturation_aware: SaturationAwareConfig = attrs.field(factory=SaturationAwareConfig)

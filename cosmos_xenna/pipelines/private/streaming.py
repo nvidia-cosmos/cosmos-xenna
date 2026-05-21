@@ -421,7 +421,7 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
         msg = "effective_autoscale_interval requires StreamingSpecificSpec; got mode_specific=None"
         raise RuntimeError(msg)
     kind = mode_specific.scheduler
-    if kind is specs.SchedulerKind.SATURATION_AWARE:
+    if kind == specs.SchedulerKind.SATURATION_AWARE:
         interval = mode_specific.saturation_aware.interval_s
         source = "mode_specific.saturation_aware.interval_s"
     else:

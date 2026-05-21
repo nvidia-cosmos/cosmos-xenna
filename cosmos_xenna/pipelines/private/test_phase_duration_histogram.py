@@ -25,7 +25,7 @@ per phase on the ``_PHASE_DURATION_HISTOGRAM`` Histogram, tagged
 
 These tests pin five behaviours of the wrapper contract:
 
-  * Exactly one observation per cycle for each of the 8 phase labels.
+  * Exactly one observation per cycle for each of the 9 phase labels.
   * Sum of per-phase durations equals the cycle wall-clock duration
     (within histogram-observe overhead tolerance).
   * Memory-pressure gate freezing Phase C still records a ``phase_c``

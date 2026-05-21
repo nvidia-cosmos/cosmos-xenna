@@ -1502,7 +1502,8 @@ class SaturationAwareScheduler:
             # closed so the EWMA cache, classifier state, and stabilization
             # history keep tracking reality; only the returned delta is
             # clamped to zero while the gate is closed.
-            if num_used_slots + num_empty_slots > 0:
+            cycle_has_fresh_sample = num_used_slots + num_empty_slots > 0
+            if cycle_has_fresh_sample:
                 stage_state.valid_signal_samples = min(stage_state.valid_signal_samples + 1, stage_cfg.min_data_points)
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
@@ -1515,11 +1516,35 @@ class SaturationAwareScheduler:
                 observed_throughput_sample=throughput_samples.get(stage_name, 0.0),
                 pipeline_name=self._pipeline_name,
             )
-            if stage_state.valid_signal_samples < stage_cfg.min_data_points and delta != 0:
+            # Trust gate has two independent freshness requirements that
+            # must BOTH hold for a non-zero recommendation to land:
+            #
+            # 1.  Enough accumulated warmup-filtered samples to trust the
+            #     classifier output (``min_data_points``).
+            # 2.  The CURRENT cycle observed at least one warmup-filtered
+            #     ready actor. After ``min_data_points`` was reached,
+            #     worker churn or post-shrink warmup grace can produce
+            #     zero-sample cycles whose ``run_per_stage_pipeline``
+            #     classifies off carry-forward EWMA; treating those as
+            #     trustworthy lets the scheduler add or remove workers
+            #     based on stale measurements precisely during the
+            #     warmup-churn window the gate was meant to dampen.
+            #     Clamping the delta when the current cycle has zero
+            #     valid samples enforces "history + freshness" without
+            #     resetting the accumulated counter (so the next valid
+            #     cycle resumes immediately).
+            if delta != 0 and stage_state.valid_signal_samples < stage_cfg.min_data_points:
                 logger.debug(
                     f"saturation-aware: stage {stage_name!r} valid samples "
                     f"{stage_state.valid_signal_samples}/{stage_cfg.min_data_points} - "
                     f"trust gate clamping recommendation {delta} to 0."
+                )
+                delta = 0
+            elif delta != 0 and not cycle_has_fresh_sample:
+                logger.debug(
+                    f"saturation-aware: stage {stage_name!r} current cycle has "
+                    f"zero warmup-filtered slot samples - trust gate clamping "
+                    f"stale-signal recommendation {delta} to 0."
                 )
                 delta = 0
             if quiescence_active and delta > 0:
