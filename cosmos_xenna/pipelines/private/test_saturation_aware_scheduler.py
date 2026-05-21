@@ -30,6 +30,7 @@ Tests use real ``Problem`` and ``ProblemState`` objects (not mocks)
 so the Python -> Rust round-trips are exercised end-to-end.
 """
 
+import math
 import threading
 
 import pytest
@@ -355,16 +356,18 @@ class TestUpdateWithMeasurementsAccumulator:
     """``update_with_measurements`` accumulates per-stage completion counts under the lock."""
 
     def test_empty_measurements_do_not_touch_counts(self) -> None:
-        """Empty measurements leave both ``_completed_counts`` and ``_stage_states`` unchanged."""
+        """Empty measurements leave the count AND service-time accumulators untouched."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         snapshot_before = dict(scheduler._stage_states)
-        # ``setup()`` zero-initialises every stage's count.
+        # ``setup()`` zero-initialises both per-stage accumulators.
         assert scheduler._completed_counts == {"A": 0}
+        assert scheduler._completed_service_time_sums == {"A": 0.0}
         empty_measurements = data_structures.Measurements(time=0.0, stage_measurements=[])
         scheduler.update_with_measurements(time=0.0, measurements=empty_measurements)
         assert scheduler._stage_states == snapshot_before
         assert scheduler._completed_counts == {"A": 0}
+        assert scheduler._completed_service_time_sums == {"A": 0.0}
 
     def test_task_count_accumulates_across_calls(self) -> None:
         """Each ``TaskMeasurement`` adds 1 to the per-stage count regardless of ``num_returns``."""
@@ -422,8 +425,8 @@ class TestUpdateWithMeasurementsAccumulator:
         scheduler.update_with_measurements(time=0.0, measurements=ms)
         assert scheduler._completed_counts == {"upstream": 1, "downstream": 4}
 
-    def test_setup_resets_completed_counts(self) -> None:
-        """A second ``setup()`` zeroes out the running totals from the prior pipeline."""
+    def test_setup_resets_measurement_accumulators(self) -> None:
+        """A second ``setup()`` zeroes out the count AND service-time accumulators from the prior pipeline."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
 
@@ -431,18 +434,21 @@ class TestUpdateWithMeasurementsAccumulator:
             time=0.0,
             stage_measurements=[
                 data_structures.StageMeasurements(
-                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(7)]
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 0.5, 1) for _ in range(7)]
                 )
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
         assert scheduler._completed_counts["A"] == 7
+        assert scheduler._completed_service_time_sums["A"] == pytest.approx(7 * 0.5)
 
-        # New pipeline -> fresh counters and the throughput-snapshot
+        # New pipeline -> fresh counters and BOTH per-cycle snapshots
         # cleared so the next sample is cold-start.
         scheduler.setup(_problem_with_stages(["X", "Y"]))
         assert scheduler._completed_counts == {"X": 0, "Y": 0}
+        assert scheduler._completed_service_time_sums == {"X": 0.0, "Y": 0.0}
         assert scheduler._last_throughput_sample == {}
+        assert scheduler._last_service_time_sample == {}
 
 
 class TestConsumeThroughputSamples:
@@ -539,6 +545,174 @@ class TestConsumeThroughputSamples:
         scheduler._completed_counts["A"] = 50
         samples = scheduler._consume_throughput_samples(now_ts=2.0)
         assert samples == {"A": 0.0}
+
+
+class TestServiceTimeAccumulator:
+    """``update_with_measurements`` accumulates per-stage service-time sums alongside counts."""
+
+    def test_service_time_sum_accumulates_with_count(self) -> None:
+        """Each ``TaskMeasurement`` adds its ``end - start`` duration to the per-stage sum."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # 3 tasks with durations 0.5s, 1.0s, 1.5s -> sum = 3.0s.
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[
+                        data_structures.TaskMeasurement(0.0, 0.5, 1),
+                        data_structures.TaskMeasurement(0.0, 1.0, 1),
+                        data_structures.TaskMeasurement(0.0, 1.5, 1),
+                    ]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        assert scheduler._completed_counts["A"] == 3
+        assert scheduler._completed_service_time_sums["A"] == pytest.approx(3.0)
+
+    def test_per_stage_service_time_attribution(self) -> None:
+        """Stage order in ``StageMeasurements`` zips with ``self._stage_names`` for both accumulators."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["fast", "slow"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                # fast: 2 tasks at 0.1s each -> sum 0.2s.
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 0.1, 1) for _ in range(2)]
+                ),
+                # slow: 4 tasks at 2.0s each -> sum 8.0s.
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 2.0, 1) for _ in range(4)]
+                ),
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        assert scheduler._completed_service_time_sums["fast"] == pytest.approx(0.2)
+        assert scheduler._completed_service_time_sums["slow"] == pytest.approx(8.0)
+
+
+class TestConsumeServiceTimeSamples:
+    """``_consume_service_time_samples`` derives per-stage mean ``S_k`` from the accumulators."""
+
+    def test_first_cycle_returns_nan_for_every_stage(self) -> None:
+        """The cold-start contract: first cycle has no prior snapshot -> NaN per stage."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A", "B"]))
+
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 0.5, 1) for _ in range(10)]
+                ),
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 2.0, 1) for _ in range(20)]
+                ),
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        samples = scheduler._consume_service_time_samples()
+        # Cold-start: every stage returns NaN; bottleneck.py / heterogeneity.py fold NaN into
+        # the cold-start branch (gauge observes NaN, stage skipped from argmax).
+        assert math.isnan(samples["A"])
+        assert math.isnan(samples["B"])
+        # Snapshot now holds the cold-start (count, sum) pair so the next cycle has a delta.
+        assert scheduler._last_service_time_sample["A"] == (10, pytest.approx(5.0))
+        assert scheduler._last_service_time_sample["B"] == (20, pytest.approx(40.0))
+
+    def test_steady_state_returns_dsum_over_dcount(self) -> None:
+        """Second cycle returns ``(now_sum - prev_sum) / (now_count - prev_count)``."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Cycle 1: 10 tasks at 0.5s each -> sum 5.0s; seed snapshot.
+        ms1 = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 0.5, 1) for _ in range(10)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms1)
+        scheduler._consume_service_time_samples()
+
+        # Cycle 2: 20 more tasks at 1.0s each -> dsum 20.0s, dcount 20 -> mean 1.0s.
+        ms2 = data_structures.Measurements(
+            time=1.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 1.0, 1) for _ in range(20)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=1.0, measurements=ms2)
+        samples = scheduler._consume_service_time_samples()
+        assert samples["A"] == pytest.approx(1.0)
+
+    def test_no_progress_cycle_returns_nan(self) -> None:
+        """A cycle with no new completed tasks has dcount=0 -> NaN (cold-start sentinel)."""
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Seed the snapshot with one batch.
+        ms = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(task_measurements=[data_structures.TaskMeasurement(0.0, 0.5, 1)])
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms)
+        scheduler._consume_service_time_samples()
+
+        # Second cycle with no new measurements -> dcount=0 -> NaN.
+        samples = scheduler._consume_service_time_samples()
+        assert math.isnan(samples["A"])
+
+    def test_independent_snapshots_from_throughput_consumer(self) -> None:
+        """Calling ``_consume_throughput_samples`` first must not corrupt the service-time delta.
+
+        Both consumers carry their own ``(count, ...)`` snapshot; the
+        autoscale call site wires both helpers in the same cycle so a
+        future re-order of the calls cannot silently zero the
+        bottleneck score.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_stages(["A"]))
+
+        # Cycle 1.
+        ms1 = data_structures.Measurements(
+            time=0.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 0.5, 1) for _ in range(10)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=0.0, measurements=ms1)
+        # Throughput first.
+        scheduler._consume_throughput_samples(now_ts=1.0)
+        # Then service time.
+        scheduler._consume_service_time_samples()
+
+        # Cycle 2.
+        ms2 = data_structures.Measurements(
+            time=1.0,
+            stage_measurements=[
+                data_structures.StageMeasurements(
+                    task_measurements=[data_structures.TaskMeasurement(0.0, 2.0, 1) for _ in range(5)]
+                )
+            ],
+        )
+        scheduler.update_with_measurements(time=1.0, measurements=ms2)
+        scheduler._consume_throughput_samples(now_ts=2.0)
+        # Even after throughput consumer ran, service-time delta must be (5 tasks * 2.0s) / 5 = 2.0s.
+        samples = scheduler._consume_service_time_samples()
+        assert samples["A"] == pytest.approx(2.0)
 
 
 class TestPressureEndToEnd:

@@ -97,44 +97,53 @@ NSDI) — the cardinality envelope is paid once and reused.
                                      │
                                      ▼
               ┌──────────────────────────────────────────────┐
-              │  read pool_stats per stage                   │
-              │  (xenna ActorPoolStats; same sampler that    │
-              │   drives pipeline_*_metrics)                 │
-              └──────────────────────────────────────────────┘
-                                     │
-                                     ▼
-              ┌──────────────────────────────────────────────┐
+              │  update_with_measurements (per monitor tick) │
               │  for each stage k:                           │
-              │    if processing_speed_tasks_per_second is   │
-              │       None:  skip (no service-time sample    │
-              │              yet — e.g. first cycle)        │
-              │    else:                                     │
-              │       S_k = 1 / processing_speed_tasks_...   │
-              │       D_k = V_k * S_k         (V_k = 1)      │
-              │       gauge.set(D_k, {stage: k.name,         │
-              │                       pipeline: P.name})     │
+              │    completed_count[k]      += len(tasks)     │
+              │    service_time_sum[k]     += sum(tm.duration())
+              │    (cumulative; thread-safe under self._lock)│
               └──────────────────────────────────────────────┘
                                      │
                                      ▼
               ┌──────────────────────────────────────────────┐
+              │  autoscale (per cycle)                       │
+              │  _consume_service_time_samples():            │
+              │    dcount = now_count - prev_count           │
+              │    dsum   = now_sum   - prev_sum             │
+              │    if dcount > 0 and dsum > 0:               │
+              │       S_k = dsum / dcount                    │
+              │    else:                                     │
+              │       S_k = math.nan  (cold-start)           │
+              │    snapshot (now_count, now_sum)             │
+              └──────────────────────────────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │  emit_bottleneck_score(service_times_s={k:S_k│
+              │                                             │
+              │    D_k = V_k * S_k         (V_k = 1)         │
+              │    gauge.set(D_k, {stage: k, pipeline: P})   │
+              │    NaN samples skipped from argmax           │
               │  identify bottleneck = argmax_k D_k          │
-              │  ─ logger.info(                              │
-              │       "[scheduler] bottleneck stage = "      │
-              │       f"{name!r} D={D:.3f}s "                │
-              │       f"throughput_bound={1/D:.3f} tasks/s") │
-              │  ─ emitted once per cycle, INFO level        │
+              │  logger.info(                                │
+              │     f"bottleneck stage: {name} "             │
+              │     f"(D = {D:.2f}s, throughput bound = "    │
+              │     f"{1/D:.2f} tasks/s)")                   │
               └──────────────────────────────────────────────┘
 ```
 
-The mean per-task service time `S_k` is already computed by the
-per-stage sampler that publishes `pipeline_actor_process_time` —
-the bottleneck-score gauge reads the same
-`pool_stats.processing_speed_tasks_per_second` field on
-[`ActorPoolStats`](../../../cosmos_xenna/ray_utils/monitoring.py)
-and applies the Forced-Flow framing on top. Stages whose service
-rate is still `None` (no completed task yet, e.g. cold start) are
-skipped for the cycle and do not appear in the per-cycle log line;
-they re-enter once their first sample lands.
+The mean per-task service time `S_k` is computed directly from the
+`TaskMeasurement.duration()` (`end - start`) values that
+`update_with_measurements` already receives on every monitor tick.
+Two cumulative accumulators (`_completed_counts` and
+`_completed_service_time_sums`) feed two independent per-cycle
+samplers (`_consume_throughput_samples` and
+`_consume_service_time_samples`) so the backlog-time pressure rate
+and the Forced-Flow service demand stay decoupled. Stages whose
+delta-count or delta-sum is non-positive in the current cycle
+observe `math.nan` on the gauge and are excluded from the argmax
+and the INFO log; they re-enter once their first non-empty
+measurement batch lands.
 
 The single per-cycle log line means an operator triaging a slow
 pipeline does not need a Grafana dashboard to identify the

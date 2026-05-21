@@ -338,12 +338,26 @@ class SaturationAwareScheduler:
         # ``_RecommendationHistory`` instance across cycles so the buffer can
         # actually accumulate consensus.
         self._recommendation_histories: dict[str, _RecommendationHistory] = {}
-        # Throughput accumulator: ``update_with_measurements`` adds per
-        # monitor tick, ``_consume_throughput_samples`` snapshots once per
-        # autoscale cycle. The lock decouples the two cadences.
+        # Measurement accumulators: ``update_with_measurements`` adds per
+        # monitor tick, the per-cycle ``_consume_*`` helpers snapshot once
+        # per autoscale cycle. The lock decouples the two cadences.
+        # Two independent cumulative accumulators feed two independent
+        # samplers:
+        #   * ``_completed_counts`` + ``_last_throughput_sample`` -> rate
+        #     (dcount / dt) consumed by the backlog-time pressure signal.
+        #   * ``_completed_service_time_sums`` +
+        #     ``_last_service_time_sum_sample`` -> mean per-task service
+        #     time (dsum / dcount) consumed by the Forced-Flow-Law
+        #     bottleneck score and cluster heterogeneity ratio.
         self._lock: threading.Lock = threading.Lock()
         self._completed_counts: dict[str, int] = {}
         self._last_throughput_sample: dict[str, tuple[int, float]] = {}
+        self._completed_service_time_sums: dict[str, float] = {}
+        # Service-time consumer keeps its OWN ``(count, sum)`` snapshot
+        # so the call order with ``_consume_throughput_samples`` does
+        # not matter; both helpers can run in any order in the same
+        # autoscale cycle without their snapshots interfering.
+        self._last_service_time_sample: dict[str, tuple[int, float]] = {}
         # Per-instance streak ledger for the cluster heterogeneity ratio
         # warn log. Owned at the instance level (not module-level)
         # because the scheduler may be re-instantiated across tests;
@@ -390,12 +404,14 @@ class SaturationAwareScheduler:
         self._cycle_counter = 0
         self._last_donation_cycle = {}
         self._donations_received_this_cycle = {}
-        # Throughput accumulator reset; locked because
-        # ``update_with_measurements`` and ``_consume_throughput_samples``
-        # also acquire ``self._lock``.
+        # Measurement accumulator reset; locked because
+        # ``update_with_measurements`` and the per-cycle ``_consume_*``
+        # helpers also acquire ``self._lock``.
         with self._lock:
             self._completed_counts = {name: 0 for name in self._stage_names}
             self._last_throughput_sample = {}
+            self._completed_service_time_sums = {name: 0.0 for name in self._stage_names}
+            self._last_service_time_sample = {}
         # Build per-stage stabilization-window buffers from the resolved
         # effective config; both windows are config-time invariants
         # (cross-validated in ``SaturationAwareStageConfig.__attrs_post_init__``)
@@ -561,10 +577,23 @@ class SaturationAwareScheduler:
         rust_stages = measurements.rust.stages
         with self._lock:
             for stage_name, stage_measurements in zip(self._stage_names, rust_stages, strict=False):
-                count = len(stage_measurements.task_measurements)
+                task_measurements = stage_measurements.task_measurements
+                count = len(task_measurements)
                 if count == 0:
                     continue
                 self._completed_counts[stage_name] = self._completed_counts.get(stage_name, 0) + count
+                # Accumulate cumulative per-stage service-time sums in
+                # the same loop so the bottleneck score / heterogeneity
+                # ratio see the same per-cycle window the backlog-time
+                # pressure throughput sample sees. ``duration()`` is the
+                # Rust-side ``end - start`` accessor; each ``count``
+                # contributes one sample, so ``mean = sum / count`` is a
+                # straightforward Forced-Flow ``S_k`` estimate (V_k = 1
+                # for Xenna's linear DAG, so D_k = S_k).
+                sum_service = sum(tm.duration() for tm in task_measurements)
+                self._completed_service_time_sums[stage_name] = (
+                    self._completed_service_time_sums.get(stage_name, 0.0) + sum_service
+                )
 
     def _consume_throughput_samples(self, now_ts: float) -> dict[str, float]:
         """Consume the per-stage completed-count delta and emit throughput samples.
@@ -602,6 +631,56 @@ class SaturationAwareScheduler:
                     dcount = max(0, now_count - prev_count)
                     samples[stage_name] = dcount / dt if dt > 0.0 else 0.0
                 self._last_throughput_sample[stage_name] = (now_count, now_ts)
+        return samples
+
+    def _consume_service_time_samples(self) -> dict[str, float]:
+        """Consume per-stage cumulative service-time deltas and emit mean ``S_k`` samples.
+
+        Companion to :meth:`_consume_throughput_samples`. Computes the
+        per-stage mean per-task service time over the in-cycle window
+        as ``dsum / dcount`` against the previously snapshotted
+        ``(count, sum)`` pair, then refreshes the snapshot for the
+        next cycle.
+
+        Cold-start contract: returns ``math.nan`` for any stage that
+        has not yet observed a non-empty completed-task delta. The
+        :func:`emit_bottleneck_score` and
+        :func:`compute_heterogeneity_ratio` helpers fold ``math.nan``
+        into their cold-start path (gauge observes ``NaN``, stage is
+        excluded from the ``argmax_k D_k`` and from the heterogeneity
+        ratio computation).
+
+        The helper keeps its own ``(count, sum)`` snapshot in
+        ``self._last_service_time_sample`` so the call order with
+        :meth:`_consume_throughput_samples` does not matter -- both
+        helpers can run in any order in the same autoscale cycle
+        without their snapshots interfering.
+
+        Returns:
+            Mapping of stage name to mean per-task service time in
+            seconds (``S_k``), or ``math.nan`` for cold-start. Always
+            contains an entry for every name in ``self._stage_names``
+            so the autoscale call site can pass the dict to
+            :func:`emit_bottleneck_score` directly.
+
+        """
+        samples: dict[str, float] = {}
+        with self._lock:
+            for stage_name in self._stage_names:
+                now_count = self._completed_counts.get(stage_name, 0)
+                now_sum = self._completed_service_time_sums.get(stage_name, 0.0)
+                prev = self._last_service_time_sample.get(stage_name)
+                if prev is None:
+                    samples[stage_name] = math.nan
+                else:
+                    prev_count, prev_sum = prev
+                    dcount = max(0, now_count - prev_count)
+                    dsum = now_sum - prev_sum
+                    if dcount > 0 and dsum > 0.0:
+                        samples[stage_name] = dsum / dcount
+                    else:
+                        samples[stage_name] = math.nan
+                self._last_service_time_sample[stage_name] = (now_count, now_sum)
         return samples
 
     def autoscale(
@@ -863,18 +942,18 @@ class SaturationAwareScheduler:
         # docs/scheduler/saturation-aware/22-prometheus-metrics.md. Both
         # calls are sub-millisecond pure observability.
         #
-        # ``service_times_s`` is intentionally empty here because the
-        # current ``autoscale()`` signature accepts only ``ProblemState``,
-        # which omits the ``processing_speed_tasks_per_second`` field
-        # that lives on ``ActorPoolStats`` (sampled in ``streaming.py``).
-        # Both helpers honour the cold-start contract (empty mapping ->
-        # NaN gauge, no INFO log); threading the service-time data
-        # through the autoscale call is the responsibility of a
-        # follow-up that extends the scheduler protocol to carry pool
-        # stats.
-        emit_bottleneck_score(service_times_s={}, pipeline_name=self._pipeline_name)
+        # ``service_times_s`` is consumed here from the same accumulator
+        # path as ``throughput_samples`` - both feed off
+        # ``update_with_measurements`` ticks. The mean per-stage
+        # service time over the autoscale window is the Forced-Flow
+        # ``S_k`` (and ``D_k = V_k * S_k = S_k`` for Xenna's linear DAG).
+        # Cold-start stages observe ``math.nan`` so the helpers preserve
+        # gauge cardinality and skip the ``argmax_k`` / log line for
+        # any stage that has not produced a completed-task sample yet.
+        service_times_s = self._consume_service_time_samples()
+        emit_bottleneck_score(service_times_s=service_times_s, pipeline_name=self._pipeline_name)
         compute_heterogeneity_ratio(
-            service_times_s={},
+            service_times_s=service_times_s,
             pipeline_name=self._pipeline_name,
             state=self._heterogeneity_state,
             warn_threshold=self._config.cluster_heterogeneity_warn_threshold,
