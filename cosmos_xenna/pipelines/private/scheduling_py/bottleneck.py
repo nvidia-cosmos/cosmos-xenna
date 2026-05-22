@@ -539,8 +539,14 @@ def identify_bottleneck(
         ``BottleneckIdentity`` describing the cycle.
 
     Raises:
-        ValueError: If ``near_tie_tolerance`` is outside ``[0.0, 1.0)``.
+        ValueError: If ``heterogeneity_threshold`` is non-finite or
+            ``<= 1.0`` (a homogeneous cluster has ratio ``1.0``;
+            the floor must be strictly greater), or if
+            ``near_tie_tolerance`` is outside ``[0.0, 1.0)``.
     """
+    if not math.isfinite(heterogeneity_threshold) or heterogeneity_threshold <= 1.0:
+        msg = f"heterogeneity_threshold must be finite and > 1.0, got {heterogeneity_threshold!r}"
+        raise ValueError(msg)
     if not 0.0 <= near_tie_tolerance < 1.0:
         msg = f"near_tie_tolerance must be in [0.0, 1.0), got {near_tie_tolerance}"
         raise ValueError(msg)

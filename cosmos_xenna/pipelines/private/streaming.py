@@ -412,11 +412,20 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
             is inspected.
 
     Returns:
-        Cycle interval in seconds.
+        Cycle interval in seconds (always strictly positive; callers
+        such as the dispatcher rate-limiter rely on this contract to
+        invert without ``ZeroDivisionError`` or a negative rate).
 
     Raises:
         RuntimeError: ``pipeline_spec.config.mode_specific`` is ``None``
             (a programmer error - streaming mode requires it).
+        ValueError: The resolved interval is ``<= 0``. The
+            saturation-aware path is already protected by
+            ``attrs.validators.gt(0.0)`` on
+            ``SaturationAwareGlobalConfig.interval_s``; the
+            fragmentation-based path's ``autoscale_interval_s``
+            has no field-level validator, so this resolver
+            enforces the invariant for both paths uniformly.
     """
     mode_specific = pipeline_spec.config.mode_specific
     if mode_specific is None:
@@ -429,6 +438,12 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
     else:
         interval = mode_specific.autoscale_interval_s
         source = "mode_specific.autoscale_interval_s"
+    if interval <= 0:
+        msg = (
+            f"Autoscale interval must be > 0; got {interval!r} from {source} "
+            f"(scheduler={kind.name}). Set a positive value in the streaming config."
+        )
+        raise ValueError(msg)
     logger.info(
         f"Streaming dispatcher autoscale cadence resolved: scheduler={kind} interval_s={interval} source={source}"
     )
@@ -714,6 +729,14 @@ class Autoscaler:
 
         Returns:
             A `ProblemState` object representing the current state of the pipeline.
+
+        Raises:
+            ValueError: If ``actor_pools``, ``stages_is_dones``,
+                ``upstream_queue_lens``, and ``stage_batch_sizes``
+                do not all have the same length (caller contract
+                violation, surfaced by ``zip(strict=True)``), or if
+                any per-stage signal would be negative
+                (surfaced by ``_validate_non_negative_signal``).
         """
         stages = []
         for pool, is_done, upstream_samples, stage_batch_size in zip(
@@ -804,6 +827,13 @@ class Autoscaler:
             stage_batch_sizes: Per-stage declared
                 ``stage_batch_size`` values; used to convert
                 ``upstream_queue_lens`` from samples to tasks.
+
+        Raises:
+            ValueError: Propagated from ``_make_problem_state`` when
+                ``pools``, ``stages_is_dones``, ``upstream_queue_lens``,
+                and ``stage_batch_sizes`` do not all have the same
+                length, or when a per-stage saturation signal would
+                be negative.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
@@ -1267,9 +1297,14 @@ def run_pipeline(
     # Create a vector used to track whether a stages are finished or not.
     stage_is_dones = [False for _ in pools]
 
-    # Static per-stage ``stage_batch_size`` values used by the backlog-aware
-    # scale-down guard. Stage batch sizes do not change over the
-    # pipeline's lifetime, so build once outside the main loop.
+    # Static per-stage ``stage_batch_size`` values consumed by both
+    # the backlog-aware scale-down guard
+    # (``Autoscaler.apply_autoscale_result_if_ready``) and the
+    # autoscaler's ``input_queue_depth`` aggregation
+    # (``Autoscaler.start_autoscale_calculation`` ->
+    # ``_make_problem_state``). Stage batch sizes do not change
+    # over the pipeline's lifetime, so build once outside the main
+    # loop.
     stage_batch_sizes: list[int] = [
         typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
     ]

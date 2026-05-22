@@ -589,6 +589,44 @@ class TestIdentifyBottleneck:
                 near_tie_tolerance=1.01,
             )
 
+    def test_heterogeneity_threshold_at_one_is_rejected(self) -> None:
+        """A homogeneous cluster has ratio ``1.0``; the floor must be strictly greater."""
+        with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=1.0,
+            )
+
+    def test_heterogeneity_threshold_below_one_is_rejected(self) -> None:
+        """A floor below ``1.0`` would engage on near-uniform pipelines."""
+        with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=0.5,
+            )
+
+    def test_heterogeneity_threshold_nan_is_rejected(self) -> None:
+        """``NaN`` would silently engage every cycle (``ratio < NaN`` is always ``False``)."""
+        with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=math.nan,
+            )
+
+    def test_heterogeneity_threshold_inf_is_rejected(self) -> None:
+        """``+inf`` passes ``attrs.validators.gt(1.0)`` upstream but silently disables engagement.
+
+        The function-boundary check closes the gap the spec validator
+        leaves open: no finite cluster ratio can ever exceed ``+inf``,
+        so the gate would be permanently disengaged without a clear
+        error.
+        """
+        with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=math.inf,
+            )
+
 
 class TestMaybeLogBottleneckEngagement:
     """Pin the persistence-gated engagement INFO log."""

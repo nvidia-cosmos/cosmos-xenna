@@ -207,6 +207,32 @@ class TestEffectiveAutoscaleInterval:
         with pytest.raises(RuntimeError, match="mode_specific=None"):
             effective_autoscale_interval(spec)
 
+    def test_fragmentation_based_zero_interval_rejected(self) -> None:
+        """Zero ``autoscale_interval_s`` is rejected before the dispatcher inverts to a rate.
+
+        ``StreamingSpecificSpec.autoscale_interval_s`` carries no
+        field-level validator, so the resolver enforces the
+        positive-interval invariant on this path; without it the
+        rate-limiter would produce ``ZeroDivisionError`` at the
+        ``1.0 / interval`` site.
+        """
+        spec = _streaming_pipeline_spec(SchedulerKind.FRAGMENTATION_BASED, autoscale_interval_s=0.0)
+
+        with pytest.raises(ValueError, match=r"must be > 0.*autoscale_interval_s.*FRAGMENTATION_BASED"):
+            effective_autoscale_interval(spec)
+
+    def test_fragmentation_based_negative_interval_rejected(self) -> None:
+        """Negative ``autoscale_interval_s`` is rejected before the dispatcher inverts to a rate.
+
+        Without this guard the rate-limiter would derive a negative
+        rate, silently breaking the cadence rather than failing
+        loudly.
+        """
+        spec = _streaming_pipeline_spec(SchedulerKind.FRAGMENTATION_BASED, autoscale_interval_s=-1.5)
+
+        with pytest.raises(ValueError, match=r"must be > 0.*-1\.5.*FRAGMENTATION_BASED"):
+            effective_autoscale_interval(spec)
+
 
 class TestRawStringSchedulerKindNormalization:
     """Raw-string ``scheduler`` values must coerce to ``SchedulerKind`` at construction.
