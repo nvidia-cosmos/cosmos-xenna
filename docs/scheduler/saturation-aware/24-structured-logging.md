@@ -193,7 +193,7 @@ protect.
 The default `INFO` level is the production target: every decision
 and every warning is preserved, while per-cycle internals are
 suppressed so the volume stays bounded by the number of *decisions
-taken* and not by the number of *stages * cycles*.
+taken* and not by the number of *stages × cycles*.
 
 ## See also
 
