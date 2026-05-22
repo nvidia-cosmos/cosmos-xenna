@@ -873,7 +873,13 @@ class SaturationAwareConfig:
     # first failed no-donor allocation. Counter resets on any successful add
     # or donation for the receiver stage. Post-donation retry failures raise
     # immediately because the donor removal cannot be rolled back safely.
-    floor_stuck_grace_cycles: int = attrs.field(default=6, validator=attrs.validators.ge(0))
+    floor_stuck_grace_cycles: int = attrs.field(
+        default=6,
+        validator=attrs.validators.and_(
+            attrs.validators.instance_of(int),
+            attrs.validators.ge(0),
+        ),
+    )
 
     # Fraction of ``interval_s`` above which a cycle's wall-clock duration
     # triggers a WARN log via ``loop_watchdog`` (cluster-wide). Range

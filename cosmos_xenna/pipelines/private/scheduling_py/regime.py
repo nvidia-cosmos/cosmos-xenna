@@ -33,8 +33,11 @@ aggregate empty-slot fraction against
 
 Hysteresis: enter super-HW only after ``streak_cycles`` consecutive
 cycles below ``threshold``. Exit super-HW only after the same streak
-above ``threshold * EXIT_BAND_MULTIPLIER`` - a wider exit band so
-noisy oscillation around the boundary cannot flap the regime.
+above ``min(1.0, threshold * EXIT_BAND_MULTIPLIER)`` - a wider exit
+band so noisy oscillation around the boundary cannot flap the regime,
+upper-clamped to ``1.0`` so the band stays reachable for small
+clusters whose ``threshold`` already approaches the cluster_idle
+ceiling.
 ``RegimeDetectorState`` carries the cross-cycle streak; the
 scheduler resets it on each ``setup()`` call so a new run starts from
 base aggressiveness.
@@ -165,9 +168,12 @@ def update_regime_state(
     Enter ``SUPER_HALFIN_WHITT`` from ``SUB_HALFIN_WHITT`` after
     ``streak_cycles`` cycles whose signal is below ``threshold``. Exit
     after the same streak whose signal is at or above
-    ``threshold * exit_band_multiplier`` (asymmetric exit band so noisy
-    oscillation around the boundary cannot flap the regime). Cycles
-    whose signal is unavailable do not advance or reset the streak.
+    ``min(1.0, threshold * exit_band_multiplier)`` (asymmetric exit
+    band so noisy oscillation around the boundary cannot flap the
+    regime; the upper clamp keeps the band reachable for small
+    clusters where ``threshold`` is already close to or equal to
+    ``1.0`` -- e.g. ``total_workers <= 2``). Cycles whose signal is
+    unavailable do not advance or reset the streak.
 
     Args:
         state: Mutated in place to reflect the new regime / streak.
@@ -208,7 +214,7 @@ def update_regime_state(
         state.streak = 0
         return False
 
-    exit_threshold = signal.threshold * exit_band_multiplier
+    exit_threshold = min(1.0, signal.threshold * exit_band_multiplier)
     if signal.cluster_idle_fraction >= exit_threshold:
         state.streak += 1
         if state.streak >= streak_cycles:

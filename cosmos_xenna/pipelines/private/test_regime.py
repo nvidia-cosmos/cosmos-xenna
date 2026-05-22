@@ -182,3 +182,45 @@ class TestNoSignalDefensiveGuard:
         assert transitioned is False
         assert state.current_regime is Regime.SUPER_HALFIN_WHITT
         assert state.streak == 2
+
+
+class TestExitBandSmallClusterReachability:
+    """Pin the ``min(1.0, threshold * 1.5)`` upper clamp on the exit band.
+
+    Without the clamp, ``threshold * 1.5`` exceeds the maximum
+    achievable ``cluster_idle_fraction`` (``1.0``) for tiny clusters,
+    leaving a stage that briefly went busy permanently stuck in
+    ``SUPER_HALFIN_WHITT``. The clamp makes the SUPER -> SUB exit
+    reachable when ``cluster_idle_fraction == 1.0`` (every slot empty).
+    """
+
+    def test_single_worker_fully_idle_exits_after_streak(self) -> None:
+        """``total_workers=1`` gives ``threshold=1.0`` so raw exit_band would be 1.5; clamp restores reachability."""
+        state = RegimeDetectorState(current_regime=Regime.SUPER_HALFIN_WHITT, streak=0)
+        signal = compute_regime_signal(total_workers=1, total_used_slots=0, total_empty_slots=4)
+        for _ in range(2):
+            update_regime_state(state, signal, streak_cycles=3)
+        transitioned = update_regime_state(state, signal, streak_cycles=3)
+        assert transitioned is True
+        assert state.current_regime is Regime.SUB_HALFIN_WHITT
+        assert state.streak == 0
+
+    def test_two_workers_fully_idle_exits_after_streak(self) -> None:
+        """``total_workers=2`` gives raw exit_band ~1.06 so the clamp at 1.0 keeps the SUPER->SUB exit reachable."""
+        state = RegimeDetectorState(current_regime=Regime.SUPER_HALFIN_WHITT, streak=0)
+        signal = compute_regime_signal(total_workers=2, total_used_slots=0, total_empty_slots=8)
+        for _ in range(2):
+            update_regime_state(state, signal, streak_cycles=3)
+        transitioned = update_regime_state(state, signal, streak_cycles=3)
+        assert transitioned is True
+        assert state.current_regime is Regime.SUB_HALFIN_WHITT
+        assert state.streak == 0
+
+    def test_single_worker_partially_idle_holds_super_hw(self) -> None:
+        """``cluster_idle_fraction < 1.0`` cannot meet the clamped exit band on a one-worker cluster."""
+        state = RegimeDetectorState(current_regime=Regime.SUPER_HALFIN_WHITT, streak=0)
+        signal = compute_regime_signal(total_workers=1, total_used_slots=1, total_empty_slots=3)
+        for _ in range(10):
+            update_regime_state(state, signal, streak_cycles=3)
+        assert state.current_regime is Regime.SUPER_HALFIN_WHITT
+        assert state.streak == 0
