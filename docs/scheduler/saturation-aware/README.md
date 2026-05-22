@@ -130,6 +130,7 @@ adjust a knob in production, jump to:
 | [24-structured-logging.md](24-structured-logging.md) | Per-decision INFO logging contract |
 | [25-bottleneck-decision-integration.md](25-bottleneck-decision-integration.md) | EWMA-smoothed `D_k` driving Phase C grow priority and Phase D shrink protection |
 | [26-stuck-plan-detector.md](26-stuck-plan-detector.md) | Per-stage WARN-to-INFO latch + Prometheus instrumentation for `_stuck_plan_counters` |
+| [27-topology-aware-classifier.md](27-topology-aware-classifier.md) | Topology-aware classifier |
 | [28-capacity-sizer.md](28-capacity-sizer.md) | Closed-form target worker count from queue-time inputs (`Little's Law` + `Forced Flow Law`) |
 
 ## Conventions used in these docs

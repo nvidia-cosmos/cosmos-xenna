@@ -89,7 +89,7 @@ Treat one autoscale call as a **fixed four-phase pipeline** with
               │  Compute per-stage intent deltas             │
               │  ─ aggregate slot signals (warmup-excluded)  │
               │  ─ EWMA smoothing                            │
-              │  ─ classify into 5 zones (with hysteresis)   │
+              │  ─ classify into 4 zones (with hysteresis)   │
               │  ─ asymmetric streak counters                │
               │  ─ trust gate (min_data_points)              │
               │  ─ stabilization-window consensus            │

@@ -70,7 +70,7 @@ of Layer 2 at the scheduler-constructor boundary.
   is re-checked against the union of all three tiers, so a
   higher-precedence override cannot silently weaken a cluster
   guardrail. A misconfigured override raises synchronously from
-  `Autoscaler.__init__`; the planner thread never sees it.
+  `SaturationAwareScheduler.__init__`; the planner thread never sees it.
 
 ```
         SaturationAwareConfig(...)                SaturationAwareScheduler(

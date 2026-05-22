@@ -2,8 +2,9 @@
 
 This is the operator's quick-reference for tuning the saturation-aware
 scheduler in production. The per-feature decision docs (`00-overview`
-through `24-structured-logging` in this folder) explain **why** each
-knob exists; this guide explains **which knob to turn when**.
+through the latest numbered decision docs in this folder; see
+`README.md` for the full index) explain **why** each knob exists;
+this guide explains **which knob to turn when**.
 
 > **Source of truth**: every default and range below is mirrored in
 > [`cosmos-xenna/cosmos_xenna/pipelines/private/specs.py`](../../../cosmos_xenna/pipelines/private/specs.py)

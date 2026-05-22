@@ -782,22 +782,24 @@ class TestDonorFlowUnderChurn:
           * receiver: floor=4, current=1.
           * donor: floor=2, current=3 (above floor by 1).
           * Cycle 1: 1 + 3 = 4 = cluster full.
-          * Cycle 2: donor loses 1 worker -> 2 (= floor, slack=0).
+          * Cycle 2: donor loses 1 worker -> 2 (= floor, slack=0); the
+            loss frees 1 CPU, so the cluster has exactly 1 free CPU
+            entering Phase B.
 
         Phase B for receiver (target=4):
-          * try_add succeeds twice (cluster has 2 free CPUs after the
-            loss freed one); receiver = 3.
+          * try_add succeeds once (1 free CPU consumed); receiver = 2.
           * try_add fails (cluster full again).
           * donor fallback queries ``select_youngest_eligible_donor``;
-            donor stage at floor returns None.
-          * receiver remains at 3 below floor 4 -> floor_stuck_counter
-            advances; ``floor_stuck_grace_cycles`` (default 5) bounds
-            how long this is tolerated.
+            donor stage at floor returns ``None`` (no slack to donate).
+          * receiver ends at 2, still below floor=4.
 
-        Pin: ``_floor_stuck_counters['receiver']`` == 1 (one cycle of
-        non-progress at floor); donor stage's deleted_workers is empty
-        (no donation attempted because donor was at floor); the lost id
-        is absent from scheduler state.
+        Pin: ``_floor_stuck_counters['receiver']`` is **absent** -- the
+        partial direct-add counts as progress, which Phase B's
+        ``made_progress`` branch uses to clear the counter for this
+        cycle (the next cycle without progress is the one that would
+        increment it). ``donor.deleted_workers`` is empty (no donation
+        attempted because the donor was at floor) and the lost id is
+        absent from scheduler state.
         """
         cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(

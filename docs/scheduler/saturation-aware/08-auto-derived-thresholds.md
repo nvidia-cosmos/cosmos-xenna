@@ -82,7 +82,7 @@ the stage**, so it is the only `c` that produces a stable threshold.
                                  │
                                  ▼
               ┌──────────────────────────────────────────────┐
-              │  runtime stage S has slots_per_worker = c    │
+              │  runtime stage S has slots_per_actor = c     │
               │  (from ProblemStageState, not config)        │
               └──────────────────────────────────────────────┘
                                  │

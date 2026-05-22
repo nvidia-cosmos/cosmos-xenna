@@ -30,6 +30,7 @@ Tests use real ``Problem`` and ``ProblemState`` objects (not mocks)
 so the Python -> Rust round-trips are exercised end-to-end.
 """
 
+import copy
 import math
 import threading
 
@@ -359,7 +360,11 @@ class TestUpdateWithMeasurementsAccumulator:
         """Empty measurements leave the count AND service-time accumulators untouched."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        snapshot_before = dict(scheduler._stage_states)
+        # Deep-copy so any in-place mutation of a ``_StageRuntimeState`` value
+        # by ``update_with_measurements`` would surface as inequality below;
+        # a shallow ``dict(...)`` would alias the same ``_StageRuntimeState``
+        # references and mask the regression.
+        snapshot_before = copy.deepcopy(scheduler._stage_states)
         # ``setup()`` zero-initialises both per-stage accumulators.
         assert scheduler._completed_counts == {"A": 0}
         assert scheduler._completed_service_time_sums == {"A": 0.0}

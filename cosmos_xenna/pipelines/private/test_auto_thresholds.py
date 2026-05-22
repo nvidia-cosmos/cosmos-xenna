@@ -135,7 +135,7 @@ class TestClamps:
         assert resolved.saturation_threshold == pytest.approx(cfg.auto_threshold_min)
 
     def test_small_c_does_not_exceed_auto_threshold_max(self) -> None:
-        """At c=1 with aggressiveness=0.60 the raw formula equals 0.60; the 0.50 ceiling clamps it.
+        """At c=1 with aggressiveness=0.60 the raw formula equals 0.60; ``cfg.auto_threshold_max`` clamps it.
 
         Pair the upper clamp with a sufficiently-high
         ``over_provisioned_threshold`` so the resolved triple still
@@ -153,7 +153,7 @@ class TestClamps:
         """A formula output strictly inside the clamp interval is returned unchanged."""
         cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.30)
         resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4)
-        # 0.30 / sqrt(4) = 0.15, comfortably inside [0.02, 0.50].
+        # 0.30 / sqrt(4) = 0.15, comfortably inside [auto_threshold_min, auto_threshold_max].
         assert resolved.saturation_threshold == pytest.approx(0.15)
 
 

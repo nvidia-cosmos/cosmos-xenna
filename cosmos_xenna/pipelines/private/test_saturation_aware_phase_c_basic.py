@@ -275,16 +275,15 @@ class TestClusterExhaustion:
         assert added <= 7
 
     def test_warning_logged_on_cluster_exhaustion(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
-        """Operators see a WARNING with stage name + intent + actual + deficit on partial grows."""
+        """Operators see exactly one WARNING with stage name + intent + actual + deficit on partial grows."""
         scheduler = _scheduler([("A", None)])
         state = _problem_state([("A", 1, 1, False)])
 
         _autoscale_with_intents(scheduler, state, {"A": 100})
 
         warnings = [record.getMessage() for record in loguru_caplog.records if record.levelname == "WARNING"]
-        assert any("'A'" in msg and "deficit" in msg for msg in warnings), (
-            f"expected one stage-named deficit warning; got: {warnings}"
-        )
+        deficit_count = sum(1 for msg in warnings if "'A'" in msg and "deficit" in msg)
+        assert deficit_count == 1, f"expected exactly one stage-named deficit warning; got: {warnings}"
 
 
 class TestMultiStageIndependentGrowth:

@@ -127,13 +127,14 @@ cannot drop the diagnostic.
 ```
 
 **Trade-off.** A few microseconds per cycle for fail-loud behaviour
-on internal corruption. The shape check is O(1); the per-stage
-counter sweep is O(stages) with two FFI hops per stage; Phase C
-adds an O(stages) classifier-state finiteness sweep; Phase D adds
-an O(stages) floor sweep and an O(stages) stuck-plan monotonicity
-sweep. All passes are pure-Python and allocate at most a shallow
-dict view, so the per-cycle budget remains negligible for clusters
-up to several thousand stages.
+on internal corruption. The pre-Phase-A shape check is O(stages)
+because it pairs a length comparison with a name-at-index sweep
+(the per-stage counter sweep is also O(stages) with two FFI hops
+per stage); Phase C adds an O(stages) classifier-state finiteness
+sweep; Phase D adds an O(stages) floor sweep and an O(stages)
+stuck-plan monotonicity sweep. All passes are pure-Python and
+allocate at most a shallow dict view, so the per-cycle budget
+remains negligible for clusters up to several thousand stages.
 
 ## How it works
 

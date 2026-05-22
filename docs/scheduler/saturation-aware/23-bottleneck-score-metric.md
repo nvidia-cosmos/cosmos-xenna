@@ -122,8 +122,10 @@ envelope is paid once and reused.
                                      │
                                      ▼
               ┌──────────────────────────────────────────────┐
-              │  emit_bottleneck_score(service_times_s={k:S_k│
-              │                                             │
+              │  emit_bottleneck_score(                      │
+              │     service_times_s={k: S_k for k in stages},│
+              │     pipeline_name=P,                         │
+              │  )                                           │
               │    D_k = V_k * S_k         (V_k = 1)         │
               │    gauge.set(D_k, {stage: k, pipeline: P})   │
               │    NaN samples skipped from argmax           │

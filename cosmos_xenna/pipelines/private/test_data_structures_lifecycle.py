@@ -102,7 +102,7 @@ class TestConcurrentConstruction:
     """
 
     def test_many_threads_can_construct_solutions_concurrently(self) -> None:
-        """100 threads * 10 Solutions each = 1000 Solutions; no exceptions, no race."""
+        """100 ThreadPool workers * 1 Solution each = 100 Solutions; no exceptions, no race."""
 
         def build_one(idx: int) -> int:
             ss = data_structures.StageSolution.make(slots_per_worker=2)
@@ -113,7 +113,7 @@ class TestConcurrentConstruction:
             futures = [pool.submit(build_one, i) for i in range(100)]
             results = [f.result() for f in concurrent.futures.as_completed(futures)]
         assert len(results) == 100
-        # Each future returned len(sol.stages) + idx == 1 + idx; sum is sum(1..100) + 100*1.
+        # Each future returned len(sol.stages) + idx == 1 + idx; sorted gives [1, 2, ..., 100].
         assert sorted(results) == [1 + i for i in range(100)]
 
     def test_solution_built_in_one_thread_is_consumable_in_another(self) -> None:

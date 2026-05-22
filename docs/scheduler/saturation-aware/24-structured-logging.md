@@ -20,10 +20,12 @@ itself is fixed in source.
 ## Problem
 
 The saturation-aware autoscaler runs a dense decision pipeline every
-cycle: classify each stage into one of five zones, smooth signals
-through EWMA and asymmetric streak counters, gate growth through a
-state machine, attempt cross-stage donations, run four ordered
-phases, and finally clamp every result against hard caps and floors.
+cycle: classify each stage into one of four zones (`NORMAL`,
+`SATURATED`, `SATURATED_CRITICAL`, `OVER_PROVISIONED`), smooth
+signals through EWMA and asymmetric streak counters, gate growth
+through a state machine, attempt cross-stage donations, run four
+ordered phases, and finally clamp every result against hard caps
+and floors.
 When something goes wrong — a stage that will not grow, a donor
 that flaps, a regime that should have lifted but did not — the
 operator wants to reconstruct **which decisions fired and why**

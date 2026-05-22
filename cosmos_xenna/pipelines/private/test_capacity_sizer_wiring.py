@@ -76,7 +76,7 @@ class TestRefreshCapacityTargetWorkers:
     """Pin the orchestrator's capacity-target population logic."""
 
     def test_returns_none_when_d_k_is_unobservable(self, scheduler: SaturationAwareScheduler) -> None:
-        """No D_k EWMA sample yet -> cold-start sentinel ``None``."""
+        """No D_k EWMA sample yet -> cold-start sentinel ``None``; runtime state mirrors the result."""
         scheduler._d_k_ewma["S"] = math.nan
         result = scheduler._refresh_capacity_target_workers(
             stage_state=scheduler._stage_states["S"],
@@ -87,9 +87,10 @@ class TestRefreshCapacityTargetWorkers:
             stage_name="S",
         )
         assert result is None
+        assert scheduler._stage_states["S"].capacity_target_workers == result
 
     def test_returns_none_when_thresholds_unresolved(self, scheduler: SaturationAwareScheduler) -> None:
-        """Without resolved thresholds the utilisation target cannot be derived."""
+        """Without resolved thresholds the utilisation target cannot be derived; runtime state mirrors the result."""
         scheduler._stage_states["S"].resolved_thresholds = None
         scheduler._d_k_ewma["S"] = 5.0
         result = scheduler._refresh_capacity_target_workers(
@@ -101,9 +102,10 @@ class TestRefreshCapacityTargetWorkers:
             stage_name="S",
         )
         assert result is None
+        assert scheduler._stage_states["S"].capacity_target_workers == result
 
     def test_returns_target_when_d_k_finite(self, scheduler: SaturationAwareScheduler) -> None:
-        """Finite D_k + populated thresholds -> closed-form target."""
+        """Finite D_k + populated thresholds -> closed-form target; runtime state mirrors the result."""
         scheduler._d_k_ewma["S"] = 2.0
         result = scheduler._refresh_capacity_target_workers(
             stage_state=scheduler._stage_states["S"],
@@ -113,4 +115,6 @@ class TestRefreshCapacityTargetWorkers:
             slots_per_worker=1,
             stage_name="S",
         )
-        assert result is not None and result >= 1
+        assert result is not None
+        assert result >= 1
+        assert scheduler._stage_states["S"].capacity_target_workers == result
