@@ -270,18 +270,17 @@ class TestMultiCycleClassifierConvergence:
         assert runtime.slots_empty_ratio_ewma is not None
         assert 0.0 <= runtime.slots_empty_ratio_ewma <= 1.0
 
-    def test_steady_idle_signal_settles_into_over_provisioned_or_starved(self) -> None:
-        """A steady-idle signal classifies the stage in the idle zone after enough cycles."""
+    def test_steady_idle_signal_settles_into_over_provisioned(self) -> None:
+        """A steady-idle signal classifies the stage as OVER_PROVISIONED after enough cycles."""
         scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
         scheduler.setup(_problem_with_stages(["idle"]))
-        # Mostly empty slots and zero queue -> STARVED zone.
         ps = _problem_state_with_signals([("idle", 4, 8, 4, 28, 0, False)])
 
         for _ in range(5):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         runtime = scheduler._stage_states["idle"]
-        assert runtime.classifier_state in {StageState.OVER_PROVISIONED, StageState.STARVED}
+        assert runtime.classifier_state is StageState.OVER_PROVISIONED
 
 
 class TestIntentDictResetsAcrossCycles:

@@ -211,7 +211,6 @@ demotion gate inside each slot-pin branch:
 | ``pressure_critical_threshold`` | ``2.0`` | Smoothed pressure above which a slot-pin ``SATURATED_CRITICAL`` actually fires. Strictly larger than ``pressure_saturation_threshold`` and ``≤ BACKLOG_CAP`` (``3.0``). |
 | ``pressure_saturation_threshold`` | ``1.0`` | Pressure above which a slot-pin ``SATURATED`` actually fires. Strictly larger than ``pressure_normal_threshold``. |
 | ``pressure_normal_threshold`` | ``0.3`` | Pressure above which a slot-pin ``OVER_PROVISIONED`` is demoted to ``NORMAL`` (queue is stuck downstream; shrinking would worsen the bottleneck). |
-| ``enable_backlog_time_classifier`` | ``True`` | Escape hatch: ``False`` reverts the stage to legacy slot-only behaviour (no demotion, no pressure refresh). |
 
 Cross-field invariants enforced at construction time:
 

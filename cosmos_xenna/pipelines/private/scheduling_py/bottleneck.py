@@ -473,6 +473,14 @@ class BottleneckIdentity:
     heterogeneity_ratio: float
 
 
+@attrs.frozen
+class BottleneckCycleContext:
+    """Per-cycle bottleneck signal scoped to one stage."""
+
+    engaged: bool = False
+    self_upstream: bool = False
+
+
 @attrs.define
 class BottleneckEngagementState:
     """Streak ledger for debouncing the bottleneck-engagement INFO log.

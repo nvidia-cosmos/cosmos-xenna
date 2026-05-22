@@ -202,8 +202,8 @@ B is the bottleneck. Steady-state classifier output:
 |---|---|---|---|
 | A | Slot occupancy ≪ 1 (throttled by B) | OVER_PROVISIONED | ≤ 0 |
 | B | Slot occupancy = 1 (saturated) | SATURATED | `+N` |
-| C | Idle slots, short queue (starved by B) | STARVED | 0 |
-| D | Idle slots, short queue | STARVED | 0 |
+| C | Idle slots, drained queue (starved by B) | OVER_PROVISIONED | 0 (until streak fires shrink) |
+| D | Idle slots, drained queue | OVER_PROVISIONED | 0 (until streak fires shrink) |
 | E | Idle slots, short queue | NORMAL | 0 |
 | F | Idle slots, short queue | NORMAL | 0 |
 

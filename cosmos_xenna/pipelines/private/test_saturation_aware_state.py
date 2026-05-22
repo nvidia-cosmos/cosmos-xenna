@@ -37,7 +37,6 @@ class TestStageStateEnum:
     def test_string_values_match_metric_label_convention(self) -> None:
         """Values are upper-snake-case so they can be used as Prometheus label values."""
         assert StageState.NORMAL.value == "NORMAL"
-        assert StageState.STARVED.value == "STARVED"
         assert StageState.SATURATED.value == "SATURATED"
         assert StageState.SATURATED_CRITICAL.value == "SATURATED_CRITICAL"
         assert StageState.OVER_PROVISIONED.value == "OVER_PROVISIONED"
@@ -83,7 +82,7 @@ class TestComputeSlotsEmptyRatio:
         assert compute_slots_empty_ratio(num_used_slots=8, num_empty_slots=0) == 0.0
 
     def test_all_free_returns_one(self) -> None:
-        """All slots free -> ratio 1.0 (the OVER_PROVISIONED / STARVED signal)."""
+        """All slots free -> ratio 1.0 (the OVER_PROVISIONED signal)."""
         assert compute_slots_empty_ratio(num_used_slots=0, num_empty_slots=8) == 1.0
 
     def test_half_busy_returns_one_half(self) -> None:

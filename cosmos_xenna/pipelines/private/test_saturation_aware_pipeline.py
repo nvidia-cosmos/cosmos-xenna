@@ -244,11 +244,19 @@ class TestOverProvisionedShrinkPath:
         assert state.growth_streak == 1
 
 
-class TestStarvedPath:
-    """STARVED -> no local action regardless of streak."""
+class TestEmptyQueueWithIdleSlotsClassifiesAsOverProvisioned:
+    """Free slots + drained queue -> OVER_PROVISIONED.
 
-    def test_starved_signal_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
-        """Free slots + empty queue -> STARVED -> delta=0 (upstream is the bottleneck)."""
+    Replaces the legacy queue==0 -> STARVED short-circuit. The first
+    cycle does not fire delta because the OVER_PROVISIONED streak
+    threshold has not yet been reached.
+    """
+
+    def test_empty_queue_with_idle_slots_classifies_as_over_provisioned(
+        self,
+        cfg: SaturationAwareStageConfig,
+    ) -> None:
+        """Free slots + empty queue -> OVER_PROVISIONED; first cycle delta is zero."""
         state = _fresh_state(cfg)
         delta = run_per_stage_pipeline(
             stage_state=state,
@@ -259,7 +267,7 @@ class TestStarvedPath:
             config=cfg,
         )
         assert delta == 0
-        assert state.classifier_state is StageState.STARVED
+        assert state.classifier_state is StageState.OVER_PROVISIONED
 
 
 class TestZeroActorsColdStart:

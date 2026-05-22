@@ -107,9 +107,9 @@ non-trivial branch wins:
 For every non-finished stage in that order:
 
 1. **Read the intent** from `_last_intent_deltas`. Non-positive
-   intent (NORMAL, STARVED, OVER_PROVISIONED) is a no-op for
-   Phase C; the stuck-plan counter for the stage is reset to 0
-   and the loop moves on.
+   intent (NORMAL, OVER_PROVISIONED) is a no-op for Phase C;
+   the stuck-plan counter for the stage is reset to 0 and the
+   loop moves on.
 2. **Clamp to remaining headroom** under the per-stage ceiling
    `min(max_workers, max_workers_per_node * N)`. If the clamp
    reduces the request to zero, skip and reset the stuck counter.

@@ -138,8 +138,8 @@ then clamped to `aggressive_growth_max_per_cycle`):
 | `HOLD`      | `hold_saturated_growth_count` (default `0`)                                          | `hold_critical_growth_count` (default `+1`)                                         |
 
 `OVER_PROVISIONED` shrink magnitude is independent of mode
-(see `_shrink_delta` in `decisions.py`); `NORMAL` and `STARVED`
-always emit zero regardless of mode.
+(see `_shrink_delta` in `decisions.py`); `NORMAL` always
+emits zero regardless of mode.
 
 ## How it works
 

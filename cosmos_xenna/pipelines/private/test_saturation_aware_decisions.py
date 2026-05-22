@@ -23,7 +23,6 @@ Default per-stage thresholds at the time of writing:
   saturated_critical_streak_min_cycles = 1
   saturated_streak_min_cycles = 2
   over_provisioned_streak_min_cycles = 30
-  starved_streak_min_cycles = 6
   acquiring_critical_growth_factor = 0.5
   acquiring_saturated_growth_factor = 0.25
   tracking_critical_growth_count = 2
@@ -114,18 +113,6 @@ class TestShouldFireActionScaleDown:
     def test_over_provisioned_fires_at_threshold(self, cfg: SaturationAwareStageConfig) -> None:
         """OVER_PROVISIONED at streak == min cycles is the trigger boundary."""
         assert should_fire_action(StageState.OVER_PROVISIONED, streak=30, config=cfg) is True
-
-
-class TestShouldFireActionStarved:
-    """STARVED is informational; threshold gates the upstream-bottleneck WARN log."""
-
-    def test_starved_does_not_fire_below_threshold(self, cfg: SaturationAwareStageConfig) -> None:
-        """STARVED at streak 5 < min 6 -> not yet logging; transient may resolve."""
-        assert should_fire_action(StageState.STARVED, streak=5, config=cfg) is False
-
-    def test_starved_fires_at_threshold(self, cfg: SaturationAwareStageConfig) -> None:
-        """STARVED at streak == min cycles -> upstream bottleneck signal is sustained."""
-        assert should_fire_action(StageState.STARVED, streak=6, config=cfg) is True
 
 
 class TestShouldFireActionNormal:
@@ -280,16 +267,11 @@ class TestComputeDeltaCapAppliesUniformly:
 
 
 class TestComputeDeltaNoActionStates:
-    """NORMAL and STARVED zones produce zero delta regardless of growth mode."""
+    """NORMAL produces zero delta regardless of growth mode."""
 
     def test_normal_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
         """NORMAL is the no-action zone."""
         result = compute_delta(StageState.NORMAL, GrowthMode.ACQUIRING, current_workers=10, config=cfg)
-        assert result == 0
-
-    def test_starved_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
-        """STARVED has no local action; upstream is the bottleneck."""
-        result = compute_delta(StageState.STARVED, GrowthMode.ACQUIRING, current_workers=10, config=cfg)
         assert result == 0
 
 

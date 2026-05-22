@@ -140,11 +140,7 @@ inside `run_per_stage_pipeline`. The pipeline only calls the helper
 when the slot signal is available; cycles that short-circuit with no
 slot signal (zero ready actors, no prior valid EWMA) intentionally do
 not refresh these gauges so the next valid cycle's demotion decision
-sees a clean signal. The gauges are emitted on every cycle the pressure helper runs,
-regardless of the `enable_backlog_time_classifier` flag — when the
-flag is `False` the classifier ignores `pressure_ewma`, but the
-helper still computes it and updates the gauges so operators can keep
-auditing the demotion math even on legacy-mode stages. Safety metrics update
+sees a clean signal. Safety metrics update
 opportunistically: the memory-pressure gauges refresh on every
 `is_pressure_active()` call (whether a cache hit or a fresh Ray poll),
 and the allocation-failures counter increments only on the

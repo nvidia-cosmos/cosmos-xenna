@@ -35,27 +35,27 @@ import enum
 import attrs
 
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import ResolvedThresholds
+from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import BottleneckCycleContext
 
 
 class StageState(str, enum.Enum):
-    """Five-zone saturation classifier output for a single stage.
+    """Four-zone saturation classifier output for a single stage.
 
     Attributes:
         NORMAL: Operating within bounds; no scale action warranted.
-        STARVED: Free slots remain but the input queue is empty;
-            upstream is the bottleneck, no local scale action helps.
         SATURATED: Few free slots (below ``saturation_threshold``);
             ordinary scale-up signal once sustained.
         SATURATED_CRITICAL: Effectively zero free slots (below
             ``activation_threshold``); burst signal that bypasses
             hysteresis.
-        OVER_PROVISIONED: Many free slots with input pending;
-            sustained scale-down signal.
+        OVER_PROVISIONED: Sustained idle slots; scale-down candidate
+            and cross-stage donor candidate. Captures both genuine
+            over-provisioning and backpressure-induced idleness
+            upstream / downstream of an engaged bottleneck.
 
     """
 
     NORMAL = "NORMAL"
-    STARVED = "STARVED"
     SATURATED = "SATURATED"
     SATURATED_CRITICAL = "SATURATED_CRITICAL"
     OVER_PROVISIONED = "OVER_PROVISIONED"
@@ -127,6 +127,12 @@ class _StageRuntimeState:
             first cycle with a valid slot signal; left untouched when
             ``run_per_stage_pipeline`` short-circuits, so the classifier
             never reads stale data.
+        cycle_bottleneck_context: Per-cycle bottleneck signal scoped
+            to this stage, refreshed by the orchestrator after
+            ``identify_bottleneck`` runs. Read by the per-stage
+            decision pipeline solely for diagnostic logging
+            (``bottleneck=`` / ``upstream=`` fields on the
+            classifier-trace and classifier-transition log lines).
 
     """
 
@@ -141,6 +147,9 @@ class _StageRuntimeState:
     resolved_thresholds: ResolvedThresholds | None = None
     valid_signal_samples: int = 0
     pressure_ewma: float | None = None
+    cycle_bottleneck_context: BottleneckCycleContext = attrs.field(
+        factory=BottleneckCycleContext,
+    )
 
 
 def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> float:

@@ -159,16 +159,6 @@ class TestPressureFieldValidators:
         with pytest.raises(ValueError):
             SaturationAwareStageConfig(pressure_smoothing_level=1.01)
 
-    def test_enable_backlog_time_classifier_default_is_true(self) -> None:
-        """The backlog-time pressure classifier is enabled by default."""
-        cfg = SaturationAwareStageConfig()
-        assert cfg.enable_backlog_time_classifier is True
-
-    def test_enable_backlog_time_classifier_must_be_bool(self) -> None:
-        """Truthy strings are rejected so an operator typo cannot silently disable the gate."""
-        with pytest.raises(TypeError):
-            SaturationAwareStageConfig(enable_backlog_time_classifier=cast(bool, "yes"))
-
 
 class TestSaturationAwareStageConfigCrossFieldValidators:
     """Cross-field invariants enforced in __attrs_post_init__."""

@@ -69,6 +69,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     _resolve_auto_thresholds,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+    BottleneckCycleContext,
     BottleneckEngagementState,
     BottleneckIdentity,
     HeterogeneityWarnState,
@@ -932,24 +933,15 @@ class SaturationAwareScheduler:
             self._run_phase_b_floor(ctx, problem_state)
             check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
-        with self._phase_timer("intent"):
-            # Sample throughput once per cycle BEFORE the intent loop so every
-            # stage observes the same per-cycle delta even when a stage's
-            # ``run_per_stage_pipeline`` raises (the lock is released first).
-            throughput_samples = self._consume_throughput_samples(now_ts=time)
-            self._last_intent_deltas = self._compute_intent_deltas(
-                ctx,
-                problem_state,
-                now=time,
-                throughput_samples=throughput_samples,
-            )
-
-        # Bottleneck calculation block: must run BEFORE Phase C / Phase D so
-        # both phases see fresh ``_last_bottleneck_meta`` / ``_d_k_ewma`` for
-        # the current cycle. The block is wrapped in its own phase timer so
-        # the per-phase Prometheus histogram accounts for its share of the
-        # cycle duration; without the timer, ``loop_watchdog``'s wall-clock
-        # measurement would diverge from the sum of per-phase histograms.
+        # Bottleneck calculation block runs BEFORE the intent loop so the
+        # per-stage decision pipeline observes a populated
+        # ``cycle_bottleneck_context`` for the current cycle, and BEFORE
+        # Phase C / Phase D so both phases see fresh
+        # ``_last_bottleneck_meta`` / ``_d_k_ewma``. The block is wrapped
+        # in its own phase timer so the per-phase Prometheus histogram
+        # accounts for its share of the cycle duration; without the timer,
+        # ``loop_watchdog``'s wall-clock measurement would diverge from
+        # the sum of per-phase histograms.
         with self._phase_timer("bottleneck"):
             service_times_s = self._consume_service_time_samples()
             self._update_d_k_ewma(service_times_s)
@@ -957,6 +949,7 @@ class SaturationAwareScheduler:
                 self._d_k_ewma,
                 heterogeneity_threshold=self._config.bottleneck_heterogeneity_threshold,
             )
+            self._refresh_cycle_bottleneck_context()
             # Engagement log is silenced when both decision toggles are off:
             # disabling both decision paths must not introduce a new
             # operator log line. The EWMA state and meta snapshot are
@@ -969,6 +962,18 @@ class SaturationAwareScheduler:
                     persistence_cycles=self._config.bottleneck_engagement_persistence_cycles,
                     pipeline_name=self._pipeline_name,
                 )
+
+        with self._phase_timer("intent"):
+            # Sample throughput once per cycle BEFORE the intent loop so every
+            # stage observes the same per-cycle delta even when a stage's
+            # ``run_per_stage_pipeline`` raises (the lock is released first).
+            throughput_samples = self._consume_throughput_samples(now_ts=time)
+            self._last_intent_deltas = self._compute_intent_deltas(
+                ctx,
+                problem_state,
+                now=time,
+                throughput_samples=throughput_samples,
+            )
 
         # Capture pre-Phase-C worker counts so we can compute the post-commit
         # executed delta per stage and feed it to the growth-mode state machine
@@ -1588,52 +1593,43 @@ class SaturationAwareScheduler:
                     f"clamping Phase C intent +{delta} -> 0."
                 )
                 delta = 0
-            self._maybe_emit_starved_warning(
-                stage_state=stage_state,
-                stage_name=stage_name,
-                stage_cfg=stage_cfg,
-                input_queue_depth=runtime_stage.input_queue_depth,
-            )
             intents[stage_name] = delta
         return intents
 
-    def _maybe_emit_starved_warning(
-        self,
-        *,
-        stage_state: _StageRuntimeState,
-        stage_name: str,
-        stage_cfg: SaturationAwareStageConfig,
-        input_queue_depth: int,
-    ) -> None:
-        """Emit one INFO log when STARVED sustains for ``starved_streak_min_cycles``.
+    def _refresh_cycle_bottleneck_context(self) -> None:
+        """Publish the current cycle's bottleneck context onto every stage state.
 
-        STARVED is a no-scale classifier output: ``compute_delta`` always
-        returns 0, so there is no autoscaler-side action to take. The
-        operator-visible signal is that an upstream stage is failing to
-        feed this stage. Logging once per streak (when the streak ticks
-        exactly up to ``starved_streak_min_cycles``) gives the operator
-        actionability without log-flooding while the bottleneck
-        persists. Re-entering STARVED later in the run logs again.
-
-        Args:
-            stage_state: Per-stage runtime state; only the classifier
-                fields are read.
-            stage_name: Stage name for log output.
-            stage_cfg: Per-stage configuration; ``starved_streak_min_cycles``
-                controls the gate.
-            input_queue_depth: Tasks waiting upstream of this stage.
+        Called once per cycle from the bottleneck phase timer right
+        after :func:`identify_bottleneck` returns. Each stage's
+        ``cycle_bottleneck_context`` is overwritten with a fresh
+        ``BottleneckCycleContext``; the per-stage decision pipeline
+        and the classifier-trace / classifier-transition log lines
+        read it for the ``bottleneck=`` / ``upstream=`` diagnostic
+        fields.
         """
-        if (
-            stage_state.classifier_state is not StageState.STARVED
-            or stage_state.classifier_streak != stage_cfg.starved_streak_min_cycles
-        ):
+        meta = self._last_bottleneck_meta
+        if meta is None or not meta.engaged or meta.stage_name is None:
+            for stage_state in self._stage_states.values():
+                stage_state.cycle_bottleneck_context = BottleneckCycleContext()
             return
-        logger.info(
-            f"saturation-aware: stage {stage_name!r} classifier STARVED for "
-            f"{stage_state.classifier_streak} consecutive cycles "
-            f"(threshold={stage_cfg.starved_streak_min_cycles}); upstream queue depth "
-            f"{input_queue_depth} - investigate the producing stage for an upstream bottleneck."
-        )
+        try:
+            bottleneck_index = self._stage_names.index(meta.stage_name)
+        except ValueError:
+            # Defensive: identify_bottleneck returned a stage name not in
+            # ``_stage_names`` (e.g. a stale meta after a stage list
+            # change). Treat the cycle as disengaged so the per-stage
+            # context never points at a missing stage.
+            for stage_state in self._stage_states.values():
+                stage_state.cycle_bottleneck_context = BottleneckCycleContext()
+            return
+        for stage_index, stage_name in enumerate(self._stage_names):
+            stage_state = self._stage_states.get(stage_name)
+            if stage_state is None:
+                continue
+            stage_state.cycle_bottleneck_context = BottleneckCycleContext(
+                engaged=True,
+                self_upstream=stage_index < bottleneck_index,
+            )
 
     def _set_stuck_plan_counter(self, stage_name: str, value: int, *, last_intent: int) -> None:
         """Update ``_stuck_plan_counters[stage_name]`` and notify the detector."""
@@ -1707,8 +1703,8 @@ class SaturationAwareScheduler:
         stage in the current cycle and a single WARNING per affected
         stage is emitted so operators retain visibility into
         partially-satisfied saturation-driven growth. Negative or
-        zero intent (NORMAL, STARVED, OVER_PROVISIONED) is a no-op
-        here; saturation-driven scale-down lands as Phase D.
+        zero intent (NORMAL, OVER_PROVISIONED) is a no-op here;
+        saturation-driven scale-down lands as Phase D.
 
         Iteration order is delegated to
         :func:`compute_grow_priority_order`. When the bottleneck gate

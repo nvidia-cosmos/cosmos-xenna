@@ -82,8 +82,8 @@ and dashboards can read directly.
                 ├─────────────────────────┼──────────────────────────┤
   normalized   │      pressure ≈ 0       │  pressure ≈ 0           │
   backlog LOW  │  (genuine idle —         │  (transient burst —     │
-  (queue       │   STARVED on empty       │   queue is draining;    │
-  draining)    │   queue streak)          │   warmup cost would      │
+  (queue       │   OVER_PROVISIONED       │   queue is draining;    │
+  draining)    │   eligible for shrink)   │   warmup cost would      │
                 │                         │   dominate)              │
                 └─────────────────────────┴──────────────────────────┘
 ```
@@ -98,11 +98,7 @@ Each slot-pin branch has its own pressure threshold:
 |---|---|---|---|
 | `SATURATED_CRITICAL` (`slots_empty < activation`) | `pressure_critical_threshold` (default `2.0`) | stays `SATURATED_CRITICAL` | falls through to `SATURATED` gate |
 | `SATURATED` (`slots_empty < saturation`) | `pressure_saturation_threshold` (default `1.0`) | stays `SATURATED` | demoted to `NORMAL` |
-| `OVER_PROVISIONED` (`slots_empty ≥ over_provisioned`, `queue > 0`) | `pressure_normal_threshold` (default `0.3`) | demoted to `NORMAL` (queue stuck downstream) | stays `OVER_PROVISIONED` |
-| `STARVED` (`slots_empty ≥ over_provisioned`, `queue = 0`) | n/a | n/a | always `STARVED` (queue empty is structural) |
-
-`STARVED` is excluded because the queue is empty by construction; no
-backlog-time signal can change that diagnosis.
+| `OVER_PROVISIONED` (`slots_empty ≥ over_provisioned`) | `pressure_normal_threshold` (default `0.3`) | demoted to `NORMAL` (queue stuck downstream) | stays `OVER_PROVISIONED` |
 
 The slot-pin gate continues to honour the existing **asymmetric
 deadband** for hysteresis (saturation deadband, over-provisioned
@@ -170,22 +166,6 @@ pressure EWMA. This is intentional: feeding `compute_pressure` with
 a zero utilisation while the actual pool is in setup-phase quiescence
 would corrupt the next valid cycle's demotion decision.
 
-## Escape hatch — slot-only classifier
-
-The pressure gate can be disabled per-stage:
-
-```python
-SaturationAwareStageConfig(
-    enable_backlog_time_classifier=False,  # default True
-)
-```
-
-When disabled the classifier reverts to the legacy slot-only behaviour
-(no demotion, no pressure refresh, no Prometheus pressure gauges
-emitted for the stage). Use this for stages that were pre-tuned
-against the slot-ratio signal alone and should not adopt the new
-demotion rule.
-
 ## Knobs
 
 All on
@@ -198,7 +178,6 @@ All on
 | `pressure_critical_threshold` | `2.0` | Pressure above which a slot-pin `SATURATED_CRITICAL` actually fires. Strictly larger than `pressure_saturation_threshold`. |
 | `pressure_saturation_threshold` | `1.0` | Pressure above which a slot-pin `SATURATED` actually fires. |
 | `pressure_normal_threshold` | `0.3` | Pressure above which a slot-pin `OVER_PROVISIONED` is demoted to `NORMAL` (queue is stuck elsewhere). |
-| `enable_backlog_time_classifier` | `True` | Escape hatch — disables the pressure gate and falls back to slot-only. |
 
 Cross-field invariants enforced at construction time:
 

@@ -194,7 +194,7 @@ class TestNonPositiveIntentIsNoOp:
     """Negative and zero intent values do not cause Phase C to act."""
 
     def test_zero_intent_does_not_grow(self) -> None:
-        """NORMAL / STARVED stages produce intent 0 and Phase C is a no-op."""
+        """NORMAL stages produce intent 0 and Phase C is a no-op."""
         scheduler = _scheduler([("A", None)])
         state = _problem_state([("A", 1, 1, False)])
 

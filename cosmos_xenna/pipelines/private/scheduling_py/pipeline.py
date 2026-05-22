@@ -215,6 +215,7 @@ def run_per_stage_pipeline(
         # gate decision.
         delta = apply_stabilization_gate(recommendation_history, delta)
 
+    bottleneck_ctx = stage_state.cycle_bottleneck_context
     logger.debug(
         f"classifier trace: stage={stage_state.stage_name!r} "
         f"slots_empty_ratio_ewma={classifier_input:.3f} "
@@ -223,6 +224,8 @@ def run_per_stage_pipeline(
         f"prev_state={prev_classifier_state.name} "
         f"new_state={new_classifier_state.name} "
         f"streak={stage_state.classifier_streak} "
+        f"bottleneck_engaged={bottleneck_ctx.engaged} "
+        f"upstream_of_bottleneck={bottleneck_ctx.self_upstream} "
         f"should_fire={should_fire} "
         f"delta={delta}"
     )
@@ -231,7 +234,9 @@ def run_per_stage_pipeline(
             f"classifier transition: stage={stage_state.stage_name!r} "
             f"{prev_classifier_state.name} -> {new_classifier_state.name} "
             f"(pressure_ewma={pressure_ewma:.3f}, slots_empty_ratio_ewma={classifier_input:.3f}, "
-            f"queue={input_queue_depth}, streak={stage_state.classifier_streak}, delta={delta})"
+            f"queue={input_queue_depth}, streak={stage_state.classifier_streak}, "
+            f"bottleneck_engaged={bottleneck_ctx.engaged}, "
+            f"upstream_of_bottleneck={bottleneck_ctx.self_upstream}, delta={delta})"
         )
 
     stage_state.prev_workers = current_workers

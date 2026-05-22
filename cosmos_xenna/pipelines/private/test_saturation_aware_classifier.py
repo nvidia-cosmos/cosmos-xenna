@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behaviour tests for the 5-state classifier.
+"""Behaviour tests for the 4-state classifier.
 
 Each test pins exactly one zone or one hysteresis edge so a future
 threshold tweak surfaces as a precise test failure instead of a
@@ -202,16 +202,11 @@ class TestSaturatedHysteresis:
         )
         assert result is StageState.SATURATED
 
-    def test_above_deadband_with_empty_queue_classifies_as_normal_not_starved(
+    def test_above_deadband_with_empty_queue_classifies_as_normal(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """Escape-up from SATURATED into the NORMAL band ignores queue depth.
-
-        The SATURATED -> NORMAL transition does not pass through the
-        OVER_PROVISIONED check, so an empty queue does not promote the
-        result to STARVED. STARVED only fires from the upper zone.
-        """
+        """Escape-up from SATURATED into the NORMAL band ignores queue depth."""
         ratio_above_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct) + 1e-6
         result = _classify(
             cfg,
@@ -237,8 +232,14 @@ class TestNormalZone:
         assert result is StageState.NORMAL
 
 
-class TestOverProvisionedAndStarvedZones:
-    """ratio >= over_provisioned_threshold; queue depth disambiguates."""
+class TestOverProvisionedZone:
+    """ratio >= over_provisioned_threshold -> OVER_PROVISIONED regardless of queue depth.
+
+    Backpressure-induced idleness (queue=0 because a downstream
+    bottleneck stalls upstream output) yields the same verdict as
+    genuine over-provisioning. Operators see the topology context
+    on the per-cycle classifier-trace log line.
+    """
 
     def test_high_ratio_with_queue_classifies_as_over_provisioned(
         self,
@@ -253,18 +254,25 @@ class TestOverProvisionedAndStarvedZones:
         )
         assert result is StageState.OVER_PROVISIONED
 
-    def test_high_ratio_with_empty_queue_classifies_as_starved(
+    def test_high_ratio_with_empty_queue_classifies_as_over_provisioned(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """Free slots + empty queue -> upstream is the bottleneck (no local action)."""
+        """Free slots + drained queue -> OVER_PROVISIONED.
+
+        Pins the topology-aware classifier verdict for the case
+        where an upstream stage drains its input queue because a
+        downstream bottleneck back-pressures it: the verdict must
+        be OVER_PROVISIONED (eligible for shrink + cross-stage
+        donor) rather than a no-action state.
+        """
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
-        assert result is StageState.STARVED
+        assert result is StageState.OVER_PROVISIONED
 
     def test_full_ratio_with_queue_is_over_provisioned(
         self,
@@ -275,6 +283,19 @@ class TestOverProvisionedAndStarvedZones:
             cfg,
             slots_empty_ratio_ewma=1.0,
             input_queue_depth=10,
+            prev_state=StageState.NORMAL,
+        )
+        assert result is StageState.OVER_PROVISIONED
+
+    def test_full_ratio_with_empty_queue_is_over_provisioned(
+        self,
+        cfg: SaturationAwareStageConfig,
+    ) -> None:
+        """ratio == 1.0 with empty queue -> OVER_PROVISIONED."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=1.0,
+            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -292,22 +313,18 @@ class TestOverProvisionedAndStarvedZones:
         )
         assert result is StageState.OVER_PROVISIONED
 
-    def test_at_over_provisioned_threshold_with_empty_queue_is_starved(
+    def test_at_over_provisioned_threshold_with_empty_queue_is_over_provisioned(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """Boundary equality: ratio == op_threshold + queue == 0 -> STARVED.
-
-        Confirms the queue-disambiguation branch fires at the boundary,
-        not just strictly above it.
-        """
+        """Boundary equality: ratio == op_threshold + queue == 0 -> OVER_PROVISIONED."""
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold,
             input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
-        assert result is StageState.STARVED
+        assert result is StageState.OVER_PROVISIONED
 
 
 class TestOverProvisionedHysteresis:
@@ -339,17 +356,11 @@ class TestOverProvisionedHysteresis:
         )
         assert result is StageState.NORMAL
 
-    def test_hysteresis_preserves_starved_when_queue_empties_inside_deadband(
+    def test_inside_deadband_with_empty_queue_holds_over_provisioned(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """Queue drops to 0 while ratio is in the OVER_PROVISIONED deadband -> STARVED.
-
-        prev_state == OVER_PROVISIONED keeps the lowered op_boundary,
-        so the upper-zone classification still applies; the queue
-        disambiguation then routes the result to STARVED rather than
-        OVER_PROVISIONED.
-        """
+        """Empty queue inside the deadband does not change the verdict."""
         ratio_inside_deadband = cfg.over_provisioned_threshold * (1.0 - cfg.over_provisioned_deadband_pct / 2.0)
         result = _classify(
             cfg,
@@ -357,17 +368,17 @@ class TestOverProvisionedHysteresis:
             input_queue_depth=0,
             prev_state=StageState.OVER_PROVISIONED,
         )
-        assert result is StageState.STARVED
+        assert result is StageState.OVER_PROVISIONED
 
 
-class TestStarvedDoesNotApplyToBusyStages:
-    """STARVED requires free slots; a fully busy stage with empty queue is not STARVED."""
+class TestEmptyQueueWithBusySlots:
+    """Empty queue with busy slots is never reclassified to OVER_PROVISIONED."""
 
-    def test_zero_ratio_with_empty_queue_classifies_as_critical_not_starved(
+    def test_zero_ratio_with_empty_queue_classifies_as_critical(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """A stage saturated on already-pulled work shows CRITICAL, not STARVED."""
+        """A stage saturated on already-pulled work shows CRITICAL."""
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
@@ -435,37 +446,71 @@ class TestCrossZoneTransitions:
         )
         assert result is StageState.SATURATED
 
-    def test_starved_prev_returns_to_normal_with_no_hysteresis(
+
+class TestStarvedEnumValueRemoved:
+    """Sentry: ``StageState`` no longer exposes a STARVED member."""
+
+    def test_stage_state_enum_does_not_contain_starved(self) -> None:
+        """Removing this assertion would silently re-enable the legacy queue=0 short-circuit."""
+        assert "STARVED" not in {member.name for member in StageState}
+
+
+class TestPressureNormalThresholdStrictness:
+    """``pressure_normal_threshold`` is a strict-greater gate, not >=."""
+
+    def test_pressure_at_normal_threshold_does_not_demote(self, cfg: SaturationAwareStageConfig) -> None:
+        """pressure == normal_threshold -> stays OVER_PROVISIONED (gate is strict ``>``)."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
+            input_queue_depth=10,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=cfg.pressure_normal_threshold,
+        )
+        assert result is StageState.OVER_PROVISIONED
+
+    def test_pressure_above_normal_threshold_demotes_to_normal(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """STARVED is not subject to hysteresis -- when input returns the stage drops to NORMAL immediately.
-
-        Unlike OVER_PROVISIONED, STARVED does not lower the
-        op_boundary on exit because STARVED is a transient
-        upstream-bottleneck state, not a scaled-out state.
-        """
+        """pressure > normal_threshold -> demotes to NORMAL (downstream is stuck)."""
         result = _classify(
             cfg,
-            slots_empty_ratio_ewma=cfg.over_provisioned_threshold - 1e-6,
+            slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
             input_queue_depth=10,
-            prev_state=StageState.STARVED,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=cfg.pressure_normal_threshold + 0.01,
         )
         assert result is StageState.NORMAL
 
-    def test_starved_prev_with_falling_ratio_classifies_as_saturated_immediately(
+
+class TestPressureColdStartFallback:
+    """``pressure_ewma=None`` preserves slot-only behaviour for the cycle."""
+
+    def test_cold_start_with_idle_slots_classifies_as_over_provisioned(
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """STARVED stage that fills up faster than input arrives drops straight to SATURATED.
-
-        Ensures the STARVED -> SATURATED edge does not get held by
-        any spurious hysteresis path.
-        """
+        """Free slots + drained queue + no pressure value -> OVER_PROVISIONED."""
         result = _classify(
             cfg,
-            slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
-            prev_state=StageState.STARVED,
+            slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
+            input_queue_depth=0,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=None,
         )
-        assert result is StageState.SATURATED
+        assert result is StageState.OVER_PROVISIONED
+
+    def test_cold_start_with_critical_slot_pin_fires_critical(
+        self,
+        cfg: SaturationAwareStageConfig,
+    ) -> None:
+        """Slot ratio 0.0 + no pressure value -> SATURATED_CRITICAL (slot-only fallback)."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=0.0,
+            input_queue_depth=10,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=None,
+        )
+        assert result is StageState.SATURATED_CRITICAL

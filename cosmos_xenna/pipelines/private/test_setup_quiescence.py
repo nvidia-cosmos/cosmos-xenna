@@ -149,10 +149,10 @@ def _over_provisioned_signal(
 ) -> data_structures.ProblemStageState:
     """Build an OVER_PROVISIONED-shaped slot signal for the stage.
 
-    OVER_PROVISIONED is only distinguishable from STARVED when the
-    upstream queue is non-empty -- a stage with empty slots and no
-    queue is just idle, not over-provisioned. The classifier reads
-    ``input_queue_depth > 0`` as the disambiguator.
+    Idle slots with a non-empty input queue is the canonical
+    OVER_PROVISIONED shape; the classifier also accepts a drained
+    queue here, but a non-empty queue is what most quiescence-suite
+    tests want to assert against.
     """
     total = num_workers * slots_per_worker
     return _stage_state(
@@ -244,7 +244,7 @@ class TestColdStartSkipsIntentPipeline:
         The default classifier state at ``setup()`` is ``NORMAL`` with
         a zero streak; if the cold-start cycle slipped through the
         gate the classifier would observe a zero-signal slot ratio
-        and either tick the streak or transition to ``STARVED``.
+        and either tick the streak or transition out of ``NORMAL``.
         """
         scheduler = _scheduler_with_stage("hot")
         ps = data_structures.ProblemState(

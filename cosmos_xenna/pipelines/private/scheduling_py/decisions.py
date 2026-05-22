@@ -81,8 +81,7 @@ def should_fire_action(
     Streak thresholds are intentionally asymmetric: scale-up
     (SATURATED, SATURATED_CRITICAL) fires aggressively after few
     cycles; scale-down (OVER_PROVISIONED) requires a long sustained
-    signal; STARVED waits long enough to log the upstream-bottleneck
-    warning. NORMAL is the no-action zone and never fires.
+    signal. NORMAL is the no-action zone and never fires.
 
     Args:
         state: Current classifier output.
@@ -99,8 +98,6 @@ def should_fire_action(
         return streak >= config.saturated_streak_min_cycles
     if state == StageState.OVER_PROVISIONED:
         return streak >= config.over_provisioned_streak_min_cycles
-    if state == StageState.STARVED:
-        return streak >= config.starved_streak_min_cycles
     return False
 
 
@@ -118,8 +115,8 @@ def compute_delta(
     encodes the algorithm's intent, not the feasibility check.
 
     Args:
-        state: Current classifier output. NORMAL and STARVED produce
-            zero (no scale action).
+        state: Current classifier output. NORMAL produces zero
+            (no scale action).
         growth_mode: Per-stage growth controller mode (ACQUIRING,
             TRACKING, HOLD). Determines the magnitude of scale-up.
         current_workers: Worker count before this cycle's decision.
@@ -132,7 +129,7 @@ def compute_delta(
 
     Returns:
         Signed integer: positive to add workers, negative to remove,
-        zero for NORMAL/STARVED.
+        zero for NORMAL.
 
     Raises:
         ValueError: If ``current_workers`` is negative.

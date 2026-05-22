@@ -439,29 +439,6 @@ class TestPressureClassifierFields:
     a field cannot be added without an observable wiring point.
     """
 
-    def test_enable_backlog_time_classifier_false_preserves_slot_only_saturated(self) -> None:
-        """Toggle off -> classifier ignores pressure_ewma and stays SATURATED on slot pin."""
-        slot_only_cfg = SaturationAwareStageConfig(
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            enable_backlog_time_classifier=False,
-        )
-
-        # Slot pin in SATURATED band (0.10 in [0.05, 0.15)). Pressure
-        # 0.0 would demote to NORMAL under the default compound
-        # classifier; the slot-only path must fire SATURATED regardless.
-        verdict = classify(
-            slots_empty_ratio_ewma=0.10,
-            input_queue_depth=100,
-            prev_state=StageState.NORMAL,
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            config=slot_only_cfg,
-            pressure_ewma=0.0,
-        )
-
-        assert verdict is StageState.SATURATED
-
     def test_pressure_saturation_threshold_high_demotes_slot_pin_to_normal(self) -> None:
         """High ``pressure_saturation_threshold`` demotes a slot-pinned SATURATED to NORMAL.
 
@@ -585,19 +562,6 @@ class TestStageOverridePrecedenceForPressureFields:
 
         assert sat_cfg.get_effective_stage_config("tight").target_backlog_seconds == pytest.approx(5.0)
         assert sat_cfg.get_effective_stage_config("loose").target_backlog_seconds == pytest.approx(120.0)
-
-    def test_per_stage_override_changes_enable_backlog_time_classifier_for_named_stage(self) -> None:
-        """Per-stage override flips the classifier toggle only for the named stage."""
-        per_stage = {
-            "slot_only": SaturationAwareStageConfig(enable_backlog_time_classifier=False),
-        }
-        sat_cfg = SaturationAwareConfig(
-            stage_defaults=SaturationAwareStageConfig(enable_backlog_time_classifier=True),
-            per_stage_overrides=per_stage,
-        )
-
-        assert sat_cfg.get_effective_stage_config("slot_only").enable_backlog_time_classifier is False
-        assert sat_cfg.get_effective_stage_config("compound").enable_backlog_time_classifier is True
 
 
 class TestBottleneckDecisionFields:
@@ -738,59 +702,6 @@ class TestGrowthModeStateMachineKillSwitch:
         assert state.growth_streak == initial_streak
 
 
-class TestStarvedWarningIsRateLimited:
-    """The STARVED INFO line fires exactly once per streak crossing.
-
-    The timing contract has three components: pre-threshold cycles
-    emit nothing, the threshold cycle emits exactly one log line, and
-    subsequent cycles do not re-emit. Asserting after each cycle pins
-    the exact streak count required to fire so a future regression
-    (off-by-one, missing rate limit, log fired on non-STARVED state)
-    is caught at the failing cycle rather than confounded into a
-    single total-count check at the end.
-    """
-
-    def test_warning_fires_exactly_when_streak_reaches_threshold(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Pin: zero lines at cycle 1, one line at cycle 2 (threshold), still one at cycle 3."""
-        sat_cfg = SaturationAwareConfig(
-            stage_defaults=SaturationAwareStageConfig(
-                starved_streak_min_cycles=2,
-                min_data_points=1,
-                worker_warmup_measurement_grace_s=0.0,
-                donor_warmup_grace_s=0.0,
-            ),
-        )
-        scheduler = SaturationAwareScheduler(sat_cfg)
-        scheduler.setup(_problem(["upstream", "S"]))
-
-        # All slots empty + queue=0 -> STARVED classification.
-        ps = _problem_state_with_signals([("upstream", 1, 8, 1, 7), ("S", 1, 8, 0, 8)])
-
-        log_lines: list[str] = []
-        sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="INFO")
-        try:
-
-            def _starved_count() -> int:
-                return sum(1 for line in log_lines if "classifier STARVED" in line and "stage 'S'" in line)
-
-            # Cycle 1: streak == 1 (< threshold) -> no STARVED log yet.
-            scheduler.autoscale(time=0.0, problem_state=ps)
-            assert _starved_count() == 0, f"cycle 1 should be silent; got: {log_lines}"
-
-            # Cycle 2: streak == threshold -> exactly one new STARVED log.
-            scheduler.autoscale(time=1.0, problem_state=ps)
-            assert _starved_count() == 1, f"cycle 2 should fire exactly once; got: {log_lines}"
-
-            # Cycle 3: streak past threshold -> no additional STARVED log.
-            scheduler.autoscale(time=2.0, problem_state=ps)
-            assert _starved_count() == 1, f"cycle 3 should not re-emit; got: {log_lines}"
-        finally:
-            logger.remove(sink_id)
-
-
 class TestStageOverridePrecedenceForMinDataPoints:
     """``min_data_points`` precedence: stage_defaults < per_stage_overrides < StageSpec.saturation_aware."""
 
@@ -844,8 +755,6 @@ class TestConfigWiringMetaCoverage:
     _STAGE_BEHAVIOR_TESTS: ClassVar[set[str]] = {
         "min_data_points",
         "enable_growth_mode_state_machine",
-        "starved_streak_min_cycles",
-        "enable_backlog_time_classifier",
         "pressure_critical_threshold",
         "pressure_saturation_threshold",
         "pressure_normal_threshold",
@@ -856,7 +765,6 @@ class TestConfigWiringMetaCoverage:
     _STAGE_OVERRIDE_TESTS: ClassVar[set[str]] = {
         "min_data_points",
         "target_backlog_seconds",
-        "enable_backlog_time_classifier",
     }
 
     # Fields the wiring suite does not yet cover. Each entry is
@@ -925,7 +833,6 @@ class TestConfigWiringMetaCoverage:
 
     _KNOWN_COVERAGE_GAPS_STAGE_OVERRIDE: ClassVar[set[str]] = _KNOWN_COVERAGE_GAPS_STAGE_BEHAVIOR | {
         "enable_growth_mode_state_machine",
-        "starved_streak_min_cycles",
         "pressure_critical_threshold",
         "pressure_saturation_threshold",
         "pressure_normal_threshold",

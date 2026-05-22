@@ -522,8 +522,6 @@ class SaturationAwareStageConfig:
     # Cycles a stage must remain OVER_PROVISIONED before scale-down is applied.
     # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
     over_provisioned_streak_min_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
-    # Cycles a stage must remain STARVED before logging the upstream-bottleneck warning.
-    starved_streak_min_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
 
     # When True, per-stage growth mode (ACQUIRING / TRACKING / HOLD) shapes
     # the per-cycle delta. When False, growth uses fixed TRACKING values.
@@ -668,13 +666,6 @@ class SaturationAwareStageConfig:
     pressure_normal_threshold: float = attrs.field(
         default=0.3,
         validator=attrs.validators.gt(0.0),
-    )
-    # Master toggle. ``False`` reverts the classifier to today's
-    # utilisation-only behaviour for this stage (escape hatch for
-    # workloads pre-tuned against the slot-only signal).
-    enable_backlog_time_classifier: bool = attrs.field(
-        default=True,
-        validator=attrs.validators.instance_of(bool),
     )
 
     def __attrs_post_init__(self) -> None:

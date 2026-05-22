@@ -65,7 +65,6 @@ See [08 — Auto-derived thresholds](08-auto-derived-thresholds.md).
 | `saturated_streak_min_cycles` | `2` | `[1, 8]` typical | Burst response. Higher → slower ramp; lower → noisier ramp. |
 | `over_provisioned_streak_min_cycles` | `30` | `[15, 60]` typical | Scale-down patience. Higher → less churn; lower → reclaim resources sooner. |
 | `saturated_critical_streak_min_cycles` | `1` | `[1, 4]` | How fast `SATURATED_CRITICAL` fires. Lower means burst response in one cycle. |
-| `starved_streak_min_cycles` | `6` | `[3, 12]` | How long before the upstream-bottleneck warning fires. |
 
 Cross-field invariant: `over_provisioned_streak_min_cycles >
 saturated_streak_min_cycles` (validated; see
@@ -135,7 +134,6 @@ operators typically tune is `target_backlog_seconds`.
 | `pressure_critical_threshold` | `2.0` | Operator-pinned override. Increase only if a stage produces high-pressure bursts that should not trigger the burst-response (`SATURATED_CRITICAL`) path. The hard cap is `BACKLOG_CAP=3.0`. |
 | `pressure_saturation_threshold` | `1.0` | Operator-pinned override. Lowering toward `0.6` makes the AND-criterion more permissive (slot pin still demoted if pressure is below `0.6`), which can be useful when measurements consistently underestimate true throughput. |
 | `pressure_normal_threshold` | `0.3` | Operator-pinned override. Decrease (toward `0.1`) when an idle stage with a consistently long downstream queue should NOT scale down. Increase (toward `0.6`) when the operator wants the demotion gate to ignore mild pressure and shrink the stage anyway. |
-| `enable_backlog_time_classifier` | `True` | **Escape hatch.** Set `False` per-stage to revert to legacy slot-only behaviour for workloads that were pre-tuned against the slot-ratio signal alone. Disabling globally re-introduces the false-positive scale-up failure mode the pressure gate was added to solve. |
 
 Tuning workflow:
 

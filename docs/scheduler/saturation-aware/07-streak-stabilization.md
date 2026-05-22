@@ -119,8 +119,7 @@ composes the three layers in this order:
    `should_fire_action` then gates on the per-state minimum
    (`saturated_critical_streak_min_cycles`,
    `saturated_streak_min_cycles`,
-   `over_provisioned_streak_min_cycles`,
-   `starved_streak_min_cycles`). NORMAL never fires.
+   `over_provisioned_streak_min_cycles`). NORMAL never fires.
 4. **Compute delta.** `compute_delta` produces the signed
    worker-count intent for the firing state; magnitude is shaped
    by the growth-mode state machine.
@@ -152,7 +151,6 @@ via the three-tier resolver — see
 | `saturated_critical_streak_min_cycles` | `1` | Cycles in SATURATED_CRITICAL before the burst delta fires. |
 | `saturated_streak_min_cycles` | `2` | Cycles in SATURATED before the ordinary scale-up delta fires. |
 | `over_provisioned_streak_min_cycles` | `30` | Cycles in OVER_PROVISIONED before the scale-down delta fires. Cross-field invariant: must be strictly greater than `saturated_streak_min_cycles`. |
-| `starved_streak_min_cycles` | `6` | Cycles in STARVED before the upstream-bottleneck warning is logged. |
 | `stabilization_window_cycles_up` | `1` | Recommendation-history depth for scale-up. `1` means a single up cycle suffices. |
 | `stabilization_window_cycles_down` | `30` | Recommendation-history depth for scale-down. At the default `interval_s = 10.0` autoscale period this is 5 minutes, matching Kubernetes HPA's `scaleDown.stabilizationWindowSeconds = 300`. Cross-field invariant: must be strictly greater than `stabilization_window_cycles_up`. |
 

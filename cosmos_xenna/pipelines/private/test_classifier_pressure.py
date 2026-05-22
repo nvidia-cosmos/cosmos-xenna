@@ -15,11 +15,11 @@
 
 """Backlog-time pressure demotion behaviour for the saturation-aware classifier.
 
-These tests pin the slot-pin-gate-then-pressure-demotion contract that
-``classify()`` introduces alongside the existing slot-ratio thresholds.
+Pins the slot-pin-gate-then-pressure-demotion contract that
+``classify()`` enforces alongside the existing slot-ratio thresholds.
 Every demotion branch (CRITICAL, SATURATED, OVER_PROVISIONED) plus the
-missing-pressure fallback and the escape-hatch flag have a focused test
-so a refactor cannot silently weaken the gate ordering.
+missing-pressure fallback have a focused test so a refactor cannot
+silently weaken the gate ordering.
 """
 
 import pytest
@@ -182,18 +182,38 @@ class TestOverProvisionedPressureDemotion:
         )
         assert result is StageState.NORMAL
 
-    def test_empty_queue_stays_starved_regardless_of_pressure(self, cfg: SaturationAwareStageConfig) -> None:
-        """STARVED is structural (queue empty); pressure is irrelevant."""
+    def test_empty_queue_high_pressure_demotes_to_normal(self, cfg: SaturationAwareStageConfig) -> None:
+        """Empty queue + idle slots + high pressure (downstream stuck) -> NORMAL."""
         result = classify(
             slots_empty_ratio_ewma=0.6,
             input_queue_depth=0,
-            pressure_ewma=2.5,  # would otherwise trigger every demotion gate
+            pressure_ewma=2.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
             activation_threshold=0.05,
             config=cfg,
         )
-        assert result is StageState.STARVED
+        assert result is StageState.NORMAL
+
+    def test_empty_queue_low_pressure_is_over_provisioned(self, cfg: SaturationAwareStageConfig) -> None:
+        """Empty queue + idle slots + low pressure -> OVER_PROVISIONED.
+
+        Replaces the legacy queue==0 -> STARVED short-circuit. With the
+        topology-aware design, an idle drained queue is over-provisioned
+        for the current upstream rate; whether the idleness is genuine
+        or backpressure-induced is read off the per-cycle bottleneck
+        log fields, not from a separate state.
+        """
+        result = classify(
+            slots_empty_ratio_ewma=0.6,
+            input_queue_depth=0,
+            pressure_ewma=0.1,
+            prev_state=StageState.NORMAL,
+            saturation_threshold=0.15,
+            activation_threshold=0.05,
+            config=cfg,
+        )
+        assert result is StageState.OVER_PROVISIONED
 
     def test_missing_pressure_keeps_over_provisioned(self, cfg: SaturationAwareStageConfig) -> None:
         """``pressure_ewma=None`` preserves the legacy OVER_PROVISIONED behaviour."""
@@ -205,57 +225,5 @@ class TestOverProvisionedPressureDemotion:
             saturation_threshold=0.15,
             activation_threshold=0.05,
             config=cfg,
-        )
-        assert result is StageState.OVER_PROVISIONED
-
-
-class TestEnableFlagOff:
-    """When ``enable_backlog_time_classifier=False`` the classifier reverts to slot-only."""
-
-    @pytest.fixture
-    def cfg_disabled(self) -> SaturationAwareStageConfig:
-        """Same thresholds as the active fixture but with the pressure gate disabled."""
-        return SaturationAwareStageConfig(
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            enable_backlog_time_classifier=False,
-        )
-
-    def test_disabled_critical_ignores_low_pressure(self, cfg_disabled: SaturationAwareStageConfig) -> None:
-        """Slot-pin CRITICAL fires on slot ratio alone -- pressure is ignored."""
-        result = classify(
-            slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
-            pressure_ewma=0.0,
-            prev_state=StageState.NORMAL,
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            config=cfg_disabled,
-        )
-        assert result is StageState.SATURATED_CRITICAL
-
-    def test_disabled_saturated_ignores_low_pressure(self, cfg_disabled: SaturationAwareStageConfig) -> None:
-        """Slot-pin SATURATED fires on slot ratio alone -- low pressure does not demote."""
-        result = classify(
-            slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
-            pressure_ewma=0.0,
-            prev_state=StageState.NORMAL,
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            config=cfg_disabled,
-        )
-        assert result is StageState.SATURATED
-
-    def test_disabled_over_provisioned_ignores_high_pressure(self, cfg_disabled: SaturationAwareStageConfig) -> None:
-        """Idle-slot OVER_PROVISIONED stays put -- high pressure does not demote."""
-        result = classify(
-            slots_empty_ratio_ewma=0.6,
-            input_queue_depth=10,
-            pressure_ewma=2.5,
-            prev_state=StageState.NORMAL,
-            saturation_threshold=0.15,
-            activation_threshold=0.05,
-            config=cfg_disabled,
         )
         assert result is StageState.OVER_PROVISIONED
