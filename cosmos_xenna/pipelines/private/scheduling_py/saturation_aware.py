@@ -1884,7 +1884,12 @@ class SaturationAwareScheduler:
                     )
                     break
                 if self._try_add_worker_with_defense(ctx, stage_index, stage_name) is None:
-                    if self._phase_c_allocation_failure:
+                    # ``_attempt_cross_stage_donation`` and the second
+                    # ``_try_add_worker_with_defense`` may both flip the
+                    # phase-C allocation-failure flag through
+                    # ``_absorb_allocation_failure``;
+                    allocation_failure_observed: bool = self._phase_c_allocation_failure
+                    if allocation_failure_observed:
                         return
                     # The donor was already removed by ctx.try_remove_worker in
                     # _attempt_cross_stage_donation. The post-donation retry

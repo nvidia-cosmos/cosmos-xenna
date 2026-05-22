@@ -62,15 +62,22 @@ class StageState(str, enum.Enum):
 
 
 class GrowthMode(str, enum.Enum):
-    """Slow-start growth-controller mode for a stage.
+    """Per-stage lifecycle mode that gates HOLD entry.
+
+    Scale-up magnitude is delivered by the capacity sizer
+    (``compute_capacity_target_workers``); this enum captures
+    "has-this-stage-ever-shrunk?" so the HOLD stabilization window
+    can be entered exactly once per shrink event.
 
     Attributes:
-        ACQUIRING: New stage or recently shrank below the previous
-            ceiling; grow multiplicatively on saturation signals.
-        TRACKING: Operating near the previous saturated ceiling;
-            grow additively (congestion-avoidance).
-        HOLD: Just shrank from over-provisioned; suppress
-            non-critical growth for one or more cycles to stabilize.
+        ACQUIRING: Initial state; no shrink has been observed.
+            Has no effect on grow magnitude.
+        TRACKING: At least one shrink has been observed; the
+            stage's ceiling is known. Has no effect on grow
+            magnitude.
+        HOLD: Post-shrink stabilization window. Blocks
+            ``SATURATED`` grow for ``stabilization_window_cycles_down``
+            cycles; ``SATURATED_CRITICAL`` grow is always allowed.
 
     """
 

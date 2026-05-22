@@ -82,21 +82,39 @@ def _format_gpu_fragmentation(cluster_resources: Any) -> list[dict[str, object]]
     """Return ``(node, gpu_index, used_fraction, free_fraction)`` for every GPU.
 
     Stable-ordered by ``(node_id, gpu.index)`` so two snapshots of the
-    same cluster compare as identical strings.
+    same cluster compare as identical strings. The per-GPU
+    ``used_fraction`` is resolved via :func:`_gpu_used_fraction` so the
+    snapshot works against both Python ``GpuResources`` and the Rust
+    binding without runtime type checks leaking into the caller.
     """
     rows: list[dict[str, object]] = []
     for node_id in sorted(cluster_resources.nodes):
         node = cluster_resources.nodes[node_id]
         for gpu in sorted(node.gpus, key=lambda g: g.index):
+            used = _gpu_used_fraction(gpu)
             rows.append(
                 {
                     "node": node_id,
                     "gpu_index": gpu.index,
-                    "used_fraction": round(gpu.used_fraction, 4),
-                    "free_fraction": round(max(0.0, 1.0 - gpu.used_fraction), 4),
+                    "used_fraction": round(used, 4),
+                    "free_fraction": round(max(0.0, 1.0 - used), 4),
                 }
             )
     return rows
+
+
+def _gpu_used_fraction(gpu: Any) -> float:
+    """Return ``used_fraction`` for both Python and Rust ``GpuResources``.
+
+    The Python attrs ``GpuResources`` exposes ``used_fraction`` as a
+    plain attribute. The Rust binding does not publish that field
+    directly; ``used_pool().gpus`` is the supported accessor. This
+    helper picks the right path so the snapshot works against either
+    object without runtime type checks leaking into the caller.
+    """
+    if hasattr(gpu, "used_fraction"):
+        return float(gpu.used_fraction)
+    return float(gpu.used_pool().gpus)
 
 
 def _node_cpu_totals(node: Any) -> tuple[float, float]:

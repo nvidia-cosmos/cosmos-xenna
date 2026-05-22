@@ -2,58 +2,54 @@
 
 ## TL;DR
 
-Each stage carries a **three-mode** growth controller —
-`ACQUIRING`, `TRACKING`, `HOLD` — that shapes how aggressively
-the scheduler scales it up for the same classifier output. Mode
-transitions are driven by the **executed delta**, not the
-classifier output alone, so a recommendation suppressed by the
-stabilization gate does not change the mode. `HOLD` is a
-post-shrink stabilization window that throttles non-critical
-growth while still allowing minimal burst response.
+Each stage carries a **three-mode** lifecycle —
+`ACQUIRING`, `TRACKING`, `HOLD` — that records whether the
+stage has ever shrunk. The capacity sizer drives scale-up
+magnitude; the lifecycle is consumed as a **binary HOLD gate**:
+`HOLD` blocks `SATURATED` grow during a post-shrink
+stabilization window so a re-saturation blip cannot immediately
+re-grow the stage. `SATURATED_CRITICAL` is always allowed.
+Transitions are evaluated against the **executed delta**, not
+the classifier output, so a recommendation suppressed by the
+stabilization gate does not change the mode.
 
 ## Problem
 
-The classifier emits a discrete zone (`SATURATED`,
-`SATURATED_CRITICAL`, ...) but does not say *how much* to grow.
-The right magnitude depends on how much the scheduler already
-knows about the stage:
+A re-saturation blip immediately after a shrink would let the
+sizer re-add the workers we just removed, oscillating the
+cluster. The scheduler needs a per-stage cool-down window that
+suppresses non-critical grow for a bounded number of cycles
+after each shrink, yet still lets genuine bursts through when
+the classifier escalates to `SATURATED_CRITICAL`.
 
-- **Cold start, no ceiling discovered.** Adding one worker per
-  cycle leaves a stage that ultimately needs 64 workers
-  undersized for most of the run; we want to find the ceiling
-  fast.
-- **After the first over-provisioned event.** We have a
-  ceiling. Aggressive multiplicative growth from there
-  overshoots it, triggers another shrink, and the stage flaps.
-- **Immediately after a shrink.** Resuming aggressive growth
-  on the next saturated signal re-creates the same
-  over-provision. We need a cool-down window — but it must
-  still let genuine bursts through.
-
-A single fixed growth policy cannot serve all three regimes.
-Picking the most aggressive policy wastes capacity by flapping;
-picking the safest one starves stages during cold start.
+A purely capacity-driven sizer (no cool-down) would correctly
+identify the demand on every cycle but cannot distinguish "this
+demand is structural" from "this demand is a transient blip from
+a worker that just died". A cool-down keyed on the **executed
+delta** records that distinction without observing transient
+demand directly.
 
 ## Decision
 
 Track a per-stage three-state machine —
 [`GrowthMode`](../../../cosmos_xenna/pipelines/private/scheduling_py/state.py)
-`ACQUIRING` / `TRACKING` / `HOLD` — that drives the magnitude
-selection inside
+`ACQUIRING` / `TRACKING` / `HOLD` — and consume it as a binary
+grow gate inside
 [`compute_delta`](../../../cosmos_xenna/pipelines/private/scheduling_py/decisions.py).
 The pure-function transition rule lives in
 [`compute_growth_mode_transition`](../../../cosmos_xenna/pipelines/private/scheduling_py/growth_mode.py).
 
-- **`ACQUIRING`** (initial state). Grow **multiplicatively**:
-  `delta = ceil(factor * current_workers)`. Discovers the
-  ceiling fast. Conceptual analog of TCP slow-start.
-- **`TRACKING`** (post-first-shrink). Grow **additively**:
-  fixed `+1` or `+2`. The ceiling is known; do not overshoot
-  it.
-- **`HOLD`** (post-shrink stabilization). Suppress non-critical
-  growth for `stabilization_window_cycles_down` cycles; still
-  emit `+1` on `SATURATED_CRITICAL` so a real burst is not
-  ignored. A re-shrink while in `HOLD` restarts the timer.
+- **`ACQUIRING`** (initial state, no shrink ever observed). Grow
+  is allowed; magnitude is the capacity sizer's shortfall
+  bounded by `aggressive_growth_max_per_cycle`.
+- **`TRACKING`** (post-first-shrink, ceiling discovered). Same
+  grow contract as `ACQUIRING` — the lifecycle simply records
+  that at least one shrink has happened.
+- **`HOLD`** (post-shrink stabilization). Blocks `SATURATED`
+  grow for `stabilization_window_cycles_down` cycles;
+  `SATURATED_CRITICAL` grow is always allowed so a real burst
+  is not ignored. A re-shrink while in `HOLD` restarts the
+  timer.
 
 Crucially, transitions are evaluated against the **post-commit
 executed delta** the cycle actually applied (see
@@ -81,16 +77,15 @@ in three places:
 The mode therefore stays consistent with what the workers
 actually saw.
 
-Every growth path also runs through a hard
-`aggressive_growth_max_per_cycle` cap, so a multiplicative
-`ACQUIRING` step on a large stage cannot single-handedly
-overshoot the cluster.
+Every grow path also runs through the
+`aggressive_growth_max_per_cycle` cap, so a single cycle's
+shortfall cannot single-handedly overshoot the cluster.
 
 **Trade-off.** One extra integer of per-stage state plus a
-streak counter, plus an extra knob
+streak counter, plus one knob
 (`stabilization_window_cycles_down`) operators must understand.
-In exchange we get fast cold-start convergence, stable additive
-steady-state, and bounded oscillation after over-provisioning.
+In exchange we get bounded oscillation after over-provisioning
+without giving up burst response.
 
 ```
    delta_executed >= 0  —  grow / no-op
@@ -98,28 +93,27 @@ steady-state, and bounded oscillation after over-provisioning.
 
 
    ┌──────────────────┐
-   │   ACQUIRING      │ ◄── grow / no-op:
-   │   cold start,    │     stay, streak += 1
-   │   multiplicative │
+   │    ACQUIRING     │ ◄── grow / no-op:
+   │    initial,      │     stay, streak += 1
+   │    no shrink yet │
    └──────────────────┘
             │
             │  first shrink
             ▼
    ┌──────────────────┐
-   │    TRACKING      │ ◄── grow / no-op:
-   │    ceiling       │     stay, streak += 1
-   │    known,        │
-   │    additive      │
+   │     TRACKING     │ ◄── grow / no-op:
+   │     ceiling      │     stay, streak += 1
+   │     observed     │
    └──────────────────┘
         ▲       │
         │       │  later shrink
         │       ▼
         │  ┌──────────────────┐
-        │  │      HOLD        │ ◄── grow / no-op,
+        │  │       HOLD       │ ◄── grow / no-op,
         │  │   post-shrink    │     window not expired:
         │  │   stabilization, │     stay, streak += 1
-        │  │   burst-only     │
-        │  │   growth         │ ◄── re-shrink:
+        │  │   SATURATED grow │
+        │  │   blocked        │ ◄── re-shrink:
         │  └──────────────────┘     stay HOLD, streak = 1
         │       │                   (restart timer)
         │       │
@@ -197,8 +191,8 @@ extend the cooldown.
   the gate that turns a recommended delta into the *executed*
   delta the transition rule consumes.
 - [10 — Slow-start mechanisms](10-slow-start-mechanisms.md) —
-  the three cold-start safety layers; the `ACQUIRING` mode is
-  one of them.
+  the three cold-start safety layers; HOLD's binary
+  grow gate is one of them.
 - [13 — Cross-stage donor](13-cross-stage-donor.md) — the
   saturation-mode donor protocol whose Layer 2 rejects donors
   in `HOLD` for the same anti-flap reason this state machine

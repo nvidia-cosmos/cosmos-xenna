@@ -357,7 +357,7 @@ class StageSpec(typing.Generic[T, V]):
             )
         validate_stage(self.stage, cluster_resources)
 
-    def override_with_pipeline_params(self, p: PipelineConfig) -> StageSpec:
+    def override_with_pipeline_params(self, p: PipelineConfig) -> StageSpec[T, V]:
         """Maybe override some fields using the global params.
 
         The StageSpec and PipelineSpec share some params we want to override the stage with the global params if the
@@ -365,7 +365,7 @@ class StageSpec(typing.Generic[T, V]):
         """
         c = copy.deepcopy(self)
 
-        def _override_if_none(attr_name: str):  # noqa: ANN202
+        def _override_if_none(attr_name: str) -> None:
             if getattr(c, attr_name) is None:
                 setattr(c, attr_name, getattr(p, attr_name))
 
@@ -1250,10 +1250,10 @@ class JobInfo:
 
 @attrs.define
 class ServingQueues:
-    source: multiprocessing.Queue
-    sink: multiprocessing.Queue
+    source: multiprocessing.Queue[Any]
+    sink: multiprocessing.Queue[Any]
 
-    def __deepcopy__(self, memo: dict) -> "ServingQueues":
+    def __deepcopy__(self, memo: dict[Any, Any]) -> "ServingQueues":
         # do a shallow copy
         return ServingQueues(self.source, self.sink)
 
@@ -1271,14 +1271,14 @@ class PipelineSpec:
     # offline processing with pre-populated input data
     # TODO: Can we support a generator here?
     input_data: Sequence[Any]
-    stages: Sequence[StageSpec | Stage]
+    stages: Sequence[StageSpec[Any, Any] | Stage[Any, Any]]
     config: PipelineConfig = attrs.field(factory=PipelineConfig)
     job_info: Optional[JobInfo] = None
 
     # online serving with input queue to poll for new requests and output queue to push results
     serving_queues: ServingQueues | None = None
 
-    def _format_stage_spec(self, stage_spec: StageSpec) -> str:
+    def _format_stage_spec(self, stage_spec: StageSpec[Any, Any]) -> str:
         stage = stage_spec.stage
         stage_info = f"   class_name: {type(stage).__name__}\n"
         stage_info += f"   required_resources: {stage.required_resources}\n"
@@ -1305,7 +1305,7 @@ class PipelineSpec:
 
 
 class WrappedStage(stage.Interface):
-    def __init__(self, stage: Stage):
+    def __init__(self, stage: Stage[Any, Any]):
         self._stage = stage
 
     def setup_on_node(self, node_info: resources.NodeInfo, worker_metadata: resources.WorkerMetadata) -> None:
@@ -1328,7 +1328,10 @@ class StageAndParams:
 
 
 def make_actor_pool_stage_from_stage_spec(
-    pipeline_config: PipelineConfig, spec: StageSpec, stage_idx: int, cluster_resources: resources.ClusterResources
+    pipeline_config: PipelineConfig,
+    spec: StageSpec[Any, Any],
+    stage_idx: int,
+    cluster_resources: resources.ClusterResources,
 ) -> StageAndParams:
     assert spec.slots_per_actor is not None
     assert spec.worker_max_lifetime_m is not None

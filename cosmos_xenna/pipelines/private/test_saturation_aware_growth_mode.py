@@ -61,7 +61,7 @@ class TestAcquiringTransitions:
         assert result == (GrowthMode.ACQUIRING, 6)
 
     def test_grow_holds_acquiring_and_increments_streak(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING + delta>0 -> (ACQUIRING, prev_streak + 1) -- multiplicative growth, mode unchanged."""
+        """ACQUIRING + delta>0 -> (ACQUIRING, prev_streak + 1) - mode unchanged on grow."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.ACQUIRING,
             prev_streak=3,
@@ -95,7 +95,7 @@ class TestTrackingTransitions:
         assert result == (GrowthMode.TRACKING, 11)
 
     def test_grow_holds_tracking_and_increments_streak(self, cfg: SaturationAwareStageConfig) -> None:
-        """TRACKING + delta>0 -> (TRACKING, prev_streak + 1) -- additive growth, mode unchanged."""
+        """TRACKING + delta>0 -> (TRACKING, prev_streak + 1) -- mode unchanged on grow."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.TRACKING,
             prev_streak=10,
@@ -271,7 +271,7 @@ class TestFullLifecycleTrace:
         assert mode is GrowthMode.TRACKING
         assert streak == 1
 
-        # ---- Phase 4: TRACKING with steady additive growth (4 cycles).
+        # ---- Phase 4: TRACKING with steady positive deltas (4 cycles).
         for _ in range(4):
             mode, streak = compute_growth_mode_transition(
                 prev_mode=mode, prev_streak=streak, delta_executed=1, config=cfg

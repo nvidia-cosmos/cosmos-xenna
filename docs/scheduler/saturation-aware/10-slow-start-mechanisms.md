@@ -9,9 +9,9 @@ them onto its slots. Three independent layers stop those transient
 empty-slot readings from oscillating the cluster: **per-worker
 measurement grace** hides warmup samples from the EWMA, **donor
 warmup grace** hides warmup workers from victim selection, and the
-**growth-mode `ACQUIRING -> TRACKING`** state machine caps
-post-discovery scale-up at additive `+1`/`+2` so a re-saturation blip
-cannot fire another multiplicative grow.
+**growth-mode HOLD gate** blocks `SATURATED` grow during a
+post-shrink stabilization window so a re-saturation blip cannot
+immediately re-grow the stage.
 
 ## Problem
 
@@ -26,13 +26,13 @@ fills its queue. During this window:
   `OVER_PROVISIONED`, the streak fires, and Phase D shrinks the
   worker we just added on the very next cycle.
 - If the stage was classified `SATURATED` immediately before the
-  blip, `ACQUIRING`-mode multiplicative scale-up re-adds several
-  workers on the rebound and the cycle oscillates.
+  blip, the capacity sizer would re-add the workers we just removed
+  on the very next cycle, oscillating the cluster.
 
 A single global "ignore warmup workers" knob over-fits one of these
 mechanisms. The scheduler protects each consumer of the warmup
-signal — the EWMA, donor selection, and multiplicative growth — with
-its own grace policy.
+signal — the EWMA, donor selection, and post-shrink stabilization —
+with its own grace policy.
 
 ## Decision
 
@@ -55,7 +55,7 @@ drift across those.
                         donor + Phase D shrink only)
 
    Growth mode         A     A     A     A     A     A   ...  T
-   (per stage)         └──── ACQUIRING (multiplicative) ────┘└─ TRACKING ─┘
+   (per stage)         └──── ACQUIRING (no shrink yet) ────┘└─ TRACKING ─┘
                                                             ^
                                                             first executed
                                                             shrink
@@ -110,11 +110,10 @@ from `_run_phase_b_floor`) **bypasses** this layer. A floor miss is
 a hard structural failure — deadlocking the cluster on
 warmup-protected donors is worse than killing a young donor.
 
-### Layer 3 — growth-mode `ACQUIRING` → `TRACKING` → `HOLD`
+### Layer 3 — growth-mode HOLD gate
 
-`compute_growth_mode_transition` gates the per-cycle scale-up
-magnitude on a per-stage state machine seeded with
-`GrowthMode.ACQUIRING`. The mode stays put on any
+`compute_growth_mode_transition` advances the per-stage lifecycle
+seeded with `GrowthMode.ACQUIRING`. The mode stays put on any
 `delta_executed >= 0` cycle. On the first cycle whose
 `delta_executed < 0` — i.e. Phase D actually shrunk the stage,
 which only happens after an `OVER_PROVISIONED` streak fires — the
@@ -126,9 +125,9 @@ can still grow during the cool-down window.
 
 The grow magnitude itself is the closed-form capacity gap from
 [`28-capacity-sizer.md`](28-capacity-sizer.md), bounded by
-`aggressive_growth_max_per_cycle`. The growth mode therefore acts
-as a binary gate on top of the sizer rather than carrying its own
-magnitude. See
+`aggressive_growth_max_per_cycle`. The growth mode is consumed by
+`compute_delta` as a binary gate on top of the sizer; only `HOLD`
+has any effect, and only on `SATURATED` grow. See
 [11-growth-mode-state-machine.md](11-growth-mode-state-machine.md)
 for the full transition diagram.
 
@@ -148,7 +147,7 @@ configured `donor_warmup_grace_s`.
 
 - [11 — Growth-mode state machine](11-growth-mode-state-machine.md)
   — the full `ACQUIRING -> TRACKING -> HOLD` transitions and the
-  per-mode scale-up magnitude table.
+  grow-gate effect table.
 - [14 — Worker age tracking](14-worker-age-tracking.md) — planner
   ages (cycles since add) vs. ready first-seen timestamps (seconds
   since READY), and why the warmup graces use the latter.

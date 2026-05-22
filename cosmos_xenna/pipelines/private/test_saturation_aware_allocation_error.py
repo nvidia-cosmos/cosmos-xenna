@@ -19,6 +19,7 @@
 import logging
 import uuid
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -466,3 +467,110 @@ class TestEmitAllocationFailureToleratesMalformedClusterResources:
         assert "AttributeError" in message
         assert "AllocationError" in message
         assert "synthetic placement failure" in message
+
+
+@pytest.fixture
+def rust_cluster_with_two_gpus() -> Any:
+    """Two-GPU cluster materialised as its underlying Rust PyO3 binding.
+
+    Mirrors the Python-side ``ClusterResources`` fixture used by
+    ``test_emit_allocation_failure_logs_gpu_fragmentation_rows`` but
+    exposes the underlying rust object via ``.to_rust()``. Production
+    code in ``SaturationAwareScheduler._absorb_allocation_failure``
+    passes ``self._problem.rust.cluster_resources`` (the rust binding)
+    -- not the Python wrapper -- so tests in
+    :class:`TestAllocationFailureSnapshotAcrossRustBinding` consume
+    this fixture to exercise the actual production-side type.
+    """
+    cluster = resources.ClusterResources(
+        nodes={
+            "node-0": resources.NodeResources(
+                used_cpus=0,
+                total_cpus=8,
+                gpus=[
+                    resources.GpuResources(index=1, uuid_=uuid.uuid4(), used_fraction=0.25),
+                    resources.GpuResources(index=0, uuid_=uuid.uuid4(), used_fraction=0.75),
+                ],
+                name="node-0",
+            ),
+        },
+    )
+    return cluster.to_rust()
+
+
+class TestAllocationFailureSnapshotAcrossRustBinding:
+    """Pin the dual-type contract that the snapshot helpers work for both Python and Rust clusters.
+
+    Background:
+        ``_format_gpu_fragmentation`` and ``emit_allocation_failure``
+        document acceptance of both ``resources.ClusterResources`` and
+        its underlying rust object. The Python attrs ``GpuResources``
+        exposes ``used_fraction`` as a plain attribute; the Rust
+        ``GpuResources`` PyO3 binding does not (the FixedUtil field
+        has no ``#[pyo3(get)]`` and the getter is reached via
+        ``used_pool().gpus``). These tests pin the duck-typing
+        fallback that bridges the gap and would have prevented the
+        production ``'builtins.GpuResources' object has no attribute
+        'used_fraction'`` crash that absorbed Phase C allocation
+        failures and killed the autoscaler thread.
+    """
+
+    def test_format_gpu_fragmentation_returns_sorted_rows_for_rust_binding(
+        self,
+        rust_cluster_with_two_gpus: Any,
+    ) -> None:
+        """``_format_gpu_fragmentation`` resolves ``used_fraction`` for rust ``GpuResources``.
+
+        The rust binding exposes the fraction via ``used_pool().gpus``
+        rather than a direct attribute. The dual-type helper must pick
+        the right path so per-GPU rows include the actual fractions.
+        """
+        rows = allocation_failures._format_gpu_fragmentation(rust_cluster_with_two_gpus)
+
+        assert rows == [
+            {"node": "node-0", "gpu_index": 0, "used_fraction": 0.75, "free_fraction": 0.25},
+            {"node": "node-0", "gpu_index": 1, "used_fraction": 0.25, "free_fraction": 0.75},
+        ]
+
+    def test_emit_allocation_failure_logs_gpu_rows_for_rust_binding(
+        self,
+        rust_cluster_with_two_gpus: Any,
+        loguru_caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``emit_allocation_failure`` produces a populated GPU snapshot when given the rust binding.
+
+        Regression for the production trace where Phase C absorbed an
+        ``AllocationError`` and the snapshot formatter raised
+        ``AttributeError`` on ``gpu.used_fraction``. The formatter
+        must surface the actionable per-GPU rows instead of falling
+        through to the ``<unavailable: formatting error>`` placeholder.
+        """
+        fake_counter = _FakeCounter()
+        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
+
+        allocation_failures.emit_allocation_failure(
+            stage_name="stage",
+            pipeline_name="test-pipe",
+            cluster_resources=rust_cluster_with_two_gpus,
+            exc=resources.AllocationError("synthetic placement failure"),
+        )
+
+        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}]
+        error_records = [r for r in loguru_caplog.records if r.levelno >= logging.ERROR]
+        assert len(error_records) == 1
+        message = error_records[0].message
+        # Per-GPU rows must include both gpu_index=0 (used=0.75, free=0.25) and
+        # gpu_index=1 (used=0.25, free=0.75) sourced from the rust binding.
+        assert "'gpu_index': 0" in message
+        assert "'gpu_index': 1" in message
+        assert "'used_fraction': 0.75" in message
+        assert "'used_fraction': 0.25" in message
+        assert "'free_fraction': 0.25" in message
+        assert "'free_fraction': 0.75" in message
+        # The formatter-safety fallback must NOT have triggered. Pinning
+        # the absence of its placeholder text yields a sharper failure
+        # signal -- "snapshot helper raised" -- than the indirect signal
+        # from the per-row substring assertions above.
+        assert "<unavailable: formatting error>" not in message
+        assert "snapshot formatter raised" not in message
