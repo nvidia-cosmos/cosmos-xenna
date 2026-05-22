@@ -38,6 +38,8 @@ The five anti-flap layers under test:
 
 from unittest.mock import patch
 
+import pytest
+
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, find_saturation_donor
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
@@ -848,3 +850,39 @@ class TestSaturationDonorPhaseCOrchestration:
         assert solution.stages[1].new_workers == []
         assert scheduler._last_donation_cycle == {}
         assert scheduler._donations_received_this_cycle == {}
+
+
+class TestShapeValidation:
+    """Pin the function-entry shape guard against caller mismatches.
+
+    A misaligned ``stage_names`` would otherwise IndexError at
+    ``stage_names[donor_index]`` mid-loop; an out-of-bounds
+    ``receiver_stage_index`` would silently produce wrong donor
+    semantics (the upstream filter and the receiver-skip both
+    tolerate OOB without raising). Both surface as ``ValueError``
+    at the callsite.
+    """
+
+    def test_misaligned_stage_names_is_rejected(self) -> None:
+        """``stage_names`` shorter than ``worker_ids_by_stage`` raises before iteration."""
+        with pytest.raises(ValueError, match=r"stage_names and worker_ids_by_stage must align"):
+            _find_donor(
+                stage_names=["A"],
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+            )
+
+    def test_negative_receiver_stage_index_is_rejected(self) -> None:
+        """A negative ``receiver_stage_index`` raises before donor selection runs."""
+        with pytest.raises(ValueError, match=r"receiver_stage_index=-1 is out of bounds"):
+            _find_donor(
+                receiver_stage_index=-1,
+                receiver_stage_name="B",
+            )
+
+    def test_too_large_receiver_stage_index_is_rejected(self) -> None:
+        """A ``receiver_stage_index`` past the last stage raises before donor selection runs."""
+        with pytest.raises(ValueError, match=r"receiver_stage_index=5 is out of bounds"):
+            _find_donor(
+                receiver_stage_index=5,
+                receiver_stage_name="B",
+            )

@@ -22,6 +22,8 @@ missing-pressure fallback have a focused test so a refactor cannot
 silently weaken the gate ordering.
 """
 
+import math
+
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
@@ -227,3 +229,53 @@ class TestOverProvisionedPressureDemotion:
             config=cfg,
         )
         assert result is StageState.OVER_PROVISIONED
+
+
+class TestNonFiniteEwmaRejection:
+    """Pin the function-entry guard against non-finite EWMA inputs.
+
+    NaN comparisons would silently fall through to ``StageState.NORMAL``
+    (every ``<``/``>``/``>=`` returns ``False``); ``+/-Inf`` would steer
+    the slot-pin gate into spurious CRITICAL or OVER_PROVISIONED
+    branches. The guard surfaces upstream EWMA corruption directly
+    rather than emitting a wrong scaling decision.
+    """
+
+    def test_nan_slots_empty_ratio_is_rejected(self, cfg: SaturationAwareStageConfig) -> None:
+        """``NaN`` slots EWMA would silently fall through to ``NORMAL``."""
+        with pytest.raises(ValueError, match=r"slots_empty_ratio_ewma must be finite"):
+            classify(
+                slots_empty_ratio_ewma=math.nan,
+                input_queue_depth=10,
+                pressure_ewma=0.5,
+                prev_state=StageState.NORMAL,
+                saturation_threshold=0.15,
+                activation_threshold=0.05,
+                config=cfg,
+            )
+
+    def test_inf_slots_empty_ratio_is_rejected(self, cfg: SaturationAwareStageConfig) -> None:
+        """``+Inf`` slots EWMA would steer the slot-pin gate into a spurious branch."""
+        with pytest.raises(ValueError, match=r"slots_empty_ratio_ewma must be finite"):
+            classify(
+                slots_empty_ratio_ewma=math.inf,
+                input_queue_depth=10,
+                pressure_ewma=0.5,
+                prev_state=StageState.NORMAL,
+                saturation_threshold=0.15,
+                activation_threshold=0.05,
+                config=cfg,
+            )
+
+    def test_nan_pressure_ewma_is_rejected(self, cfg: SaturationAwareStageConfig) -> None:
+        """``NaN`` pressure EWMA would silently demote SATURATED to NORMAL via fallthrough."""
+        with pytest.raises(ValueError, match=r"pressure_ewma must be finite when provided"):
+            classify(
+                slots_empty_ratio_ewma=0.0,
+                input_queue_depth=10,
+                pressure_ewma=math.nan,
+                prev_state=StageState.NORMAL,
+                saturation_threshold=0.15,
+                activation_threshold=0.05,
+                config=cfg,
+            )

@@ -212,7 +212,29 @@ def find_saturation_donor(
         stage passes every filter, or every potential donor worker
         is in ``excluded_worker_ids``.
 
+    Raises:
+        ValueError: If ``stage_names`` and ``worker_ids_by_stage``
+            disagree in length, or if ``receiver_stage_index`` is
+            outside ``[0, len(worker_ids_by_stage))``. Either
+            condition would otherwise surface as an ``IndexError``
+            mid-loop or as silently wrong donor selection far from
+            the misalignment site.
+
     """
+    if len(stage_names) != len(worker_ids_by_stage):
+        msg = (
+            "stage_names and worker_ids_by_stage must align in length, "
+            f"got len(stage_names)={len(stage_names)} vs "
+            f"len(worker_ids_by_stage)={len(worker_ids_by_stage)}"
+        )
+        raise ValueError(msg)
+    if not 0 <= receiver_stage_index < len(worker_ids_by_stage):
+        msg = (
+            f"receiver_stage_index={receiver_stage_index} is out of bounds for "
+            f"len(worker_ids_by_stage)={len(worker_ids_by_stage)}"
+        )
+        raise ValueError(msg)
+
     if not config.enable_cross_stage_donor:
         return None
 

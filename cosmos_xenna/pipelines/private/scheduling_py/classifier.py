@@ -37,6 +37,8 @@ See ``docs/scheduler/saturation-aware/05-state-classifier.md``
 and ``27-topology-aware-classifier.md`` for the full rationale.
 """
 
+import math
+
 from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
@@ -74,8 +76,23 @@ def classify(
     Returns:
         The current cycle's classifier zone.
 
+    Raises:
+        ValueError: If ``slots_empty_ratio_ewma`` is non-finite, or
+            if ``pressure_ewma`` is provided and non-finite. NaN
+            comparisons would silently fall through to
+            ``StageState.NORMAL`` (every ``<``/``>``/``>=`` returns
+            ``False``); ``+/-Inf`` would steer the slot-pin gate
+            into spurious CRITICAL or OVER_PROVISIONED branches.
+
     """
     del input_queue_depth  # diagnostic input only; preserved on the public signature.
+
+    if not math.isfinite(slots_empty_ratio_ewma):
+        msg = f"slots_empty_ratio_ewma must be finite, got {slots_empty_ratio_ewma!r}"
+        raise ValueError(msg)
+    if pressure_ewma is not None and not math.isfinite(pressure_ewma):
+        msg = f"pressure_ewma must be finite when provided, got {pressure_ewma!r}"
+        raise ValueError(msg)
 
     if slots_empty_ratio_ewma < activation_threshold:
         if pressure_ewma is None or pressure_ewma > config.pressure_critical_threshold:
