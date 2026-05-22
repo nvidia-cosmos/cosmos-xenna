@@ -430,10 +430,16 @@ def _real_actor_pool_for_phase_d() -> actor_pool.ActorPool[object, object]:
 
 
 def _make_problem_state_from_actor_pool(pool: actor_pool.ActorPool[object, object]) -> data_structures.ProblemState:
-    """Build ``ProblemState`` through the production streaming snapshot method."""
+    """Build ``ProblemState`` through the production streaming snapshot method.
+
+    Passes zeros for ``upstream_queue_lens`` and ones for
+    ``stage_batch_sizes`` so this helper exercises only the pool-side
+    signal path; the upstream-aggregation path has its own focused
+    coverage in ``test_streaming_slot_signals.py``.
+    """
     autoscaler = Autoscaler.__new__(Autoscaler)
     autoscaler._allocator = _FakeAllocator()  # type: ignore[attr-defined, assignment]
-    return autoscaler._make_problem_state([pool], [False])
+    return autoscaler._make_problem_state([pool], [False], [0], [1])
 
 
 class TestPhaseDScaleDownContract:

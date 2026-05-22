@@ -503,30 +503,17 @@ class TestDefensiveNumericInputs:
     Python helpers should respond.
     """
 
-    def test_negative_fraction_does_not_panic_at_rust_boundary(self) -> None:
-        """Negative ``used_fraction`` survives the Rust boundary (quantized to a large positive).
+    def test_negative_fraction_is_rejected_at_rust_boundary(self) -> None:
+        """Negative ``used_fraction`` panics in the Rust ``GpuAllocation`` constructor.
 
-        Documents the asymmetry vs. NaN/inf: the Rust ``GpuAllocation``
-        constructor rejects NaN and inf but does not reject negative
-        values. The Rust storage uses a quantized fixed-point
-        representation (currently u16-scaled), so negative inputs wrap
-        to a large positive value rather than raising. Production data
-        is expected to be non-negative because allocation increments
-        are always positive; a negative input would already imply
-        accounting drift in the planner. The Python aggregator never
-        sees a true negative number from production paths, so this
-        test only pins the no-panic invariant. If the Rust storage
-        changes to reject negatives, replace this body with the
-        ``pytest.raises(BaseException)`` pattern from the NaN/inf
-        siblings.
+        The Rust storage uses a quantized fixed-point representation
+        (``FixedUtil``) whose ``from_num`` rejects negatives via
+        overflow, matching the NaN/inf rejection pattern. Production
+        allocations are always non-negative; a negative input
+        signals accounting drift upstream of the planner.
         """
-        state = _make_problem_state([("A", [("A-w0", [("node-0", 0, -0.1)])], False)])
-
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
-
-        assert set(result.keys()) == {("node-0", 0)}
-        # Quantized wrap is a large positive float; precise value is implementation-defined.
-        assert result[("node-0", 0)] > 0.0
+        with pytest.raises(BaseException, match="overflows"):
+            _make_problem_state([("A", [("A-w0", [("node-0", 0, -0.1)])], False)])
 
     def test_inf_fraction_is_rejected_at_rust_boundary(self) -> None:
         """``+inf`` ``used_fraction`` panics in the Rust ``GpuAllocation`` constructor."""
