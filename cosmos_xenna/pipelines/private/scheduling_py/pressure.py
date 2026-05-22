@@ -104,13 +104,19 @@ def compute_pressure(
             output to ``0.0``.
         observed_throughput: Completed tasks/sec since the last cycle.
         target_backlog_seconds: Drain time at which
-            ``normalized_backlog == 1.0``.
+            ``normalized_backlog == 1.0``. Must be strictly positive.
         backlog_cap: Upper clamp on ``normalized_backlog``.
 
     Returns:
         Pressure scalar in ``[0.0, backlog_cap]``.
 
+    Raises:
+        ValueError: ``target_backlog_seconds`` is not strictly positive.
+
     """
+    if target_backlog_seconds <= 0.0:
+        msg = f"target_backlog_seconds must be > 0, got {target_backlog_seconds}"
+        raise ValueError(msg)
     utilisation = 1.0 - slots_empty_ratio_ewma
     if input_queue_depth <= 0:
         return 0.0
@@ -167,13 +173,20 @@ def compute_backlog_time(
     Args:
         input_queue_depth: Tasks waiting upstream.
         observed_throughput: Tasks/sec since the last cycle.
-        target_backlog_seconds: Operator-facing target.
+        target_backlog_seconds: Operator-facing target. Must be strictly
+            positive.
         backlog_cap: Upper clamp on the displayed value.
 
     Returns:
         Backlog-drain time in seconds.
 
+    Raises:
+        ValueError: ``target_backlog_seconds`` is not strictly positive.
+
     """
+    if target_backlog_seconds <= 0.0:
+        msg = f"target_backlog_seconds must be > 0, got {target_backlog_seconds}"
+        raise ValueError(msg)
     if input_queue_depth <= 0:
         return 0.0
     if observed_throughput <= 0.0:

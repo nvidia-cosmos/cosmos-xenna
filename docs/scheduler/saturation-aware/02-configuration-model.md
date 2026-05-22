@@ -111,11 +111,13 @@ The resolver itself is the five-line
 ``SaturationAwareConfig.get_effective_stage_config(stage_name,
 spec_override)``. Inside the scheduler, every consumer goes through
 the ``SaturationAwareScheduler._stage_cfg(stage_name)`` helper, which
-calls the resolver with the locked override map as the
-``spec_override`` argument. Phase B floor enforcement, Phase C grow,
-Phase D shrink, donor selection, and threshold resolution all observe
-the same precedence chain — no code path can accidentally read
-``stage_defaults`` while another reads ``per_stage_overrides``.
+looks the named stage up in the locked override map and passes the
+resulting per-stage override (or ``None`` when the stage carries no
+override) as the ``spec_override`` argument to the resolver. Phase B
+floor enforcement, Phase C grow, Phase D shrink, donor selection, and
+threshold resolution all observe the same precedence chain — no code
+path can accidentally read ``stage_defaults`` while another reads
+``per_stage_overrides``.
 
 Validation runs in two passes against the same set of cross-stage
 invariants:

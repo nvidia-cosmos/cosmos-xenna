@@ -192,7 +192,7 @@ pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
   gate sits inside the intent compute stage.
 - [02 — Configuration model](02-configuration-model.md) — every
   per-stage knob including the six new pressure-gate fields.
-- [05 — State classifier](05-state-classifier.md) — the five-zone
+- [05 — State classifier](05-state-classifier.md) — the four-zone
   decomposition with the slot-pin-then-pressure-demotion ordering.
 - [07 — Streak stabilization](07-streak-stabilization.md) — the
   asymmetric streak counters that run after the classifier fires.

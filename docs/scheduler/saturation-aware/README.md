@@ -2,9 +2,11 @@
 
 The saturation-aware scheduler is the streaming-mode autoscaler
 that decides how many workers each pipeline stage gets each cycle.
-It reads slot-occupancy and queue-depth signals, classifies each
-stage into one of five operational zones, and grows or shrinks
-worker counts within a stack of stability and safety guards.
+It reads slot-occupancy, queue-depth, and backlog-time pressure
+signals, classifies each stage into one of four operational zones
+(`NORMAL`, `SATURATED`, `SATURATED_CRITICAL`, `OVER_PROVISIONED`),
+and grows or shrinks worker counts within a stack of stability and
+safety guards.
 
 This folder holds one document per design decision. Each doc is a
 short rationale (problem → decision → diagram → knobs), not a
@@ -22,7 +24,7 @@ cycle (`A → B → C → D`) the scheduler runs every tick:
 
 - **Pre-flight (blue)** — regime detector, auto-derived thresholds,
   EWMA smoothing, and the Rust ⇄ Python planning context bridge.
-- **Classification (purple)** — the five operational zones, asymmetric
+- **Classification (purple)** — the four operational zones, asymmetric
   hysteresis, the backlog-time pressure signal, and the streak
   counters that gate every decision.
 - **Growth & Scale (green)** — the `ACQUIRING → TRACKING → HOLD`
@@ -91,7 +93,7 @@ adjust a knob in production, jump to:
 
 | Doc | Topic |
 |---|---|
-| [05-state-classifier.md](05-state-classifier.md) | Five-zone classifier with hysteresis |
+| [05-state-classifier.md](05-state-classifier.md) | Four-zone classifier with hysteresis |
 | [06-backlog-time-signal.md](06-backlog-time-signal.md) | Compound AND-criterion (utilisation + queue-time) |
 | [07-streak-stabilization.md](07-streak-stabilization.md) | EWMA smoothing + asymmetric streak counters |
 | [08-auto-derived-thresholds.md](08-auto-derived-thresholds.md) | `K / sqrt(c)` aggressiveness formula |

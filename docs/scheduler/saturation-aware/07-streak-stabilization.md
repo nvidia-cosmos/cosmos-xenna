@@ -111,9 +111,10 @@ composes the three layers in this order:
    ready actors carries the previous valid EWMA forward, and the
    first cycle with no signal at all skips the per-stage pipeline
    entirely without disturbing the streak counters.
-2. **Classify.** The classifier reads the EWMA and input queue
-   depth and emits one of five `StageState` zones with hysteresis
-   — see [05 — State classifier](05-state-classifier.md).
+2. **Classify.** The classifier reads the EWMA, the input queue
+   depth, and the smoothed pressure scalar, and emits one of four
+   `StageState` zones with hysteresis — see
+   [05 — State classifier](05-state-classifier.md).
 3. **Streak gate.** `update_streak` increments `classifier_streak`
    when the state holds, or resets to `1` on transition.
    `should_fire_action` then gates on the per-state minimum
@@ -165,7 +166,7 @@ signal.
 - [00 — Per-cycle overview](00-overview.md) — where streak
   stabilization sits inside one autoscale call.
 - [05 — State classifier](05-state-classifier.md) — the
-  five-zone classifier whose output the streak counters track.
+  four-zone classifier whose output the streak counters track.
 - [06 — Backlog-time signal](06-backlog-time-signal.md) — the
   compound AND criterion that supplements the slots-empty signal
   with queue-time evidence.

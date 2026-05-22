@@ -538,6 +538,16 @@ class TestPressureClassifierFields:
 
         assert math.isclose(small_target, 2.0 * large_target, rel_tol=1e-9)
 
+    def test_compute_pressure_rejects_non_positive_target_backlog_seconds(self) -> None:
+        """A non-positive ``target_backlog_seconds`` would divide by zero or invert the scale."""
+        with pytest.raises(ValueError, match=r"target_backlog_seconds must be > 0"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=100,
+                observed_throughput=10.0,
+                target_backlog_seconds=0.0,
+            )
+
     def test_pressure_smoothing_level_one_replaces_prior_value_with_raw(self) -> None:
         """``pressure_smoothing_level=1.0`` makes ``update_ewma`` return the raw sample."""
         no_smoothing = update_ewma(prev_ewma=5.0, sample=1.0, alpha=1.0)

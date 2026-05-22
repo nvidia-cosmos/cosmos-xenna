@@ -18,19 +18,18 @@
 
 The orchestrator's ``autoscale()`` runs the per-stage decision
 pipeline after Phase B floor enforcement and stores the resulting
-signed worker-count intents on ``self._last_intent_deltas``.
-Saturation-driven scale-up (Phase C) and scale-down (Phase D) will
-consume these intents in subsequent iterations; the current
-contract is intent-only.
+signed worker-count intents on ``self._last_intent_deltas``. Phase
+C (grow) consumes the intents in the same cycle, so positive intent
+flows into the emitted ``Solution`` as worker adds.
 
 This module pins:
 
     * Intent dict shape (active stages keyed; finished absent).
-    * Shape-mismatch validation surfaces a ``ValueError`` rather
-      than a bare ``KeyError``.
-    * ``Solution`` is unaffected by intent computation -- the worker
-      adds / removes the planner stages are independent of the
-      intent dict.
+    * Shape-mismatch surfaces a ``SchedulerInvariantError`` (raised
+      by the per-phase invariant gate) rather than a bare ``KeyError``.
+    * ``Solution`` reflects whichever portion of the positive intent
+      Phase C absorbed via ``ctx.try_add_worker``; negative intent
+      lands in Phase D.
     * Multi-cycle classifier-state convergence is observable.
     * The intent dict is reset on every cycle and on ``setup()``.
 """
