@@ -825,6 +825,24 @@ class TestCheckFloorAfterPhaseD:
                 pre_phase_d_worker_counts={0: 1},
             )
 
+    def test_finished_stage_with_missing_phase_d_entries_is_skipped(self) -> None:
+        """A finished stage absent from Phase-D-only maps is skipped before the lookup."""
+        # Pinning forward-compat: the is_finished early-exit must run BEFORE
+        # the worker_ids_by_stage / stage_floors / pre_phase_d_worker_counts
+        # dereference so a future refactor that excludes finished stages
+        # from those maps cannot regress this branch into a false invariant.
+        problem = _problem([("A", None)])
+        problem_state = _problem_state([("A", 0, 1, True)])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
+        check_floor_after_phase_d(
+            phase_name=PhaseBoundary.PHASE_D,
+            problem=problem,
+            problem_state=problem_state,
+            ctx=ctx,
+            stage_floors={},
+            pre_phase_d_worker_counts={},
+        )
+
 
 class TestCheckStuckPlanMonotonicity:
     """Pure-helper check for the stuck-plan counter monotonicity invariant."""

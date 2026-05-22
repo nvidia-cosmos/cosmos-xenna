@@ -108,25 +108,42 @@ def compute_pressure(
     to ``backlog_cap`` rather than dividing by zero.
 
     Args:
-        slots_empty_ratio_ewma: Smoothed empty-slot fraction in ``[0, 1]``.
+        slots_empty_ratio_ewma: Smoothed empty-slot fraction. Finite
+            values are clamped to ``[0, 1]`` before computing
+            ``utilisation`` so the EWMA's tiny floating-point drift
+            cannot produce negative pressure.
         input_queue_depth: Tasks waiting upstream; ``0`` collapses the
             output to ``0.0``.
         observed_throughput: Completed tasks/sec since the last cycle.
         target_backlog_seconds: Drain time at which
             ``normalized_backlog == 1.0``. Must be strictly positive.
-        backlog_cap: Upper clamp on ``normalized_backlog``.
+        backlog_cap: Upper clamp on ``normalized_backlog``. Must be
+            finite and strictly positive.
 
     Returns:
         Pressure scalar in ``[0.0, backlog_cap]``.
 
     Raises:
-        ValueError: ``target_backlog_seconds`` is not strictly positive.
+        ValueError: ``target_backlog_seconds`` is not strictly
+            positive, ``backlog_cap`` is not finite and ``> 0``, or
+            ``slots_empty_ratio_ewma`` is non-finite. NaN inputs
+            would silently propagate to the classifier's pressure
+            gate; non-positive ``backlog_cap`` would invert the sign
+            of the cold-start branch.
 
     """
     if target_backlog_seconds <= 0.0:
         msg = f"target_backlog_seconds must be > 0, got {target_backlog_seconds}"
         raise ValueError(msg)
-    utilisation = 1.0 - slots_empty_ratio_ewma
+    if not math.isfinite(backlog_cap) or backlog_cap <= 0.0:
+        msg = f"backlog_cap must be finite and > 0, got {backlog_cap!r}"
+        raise ValueError(msg)
+    if not math.isfinite(slots_empty_ratio_ewma):
+        msg = f"slots_empty_ratio_ewma must be finite, got {slots_empty_ratio_ewma!r}"
+        raise ValueError(msg)
+
+    clamped_slots_empty = max(0.0, min(1.0, slots_empty_ratio_ewma))
+    utilisation = 1.0 - clamped_slots_empty
     if input_queue_depth <= 0:
         return 0.0
     if observed_throughput <= 0.0:
@@ -184,17 +201,24 @@ def compute_backlog_time(
         observed_throughput: Tasks/sec since the last cycle.
         target_backlog_seconds: Operator-facing target. Must be strictly
             positive.
-        backlog_cap: Upper clamp on the displayed value.
+        backlog_cap: Upper clamp on the displayed value. Must be
+            finite and strictly positive.
 
     Returns:
         Backlog-drain time in seconds.
 
     Raises:
-        ValueError: ``target_backlog_seconds`` is not strictly positive.
+        ValueError: ``target_backlog_seconds`` is not strictly
+            positive, or ``backlog_cap`` is not finite and ``> 0``.
+            A non-positive cap would invert the sign of the
+            cold-start gauge value the dashboards display.
 
     """
     if target_backlog_seconds <= 0.0:
         msg = f"target_backlog_seconds must be > 0, got {target_backlog_seconds}"
+        raise ValueError(msg)
+    if not math.isfinite(backlog_cap) or backlog_cap <= 0.0:
+        msg = f"backlog_cap must be finite and > 0, got {backlog_cap!r}"
         raise ValueError(msg)
     if input_queue_depth <= 0:
         return 0.0

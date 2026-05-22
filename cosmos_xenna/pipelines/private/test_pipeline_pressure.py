@@ -211,6 +211,97 @@ class TestComputeBacklogTime:
         assert math.isclose(result, 6.0, rel_tol=1e-9)
 
 
+class TestComputePressureSlotsClamp:
+    """``slots_empty_ratio_ewma`` outside ``[0, 1]`` is clamped, not rejected.
+
+    EWMA accumulators routinely overshoot the source signal's range by
+    a few floating-point units; clamping preserves the cycle while
+    pinning the documented ``[0.0, backlog_cap]`` output bound.
+    """
+
+    def test_above_one_clamps_to_zero_utilisation(self) -> None:
+        """``slots_empty_ratio_ewma=1.5`` clamps to 1.0 -> utilisation 0 -> pressure 0."""
+        result = compute_pressure(
+            slots_empty_ratio_ewma=1.5,
+            input_queue_depth=100,
+            observed_throughput=10.0,
+            target_backlog_seconds=30.0,
+        )
+        assert result == 0.0
+
+    def test_below_zero_clamps_to_full_utilisation(self) -> None:
+        """``slots_empty_ratio_ewma=-0.1`` clamps to 0.0 -> utilisation 1.0 -> normal branch."""
+        # backlog_time = 100 / 10 = 10s; normalized_backlog = 10/30 = 1/3
+        # utilisation after clamp = 1.0 -> pressure = 1.0 * 1/3
+        result = compute_pressure(
+            slots_empty_ratio_ewma=-0.1,
+            input_queue_depth=100,
+            observed_throughput=10.0,
+            target_backlog_seconds=30.0,
+        )
+        assert math.isclose(result, 1.0 / 3.0, rel_tol=1e-9)
+
+
+class TestComputePressureInputValidation:
+    """Reject corrupted inputs at function entry rather than emitting NaN/garbage pressure."""
+
+    def test_nan_slots_empty_ratio_is_rejected(self) -> None:
+        """NaN slots EWMA would silently propagate via ``min``/``max`` to the classifier gate."""
+        with pytest.raises(ValueError, match=r"slots_empty_ratio_ewma must be finite"):
+            compute_pressure(
+                slots_empty_ratio_ewma=math.nan,
+                input_queue_depth=10,
+                observed_throughput=1.0,
+                target_backlog_seconds=30.0,
+            )
+
+    def test_inf_backlog_cap_is_rejected(self) -> None:
+        """``+inf`` cap would unbound the cold-start branch."""
+        with pytest.raises(ValueError, match=r"backlog_cap must be finite and > 0"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=10,
+                observed_throughput=1.0,
+                target_backlog_seconds=30.0,
+                backlog_cap=math.inf,
+            )
+
+    def test_non_positive_backlog_cap_is_rejected(self) -> None:
+        """Non-positive cap would invert the sign of the pressure output."""
+        with pytest.raises(ValueError, match=r"backlog_cap must be finite and > 0"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=10,
+                observed_throughput=1.0,
+                target_backlog_seconds=30.0,
+                backlog_cap=0.0,
+            )
+
+
+class TestComputeBacklogTimeInputValidation:
+    """The gauge helper enforces the same ``backlog_cap`` precondition as compute_pressure."""
+
+    def test_nan_backlog_cap_is_rejected(self) -> None:
+        """NaN cap would surface in the cold-start gauge as a NaN dashboard value."""
+        with pytest.raises(ValueError, match=r"backlog_cap must be finite and > 0"):
+            compute_backlog_time(
+                input_queue_depth=10,
+                observed_throughput=0.0,
+                target_backlog_seconds=30.0,
+                backlog_cap=math.nan,
+            )
+
+    def test_negative_backlog_cap_is_rejected(self) -> None:
+        """Negative cap would invert the sign of the cold-start gauge value."""
+        with pytest.raises(ValueError, match=r"backlog_cap must be finite and > 0"):
+            compute_backlog_time(
+                input_queue_depth=10,
+                observed_throughput=0.0,
+                target_backlog_seconds=30.0,
+                backlog_cap=-1.0,
+            )
+
+
 class TestResolvePressureSignalIntegration:
     """``run_per_stage_pipeline`` smooths pressure into ``stage_state.pressure_ewma``."""
 
