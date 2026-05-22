@@ -367,8 +367,17 @@ class TestMinDataPointsTrustGate:
         scheduler.autoscale(time=2.0, problem_state=ps)
         assert scheduler._last_intent_deltas.get("S", 0) > 0
 
-    def test_warmup_filtered_all_zero_samples_do_not_advance_counter(self) -> None:
-        """Cycles whose warmup filter drops every contribution leave the counter unchanged."""
+    def test_warmup_filtered_all_zero_samples_reset_counter(self) -> None:
+        """Cycles whose warmup filter drops every contribution RESET the counter to zero.
+
+        The starting counter is pre-seeded to ``5`` (well above any
+        plausible ``min_data_points`` default) so the assertion
+        distinguishes the new "reset to 0" semantic from a hypothetical
+        "do not advance" implementation. With the seed at ``0`` (state
+        default) both semantics would leave the counter at ``0`` and
+        the test would not catch a future regression that removed the
+        reset.
+        """
         sat_cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(
                 min_data_points=2,
@@ -378,10 +387,10 @@ class TestMinDataPointsTrustGate:
         )
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
+        scheduler._stage_states["S"].valid_signal_samples = 5
         ps = _problem_state_with_signals([("S", 1, 8, 8, 0)])
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        scheduler.autoscale(time=1.0, problem_state=ps)
 
         assert scheduler._stage_states["S"].valid_signal_samples == 0
 
@@ -399,8 +408,17 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
     fresh queue depth cannot corrupt the next valid cycle.
     """
 
-    def test_stale_cycle_after_threshold_clamps_intent_to_zero(self) -> None:
-        """``min_data_points`` reached, then a zero-sample cycle -> ``delta == 0``."""
+    def test_stale_cycle_after_threshold_clamps_intent_and_resets_counter(self) -> None:
+        """``min_data_points`` reached, then a zero-sample cycle -> ``delta == 0`` and counter resets to 0.
+
+        A no-signal gap must invalidate accumulated trust so the
+        next ``min_data_points`` consecutive fresh-sample cycles
+        must re-accrue before the gate reopens. Without the reset,
+        a single post-gap fresh sample would reopen the gate and
+        let the scheduler emit recommendations off carry-forward
+        EWMA from a worker mix that no longer reflects current
+        state.
+        """
         sat_cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(
                 min_data_points=1,
@@ -422,14 +440,67 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         # Cycle 1: same signal expressed via a 0-worker snapshot. The
         # aggregation returns ``(0, 0)`` slots so the current cycle is
         # stale-only; the trust gate must clamp the recommendation to 0
-        # even though the accumulated counter is at its ceiling.
+        # AND reset the consecutive-valid-sample counter so trust
+        # rebuilds from scratch on subsequent fresh samples.
         ps_stale = _problem_state_with_signals([("S", 0, 8, 0, 0)], input_queue_depth=100)
         scheduler.autoscale(time=1.0, problem_state=ps_stale)
 
         assert scheduler._last_intent_deltas.get("S", 0) == 0
-        # Counter is left unchanged so the next valid cycle resumes
-        # immediately (no reset penalty).
+        assert scheduler._stage_states["S"].valid_signal_samples == 0
+
+    def test_post_gap_recovery_requires_rebuilding_consecutive_trust(self) -> None:
+        """Post-gap recovery: ``min_data_points`` consecutive fresh cycles must re-accrue before the gate reopens.
+
+        With ``min_data_points=2`` this test walks the gate through
+        open -> gap -> closed -> single-fresh -> reopen and asserts
+        the counter trajectory ``1 -> 2 -> 0 -> 1 -> 2`` at each
+        step. A "clamp-without-reset" implementation would instead
+        produce ``1 -> 2 -> 2 -> 2 -> 2``, reopening the gate on
+        the first post-gap fresh sample, so the trajectory pins the
+        strict-consecutive contract.
+        """
+        sat_cfg = SaturationAwareConfig(
+            stage_defaults=SaturationAwareStageConfig(
+                min_data_points=2,
+                worker_warmup_measurement_grace_s=0.0,
+                donor_warmup_grace_s=0.0,
+                saturated_streak_min_cycles=1,
+            ),
+        )
+        scheduler = SaturationAwareScheduler(sat_cfg)
+        scheduler.setup(_problem(["S"]))
+
+        ps_fresh = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
+        ps_stale = _problem_state_with_signals([("S", 0, 8, 0, 0)], input_queue_depth=100)
+
+        # Cycle 0: first fresh sample -- counter advances but gate
+        # stays closed (need 2 consecutive).
+        scheduler.autoscale(time=0.0, problem_state=ps_fresh)
         assert scheduler._stage_states["S"].valid_signal_samples == 1
+        assert scheduler._last_intent_deltas.get("S", 0) == 0
+
+        # Cycle 1: second consecutive fresh sample opens the gate.
+        scheduler.autoscale(time=1.0, problem_state=ps_fresh)
+        assert scheduler._stage_states["S"].valid_signal_samples == 2
+        assert scheduler._last_intent_deltas.get("S", 0) > 0
+
+        # Cycle 2: stale cycle invalidates trust -- counter resets and
+        # delta is clamped to 0.
+        scheduler.autoscale(time=2.0, problem_state=ps_stale)
+        assert scheduler._stage_states["S"].valid_signal_samples == 0
+        assert scheduler._last_intent_deltas.get("S", 0) == 0
+
+        # Cycle 3: a single post-gap fresh sample is not enough -- the
+        # gate stays closed (counter back to 1, still < min_data_points).
+        scheduler.autoscale(time=3.0, problem_state=ps_fresh)
+        assert scheduler._stage_states["S"].valid_signal_samples == 1
+        assert scheduler._last_intent_deltas.get("S", 0) == 0
+
+        # Cycle 4: second consecutive post-gap fresh sample reopens
+        # the gate -- trust has fully rebuilt from scratch.
+        scheduler.autoscale(time=4.0, problem_state=ps_fresh)
+        assert scheduler._stage_states["S"].valid_signal_samples == 2
+        assert scheduler._last_intent_deltas.get("S", 0) > 0
 
     def test_stale_cycle_does_not_refresh_pressure_ewma(self) -> None:
         """Carry-forward cycles leave ``stage_state.pressure_ewma`` untouched."""

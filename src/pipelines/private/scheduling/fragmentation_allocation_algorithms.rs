@@ -366,7 +366,7 @@ impl<'a> ScratchView<'a> {
         self.estimate_fragmentation(workload)
     }
 
-    /// `true` iff a hypothetical worker of `shape` could fit on top of the current effective state.
+    /// `true` if a hypothetical worker of `shape` could fit on top of the current effective state.
     fn can_allocate(&self, shape: &rds::WorkerShape) -> bool {
         if self.effective_used_cpus + cpus_needed_for_shape(shape) > self.node.total_cpus {
             return false;

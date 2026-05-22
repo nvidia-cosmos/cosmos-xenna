@@ -126,10 +126,13 @@ def compute_pressure(
     Raises:
         ValueError: ``target_backlog_seconds`` is not strictly
             positive, ``backlog_cap`` is not finite and ``> 0``, or
-            ``slots_empty_ratio_ewma`` is non-finite. NaN inputs
-            would silently propagate to the classifier's pressure
-            gate; non-positive ``backlog_cap`` would invert the sign
-            of the cold-start branch.
+            ``slots_empty_ratio_ewma`` / ``observed_throughput`` is
+            non-finite. NaN inputs would silently propagate to the
+            classifier's pressure gate (the ``observed_throughput
+            <= 0.0`` cold-start branch is False for NaN, so the
+            divide-and-cap branch would emit NaN through the
+            classifier); non-positive ``backlog_cap`` would invert
+            the sign of the cold-start branch.
 
     """
     if target_backlog_seconds <= 0.0:
@@ -140,6 +143,9 @@ def compute_pressure(
         raise ValueError(msg)
     if not math.isfinite(slots_empty_ratio_ewma):
         msg = f"slots_empty_ratio_ewma must be finite, got {slots_empty_ratio_ewma!r}"
+        raise ValueError(msg)
+    if not math.isfinite(observed_throughput):
+        msg = f"observed_throughput must be finite, got {observed_throughput!r}"
         raise ValueError(msg)
 
     clamped_slots_empty = max(0.0, min(1.0, slots_empty_ratio_ewma))
@@ -209,9 +215,12 @@ def compute_backlog_time(
 
     Raises:
         ValueError: ``target_backlog_seconds`` is not strictly
-            positive, or ``backlog_cap`` is not finite and ``> 0``.
-            A non-positive cap would invert the sign of the
-            cold-start gauge value the dashboards display.
+            positive, ``backlog_cap`` is not finite and ``> 0``, or
+            ``observed_throughput`` is non-finite. A non-positive
+            cap would invert the sign of the cold-start gauge value
+            the dashboards display; a non-finite throughput would
+            slip past the ``<= 0.0`` cold-start branch (False for
+            NaN) and emit NaN through the ``_BACKLOG_TIME_GAUGE``.
 
     """
     if target_backlog_seconds <= 0.0:
@@ -219,6 +228,9 @@ def compute_backlog_time(
         raise ValueError(msg)
     if not math.isfinite(backlog_cap) or backlog_cap <= 0.0:
         msg = f"backlog_cap must be finite and > 0, got {backlog_cap!r}"
+        raise ValueError(msg)
+    if not math.isfinite(observed_throughput):
+        msg = f"observed_throughput must be finite, got {observed_throughput!r}"
         raise ValueError(msg)
     if input_queue_depth <= 0:
         return 0.0
@@ -267,13 +279,20 @@ def compute_capacity_target_workers(
         is unobservable so the caller can fall back to discrete sizing.
 
     Raises:
-        ValueError: For negative ``queue_depth`` or ``observed_throughput``,
-            ``slots_per_worker < 1``, non-positive ``target_backlog_seconds``,
-            or ``utilization_target`` outside ``(0, 1]``.
+        ValueError: For negative ``queue_depth``, non-finite or negative
+            ``observed_throughput``, ``slots_per_worker < 1``, non-positive
+            ``target_backlog_seconds``, or ``utilization_target`` outside
+            ``(0, 1]``. A non-finite throughput would slip past the
+            ``< 0.0`` check (False for NaN) and propagate into
+            ``target_rate``, surfacing only as an indirect
+            ``ValueError``/``OverflowError`` from ``math.ceil``.
 
     """
     if queue_depth < 0:
         msg = f"queue_depth must be >= 0, got {queue_depth}"
+        raise ValueError(msg)
+    if not math.isfinite(observed_throughput):
+        msg = f"observed_throughput must be finite, got {observed_throughput!r}"
         raise ValueError(msg)
     if observed_throughput < 0.0:
         msg = f"observed_throughput must be >= 0, got {observed_throughput}"

@@ -209,7 +209,14 @@ class SaturationAwareScheduler:
             ``added < intent``; resets to ``0`` on any cycle where the
             stage met its intent or had none. Fed into
             ``StuckPlanDetector`` for the threshold-promoted INFO log
-            and the per-stage Gauge / Counter.
+            and the per-stage Gauge / Counter. The post-Phase-D
+            ``check_stuck_plan_monotonicity`` invariant filters out
+            stages whose counter equals the prior cycle's snapshot
+            (no observable transition), so a stage Phase C bailed
+            before reaching the per-stage counter setter
+            (allocation-failure absorption, donor-retry synthetic
+            absorption) keeps its prior value without tripping the
+            strict ``+1 / 0`` regression.
         _recommendation_histories: Per-stage asymmetric
             stabilization-window buffers, sized by the resolved
             ``stabilization_window_cycles_up`` /
@@ -881,7 +888,9 @@ class SaturationAwareScheduler:
             self._refresh_worker_ready_first_seen(problem_state, now=time)
             # Snapshot the stuck-plan counters before Phase C mutates them so the
             # post-Phase-D monotonicity check can compare prev vs. curr without an
-            # in-flight Phase C state.
+            # in-flight Phase C state. The same snapshot is also reused as the
+            # caller-side filter: stages whose ``curr == prev`` were not touched
+            # by ``_set_stuck_plan_counter`` and are excluded from the assertion.
             prev_stuck_plan_counters = dict(self._stuck_plan_counters)
             self._update_regime_aware_aggressiveness(problem_state)
             self._ensure_thresholds_resolved(problem_state)
@@ -1040,18 +1049,28 @@ class SaturationAwareScheduler:
         )
 
         with self._phase_timer("invariants"):
-            # Filter ``curr_counters`` to only the stages Phase C touched
-            # (non-finished); a stage that finished mid-run leaves its counter
-            # untouched at the prior cycle's value, which would otherwise surface
-            # as an illegal ``prev == curr`` transition. ``prev_counters`` is not
-            # filtered because the helper only iterates ``curr_counters`` and
-            # looks up ``prev_counters`` by key.
+            # Filter ``curr_counters`` to non-finished stages with an
+            # observable transition this cycle:
+            #   * ``active_stage_names`` excludes stages that finished mid-run.
+            #   * ``curr != prev`` excludes stages Phase C did not touch
+            #     (allocation-failure absorption, donor-retry synthetic
+            #     absorption); since ``_set_stuck_plan_counter`` only ever
+            #     writes ``0`` or ``prev + 1``, ``curr == prev > 0`` is
+            #     unreachable through the funnel and ``curr == prev == 0``
+            #     is a valid no-op reset that the strict rule would accept
+            #     anyway, so excluding both is signal-preserving.
+            # ``prev_counters`` is not filtered: the helper iterates
+            # ``curr_counters`` only and looks up ``prev_counters`` by key,
+            # so stale entries there are inert.
             active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
+            changed_counters = {
+                name: curr
+                for name, curr in self._stuck_plan_counters.items()
+                if name in active_stage_names and curr != prev_stuck_plan_counters.get(name, 0)
+            }
             check_stuck_plan_monotonicity(
                 prev_counters=prev_stuck_plan_counters,
-                curr_counters={
-                    name: count for name, count in self._stuck_plan_counters.items() if name in active_stage_names
-                },
+                curr_counters=changed_counters,
             )
 
         # Bottleneck score and heterogeneity emission live OUTSIDE the
@@ -1503,6 +1522,19 @@ class SaturationAwareScheduler:
                 # Recording it would corrupt the classifier streak and the
                 # stabilization-window history; better to wait until at
                 # least one actor reaches ready and the signal is real.
+                #
+                # Reset ``valid_signal_samples`` so any trust accumulated
+                # before the quiescent gap is invalidated. Without this
+                # reset, a post-quiescence cycle could fire a non-zero
+                # recommendation off carry-forward EWMA the moment a
+                # single ready actor emerges (the trust gate would still
+                # see ``valid_signal_samples >= min_data_points`` from
+                # the pre-gap streak). The reset mirrors the same
+                # behaviour applied below in the trust-gate accounting
+                # block for the all-warmup-gap case, keeping the
+                # "consecutive valid samples" contract uniform across
+                # both no-signal-gap paths (skip + in-pipeline).
+                stage_state.valid_signal_samples = 0
                 logger.debug(
                     f"saturation-aware: stage {stage_name!r} cold-start quiescent "
                     f"(pending={pending_actors}, ready=0); skipping intent pipeline."
@@ -1524,23 +1556,41 @@ class SaturationAwareScheduler:
                 now=now,
             )
             # Trust gate accounting: ``min_data_points`` defines how many
-            # consecutive warmup-excluded valid samples the classifier
-            # output must accumulate before its non-zero recommendations
-            # may drive Phase C/D. A sample is "valid" iff at least one
-            # ready actor contributed (num_used_slots + num_empty_slots > 0).
+            # *strictly consecutive* warmup-excluded valid samples the
+            # classifier output must accumulate before its non-zero
+            # recommendations may drive Phase C/D. A sample is "valid"
+            # if at least one ready actor contributed
+            # (num_used_slots + num_empty_slots > 0).
             # Cycles where every ready actor was still within
-            # ``worker_warmup_measurement_grace_s`` produce zeroed signals;
-            # those do not advance the counter so the gate is gated on
-            # *real* observations, not on actor existence. Phase B floor
-            # and manual provisioning are evaluated outside this function,
-            # so this gate cannot starve a zero-worker stage. The call to
-            # ``run_per_stage_pipeline`` still runs even when the gate is
-            # closed so the EWMA cache, classifier state, and stabilization
-            # history keep tracking reality; only the returned delta is
-            # clamped to zero while the gate is closed.
+            # ``worker_warmup_measurement_grace_s`` produce zeroed
+            # signals; those RESET the counter to 0 (see ``else`` branch
+            # below) so the gate is gated on *real, contiguous*
+            # observations, not on actor existence. Phase B floor and
+            # manual provisioning are evaluated outside this function,
+            # so this gate cannot starve a zero-worker stage. The call
+            # to ``run_per_stage_pipeline`` still runs even when the
+            # gate is closed so the EWMA cache, classifier state, and
+            # stabilization history keep tracking reality; only the
+            # returned delta is clamped to zero while the gate is closed.
             cycle_has_fresh_sample = num_used_slots + num_empty_slots > 0
             if cycle_has_fresh_sample:
                 stage_state.valid_signal_samples = min(stage_state.valid_signal_samples + 1, stage_cfg.min_data_points)
+            else:
+                # No-signal cycle: either every ready actor is still
+                # inside ``worker_warmup_measurement_grace_s`` (the
+                # warmup-excluding aggregator returned ``(0, 0)``) or
+                # the stage has no ready actors at all (zero-worker
+                # snapshot). Reset the consecutive-valid-sample
+                # counter so the gate must rebuild from scratch
+                # before the classifier can fire a non-zero
+                # recommendation again. Without this reset, the gate
+                # would reopen as soon as a single warmup-cleared
+                # actor emerges, allowing the next cycle's
+                # recommendation to be derived from the
+                # ``last_valid_slots_empty_ratio_ewma`` carry-forward
+                # of a worker mix that no longer reflects current
+                # state.
+                stage_state.valid_signal_samples = 0
             stage_state.capacity_target_workers = self._refresh_capacity_target_workers(
                 stage_state=stage_state,
                 stage_cfg=stage_cfg,
@@ -1560,35 +1610,27 @@ class SaturationAwareScheduler:
                 observed_throughput_sample=throughput_samples.get(stage_name, 0.0),
                 pipeline_name=self._pipeline_name,
             )
-            # Trust gate has two independent freshness requirements that
-            # must BOTH hold for a non-zero recommendation to land:
-            #
-            # 1.  Enough accumulated warmup-filtered samples to trust the
-            #     classifier output (``min_data_points``).
-            # 2.  The CURRENT cycle observed at least one warmup-filtered
-            #     ready actor. After ``min_data_points`` was reached,
-            #     worker churn or post-shrink warmup grace can produce
-            #     zero-sample cycles whose ``run_per_stage_pipeline``
-            #     classifies off carry-forward EWMA; treating those as
-            #     trustworthy lets the scheduler add or remove workers
-            #     based on stale measurements precisely during the
-            #     warmup-churn window the gate was meant to dampen.
-            #     Clamping the delta when the current cycle has zero
-            #     valid samples enforces "history + freshness" without
-            #     resetting the accumulated counter (so the next valid
-            #     cycle resumes immediately).
+            # Trust gate: a non-zero recommendation requires
+            # ``valid_signal_samples >= min_data_points``. The
+            # accounting block above resets ``valid_signal_samples``
+            # to 0 on any no-signal cycle (all-warmup gap or
+            # zero-worker snapshot), and the cold-start quiescent
+            # skip branch above also resets, so any no-signal gap
+            # forces the trust gate to rebuild from scratch before
+            # the next non-zero recommendation may pass. This
+            # intentionally penalises transient gaps -- carry-forward
+            # EWMA over warmup-churn windows was producing add/remove
+            # decisions on stale worker mixes. The single freshness
+            # leg is sufficient because the reset collapses the
+            # "current cycle stale" case into the "counter below
+            # threshold" case; the validator pins
+            # ``min_data_points >= 1``, so ``valid_signal_samples = 0``
+            # (post-reset) always trips this check.
             if delta != 0 and stage_state.valid_signal_samples < stage_cfg.min_data_points:
                 logger.debug(
                     f"saturation-aware: stage {stage_name!r} valid samples "
                     f"{stage_state.valid_signal_samples}/{stage_cfg.min_data_points} - "
                     f"trust gate clamping recommendation {delta} to 0."
-                )
-                delta = 0
-            elif delta != 0 and not cycle_has_fresh_sample:
-                logger.debug(
-                    f"saturation-aware: stage {stage_name!r} current cycle has "
-                    f"zero warmup-filtered slot samples - trust gate clamping "
-                    f"stale-signal recommendation {delta} to 0."
                 )
                 delta = 0
             if quiescence_active and delta > 0:
@@ -1769,7 +1811,12 @@ class SaturationAwareScheduler:
         consecutive cycles where ``added < intent``; ``0`` when the
         stage met its intent or had none) and routes every mutation
         through :meth:`_set_stuck_plan_counter` so
-        :class:`StuckPlanDetector` stays in lockstep.
+        :class:`StuckPlanDetector` stays in lockstep. Bail paths
+        (allocation-failure absorption, donor-retry synthetic
+        absorption) intentionally do NOT call the funnel; the
+        post-Phase-D :func:`check_stuck_plan_monotonicity` invariant
+        excludes the resulting ``curr == prev`` no-op transitions
+        from the strict +1/0 assertion at the caller side.
 
         Args:
             ctx: The cycle's mutable planner context. Mutated in place

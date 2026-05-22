@@ -178,7 +178,7 @@ class _RecommendationHistory:
         scale based on a single un-replicated sample.
 
         Returns:
-            ``True`` iff the most recent ``window_up`` recorded
+            ``True`` if the most recent ``window_up`` recorded
             directions are all ``+1``. ``False`` for an under-filled
             buffer or any non-up cycle in the window.
 
@@ -195,7 +195,7 @@ class _RecommendationHistory:
         before its slot signals have stabilized.
 
         Returns:
-            ``True`` iff the most recent ``window_down`` recorded
+            ``True`` if the most recent ``window_down`` recorded
             directions are all ``-1``. ``False`` for an under-filled
             buffer or any non-down cycle in the window.
 

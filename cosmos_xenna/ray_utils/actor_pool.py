@@ -875,7 +875,7 @@ class ActorPool(Generic[T, V]):
         self._worker_groups_to_create.append(worker)
 
     def is_worker_group_ready(self, worker_group_id: str, min_age_s: float = 0.0) -> bool:
-        """Return True iff the group is Ready *and* has been Ready for ``min_age_s``.
+        """Return True if the group is Ready *and* has been Ready for ``min_age_s``.
 
         Used by the autoscaler-application path to defer scale-down of
         worker groups that are still in setup or that just finished setup.

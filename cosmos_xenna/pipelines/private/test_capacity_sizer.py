@@ -279,6 +279,30 @@ class TestCapacityTargetInputValidation:
                 utilization_target=0.85,
             )
 
+    def test_nan_throughput_is_rejected(self) -> None:
+        """NaN throughput would slip past ``< 0.0`` (False for NaN) into ``math.ceil`` as an indirect failure."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_capacity_target_workers(
+                queue_depth=0,
+                observed_throughput=math.nan,
+                d_k_seconds=2.0,
+                slots_per_worker=1,
+                target_backlog_seconds=30.0,
+                utilization_target=0.85,
+            )
+
+    def test_inf_throughput_is_rejected(self) -> None:
+        """``+inf`` throughput would propagate into ``target_rate`` and trip ``math.ceil`` with ``OverflowError``."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_capacity_target_workers(
+                queue_depth=0,
+                observed_throughput=math.inf,
+                d_k_seconds=2.0,
+                slots_per_worker=1,
+                target_backlog_seconds=30.0,
+                utilization_target=0.85,
+            )
+
     def test_zero_slots_per_worker_is_rejected(self) -> None:
         """slots_per_worker is the denominator at the worker boundary; must be >= 1."""
         with pytest.raises(ValueError, match="slots_per_worker must be >= 1"):

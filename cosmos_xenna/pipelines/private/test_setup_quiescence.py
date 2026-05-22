@@ -318,6 +318,33 @@ class TestColdStartSkipsIntentPipeline:
         assert len(solution.stages[0].new_workers) == 1
         assert solution.stages[0].deleted_workers == []
 
+    def test_cold_start_resets_valid_signal_samples(self) -> None:
+        """The skip branch resets ``valid_signal_samples`` so post-quiescence trust must rebuild."""
+        scheduler = _scheduler_with_stage("hot")
+        # Seed the counter as if a previous run had opened the gate.
+        # Using a value above ``min_data_points`` makes the test
+        # robust to future default-value tweaks: any non-zero pre-gap
+        # value must drop to zero after the skip.
+        scheduler._stage_states["hot"].valid_signal_samples = 5
+
+        ps = data_structures.ProblemState(
+            [
+                _stage_state(
+                    name="hot",
+                    num_workers=0,
+                    slots_per_worker=8,
+                    num_used_slots=0,
+                    num_empty_slots=0,
+                    input_queue_depth=0,
+                    num_pending_actors=2,
+                ),
+            ]
+        )
+
+        scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert scheduler._stage_states["hot"].valid_signal_samples == 0
+
 
 class TestColdStartTransitionsCleanly:
     """Once at least one actor reaches ready, the pipeline re-engages."""

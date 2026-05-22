@@ -277,6 +277,26 @@ class TestComputePressureInputValidation:
                 backlog_cap=0.0,
             )
 
+    def test_nan_observed_throughput_is_rejected(self) -> None:
+        """NaN throughput would slip past the ``<= 0.0`` cold-start branch (False for NaN) and emit NaN pressure."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=10,
+                observed_throughput=math.nan,
+                target_backlog_seconds=30.0,
+            )
+
+    def test_inf_observed_throughput_is_rejected(self) -> None:
+        """``+inf`` throughput would collapse ``input_queue_depth / observed_throughput`` to a silent zero."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=10,
+                observed_throughput=math.inf,
+                target_backlog_seconds=30.0,
+            )
+
 
 class TestComputeBacklogTimeInputValidation:
     """The gauge helper enforces the same ``backlog_cap`` precondition as compute_pressure."""
@@ -299,6 +319,24 @@ class TestComputeBacklogTimeInputValidation:
                 observed_throughput=0.0,
                 target_backlog_seconds=30.0,
                 backlog_cap=-1.0,
+            )
+
+    def test_nan_observed_throughput_is_rejected(self) -> None:
+        """NaN throughput would slip past ``<= 0.0`` and emit NaN through the ``_BACKLOG_TIME_GAUGE``."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_backlog_time(
+                input_queue_depth=10,
+                observed_throughput=math.nan,
+                target_backlog_seconds=30.0,
+            )
+
+    def test_inf_observed_throughput_is_rejected(self) -> None:
+        """``+inf`` throughput would emit ``0.0`` through the gauge, masking the upstream defect."""
+        with pytest.raises(ValueError, match=r"observed_throughput must be finite"):
+            compute_backlog_time(
+                input_queue_depth=10,
+                observed_throughput=math.inf,
+                target_backlog_seconds=30.0,
             )
 
 

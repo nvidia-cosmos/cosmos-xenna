@@ -762,6 +762,13 @@ impl AutoscalePlanContext {
                 };
 
                 let Some(resource) = removed.resources.first() else {
+                    // Data-corrupt worker (empty resources): re-insert
+                    // the removed entry so ``current_workers`` stays
+                    // consistent with the cluster's allocation state
+                    // for the rest of this cycle. ``release_allocation``
+                    // has not run yet, so cluster state is untouched
+                    // and only the in-memory map needs rolling back.
+                    workers.insert(worker_id.to_string(), removed);
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "AutoscalePlanContext.try_remove_worker: worker {} for stage {} \
                          has no resource allocation",
@@ -1039,7 +1046,7 @@ fn validate_seed_resources(
 
 /// Order-agnostic multiset equality on per-worker resource allocations.
 ///
-/// Returns `true` iff `left` and `right` have the same length and the
+/// Returns `true` if `left` and `right` have the same length and the
 /// same multiset of `WorkerResources` entries (each entry in `left` is
 /// matched against a unique, distinct entry in `right`). Element order
 /// is irrelevant; duplicate entries are honoured (each occurrence on
@@ -3412,6 +3419,75 @@ mod tests {
 
         assert!(!ctx.try_remove_worker(0, "nonexistent").unwrap());
         assert_eq!(ctx.worker_ages(), ages_before);
+    }
+
+    #[test]
+    fn try_remove_worker_data_corrupt_worker_rolls_back_state() {
+        // Atomicity guard: if a non-SPMD worker's `resources` vector is
+        // empty (data-corrupt entry that should never reach the planner
+        // but cannot be ruled out at the type level), `try_remove_worker`
+        // detects the corruption AFTER `current_workers.remove` already
+        // mutated the in-memory map. The function must roll the removal
+        // back before returning Err so `current_workers` stays consistent
+        // with the cluster's allocation state for the rest of the cycle.
+        // The cluster itself is untouched because `release_allocation`
+        // has not run at the None branch.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 2.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let mut ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        // Inject a data-corrupt worker (empty resources) directly into
+        // the inner map; the live `from_problem_state` seeding cannot
+        // produce this shape but a future planner regression could.
+        ctx.current_workers.get_mut("stage_a").unwrap().insert(
+            "corrupt_worker".to_string(),
+            ds::ProblemWorkerGroupState {
+                id: "corrupt_worker".to_string(),
+                resources: Vec::new(),
+                num_used_slots: 0,
+            },
+        );
+
+        // Inspecting a ``PyErr``'s type and message goes through Python,
+        // so the test must initialize the interpreter once. The other
+        // tests in this module only assert ``is_err()`` and do not
+        // touch the ``PyErr`` body, which is why they have not needed
+        // this. The call is idempotent across tests.
+        pyo3::prepare_freethreaded_python();
+
+        let err = ctx
+            .try_remove_worker(0, "corrupt_worker")
+            .expect_err("data-corrupt worker must surface an error, not Ok");
+        let (err_type_name, err_message) = Python::with_gil(|py| {
+            let type_name = err
+                .get_type(py)
+                .name()
+                .map(|cow| cow.to_string())
+                .unwrap_or_else(|_| String::from("<unknown>"));
+            (type_name, err.value(py).to_string())
+        });
+        assert_eq!(
+            err_type_name, "RuntimeError",
+            "data-corrupt rollback must raise PyRuntimeError; got {err_type_name}: {err_message}"
+        );
+        assert!(
+            err_message.contains("has no resource allocation"),
+            "the error must identify the data-corruption mode in its message; got: {err_message}"
+        );
+        assert!(
+            ctx.current_workers["stage_a"].contains_key("corrupt_worker"),
+            "the data-corrupt worker must be re-inserted into current_workers on the Err path"
+        );
+        assert_eq!(
+            ctx.pending_remove_count(0).unwrap(),
+            0,
+            "no pending_remove must be staged for a worker the function rolled back"
+        );
     }
 
     #[test]

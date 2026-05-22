@@ -889,6 +889,25 @@ class TestCheckStuckPlanMonotonicity:
         ):
             check_stuck_plan_monotonicity(prev_counters={"A": 5}, curr_counters={"A": 7})
 
+    def test_unchanged_counter_in_curr_counters_still_raises(self) -> None:
+        """An unchanged ``prev == curr`` value violates the strict-+1-or-0 contract.
+
+        The helper itself is strict: it has no notion of "no observable
+        transition this cycle". The caller
+        (``SaturationAwareScheduler._autoscale_body``) is responsible
+        for filtering ``curr_counters`` down to stages whose counter
+        actually changed (``curr != prev``), so a stage Phase C bailed
+        on never reaches this helper. This test pins that contract --
+        the helper itself MUST raise on any unchanged transition so a
+        future refactor that moves the diff into the helper fails this
+        test first.
+        """
+        with pytest.raises(
+            SchedulerInvariantError,
+            match=r"stage 'A' transitioned from 13 to 13",
+        ):
+            check_stuck_plan_monotonicity(prev_counters={"A": 13}, curr_counters={"A": 13})
+
     def test_multi_stage_validates_each_independently(self) -> None:
         """The helper iterates every entry in ``curr_counters``; one bad transition raises.
 
