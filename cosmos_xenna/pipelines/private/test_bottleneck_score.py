@@ -180,7 +180,7 @@ class TestEmitBottleneckScore:
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 1, f"expected exactly one INFO log line, got {[r.message for r in info_logs]}"
         message = info_logs[0].message
-        assert "bottleneck stage: b" in message
+        assert "bottleneck stage: 'b'" in message
         assert "D = 2.00s" in message
         assert "throughput bound = 0.50 tasks/s" in message
 
@@ -209,8 +209,8 @@ class TestEmitBottleneckScore:
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 1
-        assert "bottleneck stage: b" in info_logs[0].message
-        assert "bottleneck stage: a" not in info_logs[0].message
+        assert "bottleneck stage: 'b'" in info_logs[0].message
+        assert "bottleneck stage: 'a'" not in info_logs[0].message
 
     def test_all_cold_no_log(
         self,
@@ -260,7 +260,7 @@ class TestEmitBottleneckScore:
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 1
-        assert "bottleneck stage: b" in info_logs[0].message
+        assert "bottleneck stage: 'b'" in info_logs[0].message
 
     def test_log_format_pins_throughput_bound(
         self,
@@ -270,10 +270,13 @@ class TestEmitBottleneckScore:
         """Pin the INFO log regex so operators can grep without ambiguity.
 
         The format is critical for log triage:
-        ``bottleneck stage: <name> (D = N.NNs, throughput bound =
+        ``bottleneck stage: '<name>' (D = N.NNs, throughput bound =
         N.NN tasks/s)``. The two-decimal precision avoids
         scientific notation for typical service times (10 ms to
         10 s) and keeps the line single-pass grep-friendly.
+        Stage name is rendered via ``repr()`` so any embedded
+        control characters surface escaped rather than corrupting
+        the log line.
         """
         emit_bottleneck_score(
             service_times_s={"alpha": 0.04, "beta": 2.5},
@@ -443,7 +446,7 @@ class TestAutoscaleServiceTimeWiring:
         # INFO log line names "hot" with the matching D and throughput bound.
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO and "bottleneck" in r.message]
         assert len(info_logs) == 1
-        assert "bottleneck stage: hot" in info_logs[0].message
+        assert "bottleneck stage: 'hot'" in info_logs[0].message
         assert "D = 0.40s" in info_logs[0].message
         assert "throughput bound = 2.50 tasks/s" in info_logs[0].message
 
@@ -558,6 +561,33 @@ class TestIdentifyBottleneck:
 
         assert identity.engaged is True
         assert identity.stage_name == "c"
+
+    def test_near_tie_tolerance_negative_is_rejected(self) -> None:
+        """A negative tolerance would raise the tie floor above ``max_d`` and empty the tied list."""
+        with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=1.5,
+                near_tie_tolerance=-0.01,
+            )
+
+    def test_near_tie_tolerance_one_is_rejected(self) -> None:
+        """A tolerance of 1.0 collapses the band so every positive score is tied."""
+        with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=1.5,
+                near_tie_tolerance=1.0,
+            )
+
+    def test_near_tie_tolerance_above_one_is_rejected(self) -> None:
+        """A tolerance above 1.0 produces a sub-zero floor and the same degenerate verdict."""
+        with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
+            bottleneck.identify_bottleneck(
+                {"a": 1.0, "b": 2.0},
+                heterogeneity_threshold=1.5,
+                near_tie_tolerance=1.01,
+            )
 
 
 class TestMaybeLogBottleneckEngagement:

@@ -425,3 +425,24 @@ class TestMemoryPressureGate:
         assert after_poll_at is None
         assert after_used_fraction == 0.0
         assert after_poll_count == 0
+
+    def test_reset_drives_gauges_to_cleared_defaults(self) -> None:
+        """``reset()`` writes 0.0 to both gauges so a scrape between reset and the next poll sees the cleared state."""
+        from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryPressureMonitor
+
+        monitor = MemoryPressureMonitor(
+            polling_interval_s=5.0,
+            critical_threshold=0.85,
+            pipeline_name="test-pipe",
+        )
+
+        used_fraction_calls: list[tuple[float, dict[str, str]]] = []
+        pressure_active_calls: list[tuple[float, dict[str, str]]] = []
+        # Replace the bound .set methods so both writes during reset() are captured.
+        monitor._used_fraction_gauge.set = lambda value, tags: used_fraction_calls.append((value, dict(tags)))  # type: ignore[method-assign]
+        monitor._pressure_active_gauge.set = lambda value, tags: pressure_active_calls.append((value, dict(tags)))  # type: ignore[method-assign]
+
+        monitor.reset()
+
+        assert used_fraction_calls == [(0.0, {"pipeline": "test-pipe"})]
+        assert pressure_active_calls == [(0.0, {"pipeline": "test-pipe"})]

@@ -432,3 +432,37 @@ class TestAllocationFailureLogIsInjectionSafe:
         assert len(error_records) == 1
         message = error_records[0].message
         assert hostile_stage in message, "hostile stage name must appear verbatim, never re-evaluated"
+
+
+class TestEmitAllocationFailureToleratesMalformedClusterResources:
+    """A malformed ``cluster_resources`` must not mask the absorbed exception."""
+
+    def test_format_failure_logs_placeholders_and_increments_counter(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Snapshot helpers raising on a malformed input still produces an ERROR record + counter increment."""
+        fake_counter = _FakeCounter()
+        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
+        # An object with no ``nodes`` attribute drives both helpers
+        # into AttributeError on the very first access.
+        broken_cluster = object()
+        original_exc = resources.AllocationError("synthetic placement failure")
+
+        allocation_failures.emit_allocation_failure(
+            stage_name="stage",
+            pipeline_name="test-pipe",
+            cluster_resources=broken_cluster,
+            exc=original_exc,
+        )
+
+        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}]
+        error_records = [r for r in loguru_caplog.records if r.levelno >= logging.ERROR]
+        assert len(error_records) == 1
+        message = error_records[0].message
+        assert "<unavailable: formatting error>" in message
+        assert "snapshot formatter raised" in message
+        assert "AttributeError" in message
+        assert "AllocationError" in message
+        assert "synthetic placement failure" in message

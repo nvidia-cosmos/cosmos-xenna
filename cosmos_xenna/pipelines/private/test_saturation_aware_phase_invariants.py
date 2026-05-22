@@ -789,6 +789,42 @@ class TestCheckFloorAfterPhaseD:
             pre_phase_d_worker_counts={0: 5},
         )
 
+    def test_missing_pre_phase_d_count_raises_invariant_error(self) -> None:
+        """A pre-Phase-D snapshot missing the stage's index surfaces as SchedulerInvariantError, not KeyError."""
+        problem = _problem([("A", None)])
+        problem_state = _problem_state([("A", 1, 1, False)])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
+        with pytest.raises(
+            SchedulerInvariantError,
+            match=r"stage 'A'.*index 0.*KeyError.*Planner-state shape mismatch",
+        ):
+            check_floor_after_phase_d(
+                phase_name=PhaseBoundary.PHASE_D,
+                problem=problem,
+                problem_state=problem_state,
+                ctx=ctx,
+                stage_floors={0: 1},
+                pre_phase_d_worker_counts={},
+            )
+
+    def test_missing_stage_floor_raises_invariant_error(self) -> None:
+        """A stage_floors map missing the stage's index surfaces as SchedulerInvariantError."""
+        problem = _problem([("A", None)])
+        problem_state = _problem_state([("A", 1, 1, False)])
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
+        with pytest.raises(
+            SchedulerInvariantError,
+            match=r"stage 'A'.*KeyError.*Planner-state shape mismatch",
+        ):
+            check_floor_after_phase_d(
+                phase_name=PhaseBoundary.PHASE_D,
+                problem=problem,
+                problem_state=problem_state,
+                ctx=ctx,
+                stage_floors={},
+                pre_phase_d_worker_counts={0: 1},
+            )
+
 
 class TestCheckStuckPlanMonotonicity:
     """Pure-helper check for the stuck-plan counter monotonicity invariant."""

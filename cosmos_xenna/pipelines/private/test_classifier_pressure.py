@@ -198,7 +198,7 @@ class TestOverProvisionedPressureDemotion:
     def test_empty_queue_low_pressure_is_over_provisioned(self, cfg: SaturationAwareStageConfig) -> None:
         """Empty queue + idle slots + low pressure -> OVER_PROVISIONED.
 
-        Replaces the legacy queue==0 -> STARVED short-circuit. With the
+        Replaces the previous queue==0 -> STARVED short-circuit. With the
         topology-aware design, an idle drained queue is over-provisioned
         for the current upstream rate; whether the idleness is genuine
         or backpressure-induced is read off the per-cycle bottleneck

@@ -451,7 +451,7 @@ class TestStarvedEnumValueRemoved:
     """Sentry: ``StageState`` no longer exposes a STARVED member."""
 
     def test_stage_state_enum_does_not_contain_starved(self) -> None:
-        """Removing this assertion would silently re-enable the legacy queue=0 short-circuit."""
+        """Removing this assertion would silently re-enable the queue=0 short-circuit."""
         assert "STARVED" not in {member.name for member in StageState}
 
 

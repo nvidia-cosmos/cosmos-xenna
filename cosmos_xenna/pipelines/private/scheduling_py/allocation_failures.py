@@ -45,6 +45,11 @@ def emit_allocation_failure(
 ) -> None:
     """Log a per-GPU fragmentation snapshot at ERROR and bump the failure counter.
 
+    Snapshot formatting is wrapped so a malformed
+    ``cluster_resources`` shape cannot mask the absorbed ``exc``;
+    placeholders are substituted and the formatter exception is
+    appended to the ERROR record.
+
     Args:
         stage_name: Stage whose ``try_add_worker`` raised.
         pipeline_name: ``pipeline`` Prometheus tag value.
@@ -53,13 +58,23 @@ def emit_allocation_failure(
         exc: The absorbed exception.
     """
     _ALLOCATION_FAILURES_COUNTER.inc(tags={"stage": stage_name, "pipeline": pipeline_name})
-    gpu_snapshot = _format_gpu_fragmentation(cluster_resources)
-    cpu_snapshot = _format_cpu_fragmentation(cluster_resources)
+
+    gpu_snapshot: list[dict[str, object]] | str
+    cpu_snapshot: list[dict[str, object]] | str
+    formatter_note = ""
+    try:
+        gpu_snapshot = _format_gpu_fragmentation(cluster_resources)
+        cpu_snapshot = _format_cpu_fragmentation(cluster_resources)
+    except Exception as format_exc:  # noqa: BLE001 -- diagnostic path must not mask the absorbed exception
+        gpu_snapshot = "<unavailable: formatting error>"
+        cpu_snapshot = "<unavailable: formatting error>"
+        formatter_note = f". snapshot formatter raised {type(format_exc).__name__}: {format_exc!r}"
+
     logger.error(
         f"saturation-aware allocation failure: stage {stage_name!r} "
         f"raised {type(exc).__name__}: {exc!r}. "
         f"Per-GPU fragmentation snapshot: {gpu_snapshot}. "
-        f"Per-node CPU snapshot: {cpu_snapshot}"
+        f"Per-node CPU snapshot: {cpu_snapshot}{formatter_note}"
     )
 
 

@@ -232,11 +232,23 @@ def check_floor_after_phase_d(
     for stage_index, problem_stage in enumerate(problem.rust.stages):
         if problem_stage.requested_num_workers is not None:
             continue
-        if problem_state.rust.stages[stage_index].is_finished:
+        try:
+            problem_state_stage = problem_state.rust.stages[stage_index]
+            current = len(worker_ids_by_stage[stage_index])
+            floor = stage_floors[stage_index]
+            pre_d = pre_phase_d_worker_counts[stage_index]
+        except (IndexError, KeyError) as exc:
+            _log_and_raise_invariant(
+                f"After {phase_name}: stage {problem_stage.name!r} (index "
+                f"{stage_index}) cannot be resolved against the per-cycle "
+                f"collections (problem_state.rust.stages, worker_ids_by_stage, "
+                f"stage_floors, pre_phase_d_worker_counts): "
+                f"{type(exc).__name__}: {exc!r}. Planner-state shape mismatch. "
+                "This is a scheduler defect; report it with the autoscale "
+                "cycle's problem_state."
+            )
+        if problem_state_stage.is_finished:
             continue
-        current = len(worker_ids_by_stage[stage_index])
-        floor = stage_floors[stage_index]
-        pre_d = pre_phase_d_worker_counts[stage_index]
         floor_lower_bound = min(pre_d, floor)
         if current < floor_lower_bound:
             _log_and_raise_invariant(

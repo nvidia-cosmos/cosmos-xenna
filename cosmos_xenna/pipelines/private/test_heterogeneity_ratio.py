@@ -208,7 +208,7 @@ class TestComputeHeterogeneityRatio:
         assert pattern.fullmatch(info_logs[0].message), (
             f"INFO log line did not match the pinned format: {info_logs[0].message!r}"
         )
-        assert "stage slow" in info_logs[0].message
+        assert "stage 'slow'" in info_logs[0].message
         assert state.has_fired is True
 
     def test_streak_resets_below_threshold(

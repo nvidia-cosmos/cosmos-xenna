@@ -19,8 +19,8 @@ The scheduler publishes a per-cycle ``BottleneckCycleContext`` onto
 every stage's runtime state right after :func:`identify_bottleneck`
 returns. The per-stage decision pipeline reads it for diagnostic
 log fields. These tests pin the wiring contract: which stages get
-``self_upstream=True``, what happens when no bottleneck is engaged,
-and how the publish step behaves when the bottleneck moves between
+``is_upstream_of_bottleneck=True``, what happens when no bottleneck
+is engaged, and how the publish step behaves when the bottleneck moves between
 cycles.
 """
 
@@ -81,62 +81,74 @@ def _ctx(stage_state: _StageRuntimeState) -> BottleneckCycleContext:
 
 
 class TestEngagedBottleneckMarksStrictUpstream:
-    """``self_upstream=True`` is set only for stages strictly upstream of the bottleneck."""
+    """``is_upstream_of_bottleneck=True`` is set only for stages strictly upstream of the bottleneck."""
 
     def test_strict_upstream_stages_marked_upstream(
         self,
         make_scheduler_with_stages: SchedulerFactory,
     ) -> None:
-        """In ``[A, B, C]`` with bottleneck C: A and B get self_upstream=True."""
+        """In ``[A, B, C]`` with bottleneck C: A and B get is_upstream_of_bottleneck=True."""
         scheduler = make_scheduler_with_stages(["A", "B", "C"])
         scheduler._last_bottleneck_meta = _engaged_meta("C")
 
         scheduler._refresh_cycle_bottleneck_context()
 
-        assert _ctx(scheduler._stage_states["A"]) == BottleneckCycleContext(engaged=True, self_upstream=True)
-        assert _ctx(scheduler._stage_states["B"]) == BottleneckCycleContext(engaged=True, self_upstream=True)
+        assert _ctx(scheduler._stage_states["A"]) == BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=True
+        )
+        assert _ctx(scheduler._stage_states["B"]) == BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=True
+        )
 
 
 class TestEngagedBottleneckClearsDownstreamUpstream:
-    """``self_upstream=False`` for stages downstream of the bottleneck and for the bottleneck itself."""
+    """``is_upstream_of_bottleneck=False`` for stages downstream of the bottleneck and for the bottleneck itself."""
 
-    def test_bottleneck_stage_itself_has_self_upstream_false(
+    def test_bottleneck_stage_itself_has_is_upstream_false(
         self,
         make_scheduler_with_stages: SchedulerFactory,
     ) -> None:
-        """The bottleneck stage's own context has ``engaged=True`` but ``self_upstream=False``."""
+        """The bottleneck stage's own context has ``engaged=True`` but ``is_upstream_of_bottleneck=False``."""
         scheduler = make_scheduler_with_stages(["A", "B", "C"])
         scheduler._last_bottleneck_meta = _engaged_meta("B")
 
         scheduler._refresh_cycle_bottleneck_context()
 
-        assert _ctx(scheduler._stage_states["B"]) == BottleneckCycleContext(engaged=True, self_upstream=False)
+        assert _ctx(scheduler._stage_states["B"]) == BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=False
+        )
 
-    def test_strict_downstream_stages_have_self_upstream_false(
+    def test_strict_downstream_stages_have_is_upstream_false(
         self,
         make_scheduler_with_stages: SchedulerFactory,
     ) -> None:
-        """In ``[A, B, C, D]`` with bottleneck B: C and D have self_upstream=False."""
+        """In ``[A, B, C, D]`` with bottleneck B: C and D have is_upstream_of_bottleneck=False."""
         scheduler = make_scheduler_with_stages(["A", "B", "C", "D"])
         scheduler._last_bottleneck_meta = _engaged_meta("B")
 
         scheduler._refresh_cycle_bottleneck_context()
 
-        assert _ctx(scheduler._stage_states["C"]) == BottleneckCycleContext(engaged=True, self_upstream=False)
-        assert _ctx(scheduler._stage_states["D"]) == BottleneckCycleContext(engaged=True, self_upstream=False)
+        assert _ctx(scheduler._stage_states["C"]) == BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=False
+        )
+        assert _ctx(scheduler._stage_states["D"]) == BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=False
+        )
 
 
 class TestDisengagedBottleneckClearsAllStages:
     """A disengaged meta clears every stage's context to the no-bottleneck default."""
 
-    def test_disengaged_clears_self_upstream_everywhere(
+    def test_disengaged_clears_is_upstream_everywhere(
         self,
         make_scheduler_with_stages: SchedulerFactory,
     ) -> None:
         """Disengaged meta: every stage carries the default ``BottleneckCycleContext()``."""
         scheduler = make_scheduler_with_stages(["A", "B", "C"])
         # Pre-seed an engaged context on the first stage to verify the refresh wipes it.
-        scheduler._stage_states["A"].cycle_bottleneck_context = BottleneckCycleContext(engaged=True, self_upstream=True)
+        scheduler._stage_states["A"].cycle_bottleneck_context = BottleneckCycleContext(
+            engaged=True, is_upstream_of_bottleneck=True
+        )
         scheduler._last_bottleneck_meta = _disengaged_meta()
 
         scheduler._refresh_cycle_bottleneck_context()
@@ -161,11 +173,56 @@ class TestDefensiveStaleBottleneckName:
         for state in scheduler._stage_states.values():
             assert _ctx(state) == BottleneckCycleContext()
 
+    def test_empty_string_bottleneck_name_is_treated_as_disengaged(
+        self,
+        make_scheduler_with_stages: SchedulerFactory,
+    ) -> None:
+        """An empty-string ``stage_name`` falls through the same defensive branch."""
+        scheduler = make_scheduler_with_stages(["A", "B", "C"])
+        scheduler._last_bottleneck_meta = _engaged_meta("")
+
+        scheduler._refresh_cycle_bottleneck_context()
+
+        for state in scheduler._stage_states.values():
+            assert _ctx(state) == BottleneckCycleContext()
+
+
+class TestEmptyStageStates:
+    """An empty ``_stage_states`` is a no-op on every branch."""
+
+    def test_empty_stage_states_with_engaged_meta_does_not_raise(
+        self,
+        make_scheduler_with_stages: SchedulerFactory,
+    ) -> None:
+        """Engaged meta with no stages registered returns cleanly."""
+        scheduler = make_scheduler_with_stages(["A"])
+        scheduler._stage_states = {}
+        scheduler._stage_names = []
+        scheduler._last_bottleneck_meta = _engaged_meta("anything")
+
+        scheduler._refresh_cycle_bottleneck_context()
+
+        assert scheduler._stage_states == {}
+
+    def test_empty_stage_states_with_disengaged_meta_does_not_raise(
+        self,
+        make_scheduler_with_stages: SchedulerFactory,
+    ) -> None:
+        """Disengaged meta with no stages registered returns cleanly."""
+        scheduler = make_scheduler_with_stages(["A"])
+        scheduler._stage_states = {}
+        scheduler._stage_names = []
+        scheduler._last_bottleneck_meta = _disengaged_meta()
+
+        scheduler._refresh_cycle_bottleneck_context()
+
+        assert scheduler._stage_states == {}
+
 
 class TestBottleneckMovesBetweenCycles:
     """When the bottleneck moves cycle-to-cycle the per-stage context flips correctly."""
 
-    def test_bottleneck_moves_from_b_to_c_flips_self_upstream(
+    def test_bottleneck_moves_from_b_to_c_flips_is_upstream(
         self,
         make_scheduler_with_stages: SchedulerFactory,
     ) -> None:
@@ -175,11 +232,11 @@ class TestBottleneckMovesBetweenCycles:
         # Cycle N: bottleneck is C.
         scheduler._last_bottleneck_meta = _engaged_meta("C")
         scheduler._refresh_cycle_bottleneck_context()
-        assert _ctx(scheduler._stage_states["B"]).self_upstream is True
+        assert _ctx(scheduler._stage_states["B"]).is_upstream_of_bottleneck is True
 
         # Cycle N+1: bottleneck moves to B; B itself is no longer upstream of the bottleneck.
         scheduler._last_bottleneck_meta = _engaged_meta("B")
         scheduler._refresh_cycle_bottleneck_context()
-        assert _ctx(scheduler._stage_states["A"]).self_upstream is True
-        assert _ctx(scheduler._stage_states["B"]).self_upstream is False
-        assert _ctx(scheduler._stage_states["C"]).self_upstream is False
+        assert _ctx(scheduler._stage_states["A"]).is_upstream_of_bottleneck is True
+        assert _ctx(scheduler._stage_states["B"]).is_upstream_of_bottleneck is False
+        assert _ctx(scheduler._stage_states["C"]).is_upstream_of_bottleneck is False

@@ -173,18 +173,25 @@ class MemoryPressureMonitor:
         return self._cached_pressure_active
 
     def reset(self) -> None:
-        """Drop the cached pressure state.
+        """Drop the cached pressure state and clear the exported gauges.
 
         Called from ``SaturationAwareScheduler.setup()`` so a
         re-setup (test re-run, mid-flight pipeline replacement)
-        starts from a clean polling cache rather than carrying the
-        prior run's last observation forward.
+        starts from a clean polling cache. The two Prometheus
+        gauges are also driven to their cleared defaults so a
+        scrape that lands between ``reset()`` and the first
+        ``is_pressure_active()`` call observes the same state the
+        scheduler internally tracks.
         """
         self._last_poll_at = None
         self._cached_used_fraction = 0.0
         self._cached_pressure_active = False
         self._poll_failure_logged = False
         self._poll_count = 0
+
+        tags = {"pipeline": self.pipeline_name}
+        self._used_fraction_gauge.set(0.0, tags=tags)
+        self._pressure_active_gauge.set(0.0, tags=tags)
 
     @property
     def last_used_fraction(self) -> float:

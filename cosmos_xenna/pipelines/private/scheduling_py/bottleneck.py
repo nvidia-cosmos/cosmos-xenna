@@ -257,7 +257,7 @@ def emit_bottleneck_score(
     )
     throughput_bound = 1.0 / bottleneck_score
     logger.info(
-        f"bottleneck stage: {bottleneck_name} "
+        f"bottleneck stage: {bottleneck_name!r} "
         f"(D = {bottleneck_score:.2f}s, "
         f"throughput bound = {throughput_bound:.2f} tasks/s)"
     )
@@ -442,7 +442,7 @@ def compute_heterogeneity_ratio(
         f"high cluster heterogeneity (ratio={ratio:.1f} for "
         f"{state.streak_cycles} cycles); consider raising "
         f"over_provisioned_streak_min_cycles for stage "
-        f"{bottleneck_name} (bottleneck D={bottleneck_score:.1f}s) "
+        f"{bottleneck_name!r} (bottleneck D={bottleneck_score:.1f}s) "
         f"to give it more recovery margin"
     )
     state.has_fired = True
@@ -475,10 +475,19 @@ class BottleneckIdentity:
 
 @attrs.frozen
 class BottleneckCycleContext:
-    """Per-cycle bottleneck signal scoped to one stage."""
+    """Per-cycle bottleneck signal scoped to one stage.
+
+    Attributes:
+        engaged: True when the cluster-wide bottleneck gate is engaged
+            this cycle. Mirrors ``BottleneckIdentity.engaged``.
+        is_upstream_of_bottleneck: True when the owning stage sits
+            strictly upstream (smaller DAG index) of the engaged
+            bottleneck. Always False when ``engaged`` is False, and
+            always False for the bottleneck stage itself.
+    """
 
     engaged: bool = False
-    self_upstream: bool = False
+    is_upstream_of_bottleneck: bool = False
 
 
 @attrs.define
@@ -519,11 +528,23 @@ def identify_bottleneck(
         d_k_ewma: Per-stage EWMA-smoothed ``D_k`` in seconds;
             cold-start stages contribute ``math.nan``.
         heterogeneity_threshold: Engagement floor. Must be > 1.0.
-        near_tie_tolerance: Fractional tie band; 0.0 = strict argmax.
+        near_tie_tolerance: Fractional tie band in ``[0.0, 1.0)``;
+            0.0 = strict argmax. Values >= 1.0 collapse the band so
+            every positive score is "tied" and the verdict reduces
+            to a lex-smallest pick, defeating the function; negative
+            values would raise the floor above ``max_d`` and produce
+            an empty ``tied``.
 
     Returns:
         ``BottleneckIdentity`` describing the cycle.
+
+    Raises:
+        ValueError: If ``near_tie_tolerance`` is outside ``[0.0, 1.0)``.
     """
+    if not 0.0 <= near_tie_tolerance < 1.0:
+        msg = f"near_tie_tolerance must be in [0.0, 1.0), got {near_tie_tolerance}"
+        raise ValueError(msg)
+
     finite_scores: dict[str, float] = {}
     for name, d_k in d_k_ewma.items():
         score = _service_time_to_score(d_k)

@@ -247,7 +247,7 @@ class TestOverProvisionedShrinkPath:
 class TestEmptyQueueWithIdleSlotsClassifiesAsOverProvisioned:
     """Free slots + drained queue -> OVER_PROVISIONED.
 
-    Replaces the legacy queue==0 -> STARVED short-circuit. The first
+    Replaces the previous queue==0 -> STARVED short-circuit. The first
     cycle does not fire delta because the OVER_PROVISIONED streak
     threshold has not yet been reached.
     """

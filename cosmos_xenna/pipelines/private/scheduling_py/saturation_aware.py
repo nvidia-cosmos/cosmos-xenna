@@ -1597,15 +1597,11 @@ class SaturationAwareScheduler:
         return intents
 
     def _refresh_cycle_bottleneck_context(self) -> None:
-        """Publish the current cycle's bottleneck context onto every stage state.
+        """Overwrite every stage's ``cycle_bottleneck_context`` with the current cycle's identity.
 
-        Called once per cycle from the bottleneck phase timer right
-        after :func:`identify_bottleneck` returns. Each stage's
-        ``cycle_bottleneck_context`` is overwritten with a fresh
-        ``BottleneckCycleContext``; the per-stage decision pipeline
-        and the classifier-trace / classifier-transition log lines
-        read it for the ``bottleneck=`` / ``upstream=`` diagnostic
-        fields.
+        A disengaged ``_last_bottleneck_meta`` (or a bottleneck name
+        no longer present in ``_stage_names``) is treated as no
+        bottleneck: every stage receives the no-bottleneck default.
         """
         meta = self._last_bottleneck_meta
         if meta is None or not meta.engaged or meta.stage_name is None:
@@ -1615,10 +1611,9 @@ class SaturationAwareScheduler:
         try:
             bottleneck_index = self._stage_names.index(meta.stage_name)
         except ValueError:
-            # Defensive: identify_bottleneck returned a stage name not in
-            # ``_stage_names`` (e.g. a stale meta after a stage list
-            # change). Treat the cycle as disengaged so the per-stage
-            # context never points at a missing stage.
+            # Stale meta after a stage list change: fall through to the
+            # no-bottleneck default so the per-stage context never
+            # points at a missing stage.
             for stage_state in self._stage_states.values():
                 stage_state.cycle_bottleneck_context = BottleneckCycleContext()
             return
@@ -1628,7 +1623,7 @@ class SaturationAwareScheduler:
                 continue
             stage_state.cycle_bottleneck_context = BottleneckCycleContext(
                 engaged=True,
-                self_upstream=stage_index < bottleneck_index,
+                is_upstream_of_bottleneck=stage_index < bottleneck_index,
             )
 
     def _set_stuck_plan_counter(self, stage_name: str, value: int, *, last_intent: int) -> None:
