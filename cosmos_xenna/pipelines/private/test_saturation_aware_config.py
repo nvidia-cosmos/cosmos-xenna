@@ -90,11 +90,6 @@ class TestSaturationAwareStageConfigFieldValidators:
         with pytest.raises(ValueError):
             SaturationAwareStageConfig(slots_empty_ratio_smoothing_level=0.0)
 
-    def test_acquiring_growth_factor_zero_is_rejected(self) -> None:
-        """Multiplicative growth factor must be > 0; zero would never grow."""
-        with pytest.raises(ValueError):
-            SaturationAwareStageConfig(acquiring_critical_growth_factor=0.0)
-
     def test_min_workers_zero_is_rejected(self) -> None:
         """``validate_optional_positive_int`` rejects 0 (cannot disable the implicit floor)."""
         with pytest.raises(ValueError, match="must be >= 1"):

@@ -148,7 +148,8 @@ class TestCriticalScaleUpPath:
     def test_zero_ratio_triggers_critical_acquiring_growth(self, cfg: SaturationAwareStageConfig) -> None:
         """All slots full + queue pending -> CRITICAL -> fires immediately at streak=1.
 
-        ACQUIRING + CRITICAL: ceil(0.5 * 4) = 2; cap=4 doesn't bite.
+        Cold-start path (no D_k yet, so ``capacity_target_workers`` is
+        ``None``): the discrete fallback emits +1 per cycle.
         """
         state = _fresh_state(cfg)
         delta = _advance_cycle(
@@ -159,7 +160,7 @@ class TestCriticalScaleUpPath:
             current_workers=4,
             config=cfg,
         )
-        assert delta == 2
+        assert delta == 1
         assert state.classifier_state is StageState.SATURATED_CRITICAL
         # Growth fires; growth_mode stays in ACQUIRING (no shrink event).
         assert state.growth_mode is GrowthMode.ACQUIRING
@@ -186,7 +187,8 @@ class TestSaturatedScaleUpPath:
     def test_second_cycle_saturated_fires_growth(self, cfg: SaturationAwareStageConfig) -> None:
         """Two consecutive SATURATED cycles -> streak=2 -> fire.
 
-        ACQUIRING + SATURATED: ceil(0.25 * 4) = 1.
+        Cold-start path (no D_k yet, so ``capacity_target_workers`` is
+        ``None``): the discrete fallback emits +1.
         """
         state = _fresh_state(cfg)
         run_per_stage_pipeline(  # cycle 1: streak goes to 1
@@ -237,7 +239,7 @@ class TestOverProvisionedShrinkPath:
             config=cfg,
         )
         assert state.classifier_streak == 30
-        # 10 workers, fraction=0.05 -> floor(0.5)=0, max(1, 0)=1 -> -1.
+        # Cold-start fallback (no D_k yet) shrinks by exactly one worker.
         assert delta == -1
         # ACQUIRING + first shrink -> TRACKING.
         assert state.growth_mode is GrowthMode.TRACKING

@@ -128,18 +128,22 @@ steady-state, and bounded oscillation after over-provisioning.
         └───────┘
 ```
 
-Scale-up magnitude per `(mode, classifier)` cell (every cell is
-then clamped to `aggressive_growth_max_per_cycle`):
+Grow-gate effect per `(mode, classifier)` cell. The magnitude
+itself comes from the capacity sizer (see
+[`28-capacity-sizer.md`](28-capacity-sizer.md)); the mode is a
+binary gate on top of it:
 
-| Mode        | `SATURATED`                                                                          | `SATURATED_CRITICAL`                                                                |
+| Mode        | `SATURATED`        | `SATURATED_CRITICAL` |
 |---|---|---|
-| `ACQUIRING` | `+ceil(acquiring_saturated_growth_factor * current)` (default `+ceil(0.25 * cur)`)   | `+ceil(acquiring_critical_growth_factor * current)` (default `+ceil(0.50 * cur)`)   |
-| `TRACKING`  | `tracking_saturated_growth_count` (default `+1`)                                     | `tracking_critical_growth_count` (default `+2`)                                     |
-| `HOLD`      | `hold_saturated_growth_count` (default `0`)                                          | `hold_critical_growth_count` (default `+1`)                                         |
+| `ACQUIRING` | grow allowed       | grow allowed         |
+| `TRACKING`  | grow allowed       | grow allowed         |
+| `HOLD`      | grow blocked (0)   | grow allowed         |
 
-`OVER_PROVISIONED` shrink magnitude is independent of mode
-(see `_shrink_delta` in `decisions.py`); `NORMAL` always
-emits zero regardless of mode.
+`OVER_PROVISIONED` shrink magnitude is independent of mode;
+`NORMAL` always emits zero regardless of mode. The per-cycle
+shortfall and excess against the capacity target are clamped by
+`aggressive_growth_max_per_cycle` and
+`max_scale_down_fraction_per_cycle` respectively.
 
 ## How it works
 
@@ -158,39 +162,29 @@ the executed delta. The rule is exhaustive over
 | `TRACKING`   | `delta_executed >= 0`                                                  | `TRACKING`  | `streak + 1`  |
 | `HOLD`       | `delta_executed >= 0` and `streak <  stabilization_window_cycles_down` | `HOLD`      | `streak + 1`  |
 
-The mode is consumed by `compute_delta` on the *next* cycle.
-Its `_critical_delta` and `_saturated_delta` helpers branch on
-the mode to pick from the multiplicative / additive / hold-only
-counts, then clamp by `aggressive_growth_max_per_cycle`. There
-is no path back from `TRACKING` or `HOLD` to `ACQUIRING`: once
-the ceiling is observed, multiplicative growth is permanently
-off. Cold-start stages begin in `ACQUIRING` with
-`growth_streak = 0` (the sentinel set by `_StageRuntimeState`);
-the first cycle that records a non-shrink delta promotes the
-streak to `1`.
+The mode is consumed by `compute_delta` on the *next* cycle as
+a binary grow-gate. There is no path back from `TRACKING` or
+`HOLD` to `ACQUIRING`: once the ceiling is observed, the system
+remains in the post-discovery regime. Cold-start stages begin in
+`ACQUIRING` with `growth_streak = 0` (the sentinel set by
+`_StageRuntimeState`); the first cycle that records a non-shrink
+delta promotes the streak to `1`.
 
 ## Knobs
 
 All knobs live on `SaturationAwareStageConfig` in
 [`specs.py`](../../../cosmos_xenna/pipelines/private/specs.py).
 
-| Field                                | Default | Role                                                                                       |
+| Field                              | Default | Role                                                                                     |
 |---|---|---|
-| `acquiring_saturated_growth_factor`  | `0.25`  | `ACQUIRING` + `SATURATED` multiplicative factor; `delta = ceil(factor * current_workers)`. |
-| `acquiring_critical_growth_factor`   | `0.50`  | `ACQUIRING` + `SATURATED_CRITICAL` multiplicative factor.                                  |
-| `tracking_saturated_growth_count`    | `1`     | `TRACKING` + `SATURATED` additive count.                                                   |
-| `tracking_critical_growth_count`     | `2`     | `TRACKING` + `SATURATED_CRITICAL` additive count.                                          |
-| `hold_saturated_growth_count`        | `0`     | `HOLD` + `SATURATED` count. Default `0` blocks non-critical growth during stabilization.   |
-| `hold_critical_growth_count`         | `1`     | `HOLD` + `SATURATED_CRITICAL` count. Allows minimal burst response while held.             |
-| `aggressive_growth_max_per_cycle`    | `4`     | Hard ceiling applied to every grow path so multiplicative growth cannot run away.          |
-| `stabilization_window_cycles_down`   | `30`    | Cycles `HOLD` must persist with no further shrink before returning to `TRACKING`.          |
+| `enable_growth_mode_state_machine` | `True`  | When `False`, HOLD is neutralised so SATURATED grow proceeds during the stabilization window. |
+| `aggressive_growth_max_per_cycle`  | `4`     | Hard ceiling on per-cycle additions; bounds the blast radius when capacity demand jumps.   |
+| `stabilization_window_cycles_down` | `30`    | Cycles `HOLD` must persist with no further shrink before returning to `TRACKING`.          |
 
-Operators tuning a hot stage typically raise the `ACQUIRING`
-factors first, only widening `stabilization_window_cycles_down`
-if the stage flaps between `HOLD` and growth. The hold counts
-default to "block all non-critical growth, allow `+1` burst";
-both can be tuned independently if a workload needs forward
-progress while in stabilization.
+Operators tune the per-cycle blast radius via
+`aggressive_growth_max_per_cycle`. If a stage flaps between
+`HOLD` and growth, widen `stabilization_window_cycles_down` to
+extend the cooldown.
 
 ## See also
 

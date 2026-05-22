@@ -67,6 +67,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.allocation_failures import emi
 from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
+    derive_utilization_target,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
     BottleneckCycleContext,
@@ -98,6 +99,9 @@ from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryP
 from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
     record_executed_delta,
     run_per_stage_pipeline,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.pressure import (
+    compute_capacity_target_workers,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.regime import (
     EXIT_BAND_MULTIPLIER,
@@ -1537,6 +1541,14 @@ class SaturationAwareScheduler:
             cycle_has_fresh_sample = num_used_slots + num_empty_slots > 0
             if cycle_has_fresh_sample:
                 stage_state.valid_signal_samples = min(stage_state.valid_signal_samples + 1, stage_cfg.min_data_points)
+            stage_state.capacity_target_workers = self._refresh_capacity_target_workers(
+                stage_state=stage_state,
+                stage_cfg=stage_cfg,
+                input_queue_depth=runtime_stage.input_queue_depth,
+                observed_throughput=throughput_samples.get(stage_name, 0.0),
+                slots_per_worker=runtime_stage.slots_per_worker,
+                stage_name=stage_name,
+            )
             delta = run_per_stage_pipeline(
                 stage_state=stage_state,
                 num_used_slots=num_used_slots,
@@ -1596,6 +1608,48 @@ class SaturationAwareScheduler:
             intents[stage_name] = delta
         return intents
 
+    def _refresh_capacity_target_workers(
+        self,
+        *,
+        stage_state: _StageRuntimeState,
+        stage_cfg: SaturationAwareStageConfig,
+        input_queue_depth: int,
+        observed_throughput: float,
+        slots_per_worker: int,
+        stage_name: str,
+    ) -> int | None:
+        """Return the capacity-sized worker target for one stage in this cycle.
+
+        ``None`` if either ``D_k`` is unobservable (cold start) or
+        ``resolved_thresholds`` is not yet populated; the caller stores
+        the return value on ``stage_state`` and ``compute_delta`` uses
+        ``None`` as the discrete-fallback sentinel.
+
+        Args:
+            stage_state: Per-stage runtime state, read for the
+                resolved thresholds.
+            stage_cfg: Per-stage saturation config.
+            input_queue_depth: Tasks waiting upstream this cycle.
+            observed_throughput: Per-cycle completed tasks/sec sample.
+            slots_per_worker: Concurrent slots per worker for this stage.
+            stage_name: Stage label used to look up the cached ``D_k``.
+
+        Returns:
+            Target worker count, or ``None`` when D_k is unobservable
+            or thresholds have not resolved yet.
+        """
+        if stage_state.resolved_thresholds is None:
+            return None
+        d_k_seconds = self._d_k_ewma.get(stage_name, math.nan)
+        return compute_capacity_target_workers(
+            queue_depth=input_queue_depth,
+            observed_throughput=observed_throughput,
+            d_k_seconds=d_k_seconds,
+            slots_per_worker=slots_per_worker,
+            target_backlog_seconds=stage_cfg.target_backlog_seconds,
+            utilization_target=derive_utilization_target(stage_state.resolved_thresholds),
+        )
+
     def _refresh_cycle_bottleneck_context(self) -> None:
         """Overwrite every stage's ``cycle_bottleneck_context`` with the current cycle's identity.
 
@@ -1618,10 +1672,10 @@ class SaturationAwareScheduler:
                 stage_state.cycle_bottleneck_context = BottleneckCycleContext()
             return
         for stage_index, stage_name in enumerate(self._stage_names):
-            stage_state = self._stage_states.get(stage_name)
-            if stage_state is None:
+            looked_up_state = self._stage_states.get(stage_name)
+            if looked_up_state is None:
                 continue
-            stage_state.cycle_bottleneck_context = BottleneckCycleContext(
+            looked_up_state.cycle_bottleneck_context = BottleneckCycleContext(
                 engaged=True,
                 is_upstream_of_bottleneck=stage_index < bottleneck_index,
             )

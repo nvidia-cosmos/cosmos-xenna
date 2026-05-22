@@ -39,10 +39,10 @@ The signal needed is the **queue-time** observable — "how long would
 the current queue take to drain at the current throughput?" That
 number says where the stage is heading; the empty-slot ratio says
 where it is right now. The two are the principal observables that
-[Little's Law](https://en.wikipedia.org/wiki/Little%27s_law) connects:
-`L = lambda * W`, where `L` is queue length, `lambda` is arrival
-rate, and `W` is the per-task waiting time. They tell complementary
-stories and either one alone misclassifies real workloads.
+Little's Law connects: `L = lambda * W`, where `L` is queue length,
+`lambda` is arrival rate, and `W` is the per-task waiting time. They
+tell complementary stories and either one alone misclassifies real
+workloads.
 
 ## Decision
 
@@ -173,7 +173,7 @@ All on
 
 | Knob | Default | Effect |
 |---|---|---|
-| `target_backlog_seconds` | `30.0` | Operator-facing primary knob. Drain-time at which `normalized_backlog == 1.0`. Higher = more conservative; lower = more aggressive. |
+| `target_backlog_seconds` | `30.0` | Operator-facing primary knob. Drain-time at which `normalized_backlog == 1.0`; the same knob also sets the capacity sizer's drain term (see [28 — Capacity sizer](28-capacity-sizer.md)). Higher = more conservative; lower = more aggressive. |
 | `pressure_smoothing_level` | `0.20` | EWMA alpha on the composite pressure scalar. Lower = smoother (filters throughput noise); higher = more reactive. Bounded `(0.0, 1.0]`. |
 | `pressure_critical_threshold` | `2.0` | Pressure above which a slot-pin `SATURATED_CRITICAL` actually fires. Strictly larger than `pressure_saturation_threshold`. |
 | `pressure_saturation_threshold` | `1.0` | Pressure above which a slot-pin `SATURATED` actually fires. |
@@ -202,8 +202,3 @@ pressure_critical_threshold ≤ BACKLOG_CAP   (= 3.0)
   read to audit classifier decisions.
 - [tuning.md](tuning.md) — workload-class tuning advice including
   `target_backlog_seconds` calibration.
-- [Little's Law](https://en.wikipedia.org/wiki/Little%27s_law) —
-  external reference for the queue-time observable.
-- [Cloud Dataflow Streaming Engine autoscaling](https://cloud.google.com/dataflow/docs/streaming-engine)
-  — external reference for the original `backlog_time` autoscaler
-  signal.

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"""Backlog-time pressure signal for the saturation-aware classifier.
+"""Backlog-time pressure signal and capacity sizer for the saturation-aware scheduler.
 
 Pressure is ``utilisation * normalized_backlog`` (Little's Law
 ``W_q = queue / throughput`` divided by ``target_backlog_seconds``);
@@ -37,7 +37,16 @@ as a demotion gate inside the existing slot-ratio branches:
 
 The Prometheus gauges below expose the raw inputs and the smoothed
 output for operator audit.
+
+The :func:`compute_capacity_target_workers` helper sits alongside the
+pressure pipeline and answers a different question: given the same
+queueing inputs (queue depth, observed throughput, per-task service
+time, target drain time, operating utilisation), how many workers
+does the stage need? Its output drives the magnitude of
+``compute_delta``.
 """
+
+import math
 
 from ray.util.metrics import Gauge
 
@@ -194,12 +203,81 @@ def compute_backlog_time(
     return input_queue_depth / observed_throughput
 
 
+def compute_capacity_target_workers(
+    *,
+    queue_depth: int,
+    observed_throughput: float,
+    d_k_seconds: float,
+    slots_per_worker: int,
+    target_backlog_seconds: float,
+    utilization_target: float,
+) -> int | None:
+    """Return the worker count required to clear the backlog at the target rate.
+
+    Forced Flow Law applied to a queue with a drain target:
+
+    ::
+
+        target_rate    = observed_throughput + (queue_depth / target_backlog_seconds)
+                         (tasks/sec)            (tasks/sec)
+        target_slots   = ceil((target_rate * d_k_seconds) / utilization_target)
+        target_workers = ceil(target_slots / slots_per_worker)
+
+    The drain term ``queue_depth / target_backlog_seconds`` is the
+    extra arrival-rate equivalent needed to flush the existing backlog
+    within ``target_backlog_seconds``; adding it to
+    ``observed_throughput`` keeps both contributions in tasks/sec.
+
+    Args:
+        queue_depth: Tasks waiting upstream of the stage. ``>= 0``.
+        observed_throughput: Per-cycle completed tasks/sec sample. ``>= 0``.
+        d_k_seconds: Forced-Flow service time. ``<= 0`` or non-finite is
+            the cold-start sentinel and returns ``None``.
+        slots_per_worker: Concurrent task slots per worker. ``>= 1``.
+        target_backlog_seconds: Drain target for the queue component.
+            Must be strictly positive.
+        utilization_target: Operating utilisation in ``(0, 1]``.
+
+    Returns:
+        Required worker count (``>= 0``), or ``None`` when ``d_k_seconds``
+        is unobservable so the caller can fall back to discrete sizing.
+
+    Raises:
+        ValueError: For negative ``queue_depth`` or ``observed_throughput``,
+            ``slots_per_worker < 1``, non-positive ``target_backlog_seconds``,
+            or ``utilization_target`` outside ``(0, 1]``.
+
+    """
+    if queue_depth < 0:
+        msg = f"queue_depth must be >= 0, got {queue_depth}"
+        raise ValueError(msg)
+    if observed_throughput < 0.0:
+        msg = f"observed_throughput must be >= 0, got {observed_throughput}"
+        raise ValueError(msg)
+    if slots_per_worker < 1:
+        msg = f"slots_per_worker must be >= 1, got {slots_per_worker}"
+        raise ValueError(msg)
+    if target_backlog_seconds <= 0.0:
+        msg = f"target_backlog_seconds must be > 0, got {target_backlog_seconds}"
+        raise ValueError(msg)
+    if not (0.0 < utilization_target <= 1.0):
+        msg = f"utilization_target must be in (0, 1], got {utilization_target}"
+        raise ValueError(msg)
+    if not math.isfinite(d_k_seconds) or d_k_seconds <= 0.0:
+        return None
+
+    target_rate = observed_throughput + (queue_depth / target_backlog_seconds)
+    target_slots = math.ceil((target_rate * d_k_seconds) / utilization_target)
+    return math.ceil(target_slots / slots_per_worker)
+
+
 __all__ = [
     "BACKLOG_CAP",
     "PRESSURE_BACKLOG_TIME_METRIC",
     "PRESSURE_EWMA_METRIC",
     "PRESSURE_OBSERVED_THROUGHPUT_METRIC",
     "compute_backlog_time",
+    "compute_capacity_target_workers",
     "compute_pressure",
     "emit_pressure_signals",
 ]

@@ -23,17 +23,10 @@ Default per-stage thresholds at the time of writing:
   saturated_critical_streak_min_cycles = 1
   saturated_streak_min_cycles = 2
   over_provisioned_streak_min_cycles = 30
-  acquiring_critical_growth_factor = 0.5
-  acquiring_saturated_growth_factor = 0.25
-  tracking_critical_growth_count = 2
-  tracking_saturated_growth_count = 1
-  hold_critical_growth_count = 1
-  hold_saturated_growth_count = 0
   aggressive_growth_max_per_cycle = 4
   max_scale_down_fraction_per_cycle = 0.05
 """
 
-import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.decisions import (
@@ -103,10 +96,7 @@ class TestShouldFireActionScaleUp:
 class TestShouldFireActionScaleDown:
     """Conservative scale-down threshold (OVER_PROVISIONED = 30 by default)."""
 
-    def test_over_provisioned_does_not_fire_below_threshold(
-        self,
-        cfg: SaturationAwareStageConfig,
-    ) -> None:
+    def test_over_provisioned_does_not_fire_below_threshold(self, cfg: SaturationAwareStageConfig) -> None:
         """OVER_PROVISIONED at streak 29 < min 30 -> hold; protects against premature shrink."""
         assert should_fire_action(StageState.OVER_PROVISIONED, streak=29, config=cfg) is False
 
@@ -124,154 +114,231 @@ class TestShouldFireActionNormal:
         assert should_fire_action(StageState.NORMAL, streak=10**6, config=cfg) is False
 
 
-class TestComputeDeltaCriticalScaleUp:
-    """SATURATED_CRITICAL -> burst scale-up magnitude per growth mode."""
+class TestComputeDeltaCapacityDrivenGrow:
+    """SATURATED / SATURATED_CRITICAL scale-up magnitude is the capacity gap."""
 
-    def test_acquiring_uses_multiplicative_factor(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING mode: delta = ceil(0.5 * current_workers); current=4 -> +2."""
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.ACQUIRING, current_workers=4, config=cfg)
-        assert result == 2
+    def test_grow_returns_shortfall_to_capacity_target(self, cfg: SaturationAwareStageConfig) -> None:
+        """current=4, target=7 -> shortfall +3, below the per-cycle cap of 4."""
+        result = compute_delta(
+            StageState.SATURATED_CRITICAL,
+            GrowthMode.ACQUIRING,
+            current_workers=4,
+            capacity_target_workers=7,
+            config=cfg,
+        )
+        assert result == 3
 
-    def test_acquiring_uses_ceil_for_fractional_results(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING with current=3 -> ceil(0.5 * 3) = ceil(1.5) = 2."""
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.ACQUIRING, current_workers=3, config=cfg)
-        assert result == 2
-
-    def test_acquiring_clamped_by_aggressive_max_per_cycle(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING with current=100 -> ceil(50) capped at aggressive_growth_max_per_cycle (4)."""
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.ACQUIRING, current_workers=100, config=cfg)
+    def test_grow_clamped_by_aggressive_growth_max_per_cycle(self, cfg: SaturationAwareStageConfig) -> None:
+        """current=4, target=100 -> shortfall 96, clamped to aggressive_growth_max_per_cycle (4)."""
+        result = compute_delta(
+            StageState.SATURATED_CRITICAL,
+            GrowthMode.ACQUIRING,
+            current_workers=4,
+            capacity_target_workers=100,
+            config=cfg,
+        )
         assert result == cfg.aggressive_growth_max_per_cycle
 
-    def test_tracking_uses_absolute_count(self, cfg: SaturationAwareStageConfig) -> None:
-        """TRACKING mode uses tracking_critical_growth_count regardless of current_workers."""
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.TRACKING, current_workers=100, config=cfg)
-        assert result == cfg.tracking_critical_growth_count
-
-    def test_hold_emits_minimal_burst_response(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD mode allows a minimal burst response on CRITICAL (default = 1)."""
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.HOLD, current_workers=10, config=cfg)
-        assert result == cfg.hold_critical_growth_count
-
-    def test_acquiring_with_zero_workers_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
-        """current_workers=0 -> ceil(0.5 * 0) = 0; the worker-floor step independently bootstraps to one.
-
-        Programmatic edge: the classifier returns SATURATED_CRITICAL for a
-        zero-actor stage (slots_empty_ratio = 0), but compute_delta is the
-        algorithm's intent and intentionally produces zero -- the implicit
-        one-worker floor bootstrap is owned by a separate phase.
-        """
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.ACQUIRING, current_workers=0, config=cfg)
+    def test_grow_returns_zero_when_at_target(self, cfg: SaturationAwareStageConfig) -> None:
+        """current == target -> no further grow."""
+        result = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.ACQUIRING,
+            current_workers=8,
+            capacity_target_workers=8,
+            config=cfg,
+        )
         assert result == 0
 
-
-class TestComputeDeltaSaturatedScaleUp:
-    """SATURATED -> additive scale-up magnitude per growth mode."""
-
-    def test_acquiring_uses_multiplicative_factor(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING mode: delta = ceil(0.25 * current_workers); current=4 -> +1."""
-        result = compute_delta(StageState.SATURATED, GrowthMode.ACQUIRING, current_workers=4, config=cfg)
-        assert result == 1
-
-    def test_acquiring_clamped_by_aggressive_max_per_cycle(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING with current=100 -> ceil(25) capped at aggressive_growth_max_per_cycle (4)."""
-        result = compute_delta(StageState.SATURATED, GrowthMode.ACQUIRING, current_workers=100, config=cfg)
-        assert result == cfg.aggressive_growth_max_per_cycle
-
-    def test_tracking_uses_absolute_count(self, cfg: SaturationAwareStageConfig) -> None:
-        """TRACKING mode uses tracking_saturated_growth_count regardless of current_workers."""
-        result = compute_delta(StageState.SATURATED, GrowthMode.TRACKING, current_workers=100, config=cfg)
-        assert result == cfg.tracking_saturated_growth_count
-
-    def test_hold_suppresses_non_critical_growth(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD mode blocks non-critical growth (default hold_saturated_growth_count = 0)."""
-        result = compute_delta(StageState.SATURATED, GrowthMode.HOLD, current_workers=10, config=cfg)
+    def test_grow_returns_zero_when_above_target(self, cfg: SaturationAwareStageConfig) -> None:
+        """current > target -> classifier said SATURATED but the sizer disagrees; do not grow."""
+        result = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.TRACKING,
+            current_workers=10,
+            capacity_target_workers=8,
+            config=cfg,
+        )
         assert result == 0
 
-    def test_acquiring_with_zero_workers_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
-        """current_workers=0 in ACQUIRING -> ceil(0.25 * 0) = 0; mirror of the CRITICAL bootstrap edge."""
-        result = compute_delta(StageState.SATURATED, GrowthMode.ACQUIRING, current_workers=0, config=cfg)
+    def test_acquiring_and_tracking_produce_identical_magnitude(self, cfg: SaturationAwareStageConfig) -> None:
+        """Capacity-driven sizing collapses ACQUIRING and TRACKING to the same delta."""
+        acq = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.ACQUIRING,
+            current_workers=4,
+            capacity_target_workers=6,
+            config=cfg,
+        )
+        track = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.TRACKING,
+            current_workers=4,
+            capacity_target_workers=6,
+            config=cfg,
+        )
+        assert acq == track == 2
+
+
+class TestComputeDeltaHoldGate:
+    """HOLD blocks SATURATED grow but allows SATURATED_CRITICAL grow."""
+
+    def test_hold_blocks_saturated_grow(self, cfg: SaturationAwareStageConfig) -> None:
+        """HOLD + SATURATED -> 0 even when the capacity target asks for more workers."""
+        result = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.HOLD,
+            current_workers=4,
+            capacity_target_workers=10,
+            config=cfg,
+        )
         assert result == 0
 
+    def test_hold_allows_critical_grow(self, cfg: SaturationAwareStageConfig) -> None:
+        """HOLD + SATURATED_CRITICAL passes through; the capacity gap drives the magnitude."""
+        result = compute_delta(
+            StageState.SATURATED_CRITICAL,
+            GrowthMode.HOLD,
+            current_workers=4,
+            capacity_target_workers=6,
+            config=cfg,
+        )
+        assert result == 2
 
-class TestComputeDeltaOverProvisionedScaleDown:
-    """OVER_PROVISIONED -> shrink magnitude bounded by max_scale_down_fraction_per_cycle."""
 
-    def test_large_fleet_shrinks_by_fraction(self, cfg: SaturationAwareStageConfig) -> None:
-        """current=100, fraction=0.05 -> -5 (= floor(5.0))."""
-        result = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.TRACKING, current_workers=100, config=cfg)
+class TestComputeDeltaCapacityDrivenShrink:
+    """OVER_PROVISIONED shrink magnitude is the capacity excess, capped by the fraction limit."""
+
+    def test_shrink_returns_excess_below_fraction_cap(self, cfg: SaturationAwareStageConfig) -> None:
+        """current=20, target=18 -> excess 2; fraction cap floor(20*0.05)=1; shrink by 1."""
+        result = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=20,
+            capacity_target_workers=18,
+            config=cfg,
+        )
+        assert result == -1
+
+    def test_shrink_capped_by_fraction(self, cfg: SaturationAwareStageConfig) -> None:
+        """current=100, target=10 -> excess 90; fraction cap floor(100*0.05)=5; shrink by -5."""
+        result = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=100,
+            capacity_target_workers=10,
+            config=cfg,
+        )
         assert result == -5
 
-    def test_small_fleet_shrinks_by_at_least_one(self, cfg: SaturationAwareStageConfig) -> None:
-        """current=10, fraction=0.05 -> floor(0.5)=0, max(1, 0)=1 -> -1; never blocked by rounding."""
-        result = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.TRACKING, current_workers=10, config=cfg)
+    def test_shrink_floor_one_when_excess_present(self, cfg: SaturationAwareStageConfig) -> None:
+        """current=10, target=9 -> excess 1; fraction floor=0 -> max(1, 0)=1; -1 (never blocked by rounding)."""
+        result = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=10,
+            capacity_target_workers=9,
+            config=cfg,
+        )
         assert result == -1
+
+    def test_shrink_returns_zero_when_at_or_below_target(self, cfg: SaturationAwareStageConfig) -> None:
+        """OVER_PROVISIONED but already at the capacity target -> hold; classifier and sizer agree."""
+        result = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=10,
+            capacity_target_workers=10,
+            config=cfg,
+        )
+        assert result == 0
 
     def test_growth_mode_is_irrelevant_for_shrink(self, cfg: SaturationAwareStageConfig) -> None:
         """ACQUIRING/TRACKING/HOLD all produce the same shrink delta in OVER_PROVISIONED."""
-        acq = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.ACQUIRING, current_workers=20, config=cfg)
-        track = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.TRACKING, current_workers=20, config=cfg)
-        hold = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.HOLD, current_workers=20, config=cfg)
+        acq = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.ACQUIRING,
+            current_workers=20,
+            capacity_target_workers=10,
+            config=cfg,
+        )
+        track = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=20,
+            capacity_target_workers=10,
+            config=cfg,
+        )
+        hold = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.HOLD,
+            current_workers=20,
+            capacity_target_workers=10,
+            config=cfg,
+        )
         assert acq == track == hold
 
-    def test_at_implicit_floor_returns_negative_one_for_caller_to_clamp(
-        self,
-        cfg: SaturationAwareStageConfig,
-    ) -> None:
-        """current_workers=1 -> -1 (intent); caller clamps to 0 to respect one-worker floor.
 
-        compute_delta is the algorithm's intent, not the feasibility
-        check. The caller is responsible for refusing to apply the
-        delta when it would violate min_workers or the implicit
-        one-worker floor.
-        """
-        result = compute_delta(StageState.OVER_PROVISIONED, GrowthMode.TRACKING, current_workers=1, config=cfg)
+class TestComputeDeltaColdStartFallback:
+    """When the capacity target is unobservable, fall back to discrete +/-1 sizing."""
+
+    def test_saturated_critical_returns_plus_one(self, cfg: SaturationAwareStageConfig) -> None:
+        """No D_k yet -> SATURATED_CRITICAL grows by exactly one worker."""
+        result = compute_delta(
+            StageState.SATURATED_CRITICAL,
+            GrowthMode.ACQUIRING,
+            current_workers=4,
+            capacity_target_workers=None,
+            config=cfg,
+        )
+        assert result == 1
+
+    def test_saturated_returns_plus_one(self, cfg: SaturationAwareStageConfig) -> None:
+        """No D_k yet -> SATURATED grows by exactly one worker."""
+        result = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.TRACKING,
+            current_workers=4,
+            capacity_target_workers=None,
+            config=cfg,
+        )
+        assert result == 1
+
+    def test_over_provisioned_returns_minus_one(self, cfg: SaturationAwareStageConfig) -> None:
+        """No D_k yet -> OVER_PROVISIONED shrinks by exactly one worker."""
+        result = compute_delta(
+            StageState.OVER_PROVISIONED,
+            GrowthMode.TRACKING,
+            current_workers=4,
+            capacity_target_workers=None,
+            config=cfg,
+        )
         assert result == -1
 
-
-class TestComputeDeltaCapAppliesUniformly:
-    """``aggressive_growth_max_per_cycle`` is the hard ceiling on every scale-up path.
-
-    The cap protects the cluster from an operator who configures a
-    large absolute count or a large multiplicative factor without
-    realising the per-cycle blast radius. Each growth-mode path
-    (ACQUIRING / TRACKING / HOLD) must be subject to the same cap so
-    the design intent is preserved across config variations.
-    """
-
-    def test_tracking_critical_count_clamped_when_exceeds_cap(
-        self,
-        cfg: SaturationAwareStageConfig,
-    ) -> None:
-        """A custom tracking_critical_growth_count above the cap is clamped to the cap."""
-        cfg_loud = attrs.evolve(cfg, tracking_critical_growth_count=10)
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.TRACKING, current_workers=4, config=cfg_loud)
-        assert result == cfg_loud.aggressive_growth_max_per_cycle
-
-    def test_tracking_saturated_count_clamped_when_exceeds_cap(
-        self,
-        cfg: SaturationAwareStageConfig,
-    ) -> None:
-        """A custom tracking_saturated_growth_count above the cap is clamped to the cap."""
-        cfg_loud = attrs.evolve(cfg, tracking_saturated_growth_count=10)
-        result = compute_delta(StageState.SATURATED, GrowthMode.TRACKING, current_workers=4, config=cfg_loud)
-        assert result == cfg_loud.aggressive_growth_max_per_cycle
-
-    def test_hold_critical_count_clamped_when_exceeds_cap(
-        self,
-        cfg: SaturationAwareStageConfig,
-    ) -> None:
-        """A custom hold_critical_growth_count above the cap is clamped to the cap."""
-        cfg_loud = attrs.evolve(cfg, hold_critical_growth_count=10)
-        result = compute_delta(StageState.SATURATED_CRITICAL, GrowthMode.HOLD, current_workers=4, config=cfg_loud)
-        assert result == cfg_loud.aggressive_growth_max_per_cycle
+    def test_hold_blocks_cold_start_saturated(self, cfg: SaturationAwareStageConfig) -> None:
+        """HOLD + SATURATED with no D_k -> still blocked; the gate applies before the fallback."""
+        result = compute_delta(
+            StageState.SATURATED,
+            GrowthMode.HOLD,
+            current_workers=4,
+            capacity_target_workers=None,
+            config=cfg,
+        )
+        assert result == 0
 
 
 class TestComputeDeltaNoActionStates:
-    """NORMAL produces zero delta regardless of growth mode."""
+    """NORMAL produces zero delta regardless of growth mode and capacity target."""
 
     def test_normal_returns_zero(self, cfg: SaturationAwareStageConfig) -> None:
-        """NORMAL is the no-action zone."""
-        result = compute_delta(StageState.NORMAL, GrowthMode.ACQUIRING, current_workers=10, config=cfg)
+        """NORMAL is the no-action zone; capacity target is ignored."""
+        result = compute_delta(
+            StageState.NORMAL,
+            GrowthMode.ACQUIRING,
+            current_workers=10,
+            capacity_target_workers=20,
+            config=cfg,
+        )
         assert result == 0
 
 
@@ -281,4 +348,10 @@ class TestComputeDeltaInputValidation:
     def test_negative_current_workers_is_rejected(self, cfg: SaturationAwareStageConfig) -> None:
         """Defensive: negative worker count is a programmer bug, not a runtime concern."""
         with pytest.raises(ValueError, match="current_workers must be >= 0"):
-            compute_delta(StageState.SATURATED, GrowthMode.ACQUIRING, current_workers=-1, config=cfg)
+            compute_delta(
+                StageState.SATURATED,
+                GrowthMode.ACQUIRING,
+                current_workers=-1,
+                capacity_target_workers=4,
+                config=cfg,
+            )

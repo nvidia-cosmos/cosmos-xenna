@@ -523,24 +523,13 @@ class SaturationAwareStageConfig:
     # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
     over_provisioned_streak_min_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
 
-    # When True, per-stage growth mode (ACQUIRING / TRACKING / HOLD) shapes
-    # the per-cycle delta. When False, growth uses fixed TRACKING values.
+    # When True, HOLD blocks SATURATED grow during post-shrink stabilization.
+    # When False, HOLD has no effect and the stage grows whenever the
+    # capacity target exceeds the current worker count.
     enable_growth_mode_state_machine: bool = True
-    # ACQUIRING-mode multiplicative growth factor on SATURATED_CRITICAL:
-    # delta = ceil(factor * current_workers), capped by aggressive_growth_max_per_cycle.
-    acquiring_critical_growth_factor: float = attrs.field(default=0.5, validator=attrs.validators.gt(0.0))
-    # ACQUIRING-mode multiplicative growth factor on SATURATED.
-    acquiring_saturated_growth_factor: float = attrs.field(default=0.25, validator=attrs.validators.gt(0.0))
-    # TRACKING-mode absolute growth count on SATURATED_CRITICAL.
-    tracking_critical_growth_count: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
-    # TRACKING-mode absolute growth count on SATURATED.
-    tracking_saturated_growth_count: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
-    # HOLD-mode growth count on SATURATED_CRITICAL (HOLD allows only burst response).
-    hold_critical_growth_count: int = attrs.field(default=1, validator=attrs.validators.ge(0))
-    # HOLD-mode growth count on SATURATED (typically zero so HOLD blocks
-    # all non-critical growth during post-shrink stabilization).
-    hold_saturated_growth_count: int = attrs.field(default=0, validator=attrs.validators.ge(0))
     # Hard cap on the per-cycle additions any growth decision may produce.
+    # Bounds the blast radius when the capacity target jumps far above
+    # the current worker count (e.g. on a sudden burst of upstream load).
     aggressive_growth_max_per_cycle: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
 
     # Weight on the NEW sample in the EWMA recursion:

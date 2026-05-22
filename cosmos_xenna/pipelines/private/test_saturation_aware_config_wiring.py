@@ -660,44 +660,42 @@ class TestBottleneckDecisionFields:
 
 
 class TestGrowthModeStateMachineKillSwitch:
-    """``enable_growth_mode_state_machine=False`` forces TRACKING magnitudes."""
+    """``enable_growth_mode_state_machine=False`` neutralises HOLD's grow block."""
 
-    def test_disabled_forces_tracking_magnitude_even_when_state_is_acquiring(self) -> None:
-        """A pre-existing ACQUIRING state does not change magnitude when the kill switch is off.
+    def test_disabled_lets_hold_state_grow_on_saturated(self) -> None:
+        """HOLD + SATURATED with the kill switch off -> the capacity-driven delta is honoured.
 
-        With a large worker count (32) the ACQUIRING multiplicative path
-        produces +8 (clamped by aggressive_growth_max_per_cycle=4 -> +4),
-        while TRACKING produces +2 (``tracking_critical_growth_count``).
-        Disabling the state machine must pin the magnitude to the TRACKING
-        value regardless of ``growth_mode``.
+        With the kill switch on, HOLD blocks SATURATED grow (delta=0).
+        With the kill switch off, the magnitude calculation receives
+        ``TRACKING`` and the capacity-driven sizer drives the delta;
+        a non-zero result pins that the kill switch defeated HOLD's
+        binary block.
         """
         stage_cfg = SaturationAwareStageConfig(
             enable_growth_mode_state_machine=False,
-            saturated_critical_streak_min_cycles=1,
+            saturated_streak_min_cycles=1,
             min_data_points=1,
             worker_warmup_measurement_grace_s=0.0,
         )
         state = _resolved_state(config=stage_cfg)
-        state.growth_mode = GrowthMode.ACQUIRING
-        state.classifier_state = StageState.SATURATED_CRITICAL
+        state.growth_mode = GrowthMode.HOLD
+        state.classifier_state = StageState.SATURATED
         state.classifier_streak = 5
+        # Capacity target exceeds current_workers so the sizer-driven delta is positive.
+        state.capacity_target_workers = 10
 
-        # SATURATED_CRITICAL fires on a non-empty input queue + zero empty slots.
-        # tracking_critical_growth_count=2; ACQUIRING+SATURATED_CRITICAL on 32 workers
-        # is ceil(0.5 * 32)=16 clamped to aggressive_growth_max_per_cycle=4. So a +2
-        # answer pins the TRACKING path; +4 would mean ACQUIRING leaked through.
+        # Slot signal in the SATURATED zone (ratio between activation_threshold
+        # and saturation_threshold), high pressure prevents demotion to NORMAL.
         delta = run_per_stage_pipeline(
             stage_state=state,
-            num_used_slots=32 * 8,
-            num_empty_slots=0,
+            num_used_slots=19,
+            num_empty_slots=1,
             input_queue_depth=100,
-            current_workers=32,
+            current_workers=4,
             config=stage_cfg,
         )
 
-        assert delta == stage_cfg.tracking_critical_growth_count, (
-            f"Kill switch did not force TRACKING magnitude; got delta={delta}"
-        )
+        assert delta > 0, f"Kill switch did not neutralise HOLD; got delta={delta}"
 
     def test_disabled_skips_transition_so_state_does_not_drift(self) -> None:
         """``record_executed_delta`` is a no-op when the kill switch is off."""
@@ -820,12 +818,6 @@ class TestConfigWiringMetaCoverage:
         "saturated_streak_min_cycles",
         "saturated_critical_streak_min_cycles",
         "over_provisioned_streak_min_cycles",
-        "acquiring_critical_growth_factor",
-        "acquiring_saturated_growth_factor",
-        "tracking_critical_growth_count",
-        "tracking_saturated_growth_count",
-        "hold_critical_growth_count",
-        "hold_saturated_growth_count",
         "aggressive_growth_max_per_cycle",
         "slots_empty_ratio_smoothing_level",
         "stabilization_window_cycles_up",

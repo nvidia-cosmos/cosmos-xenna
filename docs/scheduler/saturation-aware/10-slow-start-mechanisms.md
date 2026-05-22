@@ -110,32 +110,27 @@ from `_run_phase_b_floor`) **bypasses** this layer. A floor miss is
 a hard structural failure — deadlocking the cluster on
 warmup-protected donors is worse than killing a young donor.
 
-### Layer 3 — growth-mode `ACQUIRING` → `TRACKING`
+### Layer 3 — growth-mode `ACQUIRING` → `TRACKING` → `HOLD`
 
-`compute_growth_mode_transition` (TCP slow-start analog) gates the
-per-cycle scale-up magnitude on a per-stage state machine seeded
-with `GrowthMode.ACQUIRING`. The mode stays put on any
+`compute_growth_mode_transition` gates the per-cycle scale-up
+magnitude on a per-stage state machine seeded with
+`GrowthMode.ACQUIRING`. The mode stays put on any
 `delta_executed >= 0` cycle. On the first cycle whose
 `delta_executed < 0` — i.e. Phase D actually shrunk the stage,
 which only happens after an `OVER_PROVISIONED` streak fires — the
-mode transitions to `TRACKING`. The cold-start protection comes
-from the magnitude table in
-[`decisions.py`](../../../cosmos_xenna/pipelines/private/scheduling_py/decisions.py):
+mode transitions to `TRACKING`. Subsequent shrinks transition
+`TRACKING -> HOLD`, which blocks `SATURATED` grow for
+`stabilization_window_cycles_down` cycles before returning to
+`TRACKING`. `SATURATED_CRITICAL` is never blocked, so a true burst
+can still grow during the cool-down window.
 
-- `ACQUIRING` uses multiplicative scale-up
-  (`ceil(acquiring_*_growth_factor * current)`), capped by
-  `aggressive_growth_max_per_cycle`. The stage discovers its
-  saturation ceiling fast.
-- `TRACKING` uses additive scale-up (`+tracking_*_growth_count`).
-  Once the stage has overshot once, a cold-start EWMA blip on a
-  re-saturated stage can no longer trigger a multiplicative
-  rebound; per-cycle growth is bounded at the additive count.
-
-Subsequent shrinks transition `TRACKING -> HOLD`, which suppresses
-non-critical growth for `stabilization_window_cycles_down` cycles
-before returning to `TRACKING`. See
+The grow magnitude itself is the closed-form capacity gap from
+[`28-capacity-sizer.md`](28-capacity-sizer.md), bounded by
+`aggressive_growth_max_per_cycle`. The growth mode therefore acts
+as a binary gate on top of the sizer rather than carrying its own
+magnitude. See
 [11-growth-mode-state-machine.md](11-growth-mode-state-machine.md)
-for the full transition diagram and per-mode magnitude table.
+for the full transition diagram.
 
 ## Knobs
 
@@ -143,9 +138,7 @@ for the full transition diagram and per-mode magnitude table.
 |---|---|---|
 | `worker_warmup_measurement_grace_s` | `60.0` | Layer 1: seconds a freshly-READY worker is excluded from EWMA contribution. Setting to `0` disables Layer 1. |
 | `donor_warmup_grace_s` | `180.0` | Layer 2: seconds a freshly-READY worker is excluded from saturation-mode donor and Phase D victim selection. Cross-field: must be `>= worker_warmup_measurement_grace_s`. Setting to `0` disables Layer 2. |
-| `acquiring_critical_growth_factor` | `0.5` | Layer 3: multiplicative scale-up factor in `ACQUIRING` mode on `SATURATED_CRITICAL`. |
-| `acquiring_saturated_growth_factor` | `0.25` | Layer 3: multiplicative scale-up factor in `ACQUIRING` mode on `SATURATED`. |
-| `aggressive_growth_max_per_cycle` | `4` | Layer 3: hard cap on any single-cycle scale-up, so large stages cannot double in one cycle while in `ACQUIRING`. |
+| `aggressive_growth_max_per_cycle` | `4` | Layer 3: hard cap on any single-cycle scale-up; bounds the blast radius when capacity demand jumps. |
 | `stabilization_window_cycles_down` | (see config) | Layer 3 follow-on: cycles in `HOLD` before returning to `TRACKING`; tunes post-shrink stabilization. |
 
 Floor-mode donor selection always ignores Layer 2 regardless of the

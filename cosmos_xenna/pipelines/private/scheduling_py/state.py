@@ -133,6 +133,12 @@ class _StageRuntimeState:
             decision pipeline solely for diagnostic logging
             (``bottleneck=`` / ``upstream=`` fields on the
             classifier-trace and classifier-transition log lines).
+        capacity_target_workers: Closed-form target worker count from
+            ``compute_capacity_target_workers``, refreshed by the
+            orchestrator each cycle before
+            :func:`run_per_stage_pipeline`. ``None`` until the first
+            cycle that observes a finite ``D_k`` sample; the cold-start
+            sentinel triggers ``compute_delta``'s discrete +/-1 fallback.
 
     """
 
@@ -150,6 +156,7 @@ class _StageRuntimeState:
     cycle_bottleneck_context: BottleneckCycleContext = attrs.field(
         factory=BottleneckCycleContext,
     )
+    capacity_target_workers: int | None = None
 
 
 def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> float:

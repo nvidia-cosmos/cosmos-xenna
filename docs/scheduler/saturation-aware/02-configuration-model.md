@@ -192,10 +192,12 @@ Two per-stage knobs gate the classifier-driven action loop:
   a zero-worker stage because Phase B floor enforcement runs outside
   the gate.
 - ``enable_growth_mode_state_machine`` (default ``True``) - the
-  growth-mode kill switch. When ``False``, ``compute_delta`` always
-  uses ``GrowthMode.TRACKING`` magnitudes (additive +1 / +2) and
-  ``record_executed_delta`` skips the state machine update, so the
-  per-stage runtime state stays frozen at its construction-time
+  growth-mode kill switch. When ``True``, HOLD blocks SATURATED grow
+  during the post-shrink stabilization window (SATURATED_CRITICAL is
+  always allowed). When ``False``, ``compute_delta`` receives
+  ``GrowthMode.TRACKING`` so HOLD's binary block is neutralised,
+  and ``record_executed_delta`` skips the state-machine update so
+  the per-stage runtime state stays frozen at its construction-time
   defaults. Re-enabling the flag mid-run resumes from ACQUIRING.
 
 ### Backlog-time pressure gate

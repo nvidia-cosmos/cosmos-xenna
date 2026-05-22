@@ -15,9 +15,12 @@
 
 """Slow-start growth-mode state machine.
 
-Three modes shape how aggressively the scheduler scales up a stage.
-Mode transitions depend on the final delta the caller actually applied,
-not on the classifier state alone:
+Three modes orchestrate post-shrink stabilization for a stage. The
+capacity-driven sizer in ``compute_delta`` reads the mode as a binary
+gate: HOLD blocks SATURATED grow during the stabilization window;
+ACQUIRING and TRACKING let SATURATED grow proceed. SATURATED_CRITICAL
+is never blocked. Mode transitions depend on the final delta the
+caller actually applied, not on the classifier state alone:
 
 ::
 
@@ -63,15 +66,15 @@ Non-shrink transition table:
     | HOLD      | streak >= stabilization_window| TRACKING, streak=1   |
     +-----------+-------------------------------+----------------------+
 
-Scale-up intent by growth mode:
+Grow-gate effect by mode:
 
-    +-----------+-----------------------+------------------------------+
-    | mode      | SATURATED             | SATURATED_CRITICAL           |
-    +-----------+-----------------------+------------------------------+
-    | ACQUIRING | +ceil(0.25 * current) | +ceil(0.50 * current)        |
-    | TRACKING  | +1                    | +2                           |
-    | HOLD      |  0                    | +1                           |
-    +-----------+-----------------------+------------------------------+
+    +-----------+-------------------+--------------------+
+    | mode      | SATURATED grow    | SATURATED_CRITICAL |
+    +-----------+-------------------+--------------------+
+    | ACQUIRING | allowed           | allowed            |
+    | TRACKING  | allowed           | allowed            |
+    | HOLD      | blocked (delta=0) | allowed            |
+    +-----------+-------------------+--------------------+
 
 ``compute_growth_mode_transition`` is the pure-function transition rule.
 It returns the (mode, streak) pair for the next cycle.

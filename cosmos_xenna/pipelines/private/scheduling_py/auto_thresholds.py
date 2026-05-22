@@ -162,3 +162,31 @@ def _resolve_auto_thresholds(
         saturation_threshold_was_overridden=saturation_was_overridden,
         activation_threshold_was_overridden=activation_was_overridden,
     )
+
+
+def derive_utilization_target(resolved: ResolvedThresholds) -> float:
+    """Return the operating utilisation target the capacity sizer drives toward.
+
+    The classifier fires SATURATED when the empty-slot fraction drops
+    below ``saturation_threshold``, so the matching utilisation
+    boundary is ``1 - saturation_threshold``. Aiming the sizer at that
+    boundary keeps the steady-state plan inside the NORMAL zone and
+    avoids the classifier oscillating on the threshold.
+
+    Args:
+        resolved: Per-stage thresholds from ``_resolve_auto_thresholds``.
+
+    Returns:
+        Utilisation target in ``(0, 1)``.
+
+    Raises:
+        ValueError: If the derived value is not strictly inside ``(0, 1)``.
+
+    """
+    target = 1.0 - resolved.saturation_threshold
+    if not (0.0 < target < 1.0):
+        msg = (
+            f"derived utilization_target {target} outside (0, 1) (saturation_threshold={resolved.saturation_threshold})"
+        )
+        raise ValueError(msg)
+    return target

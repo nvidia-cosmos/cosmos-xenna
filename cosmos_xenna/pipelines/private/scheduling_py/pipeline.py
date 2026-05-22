@@ -190,11 +190,12 @@ def run_per_stage_pipeline(
     stage_state.classifier_state = new_classifier_state
 
     # Growth-mode kill switch: when the state machine is disabled, force
-    # the magnitude calculation to use ``TRACKING`` (additive +1 / +2) so
-    # ACQUIRING multiplicative growth and HOLD post-shrink suppression do
-    # not influence the per-cycle decision. ``record_executed_delta`` is
-    # still called by the scheduler, but with the kill switch off it
-    # short-circuits to a no-op (see that function's body).
+    # the magnitude calculation to use ``TRACKING`` so HOLD post-shrink
+    # suppression does not block SATURATED growth. ACQUIRING vs TRACKING
+    # are interchangeable in the capacity-driven sizer, so any non-HOLD
+    # value is sufficient. ``record_executed_delta`` is still called by
+    # the scheduler, but with the kill switch off it short-circuits to a
+    # no-op (see that function's body).
     effective_growth_mode = stage_state.growth_mode if config.enable_growth_mode_state_machine else GrowthMode.TRACKING
 
     should_fire = should_fire_action(new_classifier_state, stage_state.classifier_streak, config)
@@ -203,6 +204,7 @@ def run_per_stage_pipeline(
             new_classifier_state,
             effective_growth_mode,
             current_workers,
+            stage_state.capacity_target_workers,
             config,
         )
     else:
@@ -260,11 +262,10 @@ def record_executed_delta(
 
     When ``config.enable_growth_mode_state_machine`` is ``False`` the
     state machine is short-circuited - neither ``growth_mode`` nor
-    ``growth_streak`` is mutated. ``run_per_stage_pipeline`` already
-    forces ``TRACKING`` magnitudes in that mode, so leaving the runtime
-    state frozen at its construction-time defaults keeps the per-stage
-    history clean and re-enabling the flag mid-run resumes from the
-    original ACQUIRING entry point rather than from a stale HOLD/etc.
+    ``growth_streak`` is mutated. Leaving the runtime state frozen at
+    its construction-time defaults keeps the per-stage history clean,
+    so re-enabling the flag mid-run resumes from the original
+    ACQUIRING entry point rather than from a stale HOLD.
 
     Args:
         stage_state: Per-stage runtime state. Only

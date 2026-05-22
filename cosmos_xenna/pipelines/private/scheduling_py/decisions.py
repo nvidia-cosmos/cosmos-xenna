@@ -30,10 +30,10 @@ step:
     state has reached its configured action threshold (asymmetric:
     aggressive scale-up, conservative scale-down).
   - ``compute_delta``: produces the worker count delta given the
-    current classifier state, growth mode, and worker count. The
-    caller is responsible for clamping by per-stage min/max,
-    per-node caps, and cluster capacity; this function only encodes
-    the algorithm's intent.
+    current classifier state, growth mode, current worker count, and
+    the closed-form capacity target. The caller is responsible for
+    clamping by per-stage min/max, per-node caps, and cluster
+    capacity; this function only encodes the algorithm's intent.
 
 All three are pure functions of their inputs so they can be tested
 in isolation without scheduler context.
@@ -105,31 +105,34 @@ def compute_delta(
     state: StageState,
     growth_mode: GrowthMode,
     current_workers: int,
+    capacity_target_workers: int | None,
     config: SaturationAwareStageConfig,
 ) -> int:
     """Return the unclamped worker count delta for this cycle.
 
-    Positive = scale-up; negative = scale-down; zero = no scale
-    action. The caller is responsible for clamping by per-stage
-    min/max, per-node caps, and cluster capacity; this function only
-    encodes the algorithm's intent, not the feasibility check.
+    Capacity-driven: the magnitude is the gap between the current
+    worker count and the closed-form
+    ``compute_capacity_target_workers`` target, clamped by the
+    blast-radius caps. Growth mode acts as a binary gate: HOLD blocks
+    SATURATED grow, SATURATED_CRITICAL is allowed even in HOLD.
 
     Args:
         state: Current classifier output. NORMAL produces zero
             (no scale action).
-        growth_mode: Per-stage growth controller mode (ACQUIRING,
-            TRACKING, HOLD). Determines the magnitude of scale-up.
+        growth_mode: Per-stage growth controller mode. Only HOLD has
+            magnitude effect (binary block on SATURATED grow);
+            ACQUIRING and TRACKING produce identical magnitudes.
         current_workers: Worker count before this cycle's decision.
-            Must be ``>= 0``. Used as a base for multiplicative
-            growth in ACQUIRING mode and the fraction-based scale-down
-            cap in OVER_PROVISIONED state.
-        config: Per-stage config carrying growth factors, absolute
-            counts, the per-cycle scale-up cap, and the scale-down
-            fraction cap.
+            Must be ``>= 0``.
+        capacity_target_workers: Closed-form target worker count for
+            the stage. ``None`` is the cold-start sentinel and triggers
+            the discrete +/-1 fallback.
+        config: Per-stage config; carries the per-cycle scale-up cap
+            and the scale-down fraction cap.
 
     Returns:
         Signed integer: positive to add workers, negative to remove,
-        zero for NORMAL.
+        zero for NORMAL or for HOLD-blocked SATURATED grow.
 
     Raises:
         ValueError: If ``current_workers`` is negative.
@@ -139,52 +142,35 @@ def compute_delta(
         msg = f"current_workers must be >= 0, got {current_workers}"
         raise ValueError(msg)
 
-    if state == StageState.SATURATED_CRITICAL:
-        return _critical_delta(growth_mode, current_workers, config)
-    if state == StageState.SATURATED:
-        return _saturated_delta(growth_mode, current_workers, config)
+    if state == StageState.NORMAL:
+        return 0
+
+    if state == StageState.SATURATED and growth_mode == GrowthMode.HOLD:
+        return 0
+
+    if capacity_target_workers is None:
+        return _cold_start_delta(state)
+
     if state == StageState.OVER_PROVISIONED:
-        return _shrink_delta(current_workers, config)
-    return 0
+        excess = current_workers - capacity_target_workers
+        if excess <= 0:
+            return 0
+        fraction_cap = max(1, math.floor(current_workers * config.max_scale_down_fraction_per_cycle))
+        return -min(excess, fraction_cap)
+
+    shortfall = capacity_target_workers - current_workers
+    if shortfall <= 0:
+        return 0
+    return min(shortfall, config.aggressive_growth_max_per_cycle)
 
 
-def _critical_delta(
-    growth_mode: GrowthMode,
-    current_workers: int,
-    config: SaturationAwareStageConfig,
-) -> int:
-    """Burst-zone scale-up magnitude, clamped by ``aggressive_growth_max_per_cycle``."""
-    if growth_mode == GrowthMode.ACQUIRING:
-        delta = math.ceil(config.acquiring_critical_growth_factor * current_workers)
-    elif growth_mode == GrowthMode.TRACKING:
-        delta = config.tracking_critical_growth_count
-    else:
-        delta = config.hold_critical_growth_count
-    return min(delta, config.aggressive_growth_max_per_cycle)
+def _cold_start_delta(state: StageState) -> int:
+    """Return discrete +/-1 fallback when the capacity target is unobservable.
 
-
-def _saturated_delta(
-    growth_mode: GrowthMode,
-    current_workers: int,
-    config: SaturationAwareStageConfig,
-) -> int:
-    """Sustained-saturation scale-up magnitude, clamped by ``aggressive_growth_max_per_cycle``."""
-    if growth_mode == GrowthMode.ACQUIRING:
-        delta = math.ceil(config.acquiring_saturated_growth_factor * current_workers)
-    elif growth_mode == GrowthMode.TRACKING:
-        delta = config.tracking_saturated_growth_count
-    else:
-        delta = config.hold_saturated_growth_count
-    return min(delta, config.aggressive_growth_max_per_cycle)
-
-
-def _shrink_delta(current_workers: int, config: SaturationAwareStageConfig) -> int:
-    """Return scale-down magnitude (negative integer).
-
-    Bounded by ``max_scale_down_fraction_per_cycle`` to prevent
-    cliff scale-downs that starve downstream stages. Always returns
-    at least ``-1`` once the OVER_PROVISIONED streak threshold is
-    reached; the caller clamps to per-stage and one-worker floors.
+    SATURATED / SATURATED_CRITICAL grow by one; OVER_PROVISIONED
+    shrinks by one. NORMAL and HOLD-blocked SATURATED never reach
+    this branch.
     """
-    fraction_cap = max(1, math.floor(current_workers * config.max_scale_down_fraction_per_cycle))
-    return -fraction_cap
+    if state == StageState.OVER_PROVISIONED:
+        return -1
+    return 1
