@@ -650,7 +650,11 @@ class Autoscaler:
         self._algorithm.update_with_measurements(time.time(), measurements)
 
     def _make_problem_state(
-        self, actor_pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]
+        self,
+        actor_pools: list[actor_pool.ActorPool],
+        stages_is_dones: list[bool],
+        upstream_queue_lens: list[int],
+        stage_batch_sizes: list[int],
     ) -> data_structures.ProblemState:
         """Creates a `ProblemState` instance from the current pipeline state.
 
@@ -661,6 +665,29 @@ class Autoscaler:
         on every signal because their autoscaling decisions are
         short-circuited upstream and any drain-state slot, queue, or
         pending-actor counts would be misleading saturation signal.
+
+        ``input_queue_depth`` aggregates two backlog sources:
+
+        * ``pool.num_queued_tasks`` -- tasks already pulled into the
+          pool's internal task queue. Bounded by ``compute_max_queued``
+          (the streaming-mode backpressure cap), so this signal alone
+          saturates and hides the true upstream backlog when a stage
+          is the bottleneck.
+        * ``upstream_queue_lens[idx]`` -- samples still sitting in
+          the upstream buffer (the pipeline ``input_queue`` for stage
+          ``0`` or ``queues[idx - 1]`` for downstream stages). These
+          have not yet been batched into pool tasks; the autoscaler
+          must see them or it cannot reason about a backlogged
+          bottleneck stage.
+
+        Unit normalization mirrors the backlog-aware scale-down
+        guard at ``apply_autoscale_result_if_ready``:
+        ``pool.num_queued_tasks`` is in pre-batched tasks, but
+        ``upstream_queue_lens[idx]`` is sample-denominated. Convert
+        the upstream count to tasks via
+        ``ceil(samples / stage_batch_size)`` so the aggregated
+        ``input_queue_depth`` is uniformly in tasks (the unit the
+        saturation-aware classifier and capacity sizer expect).
 
         ``num_pending_actors`` is the count of actors past
         :meth:`ActorPool.add_actor` but before
@@ -674,12 +701,28 @@ class Autoscaler:
         Args:
             actor_pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths,
+                sample-denominated. Entry ``[i]`` is the number of
+                queued samples waiting to be pulled into ``pools[i]``
+                (the pipeline ``input_queue`` for stage ``0`` or
+                ``queues[i - 1]`` for downstream stages). Must have
+                the same length as ``actor_pools``.
+            stage_batch_sizes: Per-stage declared
+                ``stage_batch_size`` values (each must be ``>= 1``);
+                used to convert ``upstream_queue_lens`` from samples
+                to tasks. Must have the same length as ``actor_pools``.
 
         Returns:
             A `ProblemState` object representing the current state of the pipeline.
         """
         stages = []
-        for pool, is_done in zip(actor_pools, stages_is_dones, strict=True):
+        for pool, is_done, upstream_samples, stage_batch_size in zip(
+            actor_pools,
+            stages_is_dones,
+            upstream_queue_lens,
+            stage_batch_sizes,
+            strict=True,
+        ):
             workers = self._allocator.get_workers_in_stage(pool.name)
             if is_done:
                 num_used_slots = 0
@@ -690,7 +733,13 @@ class Autoscaler:
             else:
                 num_used_slots = pool.num_used_slots
                 num_empty_slots = pool.num_empty_slots
-                input_queue_depth = pool.num_queued_tasks
+                # Upstream samples not yet pulled into the pool would
+                # otherwise be invisible because ``pool.num_queued_tasks``
+                # is bounded by ``compute_max_queued``. Ceil-div by
+                # ``stage_batch_size`` so the unit matches the pool's
+                # task count.
+                upstream_tasks = math.ceil(upstream_samples / stage_batch_size)
+                input_queue_depth = pool.num_queued_tasks + upstream_tasks
                 num_pending_actors = pool.num_pending_actors
                 worker_group_idle = pool.worker_group_num_used_slots()
                 for field_name, value in (
@@ -732,7 +781,13 @@ class Autoscaler:
             )
         return data_structures.ProblemState(stages)
 
-    def start_autoscale_calculation(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
+    def start_autoscale_calculation(
+        self,
+        pools: list[actor_pool.ActorPool],
+        stages_is_dones: list[bool],
+        upstream_queue_lens: list[int],
+        stage_batch_sizes: list[int],
+    ) -> None:
         """Starts a new autoscaling calculation in a background thread.
 
         If a calculation is already in progress, this method does nothing.
@@ -740,6 +795,15 @@ class Autoscaler:
         Args:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths,
+                sample-denominated; passed through to
+                ``_make_problem_state`` so ``input_queue_depth``
+                reflects backlog still sitting in
+                ``input_queue`` / ``queues[idx - 1]`` rather than
+                only the pool's own pulled tasks.
+            stage_batch_sizes: Per-stage declared
+                ``stage_batch_size`` values; used to convert
+                ``upstream_queue_lens`` from samples to tasks.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
@@ -747,7 +811,12 @@ class Autoscaler:
             return
 
         self._autoscale_start_time = time.time()
-        problem_state = self._make_problem_state(pools, stages_is_dones)
+        problem_state = self._make_problem_state(
+            pools,
+            stages_is_dones,
+            upstream_queue_lens,
+            stage_batch_sizes,
+        )
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
     def apply_autoscale_result_if_ready(
@@ -1256,7 +1325,12 @@ def run_pipeline(
             # Handle scaling the actor pools.
             # This should get called on the first loop through.
             if autoscale_rate_limiter.can_call():
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones)
+                autoscaler.start_autoscale_calculation(
+                    pools,
+                    stage_is_dones,
+                    upstream_queue_lens,
+                    stage_batch_sizes,
+                )
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools

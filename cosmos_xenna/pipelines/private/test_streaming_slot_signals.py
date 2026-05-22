@@ -35,6 +35,7 @@ This module pins the wiring contract:
 """
 
 import collections
+import math
 from typing import Any, cast
 
 import attrs
@@ -173,11 +174,20 @@ def _make_problem_state(
     is_dones: list[bool],
     *,
     allocator: _FakeAllocator | None = None,
+    upstream_queue_lens: list[int] | None = None,
+    stage_batch_sizes: list[int] | None = None,
 ) -> data_structures.ProblemState:
-    """Invoke ``Autoscaler._make_problem_state`` with the fakes above."""
+    """Invoke ``Autoscaler._make_problem_state`` with the fakes above.
+
+    Defaults ``upstream_queue_lens`` to zeros and ``stage_batch_sizes``
+    to ones so existing tests pin only the pool-side signals; tests
+    exercising the upstream-aggregation path pass explicit values.
+    """
     autoscaler = Autoscaler.__new__(Autoscaler)
     autoscaler._allocator = allocator or _FakeAllocator()  # type: ignore[attr-defined, assignment]
-    return autoscaler._make_problem_state(pools, is_dones)  # type: ignore[arg-type]
+    upstream = upstream_queue_lens if upstream_queue_lens is not None else [0] * len(pools)
+    batch_sizes = stage_batch_sizes if stage_batch_sizes is not None else [1] * len(pools)
+    return autoscaler._make_problem_state(pools, is_dones, upstream, batch_sizes)  # type: ignore[arg-type]
 
 
 class TestMakeProblemStateSlotSignals:
@@ -640,6 +650,90 @@ class TestMakeProblemStateSlotSignals:
 
         with pytest.raises(ValueError):
             _make_problem_state(pools, [False])
+
+
+class TestMakeProblemStateInputQueueDepthAggregation:
+    """Pin ``input_queue_depth`` aggregation of pool and upstream backlog.
+
+    ``pool.num_queued_tasks`` is bounded by the streaming-mode
+    ``compute_max_queued`` cap; backlog still sitting in the pipeline
+    ``input_queue`` (stage 0) or ``queues[idx - 1]`` (downstream
+    stages) would otherwise be invisible to the saturation-aware
+    classifier and capacity sizer.
+    """
+
+    def test_unit_one_adds_upstream_lens_directly_when_batch_size_is_one(self) -> None:
+        """``stage_batch_size = 1`` makes samples and tasks identical, so addition is direct."""
+        pool = _FakeActorPool("stage-0", 1, 2, 1, 5)
+
+        state = _make_problem_state(
+            [pool],
+            [False],
+            upstream_queue_lens=[37],
+            stage_batch_sizes=[1],
+        )
+
+        stage = state.rust.stages[0]
+        assert stage.input_queue_depth == 5 + 37
+
+    def test_upstream_samples_ceil_divide_by_batch_size_to_tasks(self) -> None:
+        """Sample-denominated upstream lens convert to task-denominated via ceil-div."""
+        pool = _FakeActorPool("batched", 4, 8, 0, 3)
+
+        state = _make_problem_state(
+            [pool],
+            [False],
+            upstream_queue_lens=[17],
+            stage_batch_sizes=[8],
+        )
+
+        stage = state.rust.stages[0]
+        assert stage.input_queue_depth == 3 + math.ceil(17 / 8)
+
+    def test_upstream_zero_preserves_pool_only_signal(self) -> None:
+        """An empty upstream queue yields ``input_queue_depth == pool.num_queued_tasks``."""
+        pool = _FakeActorPool("empty-upstream", 1, 0, 1, 9)
+
+        state = _make_problem_state(
+            [pool],
+            [False],
+            upstream_queue_lens=[0],
+            stage_batch_sizes=[1],
+        )
+
+        assert state.rust.stages[0].input_queue_depth == 9
+
+    def test_done_stage_ignores_upstream_queue_lens(self) -> None:
+        """Done stages emit zero on every signal; upstream lens must not leak."""
+        pool = _FakeActorPool("drained", 1, 0, 0, 0)
+
+        state = _make_problem_state(
+            [pool],
+            [True],
+            upstream_queue_lens=[1234],
+            stage_batch_sizes=[1],
+        )
+
+        assert state.rust.stages[0].input_queue_depth == 0
+
+    def test_mismatched_upstream_queue_lens_length_raises(self) -> None:
+        """``zip(strict=True)`` rejects upstream-queue-lens length mismatch.
+
+        A length mismatch is a programmer error in the streaming
+        loop (it assembles ``upstream_queue_lens`` from the same
+        pipeline spec as ``actor_pools``); failing fast prevents the
+        upstream backlog of one stage from being silently bound to
+        another.
+        """
+        pool = _FakeActorPool("only", 1, 0, 1, 0)
+
+        with pytest.raises(ValueError, match="zip"):
+            _make_problem_state(
+                [pool],
+                [False],
+                upstream_queue_lens=[],
+                stage_batch_sizes=[1],
+            )
 
 
 class TestMakeProblemStatePerWorkerNumUsedSlots:

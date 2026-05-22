@@ -78,6 +78,21 @@ def emit_allocation_failure(
     )
 
 
+def _gpu_used_fraction(gpu: Any) -> float:
+    """Return ``used_fraction`` for Python and Rust ``GpuResources``.
+
+    Both the Python attrs ``GpuResources`` and the Rust binding (via
+    its ``#[getter] fn get_used_fraction``) expose ``used_fraction``
+    as a plain attribute. The ``used_pool().gpus`` fallback covers
+    Rust bindings that pre-date the ``#[getter]`` exposure, so the
+    snapshot keeps working across Rust binary upgrades without
+    runtime type checks leaking into the caller.
+    """
+    if hasattr(gpu, "used_fraction"):
+        return float(gpu.used_fraction)
+    return float(gpu.used_pool().gpus)
+
+
 def _format_gpu_fragmentation(cluster_resources: Any) -> list[dict[str, object]]:
     """Return ``(node, gpu_index, used_fraction, free_fraction)`` for every GPU.
 
@@ -101,20 +116,6 @@ def _format_gpu_fragmentation(cluster_resources: Any) -> list[dict[str, object]]
                 }
             )
     return rows
-
-
-def _gpu_used_fraction(gpu: Any) -> float:
-    """Return ``used_fraction`` for both Python and Rust ``GpuResources``.
-
-    The Python attrs ``GpuResources`` exposes ``used_fraction`` as a
-    plain attribute. The Rust binding does not publish that field
-    directly; ``used_pool().gpus`` is the supported accessor. This
-    helper picks the right path so the snapshot works against either
-    object without runtime type checks leaking into the caller.
-    """
-    if hasattr(gpu, "used_fraction"):
-        return float(gpu.used_fraction)
-    return float(gpu.used_pool().gpus)
 
 
 def _node_cpu_totals(node: Any) -> tuple[float, float]:
