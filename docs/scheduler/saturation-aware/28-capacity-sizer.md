@@ -170,6 +170,29 @@ A workload-specific tuning playbook lives in
 SLO and produces a larger capacity target for the same queue,
 raising it does the opposite.
 
+## Why the formula
+
+Three queueing-theory laws (Conservation, Forced-Flow,
+Utilisation) compose to produce the formula:
+
+- **Drain term** comes from job-flow balance: completions over
+  a window must equal arrivals plus the queue we want drained.
+  Solving `Λ' · T = λ · T + queue_depth` with
+  `T = target_backlog_seconds` gives
+  `target_rate = throughput + queue_depth / target_backlog_seconds`.
+- **Slot count** comes from the Utilisation Law applied to `m`
+  parallel slots: `U = X · D_k / m`. Solving for `m` at a
+  target utilisation `u_target` gives
+  `m = target_rate · D_k / u_target`.
+- **Per-task service demand `D_k`** is the per-task busy time
+  at this stage. Each task visits the stage once, so the
+  Forced-Flow visit count is `1` and `D_k = S_k`.
+
+The classifier's `saturation_threshold` defines
+`u_target = 1 − saturation_threshold` so the sizer's headroom
+matches the slot-pin classifier's saturation boundary, and the
+operator only tunes one knob.
+
 ## See also
 
 - [05 — State classifier](05-state-classifier.md) — the four-zone
