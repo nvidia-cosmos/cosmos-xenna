@@ -339,7 +339,13 @@ class TestStuckPlanWarning:
     """One WARNING per stuck stage with the stage name and ``deficit`` text."""
 
     def test_per_stuck_stage_warning_in_dag_order(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
-        """3-stage chain with all positive intent + 1 free slot -> two stuck-stage WARNINGs in DAG order."""
+        """3-stage chain with all positive intent + 1 free slot -> two stuck-stage WARNINGs in DAG iteration order.
+
+        DAG-priority growth iterates deepest-first. With one contended
+        slot ``s2`` (deepest) consumes it, then ``s1`` and ``s0`` are
+        attempted in deepest-first order and both fail; their WARNING
+        emissions therefore appear as ``['s1', 's0']``.
+        """
         scheduler = _scheduler(
             [("s0", None), ("s1", None), ("s2", None)],
             cluster=_cluster(total_cpus_per_node=4),
@@ -353,14 +359,16 @@ class TestStuckPlanWarning:
         warnings = [r.getMessage() for r in loguru_caplog.records if r.levelname == "WARNING"]
         scaleup = [m for m in warnings if "saturation-aware scale-up" in m]
         assert len(scaleup) == 2
-        # Project each scale-up message to the stage identifier it names; the project
-        # contract is that warnings emerge in DAG order (deepest-first growers leave
-        # the upstream stuck stages to log in problem order).
+        # Project each scale-up message to the stage identifier it names. The project
+        # contract is that warnings emerge in DAG iteration order (deepest-first):
+        # the deepest stage wins the contended slot, then upstream stages are
+        # attempted in deepest-first order and log on exhaustion.
         observed_order = [
             stage_id for m in scaleup for stage_id in ("'s0'", "'s1'", "'s2'") if stage_id in m and "deficit" in m
         ]
-        assert observed_order == ["'s0'", "'s1'"], (
-            f"expected stuck-stage WARNINGs in DAG order ['s0', 's1']; got {observed_order} from {scaleup}"
+        assert observed_order == ["'s1'", "'s0'"], (
+            f"expected stuck-stage WARNINGs in deepest-first DAG iteration order "
+            f"['s1', 's0']; got {observed_order} from {scaleup}"
         )
 
 
