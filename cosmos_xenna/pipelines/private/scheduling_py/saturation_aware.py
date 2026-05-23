@@ -1825,18 +1825,33 @@ class SaturationAwareScheduler:
         try:
             return ctx.try_add_worker(stage_index)
         except resources.AllocationError as exc:
-            self._absorb_allocation_failure(stage_name=stage_name, exc=exc)
+            self._absorb_allocation_failure(ctx=ctx, stage_name=stage_name, exc=exc)
             return None
 
-    def _absorb_allocation_failure(self, *, stage_name: str, exc: BaseException) -> None:
-        """Log the fragmentation snapshot, bump the counter, and raise or set the skip flag."""
+    def _absorb_allocation_failure(
+        self,
+        *,
+        ctx: data_structures.AutoscalePlanContext,
+        stage_name: str,
+        exc: BaseException,
+    ) -> None:
+        """Log the fragmentation snapshot, bump the counter, and raise or set the skip flag.
+
+        The snapshot uses ``ctx.cluster_snapshot()`` (a clone of the
+        planner's working cluster) rather than the static
+        ``Problem.cluster_resources`` so the emitted log reports the
+        resources the planner actually used during the cycle. The
+        static snapshot is always cold-start-empty and would mislead
+        operators into thinking the cluster had capacity available
+        when in fact every node was already drained by Phase A / B.
+        """
         if self._problem is None:
             msg = "_absorb_allocation_failure called before setup()"
             raise RuntimeError(msg)
         emit_allocation_failure(
             stage_name=stage_name,
             pipeline_name=self._pipeline_name,
-            cluster_resources=self._problem.rust.cluster_resources,
+            cluster_resources=ctx.cluster_snapshot(),
             exc=exc,
         )
         if not self._config.skip_cycle_on_allocation_error:
