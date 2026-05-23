@@ -23,8 +23,10 @@ from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: i
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     data_structures as rust,
 )
+from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
+    resources as rust_resources,
+)
 from cosmos_xenna.pipelines.private import resources
-
 
 class ProblemStage:
     """Static autoscaling description of one pipeline stage.
@@ -551,6 +553,104 @@ class AutoscalePlanContext:
 
         """
         return int(self._r.pending_remove_count(stage_index))
+
+    def remove_workers_atomically(self, removals: list[tuple[int, str]]) -> bool:
+        """Stage a batch of worker removals all-or-nothing.
+
+        Pre-validates every ``(stage_index, worker_id)`` against the
+        planner's current snapshot. If any entry is missing the
+        method returns ``False`` and leaves planner state untouched.
+        Otherwise applies every removal in one batch with rollback:
+        a cluster release error mid-batch restores the cluster, the
+        per-stage current-worker maps, the pending-add and
+        pending-remove lists, and the worker-age map to their
+        pre-call values before raising ``RuntimeError``.
+
+        Used by transfer paths (cross-stage donor commit, Phase B
+        floor donor) that cannot recover from partial removal.
+        Single-worker callers should keep using ``try_remove_worker``;
+        this batch API is purely additive.
+
+        Args:
+            removals: Pairs of ``(stage_index, worker_id)``. Stage
+                indices reference the same ``problem.stages`` order
+                used elsewhere on this context. An empty list is a
+                no-op and returns ``True``.
+
+        Returns:
+            ``True`` when every removal was committed; ``False`` when
+            any worker id was missing from the planner snapshot
+            (planner state is untouched in that case).
+
+        Raises:
+            IndexError: any ``stage_index`` is out of range.
+            RuntimeError: a cluster release returned ``Err`` mid-batch
+                (planner state has been rolled back), or the context
+                has already been drained by ``into_solution``.
+
+        """
+        return bool(self._r.remove_workers_atomically(list(removals)))
+
+    def cluster_snapshot(self) -> rust_resources.ClusterResources:
+        """Return a clone of the planner's working cluster.
+
+        Used by allocation-failure diagnostics so emitted snapshots
+        reflect the resources the planner actually used during the
+        cycle, not the static cluster from the input ``Problem``.
+        Returns the underlying Rust ``ClusterResources`` object;
+        ``emit_allocation_failure`` already accepts both this shape
+        and the Python ``resources.ClusterResources`` wrapper via
+        duck typing. The returned object is a fresh clone, so
+        caller mutations cannot affect planner state. Safe to call
+        after ``into_solution``.
+
+        """
+        return self._r.cluster_snapshot()
+
+    def probe_add_after_removals(
+        self,
+        removals: list[tuple[int, str]],
+        add_stage_index: int,
+    ) -> rust_apc.PlacementProbeResult:
+        """Non-mutating placement probe for a candidate transfer plan.
+
+        Asks the planner whether ``try_add_worker(add_stage_index)``
+        would succeed after simulating each removal in ``removals``.
+        Clones the working cluster, applies the simulated releases on
+        the clone, then runs the same Fragmentation Gradient Descent
+        (non-SPMD) or SPMD allocator that ``try_add_worker`` consults.
+        The clone is dropped on return so live planner state is
+        untouched.
+
+        For non-SPMD receivers the simulated reuse map mirrors the
+        live ``try_add_worker`` path: it includes existing
+        receiver-stage ``pending_removes`` plus any donors removed
+        from the receiver stage in this probe call. Cross-stage
+        donations contribute resources to the cloned cluster but
+        not to the reuse map (FGD reuse semantics are scoped to a
+        single stage's pending_removes).
+
+        Args:
+            removals: Pairs of ``(stage_index, worker_id)`` whose
+                resources should be simulated as released.
+            add_stage_index: The stage we want to grow.
+
+        Returns:
+            ``PlacementProbeResult`` with ``feasible`` and an
+            optional ``reject_reason`` placement-only string
+            (``worker_not_found``, ``worker_has_no_resources``,
+            ``release_failed: ...``, or ``no_placement``).
+            Scheduler-policy reasons (signal trust, balance, spread)
+            live in Python and are recorded separately.
+
+        Raises:
+            IndexError: ``add_stage_index`` or any ``stage_index`` in
+                ``removals`` is out of range.
+            RuntimeError: the context has been drained, or a reuse
+                map worker representation could not be built.
+
+        """
+        return self._r.probe_add_after_removals(list(removals), add_stage_index)
 
     def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
         """Stage removal of an existing worker.
