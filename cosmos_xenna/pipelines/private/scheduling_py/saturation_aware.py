@@ -74,6 +74,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
     BottleneckEngagementState,
     BottleneckIdentity,
     HeterogeneityWarnState,
+    compute_d_k,
     compute_heterogeneity_ratio,
     emit_bottleneck_score,
     identify_bottleneck,
@@ -381,7 +382,7 @@ class SaturationAwareScheduler:
         # into a fresh scheduler. ``setup()`` calls ``.reset()`` so a
         # re-setup of the scheduler starts from a clean ledger.
         self._heterogeneity_state: HeterogeneityWarnState = HeterogeneityWarnState()
-        # Bottleneck-decision integration state. All three are written
+        # Bottleneck-decision integration state. All four are written
         # and read only from inside ``autoscale()`` running on the
         # streaming executor's single background thread, so no lock is
         # needed (verified call-graph: ``add_measurements`` -> main
@@ -389,7 +390,17 @@ class SaturationAwareScheduler:
         # ``setup()`` resets these without acquiring the existing
         # ``self._lock`` because no consumer can be running at re-setup
         # time, mirroring the heterogeneity_state pattern above.
-        self._d_k_ewma: dict[str, float] = {}
+        # ``_s_k_ewma`` tracks the smoothed intrinsic per-task service
+        # time S_k (consumed by the capacity sizer which divides by
+        # the stage's slots/workers itself). ``_d_k_now`` and
+        # ``_effective_capacities`` are the per-cycle actor-normalized
+        # views computed in the bottleneck phase block; consumed by
+        # ``identify_bottleneck``, the grow-priority order, the INFO
+        # log, and the heterogeneity gauge so all four agree on the
+        # same D_k definition.
+        self._s_k_ewma: dict[str, float] = {}
+        self._d_k_now: dict[str, float] = {}
+        self._effective_capacities: dict[str, int] = {}
         self._last_bottleneck_meta: BottleneckIdentity | None = None
         self._bottleneck_engagement_state: BottleneckEngagementState = BottleneckEngagementState()
         # Per-stage latch for the Phase D bottleneck-protection INFO log.
@@ -439,7 +450,11 @@ class SaturationAwareScheduler:
         # Bottleneck-decision state: NaN-seed every stage so the first
         # finite per-stage sample replaces (does not blend with) the
         # seed. ``setup()`` is pre-traffic so no lock is needed.
-        self._d_k_ewma = {name: math.nan for name in self._stage_names}
+        # ``_d_k_now`` and ``_effective_capacities`` start empty; the
+        # bottleneck phase block populates them on each cycle.
+        self._s_k_ewma = {name: math.nan for name in self._stage_names}
+        self._d_k_now = {}
+        self._effective_capacities = {}
         self._last_bottleneck_meta = None
         self._bottleneck_engagement_state.reset()
         self._bottleneck_protected_stages_logged = set()
@@ -603,7 +618,7 @@ class SaturationAwareScheduler:
 
         Args:
             time: Current wall-clock time in seconds. Currently
-                unused -- the autoscale-cycle timestamp is the
+                unused - the autoscale-cycle timestamp is the
                 canonical clock for the throughput delta. Accepted
                 so the protocol signature in ``streaming.py``
                 stays uniform across both scheduler kinds.
@@ -721,7 +736,7 @@ class SaturationAwareScheduler:
 
         The helper keeps its own ``(count, sum)`` snapshot in
         ``self._last_service_time_sample`` so the call order with
-        :meth:`_consume_throughput_samples` does not matter -- both
+        :meth:`_consume_throughput_samples` does not matter - both
         helpers can run in any order in the same autoscale cycle
         without their snapshots interfering.
 
@@ -752,8 +767,16 @@ class SaturationAwareScheduler:
                 self._last_service_time_sample[stage_name] = (now_count, now_sum)
         return samples
 
-    def _update_d_k_ewma(self, service_times_s: Mapping[str, float]) -> None:
-        """Apply one EWMA step to per-stage ``D_k`` from this cycle's service times.
+    def _update_s_k_ewma(self, service_times_s: Mapping[str, float]) -> None:
+        """Apply one EWMA step to per-stage intrinsic ``S_k`` from this cycle's service times.
+
+        The EWMA tracks the intrinsic per-task service time, NOT the
+        actor-normalized ``D_k = S_k / c_k``. Smoothing only the
+        per-task component prevents actor-count changes (Phase A
+        grow / shrink, Phase D shrink) from leaking into the smooth
+        signal: those transitions update the per-cycle ``c_k`` only,
+        so the bottleneck path can react on the next cycle while the
+        underlying service-time estimate stays stable.
 
         Args:
             service_times_s: Per-stage mean per-task service time
@@ -764,19 +787,52 @@ class SaturationAwareScheduler:
         alpha = self._config.bottleneck_d_k_smoothing_level
         for stage_name in self._stage_names:
             latest = service_times_s.get(stage_name, math.nan)
-            prev = self._d_k_ewma.get(stage_name, math.nan)
+            prev = self._s_k_ewma.get(stage_name, math.nan)
             if not math.isfinite(latest) or latest <= 0.0:
                 # Missed sample: preserve previous value (or seed NaN).
-                if stage_name not in self._d_k_ewma:
-                    self._d_k_ewma[stage_name] = math.nan
+                if stage_name not in self._s_k_ewma:
+                    self._s_k_ewma[stage_name] = math.nan
                 continue
             if not math.isfinite(prev):
                 # First-ever finite sample: replace the seed without
                 # blending; otherwise alpha=0.2 would slow convergence
                 # by ~5x for no benefit.
-                self._d_k_ewma[stage_name] = latest
+                self._s_k_ewma[stage_name] = latest
             else:
-                self._d_k_ewma[stage_name] = prev * (1.0 - alpha) + latest * alpha
+                self._s_k_ewma[stage_name] = prev * (1.0 - alpha) + latest * alpha
+
+    @staticmethod
+    def _effective_ready_capacity(runtime_stage: rust_data_structures.ProblemStageState) -> int:
+        """Compute concurrent service channels at one stage.
+
+        Effective ready capacity ``c_k`` is the number of concurrent
+        service channels the stage has available right now: each ready
+        worker contributes ``slots_per_worker`` channels, and an SPMD
+        worker group with ``K`` allocations contributes
+        ``slots_per_worker * K`` because all ``K`` allocations
+        process tasks in parallel under one DDP unit. The plan
+        documents the policy: count all ready workers, including
+        those still inside ``worker_warmup_measurement_grace_s``,
+        because ``D_k`` is an availability-adjusted demand signal
+        and the classifier owns warmup-trust gating.
+
+        Args:
+            runtime_stage: Per-cycle runtime snapshot for one stage.
+
+        Returns:
+            Concurrent service channels available right now. Returns
+            ``0`` for a stage with no ready worker groups; downstream
+            :func:`compute_d_k` folds this into the cold-start
+            sentinel ``math.nan``.
+        """
+        slots_per_worker = runtime_stage.slots_per_worker
+        if slots_per_worker <= 0:
+            return 0
+        total_allocations = 0
+        for worker_group in runtime_stage.worker_groups:
+            allocation_count = max(1, len(worker_group.resources))
+            total_allocations += allocation_count
+        return slots_per_worker * total_allocations
 
     def autoscale(
         self,
@@ -874,31 +930,31 @@ class SaturationAwareScheduler:
         # 22-prometheus-metrics.md row
         # ``xenna_scheduler_cycle_phase_duration_seconds``).
         with self._phase_timer("pre_phase_setup"):
-        if self._problem is None:
-            msg = "SaturationAwareScheduler.autoscale() called before setup()"
-            raise RuntimeError(msg)
+            if self._problem is None:
+                msg = "SaturationAwareScheduler.autoscale() called before setup()"
+                raise RuntimeError(msg)
 
             self._check_problem_state_shape_before_phase_a(problem_state)
-        self._cycle_counter += 1
-        self._donations_received_this_cycle = {}
+            self._cycle_counter += 1
+            self._donations_received_this_cycle = {}
             # Refresh ready first-seen timestamps from this cycle's snapshot before
             # any phase reads them. The per-worker measurement grace consumes them
             # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
             # cross-stage donor consult the resulting warmup-grace excluded set.
             self._refresh_worker_ready_first_seen(problem_state, now=time)
-        # Snapshot the stuck-plan counters before Phase C mutates them so the
-        # post-Phase-D monotonicity check can compare prev vs. curr without an
+            # Snapshot the stuck-plan counters before Phase C mutates them so the
+            # post-Phase-D monotonicity check can compare prev vs. curr without an
             # in-flight Phase C state. The same snapshot is also reused as the
             # caller-side filter: stages whose ``curr == prev`` were not touched
             # by ``_set_stuck_plan_counter`` and are excluded from the assertion.
-        prev_stuck_plan_counters = dict(self._stuck_plan_counters)
-        self._update_regime_aware_aggressiveness(problem_state)
-        self._ensure_thresholds_resolved(problem_state)
-        ctx = data_structures.AutoscalePlanContext.from_problem_state(
-            self._problem,
-            problem_state,
-            worker_ages=self._next_cycle_worker_ages(),
-        )
+            prev_stuck_plan_counters = dict(self._stuck_plan_counters)
+            self._update_regime_aware_aggressiveness(problem_state)
+            self._ensure_thresholds_resolved(problem_state)
+            ctx = data_structures.AutoscalePlanContext.from_problem_state(
+                self._problem,
+                problem_state,
+                worker_ages=self._next_cycle_worker_ages(),
+            )
             # Cache the per-cycle donor warmup excluded set immediately after
             # AutoscalePlanContext.from_problem_state() seeds the planner from
             # ``problem_state``. ``ctx.worker_ids_by_stage()`` at this point
@@ -938,28 +994,40 @@ class SaturationAwareScheduler:
             )
 
         with self._phase_timer("phase_a"):
-        self._run_phase_a_delete(ctx, problem_state)
-        self._run_phase_a_grow(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
+            self._run_phase_a_delete(ctx, problem_state)
+            self._run_phase_a_grow(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
 
         with self._phase_timer("phase_b"):
-        self._run_phase_b_floor(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
+            self._run_phase_b_floor(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
         # Bottleneck calculation block runs BEFORE the intent loop so the
         # per-stage decision pipeline observes a populated
         # ``cycle_bottleneck_context`` for the current cycle, and BEFORE
         # Phase C / Phase D so both phases see fresh
-        # ``_last_bottleneck_meta`` / ``_d_k_ewma``. The block is wrapped
-        # in its own phase timer so the per-phase Prometheus histogram
-        # accounts for its share of the cycle duration; without the timer,
-        # ``loop_watchdog``'s wall-clock measurement would diverge from
-        # the sum of per-phase histograms.
+        # ``_last_bottleneck_meta`` / ``_s_k_ewma`` / ``_d_k_now``. The
+        # block is wrapped in its own phase timer so the per-phase
+        # Prometheus histogram accounts for its share of the cycle
+        # duration; without the timer, ``loop_watchdog``'s wall-clock
+        # measurement would diverge from the sum of per-phase histograms.
+        # ``_d_k_now`` is recomputed each cycle from the current
+        # intrinsic ``_s_k_ewma`` divided by the live effective
+        # capacity, so all four downstream consumers (identity,
+        # grow-priority, INFO log, heterogeneity gauge) see the same
+        # actor-normalized D_k view.
         with self._phase_timer("bottleneck"):
             service_times_s = self._consume_service_time_samples()
-            self._update_d_k_ewma(service_times_s)
+            self._update_s_k_ewma(service_times_s)
+            self._effective_capacities = {
+                stage.stage_name: self._effective_ready_capacity(stage) for stage in problem_state.rust.stages
+            }
+            self._d_k_now = {
+                name: compute_d_k(self._s_k_ewma.get(name, math.nan), self._effective_capacities.get(name, 0))
+                for name in self._stage_names
+            }
             self._last_bottleneck_meta = identify_bottleneck(
-                self._d_k_ewma,
+                self._d_k_now,
                 heterogeneity_threshold=self._config.bottleneck_heterogeneity_threshold,
             )
             self._refresh_cycle_bottleneck_context()
@@ -1010,43 +1078,43 @@ class SaturationAwareScheduler:
         # pins the "always observe" guarantee for the per-phase
         # histogram contract.
         with self._phase_timer("phase_c"):
-        self._run_phase_c_grow(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
-        check_no_nan_in_classifier_state(
-            phase_name=PhaseBoundary.PHASE_C,
-            stage_runtime_states=self._stage_states,
-        )
+            self._run_phase_c_grow(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
+            check_no_nan_in_classifier_state(
+                phase_name=PhaseBoundary.PHASE_C,
+                stage_runtime_states=self._stage_states,
+            )
 
         with self._phase_timer("phase_d"):
-        # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
-        # post-Phase-D floor invariant can distinguish "Phase D reduced below
-        # floor" (a defect) from "Phase B left the stage below floor" (a
-        # grace-window scenario Phase D leaves untouched).
-        pre_phase_d_worker_counts = {
-            stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
-        }
-        self._run_phase_d_shrink(ctx, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
-        # Recompute floors once for the Phase D invariant check; the helper is
-        # O(num_stages) over an immutable Problem so the second call is cheap
-        # and avoids threading a precomputed dict through
-        # ``_run_phase_d_shrink``'s signature.
-        num_nodes = len(self._problem.rust.cluster_resources.nodes)
-        stage_floors = self._compute_stage_floors(num_nodes)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
-            problem=self._problem,
-            problem_state=problem_state,
-            ctx=ctx,
-            stage_floors=stage_floors,
-            pre_phase_d_worker_counts=pre_phase_d_worker_counts,
-        )
+            # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
+            # post-Phase-D floor invariant can distinguish "Phase D reduced below
+            # floor" (a defect) from "Phase B left the stage below floor" (a
+            # grace-window scenario Phase D leaves untouched).
+            pre_phase_d_worker_counts = {
+                stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
+            }
+            self._run_phase_d_shrink(ctx, problem_state)
+            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
+            # Recompute floors once for the Phase D invariant check; the helper is
+            # O(num_stages) over an immutable Problem so the second call is cheap
+            # and avoids threading a precomputed dict through
+            # ``_run_phase_d_shrink``'s signature.
+            num_nodes = len(self._problem.rust.cluster_resources.nodes)
+            stage_floors = self._compute_stage_floors(num_nodes)
+            check_floor_after_phase_d(
+                phase_name=PhaseBoundary.PHASE_D,
+                problem=self._problem,
+                problem_state=problem_state,
+                ctx=ctx,
+                stage_floors=stage_floors,
+                pre_phase_d_worker_counts=pre_phase_d_worker_counts,
+            )
 
-        self._record_post_commit_executed_deltas(
-            ctx=ctx,
-            problem_state=problem_state,
-            pre_phase_c_worker_counts=pre_phase_c_worker_counts,
-        )
+            self._record_post_commit_executed_deltas(
+                ctx=ctx,
+                problem_state=problem_state,
+                pre_phase_c_worker_counts=pre_phase_c_worker_counts,
+            )
 
         with self._phase_timer("invariants"):
             # Filter ``curr_counters`` to non-finished stages with an
@@ -1062,14 +1130,14 @@ class SaturationAwareScheduler:
             # ``prev_counters`` is not filtered: the helper iterates
             # ``curr_counters`` only and looks up ``prev_counters`` by key,
             # so stale entries there are inert.
-        active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
+            active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
             changed_counters = {
                 name: curr
                 for name, curr in self._stuck_plan_counters.items()
                 if name in active_stage_names and curr != prev_stuck_plan_counters.get(name, 0)
             }
-        check_stuck_plan_monotonicity(
-            prev_counters=prev_stuck_plan_counters,
+            check_stuck_plan_monotonicity(
+                prev_counters=prev_stuck_plan_counters,
                 curr_counters=changed_counters,
             )
 
@@ -1077,16 +1145,25 @@ class SaturationAwareScheduler:
         # per-phase wrappers above so the wrapper boundaries stay aligned
         # with the canonical phase labels in
         # docs/scheduler/saturation-aware/22-prometheus-metrics.md. Both
-        # calls are sub-millisecond pure observability and reuse the
-        # ``service_times_s`` snapshot consumed once per cycle before
-        # Phase C so a single consume covers both decisions and
-        # metrics. Cold-start stages observe ``math.nan`` so the
-        # helpers preserve gauge cardinality and skip the
-        # ``argmax_k`` / log line for any stage that has not produced
-        # a completed-task sample yet.
-        emit_bottleneck_score(service_times_s=service_times_s, pipeline_name=self._pipeline_name)
+        # calls are sub-millisecond pure observability and consume the
+        # actor-normalized ``self._d_k_now`` mapping computed inside the
+        # bottleneck phase block; sharing the mapping with
+        # ``identify_bottleneck`` and the grow-priority order guarantees
+        # the operator-facing log and the heterogeneity gauge cannot
+        # disagree with the planner decision in the same cycle.
+        # Cold-start stages contribute ``math.nan`` so the helpers
+        # preserve gauge cardinality and skip the ``argmax_k`` / log
+        # line for any stage that has not produced a completed-task
+        # sample yet.
+        if self._last_bottleneck_meta is not None:
+            emit_bottleneck_score(
+                d_k_by_stage=self._d_k_now,
+                bottleneck_identity=self._last_bottleneck_meta,
+                pipeline_name=self._pipeline_name,
+                effective_capacities=self._effective_capacities,
+            )
         compute_heterogeneity_ratio(
-            service_times_s=service_times_s,
+            d_k_by_stage=self._d_k_now,
             pipeline_name=self._pipeline_name,
             state=self._heterogeneity_state,
             warn_threshold=self._config.cluster_heterogeneity_warn_threshold,
@@ -1094,9 +1171,9 @@ class SaturationAwareScheduler:
         )
 
         with self._phase_timer("into_solution"):
-        solution = ctx.into_solution()
-        check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
-        self._persist_worker_ages(ctx)
+            solution = ctx.into_solution()
+            check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
+            self._persist_worker_ages(ctx)
 
         self._emit_cycle_summary()
 
@@ -1451,7 +1528,7 @@ class SaturationAwareScheduler:
              while a prior add has not finished setup would amplify
              cold-start noise and risk over-provisioning once the
              pending actor lands. Negative intents (Phase D
-             scale-down) are preserved -- they only act on ready
+             scale-down) are preserved - they only act on ready
              actors, and the still-pending actor's lifecycle is
              unaffected.
 
@@ -1618,7 +1695,7 @@ class SaturationAwareScheduler:
             # skip branch above also resets, so any no-signal gap
             # forces the trust gate to rebuild from scratch before
             # the next non-zero recommendation may pass. This
-            # intentionally penalises transient gaps -- carry-forward
+            # intentionally penalises transient gaps - carry-forward
             # EWMA over warmup-churn windows was producing add/remove
             # decisions on stale worker mixes. The single freshness
             # leg is sufficient because the reset collapses the
@@ -1682,7 +1759,7 @@ class SaturationAwareScheduler:
         """
         if stage_state.resolved_thresholds is None:
             return None
-        d_k_seconds = self._d_k_ewma.get(stage_name, math.nan)
+        d_k_seconds = self._s_k_ewma.get(stage_name, math.nan)
         return compute_capacity_target_workers(
             queue_depth=input_queue_depth,
             observed_throughput=observed_throughput,
@@ -1864,7 +1941,7 @@ class SaturationAwareScheduler:
         stage_order = compute_grow_priority_order(
             self._problem,
             bottleneck_engaged=bottleneck_engaged,
-            d_k_by_stage=self._d_k_ewma,
+            d_k_by_stage=self._d_k_now,
             enable_dag_priority=self._config.enable_dag_priority_growth,
         )
 
@@ -2415,7 +2492,7 @@ class SaturationAwareScheduler:
                 f"warmup_excluded={warmup_excluded_count}{cap_kwargs})."
             )
             deficit_reported = True
-        # Stage 3: cap-driven full removal -- only fires when no deficit branch fired,
+        # Stage 3: cap-driven full removal - only fires when no deficit branch fired,
         # because reporting "removed N workers" alongside a deficit message would be
         # contradictory.
         if cap_driven and not deficit_reported:

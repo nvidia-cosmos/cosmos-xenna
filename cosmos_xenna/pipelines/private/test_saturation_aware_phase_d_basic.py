@@ -1482,8 +1482,8 @@ class TestBottleneckShrinkProtection:
 
     @staticmethod
     def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
-        """Pre-populate D_k EWMA so identify_bottleneck engages with caption as argmax."""
-        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        """Pre-populate intrinsic ``S_k`` EWMA so identify_bottleneck engages with caption as argmax."""
+        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
 
     def test_engaged_bottleneck_with_negative_intent_is_not_shrunk(self) -> None:
         """Toggle ON, engaged, intent<0, no ceiling overflow -> stage NOT shrunk."""
@@ -1642,8 +1642,8 @@ class TestBottleneckShrinkProtectionLogDebounce:
 
     @staticmethod
     def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
-        """Pre-populate D_k EWMA so identify_bottleneck engages with caption as argmax."""
-        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        """Pre-populate intrinsic ``S_k`` EWMA so identify_bottleneck engages with caption as argmax."""
+        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
 
     def _scheduler_with_protection_on(self) -> SaturationAwareScheduler:
         scheduler, _problem_obj = _problem(
@@ -1767,7 +1767,7 @@ class TestBottleneckEngagementLogToggleGate:
     """Engagement INFO log is silenced when both decision toggles are disabled.
 
     The bottleneck calc block keeps running to maintain warm
-    ``_d_k_ewma`` state for re-enable; only the operator-facing log
+    ``_s_k_ewma`` state for re-enable; only the operator-facing log
     is gated. Disabling both toggles must not introduce a new INFO
     line.
     """
@@ -1784,11 +1784,11 @@ class TestBottleneckEngagementLogToggleGate:
 
     @staticmethod
     def _set_disengaged_homogeneous(scheduler: SaturationAwareScheduler) -> None:
-        scheduler._d_k_ewma = {"download": 1.0, "caption": 1.0, "write": 1.0}
+        scheduler._s_k_ewma = {"download": 1.0, "caption": 1.0, "write": 1.0}
 
     @staticmethod
     def _set_engaged_heterogeneous(scheduler: SaturationAwareScheduler) -> None:
-        scheduler._d_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
 
     def _drive_engagement_transition(self, scheduler: SaturationAwareScheduler) -> None:
         """Run two cycles: cycle 1 disengaged, cycle 2 engaged.

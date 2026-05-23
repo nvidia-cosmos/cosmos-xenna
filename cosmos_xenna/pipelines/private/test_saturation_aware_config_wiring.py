@@ -704,16 +704,16 @@ class TestBottleneckDecisionFields:
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["A", "B"]))
 
-        # Seed cycle: latch each stage at a distinct D_k value.
-        scheduler._update_d_k_ewma({"A": 2.0, "B": 1.0})
-        assert scheduler._d_k_ewma["A"] == pytest.approx(2.0)
-        assert scheduler._d_k_ewma["B"] == pytest.approx(1.0)
+        # Seed cycle: latch each stage at a distinct intrinsic S_k value.
+        scheduler._update_s_k_ewma({"A": 2.0, "B": 1.0})
+        assert scheduler._s_k_ewma["A"] == pytest.approx(2.0)
+        assert scheduler._s_k_ewma["B"] == pytest.approx(1.0)
 
         # Second cycle with alpha=1.0 replaces (no blending with prior).
-        scheduler._update_d_k_ewma({"A": 5.0, "B": 0.5})
+        scheduler._update_s_k_ewma({"A": 5.0, "B": 0.5})
 
-        assert scheduler._d_k_ewma["A"] == pytest.approx(5.0)
-        assert scheduler._d_k_ewma["B"] == pytest.approx(0.5)
+        assert scheduler._s_k_ewma["A"] == pytest.approx(5.0)
+        assert scheduler._s_k_ewma["B"] == pytest.approx(0.5)
 
     def test_bottleneck_heterogeneity_threshold_above_ratio_disengages(self) -> None:
         """A threshold larger than the computed ratio leaves engagement off."""

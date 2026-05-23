@@ -4,14 +4,18 @@
 
 Each autoscale cycle the scheduler exports a per-stage Prometheus
 gauge `xenna_stage_bottleneck_score{stage,pipeline}` equal to the
-Forced Flow Law per-stage *service demand* `D_k = V_k × S_k`
-(Lazowska, Zahorjan, Graham, Sevcik 1984, Chapter 3). For Xenna's
-linear streaming DAG `V_k = 1`, so the metric reduces to per-stage
-mean service time `S_k`. The stage with the largest `D_k` is the
-bottleneck; pipeline throughput is bounded by `1 / max_k D_k` no
-matter how much capacity the other stages have. A single INFO log
-line per cycle names the current bottleneck so operators do not
-need a dashboard open to diagnose one cycle.
+Forced Flow Law per-stage actor-normalized *service demand*
+`D_k = V_k × S_k / c_k` (Lazowska, Zahorjan, Graham, Sevcik 1984,
+Chapter 3, generalised to multi-server stations). For Xenna's
+linear streaming DAG `V_k = 1`, so the metric reduces to
+`D_k = S_k / c_k` where `c_k` is the effective ready capacity of
+stage `k` (sum over ready worker groups of
+`slots_per_worker × max(1, num_allocations)`). The stage with the
+largest `D_k` is the bottleneck; pipeline throughput is bounded by
+`min_k c_k / S_k = 1 / max_k D_k`. A single INFO log line per cycle
+names the current bottleneck — selected by the same near-tie
+identity the planner uses — so operators do not need a dashboard
+open to diagnose one cycle.
 
 ## Problem
 
@@ -38,30 +42,35 @@ That instinct is the most common autoscaler tuning mistake:
 ## Decision
 
 Expose a per-stage Prometheus gauge whose value is the Forced Flow
-Law service demand `D_k = V_k × S_k`:
+Law actor-normalized service demand `D_k = V_k × S_k / c_k`:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                                                              │
 │   xenna_stage_bottleneck_score{stage, pipeline}              │
-│   ─ value:  D_k = V_k * S_k                                  │
+│   ─ value:  D_k = V_k * S_k / c_k                            │
 │   ─ where   V_k = 1   (linear Xenna DAG: every task visits   │
 │                        every stage exactly once)             │
 │             S_k = mean per-task service time                 │
 │                  = 1 / processing_speed_tasks_per_second     │
+│             c_k = effective ready capacity                   │
+│                  = Σ over ready worker groups of             │
+│                    slots_per_worker × max(1, num_allocations)│
 │                                                              │
 │   bottleneck stage           = argmax over k of D_k          │
-│   pipeline throughput bound  = 1 / max_k D_k                 │
+│   pipeline throughput bound  = min_k c_k / S_k = 1/max_k D_k │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Example three-stage pipeline (`download` → `caption` → `embed`):
+Example three-stage pipeline (`download` → `caption` → `embed`,
+each stage with one CPU worker so `c_k = 1` and `D_k = S_k`):
 
 ```
    ┌──────────┐    ┌───────────┐    ┌─────────┐
    │ download │ ─► │  caption  │ ─► │  embed  │
    │ S = 0.05s│    │ S = 2.00s │    │ S=0.10s │
+   │ c = 1    │    │ c = 1     │    │ c = 1   │
    │ D = 0.05s│    │ D = 2.00s │    │ D=0.10s │
    └──────────┘    └───────────┘    └─────────┘
                          ▲▲▲
@@ -69,6 +78,19 @@ Example three-stage pipeline (`download` → `caption` → `embed`):
                   bottleneck stage = "caption"
                   pipeline throughput ≤ 1 / 2.00 = 0.5 tasks/s
 ```
+
+Actor-count normalisation is what distinguishes the metric from a
+plain per-task service time. A multi-actor stage with `S = 34s`
+and `c = 13` has `D_k ≈ 2.6s`, not `34s`: it is *availability*-rich
+and not the bottleneck even though its raw service time is the
+largest in the pipeline. Operators should read `D_k` as
+"seconds-per-channel of demand", and the throughput bound as the
+inverse of the slowest channel rate across stages.
+
+The cluster heterogeneity gauge `xenna_scheduler_cluster_heterogeneity_ratio`
+consumes the same `D_k` mapping in the same cycle, so its
+`max_k D_k / min_k D_k` value cannot disagree with the bottleneck
+label.
 
 The metric is numerically equal to the existing per-stage
 `pipeline_actor_process_time` gauge published from
@@ -122,23 +144,30 @@ envelope is paid once and reused.
                                      │
                                      ▼
               ┌──────────────────────────────────────────────┐
+              │  _update_s_k_ewma(S_k samples)               │
+              │    intrinsic per-task service time EWMA      │
+              │  c_k = effective_ready_capacity(stage)       │
+              │  d_k_now[k] = compute_d_k(S_k_ewma, c_k)     │
+              │             = S_k / c_k (NaN if c_k <= 0)    │
+              │                                              │
+              │  identity = identify_bottleneck(d_k_now)     │
               │  emit_bottleneck_score(                      │
-              │     service_times_s={k: S_k for k in stages},│
+              │     d_k_by_stage=d_k_now,                    │
+              │     bottleneck_identity=identity,            │
+              │     effective_capacities={k: c_k},           │
               │     pipeline_name=P,                         │
               │  )                                           │
-              │    D_k = V_k * S_k         (V_k = 1)         │
               │    gauge.set(D_k, {stage: k, pipeline: P})   │
               │    NaN samples skipped from argmax           │
-              │  identify bottleneck = argmax_k D_k          │
               │  logger.info(                                │
               │     f"bottleneck stage: {name} "             │
               │     f"(D = {D:.2f}s, throughput bound = "    │
-              │     f"{1/D:.2f} tasks/s)")                   │
+              │     f"{1/D:.2f} tasks/s, capacity = {c_k})") │
               └──────────────────────────────────────────────┘
 ```
 
-The mean per-task service time `S_k` is computed directly from the
-`TaskMeasurement.duration()` (`end - start`) values that
+The intrinsic per-task service time `S_k` is computed directly from
+the `TaskMeasurement.duration()` (`end - start`) values that
 `update_with_measurements` already receives on every monitor tick.
 Two cumulative accumulators (`_completed_counts` and
 `_completed_service_time_sums`) feed two independent per-cycle
@@ -149,6 +178,14 @@ delta-count or delta-sum is non-positive in the current cycle
 observe `math.nan` on the gauge and are excluded from the argmax
 and the INFO log; they re-enter once their first non-empty
 measurement batch lands.
+
+The actor-count normalisation lives in the per-cycle division step:
+`_s_k_ewma` smooths the intrinsic per-task service time only, and
+each cycle `compute_d_k` divides the smoothed `S_k` by the live
+`effective_ready_capacity(stage)`. Phase A grow / shrink, Phase B
+floor, Phase C grow, and Phase D shrink change `c_k` immediately
+so the next cycle's `D_k` reflects the new capacity without waiting
+for the EWMA to converge.
 
 The single per-cycle log line means an operator triaging a slow
 pipeline does not need a Grafana dashboard to identify the

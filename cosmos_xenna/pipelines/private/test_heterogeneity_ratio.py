@@ -103,7 +103,7 @@ class TestComputeHeterogeneityRatio:
         state = HeterogeneityWarnState()
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": 0.1, "b": 0.5, "c": 1.0},
+            d_k_by_stage={"a": 0.1, "b": 0.5, "c": 1.0},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=20.0,
@@ -123,7 +123,7 @@ class TestComputeHeterogeneityRatio:
         state = HeterogeneityWarnState()
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": math.nan, "b": 0.5, "c": 1.0},
+            d_k_by_stage={"a": math.nan, "b": 0.5, "c": 1.0},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=20.0,
@@ -143,7 +143,7 @@ class TestComputeHeterogeneityRatio:
         state = HeterogeneityWarnState(streak_cycles=5, has_fired=False)
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": math.nan, "b": 0.5},
+            d_k_by_stage={"a": math.nan, "b": 0.5},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=2.0,
@@ -168,7 +168,7 @@ class TestComputeHeterogeneityRatio:
 
         for _ in range(5):
             compute_heterogeneity_ratio(
-                service_times_s={"a": 0.1, "b": 1.0},
+                d_k_by_stage={"a": 0.1, "b": 1.0},
                 pipeline_name="test_pipeline",
                 state=state,
                 warn_threshold=5.0,
@@ -191,7 +191,7 @@ class TestComputeHeterogeneityRatio:
 
         for _ in range(warn_streak):
             compute_heterogeneity_ratio(
-                service_times_s={"fast": 0.1, "slow": 1.0},
+                d_k_by_stage={"fast": 0.1, "slow": 1.0},
                 pipeline_name="test_pipeline",
                 state=state,
                 warn_threshold=5.0,
@@ -221,7 +221,7 @@ class TestComputeHeterogeneityRatio:
 
         for _ in range(warn_streak - 1):
             compute_heterogeneity_ratio(
-                service_times_s={"a": 0.1, "b": 1.0},
+                d_k_by_stage={"a": 0.1, "b": 1.0},
                 pipeline_name="test_pipeline",
                 state=state,
                 warn_threshold=5.0,
@@ -230,7 +230,7 @@ class TestComputeHeterogeneityRatio:
         assert state.streak_cycles == warn_streak - 1
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": 0.5, "b": 1.0},
+            d_k_by_stage={"a": 0.5, "b": 1.0},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=5.0,
@@ -239,7 +239,7 @@ class TestComputeHeterogeneityRatio:
         assert state.streak_cycles == 0
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": 0.1, "b": 1.0},
+            d_k_by_stage={"a": 0.1, "b": 1.0},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=5.0,
@@ -258,7 +258,7 @@ class TestComputeHeterogeneityRatio:
 
         for _ in range(warn_streak + 5):
             compute_heterogeneity_ratio(
-                service_times_s={"a": 0.1, "b": 1.0},
+                d_k_by_stage={"a": 0.1, "b": 1.0},
                 pipeline_name="test_pipeline",
                 state=state,
                 warn_threshold=5.0,
@@ -268,7 +268,7 @@ class TestComputeHeterogeneityRatio:
         assert len(first_pass_logs) == 1, "first streak completion must fire exactly once even with extra cycles"
 
         compute_heterogeneity_ratio(
-            service_times_s={"a": 0.5, "b": 1.0},
+            d_k_by_stage={"a": 0.5, "b": 1.0},
             pipeline_name="test_pipeline",
             state=state,
             warn_threshold=5.0,
@@ -278,7 +278,7 @@ class TestComputeHeterogeneityRatio:
 
         for _ in range(warn_streak):
             compute_heterogeneity_ratio(
-                service_times_s={"a": 0.1, "b": 1.0},
+                d_k_by_stage={"a": 0.1, "b": 1.0},
                 pipeline_name="test_pipeline",
                 state=state,
                 warn_threshold=5.0,

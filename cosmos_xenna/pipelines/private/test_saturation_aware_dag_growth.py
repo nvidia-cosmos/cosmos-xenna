@@ -414,8 +414,8 @@ class TestBottleneckPriorityGrowth:
             cluster=_cluster(total_cpus_per_node=4),
             enable_bottleneck_priority_growth=True,
         )
-        # Pre-populate the EWMA so identify_bottleneck returns engaged with s1 as argmax.
-        scheduler._d_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+        # Pre-populate the intrinsic S_k EWMA so identify_bottleneck returns engaged with s1 as argmax.
+        scheduler._s_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
 
         solution = _autoscale_with_intents(
             scheduler,
@@ -434,7 +434,7 @@ class TestBottleneckPriorityGrowth:
             cluster=_cluster(total_cpus_per_node=4),
             enable_bottleneck_priority_growth=False,
         )
-        scheduler._d_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+        scheduler._s_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
 
         solution = _autoscale_with_intents(
             scheduler,
@@ -452,8 +452,8 @@ class TestBottleneckPriorityGrowth:
             cluster=_cluster(total_cpus_per_node=4),
             enable_bottleneck_priority_growth=True,
         )
-        # Balanced D_k -> ratio=1.0 < 2.0 -> not engaged.
-        scheduler._d_k_ewma = {"s0": 1.0, "s1": 1.0, "s2": 1.0}
+        # Balanced intrinsic S_k -> uniform D_k -> ratio=1.0 < 2.0 -> not engaged.
+        scheduler._s_k_ewma = {"s0": 1.0, "s1": 1.0, "s2": 1.0}
 
         solution = _autoscale_with_intents(
             scheduler,

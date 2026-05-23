@@ -19,21 +19,27 @@ The Forced Flow Law (Lazowska, Zahorjan, Graham, Sevcik 1984,
 *Quantitative System Performance*, Chapter 3) gives the per-stage
 service demand of a separable queueing network as::
 
-    D_k = V_k * S_k
+    D_k = V_k * S_k / c_k
 
 where:
 
-  * ``V_k`` is the per-task visit ratio at stage ``k`` -- how many
+  * ``V_k`` is the per-task visit ratio at stage ``k`` - how many
     times one end-to-end task visits that stage.
   * ``S_k`` is the mean per-task service time at stage ``k`` in
     seconds (the time one actor spends processing one task).
+  * ``c_k`` is the effective ready service capacity at stage ``k``
+    (count of concurrent service channels: each non-SPMD worker
+    contributes ``slots_per_worker`` channels, and an SPMD worker
+    group contributes ``slots_per_worker * num_allocations``
+    channels because all allocations process tasks in parallel).
 
 Xenna's streaming pipeline is a linear DAG: every input task visits
 every stage exactly once, so ``V_k = 1`` for all stages and the
-service demand reduces to ``D_k = S_k``. The bottleneck is the
-stage with the largest ``D_k``; pipeline throughput is bounded by
-``1 / max_k D_k`` regardless of how many workers the non-bottleneck
-stages carry (Little's Law plus the Forced Flow Law -- see
+service demand reduces to ``D_k = S_k / c_k``. The bottleneck is
+the stage with the largest ``D_k``; pipeline throughput is bounded
+by ``min_k c_k / S_k = 1 / max_k D_k`` regardless of how many
+workers the non-bottleneck stages carry (Little's Law plus the
+Forced Flow Law - see
 ``cosmos-xenna/docs/scheduler/saturation-aware/23-bottleneck-score-metric.md``).
 
 Pure observability
@@ -52,9 +58,10 @@ Cold-start contract
 ===================
 
 A stage whose mean per-task service time has not yet been observed
-this cycle has an undefined ``S_k``. The helper folds every shape
-of "no measurement" into a single sentinel -- ``math.nan`` -- and
-pins the following contract for the cycle:
+this cycle, or whose effective ready capacity is zero, has an
+undefined ``D_k``. The helper folds every shape of "no
+measurement" into a single sentinel - ``math.nan`` - and pins
+the following contract for the cycle:
 
   * The ``xenna_stage_bottleneck_score{stage, pipeline}`` gauge is
     observed with ``math.nan`` so the metric's label cardinality
@@ -67,31 +74,30 @@ pins the following contract for the cycle:
   * The per-cycle INFO log line skips the stage. If every stage in
     the input mapping is cold, no INFO log fires that cycle.
 
-Three input shapes map to the cold-start sentinel:
+Inputs that map to the cold-start sentinel:
 
-  * ``math.nan`` (no measurement yet -- the canonical cold-start).
-  * ``0.0`` -- comes from
-    ``processing_speed_tasks_per_second == 0`` where
-    ``S_k = 1 / 0`` is undefined; treated identically to NaN so
-    the call site does not have to special-case division by zero.
-  * Any non-positive value -- a physical service time is
-    strictly positive; treating negative samples as cold-start
-    prevents a pathological measurement from poisoning the argmax.
+  * ``service_time_s`` is ``math.nan`` (no completed-task sample yet).
+  * ``service_time_s`` is ``<= 0`` (defensive: a physical service
+    time is strictly positive, and ``0.0`` arrives from
+    ``processing_speed_tasks_per_second == 0`` where ``S_k = 1 / 0``
+    is undefined).
+  * ``effective_capacity`` is ``<= 0`` (no ready service channels;
+    division would be undefined).
 
-ASCII flow
+Flow chart
 ==========
 
 ::
 
-      service_times_s = {                                    +-> per-stage gauge.set(D_k)
-        "download": 0.05s,   <-- S_k                         |
-        "caption":  2.00s,   <-- S_k (bottleneck)            |   {stage, pipeline}
-        "embed":    0.10s,   <-- S_k                         |
+      d_k_by_stage = {                                       +-> per-stage gauge.set(D_k)
+        "download": 0.025s,  <-- S_k=0.05s, c_k=2            |
+        "caption":  0.250s,  <-- S_k=2.0s,  c_k=8 (bottleneck)|  {stage, pipeline}
+        "embed":    0.050s,  <-- S_k=0.10s, c_k=2            |
       }                                                      |
                 |                                            |
                 v                                            |
         +--------------------+                               |
-        | for each stage k:  |  D_k = V_k * S_k    V_k = 1  >+
+        | for each stage k:  |  D_k already actor-normalized>+
         |   set gauge(D_k)   |                              \\
         |   if finite, keep  |                               \\
         +--------------------+                                \\
@@ -101,7 +107,8 @@ ASCII flow
                 |                                          argmax / log
                 v
         logger.info("bottleneck stage: caption "
-                    "(D = 2.00s, throughput bound = 0.50 tasks/s)")
+                    "(D = 0.25s, throughput bound = 4.00 tasks/s, "
+                    "capacity = 8)")
 
 Cluster heterogeneity ratio extension
 =====================================
@@ -148,73 +155,85 @@ from cosmos_xenna.utils import python_log as logger
 _BOTTLENECK_GAUGE = Gauge(
     "xenna_stage_bottleneck_score",
     description=(
-        "Forced Flow Law per-stage service demand D_k = V_k * S_k in "
-        "seconds. For Xenna's linear DAG V_k = 1 so the metric reduces "
-        "to the mean per-task service time. The bottleneck stage is "
-        "argmax_k D_k; pipeline throughput is bounded by 1 / max_k D_k. "
-        "NaN samples indicate cold-start stages with no completed "
-        "task in the current cycle."
+        "Forced Flow Law per-stage actor-normalized service demand "
+        "D_k = V_k * S_k / c_k in seconds-per-channel. For Xenna's "
+        "linear DAG V_k = 1 so D_k = S_k / c_k where c_k is the "
+        "effective ready capacity (concurrent service channels). The "
+        "bottleneck stage is argmax_k D_k; pipeline throughput is "
+        "bounded by 1 / max_k D_k. NaN samples indicate cold-start "
+        "stages with no completed task in the current cycle, or "
+        "stages with zero effective capacity."
     ),
     tag_keys=("stage", "pipeline"),
 )
 
 
-def _service_time_to_score(service_time_s: float) -> float:
-    """Map a per-stage service-time sample to its Forced-Flow ``D_k``.
+def compute_d_k(service_time_s: float, effective_capacity: int) -> float:
+    """Compute the actor-normalized Forced-Flow service demand ``D_k``.
 
     Xenna's pipeline is a linear DAG, so the visit ratio ``V_k``
-    equals 1 for every stage and ``D_k = V_k * S_k`` reduces to
-    ``D_k = S_k``. Any non-finite or non-positive input is folded
-    into the cold-start sentinel ``math.nan``:
+    equals 1 for every stage and ``D_k = V_k * S_k / c_k`` reduces
+    to ``D_k = service_time_s / effective_capacity``. The result
+    is the per-actor-channel service demand in seconds.
 
-      * ``math.nan`` (no measurement yet) passes through unchanged.
-      * ``0.0`` comes from ``processing_speed_tasks_per_second == 0``
-        where ``S_k = 1 / 0`` is undefined.
-      * Strictly negative values cannot represent physical service
-        times and are also folded into the cold-start case so a
-        pathological sample cannot win the argmax.
+    Any cold-start input is folded into the sentinel ``math.nan``:
+
+      * ``service_time_s`` is non-finite or ``<= 0`` (no sample,
+        or ``processing_speed_tasks_per_second == 0`` where
+        ``S_k = 1 / 0`` is undefined).
+      * ``effective_capacity`` is ``<= 0`` (no ready channels;
+        division undefined).
 
     Args:
-        service_time_s: Mean per-task service time in seconds for
-            one stage. Typically computed at the call site as
-            ``1.0 / pool_stats.processing_speed_tasks_per_second``
-            from ``ActorPoolStats``.
+        service_time_s: Mean per-task service time in seconds
+            (intrinsic ``S_k``). Typically the EWMA-smoothed mean
+            of ``dsum / dcount`` from ``ActorPoolStats``.
+        effective_capacity: Concurrent service channels at this
+            stage; sum over ready worker groups of
+            ``slots_per_worker * max(1, num_allocations)``.
 
     Returns:
-        ``D_k`` in seconds, or ``math.nan`` when the input is not
-        a finite positive number.
+        ``D_k`` in seconds-per-channel, or ``math.nan`` when either
+        input fails the finite-positive contract.
     """
     if not math.isfinite(service_time_s) or service_time_s <= 0.0:
         return math.nan
-    return service_time_s
+    if effective_capacity <= 0:
+        return math.nan
+    return service_time_s / effective_capacity
 
 
 def emit_bottleneck_score(
     *,
-    service_times_s: Mapping[str, float],
+    d_k_by_stage: Mapping[str, float],
+    bottleneck_identity: "BottleneckIdentity",
     pipeline_name: str,
+    effective_capacities: Mapping[str, int] | None = None,
 ) -> None:
     """Emit per-stage bottleneck-score gauges and one INFO log line.
 
-    Computes ``D_k = V_k * S_k`` for every stage in ``service_times_s``
-    (``V_k = 1`` for Xenna's linear DAG, so ``D_k = S_k``), observes
-    the ``xenna_stage_bottleneck_score{stage, pipeline}`` gauge for
-    each, and emits one INFO log line naming the bottleneck.
+    Observes the actor-normalized ``D_k`` already computed by
+    :func:`compute_d_k` for every stage in ``d_k_by_stage`` on the
+    ``xenna_stage_bottleneck_score{stage, pipeline}`` gauge, then
+    emits one INFO log line naming the bottleneck stage selected
+    by :func:`identify_bottleneck`.
 
     Side effects per call:
 
-      * Every entry in ``service_times_s`` triggers exactly one
-        gauge observation. Cold-start stages (NaN, zero, or
-        negative service time) observe ``math.nan`` so the gauge's
-        cardinality stays stable across cycles even when a stage
-        has not produced its first completed-task sample.
-      * If at least one stage has a finite positive ``D_k``, a
-        single INFO log line is emitted naming the bottleneck
-        stage and the throughput bound
-        ``1 / max_k D_k`` in tasks per second. The format is
-        pinned by ``test_log_format_pins_throughput_bound``.
-      * If every stage is in cold-start, no INFO log fires that
-        cycle. Operators see the gauges go NaN; the bottleneck is
+      * Every entry in ``d_k_by_stage`` triggers exactly one gauge
+        observation. Cold-start stages (NaN or non-positive ``D_k``)
+        observe ``math.nan`` so the gauge's cardinality stays stable
+        across cycles even when a stage has not produced its first
+        completed-task sample.
+      * If ``bottleneck_identity.engaged`` and at least one stage
+        has a finite positive ``D_k``, a single INFO log line is
+        emitted naming the bottleneck stage from
+        ``bottleneck_identity.stage_name`` and the throughput bound
+        ``1 / max_k D_k`` in tasks per second. Sharing identity with
+        :func:`identify_bottleneck` guarantees the operator-facing
+        log cannot disagree with the planner's near-tie selection.
+      * If no stage has a finite ``D_k``, no INFO log fires.
+        Operators see the gauges go NaN; the bottleneck is
         unknown and the helper does not pretend otherwise.
 
     The helper is pure observability -- it does NOT mutate any
@@ -223,43 +242,58 @@ def emit_bottleneck_score(
     ``SaturationAwareScheduler.autoscale``.
 
     Args:
-        service_times_s: Mapping from stage name to mean per-task
-            service time in seconds (``S_k``). The mapping is
-            consumed read-only. An empty mapping is a valid input
-            and produces no observations and no log line --
-            matching the cold-start contract for the very first
-            cycle when the scheduler has not yet wired up
-            ``ActorPoolStats``.
+        d_k_by_stage: Mapping from stage name to actor-normalized
+            ``D_k`` in seconds-per-channel (the same mapping fed to
+            :func:`identify_bottleneck` and
+            :func:`compute_heterogeneity_ratio`). Consumed read-only.
+            An empty mapping produces no observations and no log
+            line -- matching the cold-start contract for the very
+            first cycle.
+        bottleneck_identity: Per-cycle identity from
+            :func:`identify_bottleneck`. The INFO log uses
+            ``identity.stage_name`` so the line cannot disagree with
+            the near-tie selection that drives Phase C / Phase D.
         pipeline_name: Pipeline identifier used as the ``pipeline``
             Prometheus tag so multiple pipelines running inside
-            the same Ray cluster remain distinguishable on the
-            metric.
+            the same Ray cluster remain distinguishable.
+        effective_capacities: Optional mapping from stage name to
+            effective ready capacity (``c_k``). When supplied the
+            bottleneck stage's capacity is included in the INFO log
+            for operator sanity-checking; absent or missing keys
+            produce a log line without the ``capacity`` field.
     """
-    if not service_times_s:
+    if not d_k_by_stage:
         return
 
     finite_scores: dict[str, float] = {}
-    for stage_name, service_time_s in service_times_s.items():
-        score = _service_time_to_score(service_time_s)
+    for stage_name, d_k in d_k_by_stage.items():
+        is_finite_positive = math.isfinite(d_k) and d_k > 0.0
+        observed = d_k if is_finite_positive else math.nan
         _BOTTLENECK_GAUGE.set(
-            score,
+            observed,
             tags={"stage": stage_name, "pipeline": pipeline_name},
         )
-        if math.isfinite(score):
-            finite_scores[stage_name] = score
+        if is_finite_positive:
+            finite_scores[stage_name] = d_k
 
     if not finite_scores:
         return
 
-    bottleneck_name, bottleneck_score = max(
-        finite_scores.items(),
-        key=lambda item: item[1],
-    )
+    if bottleneck_identity.stage_name is None or bottleneck_identity.stage_name not in finite_scores:
+        return
+
+    bottleneck_name = bottleneck_identity.stage_name
+    bottleneck_score = finite_scores[bottleneck_name]
     throughput_bound = 1.0 / bottleneck_score
+    if effective_capacities is not None and bottleneck_name in effective_capacities:
+        capacity_suffix = f", capacity = {effective_capacities[bottleneck_name]}"
+    else:
+        capacity_suffix = ""
     logger.info(
         f"bottleneck stage: {bottleneck_name!r} "
         f"(D = {bottleneck_score:.2f}s, "
-        f"throughput bound = {throughput_bound:.2f} tasks/s)"
+        f"throughput bound = {throughput_bound:.2f} tasks/s"
+        f"{capacity_suffix})"
     )
 
 
@@ -335,7 +369,7 @@ class HeterogeneityWarnState:
 
 def compute_heterogeneity_ratio(
     *,
-    service_times_s: Mapping[str, float],
+    d_k_by_stage: Mapping[str, float],
     pipeline_name: str,
     state: HeterogeneityWarnState,
     warn_threshold: float,
@@ -344,13 +378,13 @@ def compute_heterogeneity_ratio(
     """Emit the cluster heterogeneity ratio gauge and an optional INFO log.
 
     Computes ``ratio = max_k D_k / min_k D_k`` across the stages in
-    ``service_times_s`` whose service time is finite and strictly
-    positive (cold-start stages -- ``math.nan``, ``0.0``, or
-    negative values -- are excluded via :func:`_service_time_to_score`).
-    When fewer than two stages have a finite ``D_k`` the ratio is
-    undefined; the gauge then observes ``math.nan`` so its label
-    cardinality stays stable across cycles, and the streak counter
-    resets to 0 (a cold-start cluster has no heterogeneity verdict).
+    ``d_k_by_stage`` whose actor-normalized ``D_k`` is finite and
+    strictly positive (cold-start stages -- ``math.nan``, ``0.0``,
+    or negative values -- are excluded). When fewer than two stages
+    have a finite ``D_k`` the ratio is undefined; the gauge then
+    observes ``math.nan`` so its label cardinality stays stable
+    across cycles, and the streak counter resets to 0 (a cold-start
+    cluster has no heterogeneity verdict).
 
     The state argument is mutated in place:
 
@@ -377,10 +411,10 @@ def compute_heterogeneity_ratio(
     cycle from ``SaturationAwareScheduler.autoscale``.
 
     Args:
-        service_times_s: Mapping from stage name to mean per-task
-            service time in seconds (``S_k``). The mapping is
-            consumed read-only and shared with
-            :func:`emit_bottleneck_score` -- both helpers see the
+        d_k_by_stage: Mapping from stage name to actor-normalized
+            ``D_k`` in seconds-per-channel. Consumed read-only and
+            shared with :func:`emit_bottleneck_score` and
+            :func:`identify_bottleneck` -- all three helpers see the
             same per-stage ``D_k`` view in a given cycle.
         pipeline_name: Pipeline identifier used as the
             ``pipeline`` Prometheus tag. The gauge is tagged
@@ -400,10 +434,9 @@ def compute_heterogeneity_ratio(
             ``SaturationAwareConfig.cluster_heterogeneity_warn_streak``.
     """
     finite_scores: dict[str, float] = {}
-    for stage_name, service_time_s in service_times_s.items():
-        score = _service_time_to_score(service_time_s)
-        if math.isfinite(score):
-            finite_scores[stage_name] = score
+    for stage_name, d_k in d_k_by_stage.items():
+        if math.isfinite(d_k) and d_k > 0.0:
+            finite_scores[stage_name] = d_k
 
     if len(finite_scores) < 2:
         # Undefined ratio: emit NaN to keep cardinality stable, reset
@@ -534,12 +567,12 @@ class BottleneckEngagementState:
 
 
 def identify_bottleneck(
-    d_k_ewma: Mapping[str, float],
+    d_k_by_stage: Mapping[str, float],
     *,
     heterogeneity_threshold: float,
     near_tie_tolerance: float = 0.05,
 ) -> BottleneckIdentity:
-    """Identify the engaged bottleneck stage from EWMA-smoothed ``D_k``.
+    """Identify the engaged bottleneck stage from actor-normalized ``D_k``.
 
     The ratio is ``max / median`` for n>=3 and ``max / min`` for n=2.
     Engagement requires at least two finite, positive samples and a
@@ -548,7 +581,8 @@ def identify_bottleneck(
     lexicographic ``stage_name`` for cycle-to-cycle stability.
 
     Args:
-        d_k_ewma: Per-stage EWMA-smoothed ``D_k`` in seconds;
+        d_k_by_stage: Per-stage actor-normalized ``D_k`` in
+            seconds-per-channel as produced by :func:`compute_d_k`;
             cold-start stages contribute ``math.nan``.
         heterogeneity_threshold: Engagement floor. Must be > 1.0.
         near_tie_tolerance: Fractional tie band in ``[0.0, 1.0)``;
@@ -575,10 +609,9 @@ def identify_bottleneck(
         raise ValueError(msg)
 
     finite_scores: dict[str, float] = {}
-    for name, d_k in d_k_ewma.items():
-        score = _service_time_to_score(d_k)
-        if math.isfinite(score):
-            finite_scores[name] = score
+    for name, d_k in d_k_by_stage.items():
+        if math.isfinite(d_k) and d_k > 0.0:
+            finite_scores[name] = d_k
 
     if not finite_scores:
         return BottleneckIdentity(

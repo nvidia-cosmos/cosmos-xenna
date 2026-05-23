@@ -75,9 +75,9 @@ def scheduler() -> SaturationAwareScheduler:
 class TestRefreshCapacityTargetWorkers:
     """Pin the orchestrator's capacity-target population logic."""
 
-    def test_returns_none_when_d_k_is_unobservable(self, scheduler: SaturationAwareScheduler) -> None:
-        """No D_k EWMA sample yet -> cold-start sentinel ``None``."""
-        scheduler._d_k_ewma["S"] = math.nan
+    def test_returns_none_when_s_k_is_unobservable(self, scheduler: SaturationAwareScheduler) -> None:
+        """No S_k EWMA sample yet -> cold-start sentinel ``None``."""
+        scheduler._s_k_ewma["S"] = math.nan
         result = scheduler._refresh_capacity_target_workers(
             stage_state=scheduler._stage_states["S"],
             stage_cfg=scheduler._stage_cfg("S"),
@@ -91,7 +91,7 @@ class TestRefreshCapacityTargetWorkers:
     def test_returns_none_when_thresholds_unresolved(self, scheduler: SaturationAwareScheduler) -> None:
         """Without resolved thresholds the utilisation target cannot be derived."""
         scheduler._stage_states["S"].resolved_thresholds = None
-        scheduler._d_k_ewma["S"] = 5.0
+        scheduler._s_k_ewma["S"] = 5.0
         result = scheduler._refresh_capacity_target_workers(
             stage_state=scheduler._stage_states["S"],
             stage_cfg=scheduler._stage_cfg("S"),
@@ -102,9 +102,9 @@ class TestRefreshCapacityTargetWorkers:
         )
         assert result is None
 
-    def test_returns_target_when_d_k_finite(self, scheduler: SaturationAwareScheduler) -> None:
-        """Finite D_k + populated thresholds -> closed-form target."""
-        scheduler._d_k_ewma["S"] = 2.0
+    def test_returns_target_when_s_k_finite(self, scheduler: SaturationAwareScheduler) -> None:
+        """Finite S_k + populated thresholds -> closed-form target."""
+        scheduler._s_k_ewma["S"] = 2.0
         result = scheduler._refresh_capacity_target_workers(
             stage_state=scheduler._stage_states["S"],
             stage_cfg=scheduler._stage_cfg("S"),

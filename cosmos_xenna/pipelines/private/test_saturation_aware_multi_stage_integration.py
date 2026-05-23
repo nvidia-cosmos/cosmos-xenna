@@ -473,7 +473,7 @@ class TestBottleneckShiftEngagementMarkerFollowsSaturatedStage:
     def test_bottleneck_shift_engagement_marker_follows_saturated_stage(self) -> None:
         """3-stage chain: bottleneck argmax moves B -> C; per-stage upstream flag flips.
 
-        Two cycles. Before each ``autoscale()`` ``_d_k_ewma`` is
+        Two cycles. Before each ``autoscale()`` ``_s_k_ewma`` is
         seeded so :func:`identify_bottleneck` first picks B then C.
         The per-stage ``cycle_bottleneck_context.is_upstream_of_bottleneck``
         flag must track the shift: cycle 0 marks A upstream of B;
@@ -498,9 +498,9 @@ class TestBottleneckShiftEngagementMarkerFollowsSaturatedStage:
             # the three samples must be >= 2.0 for engagement. The values
             # below produce ratio = 5.0 in each cycle, well past the gate.
             if cycle_idx == 0:
-                sched._d_k_ewma = {"A": 0.1, "B": 1.0, "C": 0.2}
+                sched._s_k_ewma = {"A": 0.1, "B": 1.0, "C": 0.2}
             else:
-                sched._d_k_ewma = {"A": 0.1, "B": 0.2, "C": 1.0}
+                sched._s_k_ewma = {"A": 0.1, "B": 0.2, "C": 1.0}
 
         _run_cycles(scheduler, state_factory, num_cycles=2, before_cycle=before_cycle)
 

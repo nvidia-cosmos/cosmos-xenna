@@ -806,6 +806,335 @@ impl AutoscalePlanContext {
         }
     }
 
+    /// Atomically remove a batch of workers from the working snapshot.
+    ///
+    /// The contract differs from `try_remove_worker` in two ways:
+    ///
+    /// 1. Pre-validation. Every requested `(stage_index, worker_id)`
+    ///    is looked up before any mutation. If any worker is missing,
+    ///    the method returns `Ok(false)` and leaves planner state
+    ///    untouched. The single-worker `try_remove_worker` would
+    ///    return `Ok(false)` for the missing entry and `Ok(true)`
+    ///    for already-applied removals before it; the batch contract
+    ///    makes either-all-or-none explicit so a caller building a
+    ///    multi-donor transfer plan never observes partial removal.
+    /// 2. Rollback on commit failure. If a release operation returns
+    ///    `Err` mid-batch, the method restores the cluster, planner
+    ///    maps, pending lists, and worker-age map to their pre-call
+    ///    state before propagating the same `PyRuntimeError` shape
+    ///    that `try_remove_worker` would have emitted. This protects
+    ///    transfer paths whose recovery story assumes "either every
+    ///    donor was staged for removal, or none were".
+    ///
+    /// On success each removal follows the same semantic branches as
+    /// `try_remove_worker`:
+    ///
+    /// * SPMD branch -> release the entire group's allocations,
+    ///   cancel a same-cycle pending add (drop the worker_ages
+    ///   entry) or move the worker into `pending_removes` (preserve
+    ///   the age).
+    /// * Non-SPMD branch -> release the single allocation, otherwise
+    ///   identical bookkeeping.
+    ///
+    /// An empty `removals` list returns `Ok(true)` with no mutations
+    /// (the trivial atomic batch).
+    ///
+    /// # Arguments
+    /// * `removals` - Pairs of `(stage_index, worker_id)` identifying
+    ///   the workers to remove. Stage indices reference
+    ///   `self.stages` in the same way as `try_remove_worker`.
+    ///
+    /// # Errors
+    /// * `PyIndexError` - any `stage_index >= num_stages()`.
+    /// * `PyRuntimeError` - cluster release returned `Err`
+    ///   mid-batch (planner state is rolled back), planner-state
+    ///   inconsistency (current_workers / current_worker_groups
+    ///   entry missing for a stage), or the context has already
+    ///   been drained by `into_solution()`.
+    pub fn remove_workers_atomically(
+        &mut self,
+        removals: Vec<(usize, String)>,
+    ) -> PyResult<bool> {
+        self.ensure_not_drained("remove_workers_atomically")?;
+        if removals.is_empty() {
+            return Ok(true);
+        }
+
+        // Pre-validate: every removal targets an in-range stage, and
+        // every worker id is present in the matching planner map.
+        // Missing worker ids return `Ok(false)` without mutating any
+        // state so the caller can fall back to a different plan.
+        for (stage_index, worker_id) in &removals {
+            if *stage_index >= self.stages.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "AutoscalePlanContext.remove_workers_atomically: stage_index {} out of \
+                     range (num_stages={})",
+                    stage_index,
+                    self.stages.len(),
+                )));
+            }
+            let stage = &self.stages[*stage_index];
+            let stage_name = &stage.name;
+            let present = match stage.worker_shape {
+                rds::WorkerShape::SpmdNodeMultiple(_) => self
+                    .current_worker_groups
+                    .get(stage_name)
+                    .is_some_and(|m| m.contains_key(worker_id)),
+                _ => self
+                    .current_workers
+                    .get(stage_name)
+                    .is_some_and(|m| m.contains_key(worker_id)),
+            };
+            if !present {
+                return Ok(false);
+            }
+        }
+
+        // Snapshot every piece of state a per-removal commit can
+        // mutate. The cluster snapshot is the largest copy here
+        // (one HashMap of nodes); for typical batches (3-4 donors)
+        // the per-call cost is negligible. Holding a single set of
+        // snapshots for the whole batch is simpler than per-step
+        // unwinding and matches the all-or-nothing contract.
+        let cluster_snapshot = self.cluster.clone();
+        let current_workers_snapshot = self.current_workers.clone();
+        let current_worker_groups_snapshot = self.current_worker_groups.clone();
+        let pending_removes_snapshot = self.pending_removes.clone();
+        let pending_adds_snapshot = self.pending_adds.clone();
+        let worker_ages_snapshot = self.worker_ages.clone();
+
+        for (stage_index, worker_id) in removals {
+            if let Err(commit_err) = self.commit_validated_removal(stage_index, &worker_id) {
+                self.cluster = cluster_snapshot;
+                self.current_workers = current_workers_snapshot;
+                self.current_worker_groups = current_worker_groups_snapshot;
+                self.pending_removes = pending_removes_snapshot;
+                self.pending_adds = pending_adds_snapshot;
+                self.worker_ages = worker_ages_snapshot;
+                return Err(commit_err);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Read-only snapshot of the working cluster for diagnostics.
+    ///
+    /// Returns a fresh clone so the caller can inspect or mutate the
+    /// returned `ClusterResources` without affecting the planner's
+    /// internal state. Used by allocation-failure diagnostics so
+    /// operator-facing logs report the resources the planner
+    /// actually used, not the static snapshot from the input
+    /// `Problem`. Safe to call after `into_solution()` (read
+    /// accessors deliberately bypass the drained-state guard so
+    /// the caller can capture post-cycle diagnostics).
+    pub fn cluster_snapshot(&self) -> rds::ClusterResources {
+        self.cluster.clone()
+    }
+
+    /// Non-mutating placement probe: would `try_add_worker` succeed
+    /// after applying a set of removals?
+    ///
+    /// Used by the cross-stage donor planner to validate a candidate
+    /// donor plan before any worker is removed. Clones the working
+    /// cluster, simulates each removal's resource release on the
+    /// clone, then asks the same FGD or SPMD allocator that
+    /// `try_add_worker` consults whether one placement for
+    /// `add_stage_index` would fit. The clone is dropped on return,
+    /// so the live planner state is unchanged.
+    ///
+    /// The simulated reuse map for non-SPMD receivers includes both
+    /// the existing `pending_removes[receiver_stage_name]` entries
+    /// (pre-call planner state) and any donor workers being removed
+    /// from the receiver stage in this probe call. Mirroring the
+    /// reuse map keeps the dry-run faithful to the live
+    /// `try_add_worker` path: a receiver shape that would naturally
+    /// reuse a donor slot via FGD's reuse-fragmentation reward gets
+    /// the same verdict here as it would post-commit. Cross-stage
+    /// donations contribute resources to the cloned cluster (the
+    /// allocator sees the released capacity as fresh) but not to
+    /// the reuse map (FGD's reuse semantics are scoped to the same
+    /// stage's pending_removes).
+    ///
+    /// SPMD receivers do not consult a reuse map; the cloned
+    /// cluster's released allocations are sufficient for the SPMD
+    /// allocator to detect feasibility.
+    ///
+    /// # Arguments
+    /// * `removals` - Pairs of `(stage_index, worker_id)` identifying
+    ///   the donor workers whose resources should be simulated as
+    ///   released before testing the placement.
+    /// * `add_stage_index` - The stage we want to grow. The probe
+    ///   tests whether a single fresh placement for this stage
+    ///   would succeed against the post-removal cloned cluster.
+    ///
+    /// # Errors
+    /// * `PyIndexError` - `add_stage_index` or any `stage_index` in
+    ///   `removals` is out of range.
+    /// * `PyRuntimeError` - the context has been drained; failure
+    ///   to convert a reuse-map worker representation. Cluster
+    ///   release errors, missing worker ids, and missing-resource
+    ///   shapes are surfaced via `PlacementProbeResult.reject_reason`
+    ///   instead of as exceptions, so the caller can record them
+    ///   in operator-facing decision logs.
+    pub fn probe_add_after_removals(
+        &self,
+        removals: Vec<(usize, String)>,
+        add_stage_index: usize,
+    ) -> PyResult<PlacementProbeResult> {
+        self.ensure_not_drained("probe_add_after_removals")?;
+        if add_stage_index >= self.stages.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "AutoscalePlanContext.probe_add_after_removals: add_stage_index {} out of \
+                 range (num_stages={})",
+                add_stage_index,
+                self.stages.len(),
+            )));
+        }
+        for (stage_index, _) in &removals {
+            if *stage_index >= self.stages.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "AutoscalePlanContext.probe_add_after_removals: stage_index {} out of \
+                     range (num_stages={})",
+                    stage_index,
+                    self.stages.len(),
+                )));
+            }
+        }
+
+        let receiver_stage_name = self.stages[add_stage_index].name.clone();
+        let receiver_shape = self.stages[add_stage_index].worker_shape.clone();
+
+        // Locate every donor worker without mutating planner state.
+        // Collect resources for cloned-cluster releases, and remember
+        // donors that share the receiver stage so they can enter the
+        // simulated reuse map.
+        let mut non_spmd_resources: Vec<rds::WorkerResources> = Vec::with_capacity(removals.len());
+        let mut spmd_resources: Vec<Vec<rds::WorkerResources>> = Vec::new();
+        let mut self_stage_donor_workers: Vec<ds::ProblemWorkerGroupState> = Vec::new();
+
+        for (stage_index, worker_id) in &removals {
+            let stage = &self.stages[*stage_index];
+            let stage_name = &stage.name;
+            let donor_worker = match stage.worker_shape {
+                rds::WorkerShape::SpmdNodeMultiple(_) => self
+                    .current_worker_groups
+                    .get(stage_name)
+                    .and_then(|m| m.get(worker_id))
+                    .cloned(),
+                _ => self
+                    .current_workers
+                    .get(stage_name)
+                    .and_then(|m| m.get(worker_id))
+                    .cloned(),
+            };
+            let Some(donor_worker) = donor_worker else {
+                return Ok(PlacementProbeResult {
+                    feasible: false,
+                    reject_reason: Some("worker_not_found".to_string()),
+                });
+            };
+
+            match stage.worker_shape {
+                rds::WorkerShape::SpmdNodeMultiple(_) => {
+                    spmd_resources.push(donor_worker.resources.clone());
+                }
+                _ => match donor_worker.resources.first() {
+                    Some(resource) => non_spmd_resources.push(resource.clone()),
+                    None => {
+                        return Ok(PlacementProbeResult {
+                            feasible: false,
+                            reject_reason: Some("worker_has_no_resources".to_string()),
+                        });
+                    }
+                },
+            }
+
+            if stage_name == &receiver_stage_name {
+                self_stage_donor_workers.push(donor_worker);
+            }
+        }
+
+        // Clone the working cluster and simulate every release.
+        // ClusterResources::release_allocation on the clone is
+        // infallible (always Ok); release_allocations propagates
+        // any underlying error which we surface via reject_reason
+        // rather than as a Python exception.
+        let mut cloned_cluster = self.cluster.clone();
+        for resource in &non_spmd_resources {
+            if let Err(err) = cloned_cluster.release_allocation(resource) {
+                return Ok(PlacementProbeResult {
+                    feasible: false,
+                    reject_reason: Some(format!("release_failed: {err:?}")),
+                });
+            }
+        }
+        for spmd_group in &spmd_resources {
+            if let Err(err) = cloned_cluster.release_allocations(spmd_group) {
+                return Ok(PlacementProbeResult {
+                    feasible: false,
+                    reject_reason: Some(format!("release_failed: {err:?}")),
+                });
+            }
+        }
+
+        // Run the same allocator that `try_add_worker` consults.
+        match &receiver_shape {
+            rds::WorkerShape::SpmdNodeMultiple(spmd_shape) => {
+                let result =
+                    frag::find_best_allocation_for_spmd_node_multiple(&cloned_cluster, spmd_shape);
+                if result.worker_allocations.is_empty() {
+                    Ok(PlacementProbeResult {
+                        feasible: false,
+                        reject_reason: Some("no_placement".to_string()),
+                    })
+                } else {
+                    Ok(PlacementProbeResult {
+                        feasible: true,
+                        reject_reason: None,
+                    })
+                }
+            }
+            _ => {
+                // Build the simulated reuse map: existing receiver-stage
+                // pending_removes plus any donors being removed from the
+                // receiver stage in this probe. Mirrors the reuse_map
+                // construction in try_add_worker so the dry-run sees
+                // the same FGD reuse path the live commit would take.
+                let mut reuse_map: HashMap<String, rds::Worker> = HashMap::new();
+                if let Some(existing) = self.pending_removes.get(&receiver_stage_name) {
+                    for entry in existing {
+                        let worker = entry.to_worker(receiver_stage_name.clone())?;
+                        reuse_map.insert(entry.id.clone(), worker);
+                    }
+                }
+                for entry in &self_stage_donor_workers {
+                    let worker = entry.to_worker(receiver_stage_name.clone())?;
+                    reuse_map.insert(entry.id.clone(), worker);
+                }
+
+                let allocation = frag::find_best_allocation_using_fragmentation_gradient_descent(
+                    &cloned_cluster,
+                    &self.workload_estimate,
+                    &receiver_shape,
+                    Some(&reuse_map),
+                    self.worker_reuse_fragmentation_equivalent,
+                );
+                if allocation.did_allocate {
+                    Ok(PlacementProbeResult {
+                        feasible: true,
+                        reject_reason: None,
+                    })
+                } else {
+                    Ok(PlacementProbeResult {
+                        feasible: false,
+                        reject_reason: Some("no_placement".to_string()),
+                    })
+                }
+            }
+        }
+    }
+
     /// Build a `Solution` from the staged plan.
     ///
     /// Drains the per-stage `pending_adds` / `pending_removes` lists into
@@ -977,6 +1306,105 @@ impl AutoscalePlanContext {
         true
     }
 
+    /// Per-removal commit shared by `remove_workers_atomically`.
+    ///
+    /// Mirrors the SPMD and non-SPMD branches in `try_remove_worker`
+    /// after the existence check has already returned `Ok(false)`.
+    /// This helper assumes pre-validation has confirmed the worker
+    /// is present; a `None` lookup here is a planner-state defect
+    /// (e.g. the snapshot map is missing a stage entry that
+    /// `from_problem_state` should have created) and is surfaced as
+    /// a `PyRuntimeError`. The batch caller relies on the snapshot
+    /// it captured before the loop to roll back any prior commits
+    /// in this batch when this helper returns `Err`.
+    fn commit_validated_removal(
+        &mut self,
+        stage_index: usize,
+        worker_id: &str,
+    ) -> PyResult<()> {
+        let stage = self.stages[stage_index].clone();
+        let stage_name = stage.name;
+
+        match stage.worker_shape {
+            rds::WorkerShape::SpmdNodeMultiple(_) => {
+                let groups = self
+                    .current_worker_groups
+                    .get_mut(&stage_name)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "AutoscalePlanContext.remove_workers_atomically: \
+                             current_worker_groups entry missing for stage {}",
+                            stage_name
+                        ))
+                    })?;
+                let removed = groups.remove(worker_id).ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.remove_workers_atomically: pre-validated \
+                         worker {} for stage {} disappeared mid-batch",
+                        worker_id, stage_name
+                    ))
+                })?;
+                self.cluster
+                    .release_allocations(&removed.resources)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "AutoscalePlanContext.remove_workers_atomically: failed to release \
+                             SPMD worker group {} for stage {}: {:?}",
+                            worker_id, stage_name, e
+                        ))
+                    })?;
+                if self.cancel_pending_add(&stage_name, worker_id) {
+                    self.worker_ages.remove(worker_id);
+                } else {
+                    self.pending_removes
+                        .entry(stage_name)
+                        .or_default()
+                        .push(removed);
+                }
+                Ok(())
+            }
+            _ => {
+                let workers = self.current_workers.get_mut(&stage_name).ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.remove_workers_atomically: current_workers \
+                         entry missing for stage {}",
+                        stage_name
+                    ))
+                })?;
+                let removed = workers.remove(worker_id).ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.remove_workers_atomically: pre-validated \
+                         worker {} for stage {} disappeared mid-batch",
+                        worker_id, stage_name
+                    ))
+                })?;
+                let Some(resource) = removed.resources.first() else {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.remove_workers_atomically: worker {} for stage \
+                         {} has no resource allocation",
+                        worker_id, stage_name
+                    )));
+                };
+                self.cluster.release_allocation(resource).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.remove_workers_atomically: failed to release \
+                         worker {} for stage {}: {:?}",
+                        worker_id, stage_name, e
+                    ))
+                })?;
+                if self.cancel_pending_add(&stage_name, worker_id) {
+                    self.worker_ages.remove(worker_id);
+                } else {
+                    self.pending_removes
+                        .entry(stage_name)
+                        .or_default()
+                        .push(removed);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn take_pending_remove_matching_allocations(
         &mut self,
         stage_name: &str,
@@ -1084,12 +1512,51 @@ fn allocation_sets_match(left: &[rds::WorkerResources], right: &[rds::WorkerReso
     true
 }
 
-/// Module initialisation: register `AutoscalePlanContext` as a Python class
-/// under the scheduling submodule.
+/// Result of a non-mutating placement probe on
+/// [`AutoscalePlanContext::probe_add_after_removals`].
+///
+/// Reported as a small pyclass so the Python caller can branch on
+/// `feasible` and surface `reject_reason` in operator-facing logs
+/// without a second parser. The reason strings are placement-only:
+/// scheduler-policy decisions (signal trust, balance regression,
+/// economic spread) live in Python and are reported separately.
+///
+/// # Reason strings
+/// * `worker_not_found` - one of the requested removals does not
+///   match any worker id in the planner's current snapshot.
+/// * `worker_has_no_resources` - a non-SPMD removal target has
+///   `resources.is_empty()`, indicating a corrupted seed.
+/// * `release_failed` - cluster bookkeeping refused to release a
+///   donor's allocation on the cloned cluster (suffixed with the
+///   underlying error string).
+/// * `no_placement` - the FGD or SPMD allocator could not find a
+///   placement for `add_stage_index` after applying the simulated
+///   releases.
+#[pyclass(get_all)]
+#[derive(Debug, Clone)]
+pub struct PlacementProbeResult {
+    pub feasible: bool,
+    pub reject_reason: Option<String>,
+}
+
+#[pymethods]
+impl PlacementProbeResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "PlacementProbeResult(feasible={}, reject_reason={:?})",
+            self.feasible, self.reject_reason
+        )
+    }
+}
+
+/// Module initialisation: register `AutoscalePlanContext` and the
+/// `PlacementProbeResult` companion as Python classes under the
+/// scheduling submodule.
 pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::utils::module_builders::ImportablePyModuleBuilder;
     ImportablePyModuleBuilder::from(m.clone())?
         .add_class::<AutoscalePlanContext>()?
+        .add_class::<PlacementProbeResult>()?
         .finish();
     Ok(())
 }

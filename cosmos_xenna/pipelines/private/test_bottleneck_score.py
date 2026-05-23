@@ -21,16 +21,17 @@ Pin the contract of
 plus the one end-to-end wiring point in
 :class:`SaturationAwareScheduler`:
 
-  * Per-stage gauge values match the Forced Flow Law
-    ``D_k = V_k * S_k`` (with ``V_k = 1`` for Xenna's linear DAG).
-  * The bottleneck stage announced in the INFO log is
-    ``argmax_k D_k`` across stages whose service time was observed
-    this cycle. Cold-start stages (NaN, zero, or negative service
-    time) observe ``math.nan`` on the gauge and are excluded from
-    the argmax.
-  * Exactly one INFO log line fires per call when at least one
-    stage has a finite positive ``D_k``; no INFO log fires when
-    every stage is still in cold-start.
+  * Per-stage gauge values match the actor-normalized Forced Flow
+    Law ``D_k = V_k * S_k / c_k`` (with ``V_k = 1`` for Xenna's
+    linear DAG, so ``D_k = S_k / c_k``).
+  * The INFO log names the bottleneck stage selected by
+    :func:`identify_bottleneck` -- the operator-facing log cannot
+    disagree with the planner's near-tie verdict.
+  * Cold-start stages (NaN or non-positive ``D_k``) observe
+    ``math.nan`` on the gauge and are excluded from the argmax.
+  * Exactly one INFO log line fires per call when the engagement
+    identity has a stage_name; no INFO log fires when the gate is
+    disengaged (cold-start or homogeneous cluster).
   * The INFO log format is regex-stable so operators can
     ``grep`` the line without parsing scientific notation.
   * :meth:`SaturationAwareScheduler.autoscale` invokes the helper
@@ -44,7 +45,7 @@ any autoscaler behaviour beyond confirming the wire-up point in
 import logging
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from unittest.mock import patch
 
 import pytest
@@ -52,9 +53,35 @@ from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py import bottleneck
-from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import emit_bottleneck_score
+from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+    BottleneckIdentity,
+    compute_d_k,
+    emit_bottleneck_score,
+    identify_bottleneck,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _identity_for(d_k_by_stage: Mapping[str, float]) -> BottleneckIdentity:
+    """Build a BottleneckIdentity from a D_k mapping for the gauge tests.
+
+    Uses a near-zero heterogeneity threshold (1.000001) so any finite
+    spread engages the gate; tests that need a disengaged identity
+    (e.g. cold-start, single-finite-stage) construct one directly.
+    """
+    return identify_bottleneck(d_k_by_stage, heterogeneity_threshold=1.000001)
+
+
+def _disengaged_identity() -> BottleneckIdentity:
+    """Return a no-bottleneck identity for tests where the gate must not engage."""
+    return BottleneckIdentity(
+        engaged=False,
+        stage_name=None,
+        max_d_k=math.nan,
+        median_d_k=math.nan,
+        heterogeneity_ratio=math.nan,
+    )
 
 
 @pytest.fixture
@@ -149,7 +176,7 @@ def _build_one_stage_scheduler(
 
 
 class TestEmitBottleneckScore:
-    """Pins the Forced-Flow-Law bottleneck-score helper contract."""
+    """Pins the actor-normalized bottleneck-score helper contract."""
 
     def test_three_stage_bottleneck_at_middle_stage(
         self,
@@ -164,8 +191,10 @@ class TestEmitBottleneckScore:
         (ii) the INFO log names "b" with D=2.00s and throughput
         bound 0.50 tasks/s, (iii) exactly one INFO log per cycle.
         """
+        d_k_by_stage = {"a": 0.05, "b": 2.0, "c": 0.10}
         emit_bottleneck_score(
-            service_times_s={"a": 0.05, "b": 2.0, "c": 0.10},
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
             pipeline_name="test_pipeline",
         )
 
@@ -184,20 +213,41 @@ class TestEmitBottleneckScore:
         assert "D = 2.00s" in message
         assert "throughput bound = 0.50 tasks/s" in message
 
+    def test_capacity_field_appears_when_effective_capacities_supplied(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The INFO log includes ``capacity = N`` when capacities are supplied."""
+        d_k_by_stage = {"a": 0.05, "b": 2.0, "c": 0.10}
+        emit_bottleneck_score(
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
+            pipeline_name="test_pipeline",
+            effective_capacities={"a": 1, "b": 8, "c": 2},
+        )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1
+        assert "bottleneck stage: 'b'" in info_logs[0].message
+        assert "capacity = 8" in info_logs[0].message
+
     def test_cold_start_stage_excluded_from_argmax(
         self,
         gauge_observations: list[tuple[float, dict[str, str]]],
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A NaN service time observes a NaN gauge but cannot win argmax.
+        """A NaN D_k observes a NaN gauge but cannot win argmax.
 
         Setup: ``{"a": NaN, "b": 1.0, "c": 0.5}`` -> b is the
         bottleneck (a is excluded). Pins (i) the cold-start gauge
         is NaN, (ii) the argmax skips it, (iii) the bottleneck
         stage in the INFO log is b, not a.
         """
+        d_k_by_stage = {"a": math.nan, "b": 1.0, "c": 0.5}
         emit_bottleneck_score(
-            service_times_s={"a": math.nan, "b": 1.0, "c": 0.5},
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
             pipeline_name="test_pipeline",
         )
 
@@ -217,14 +267,10 @@ class TestEmitBottleneckScore:
         gauge_observations: list[tuple[float, dict[str, str]]],
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Every stage in cold-start: NaN gauges, no INFO log fires.
-
-        Setup: ``{"a": NaN, "b": NaN}`` -> the helper does not
-        invent a bottleneck. The gauges still observe NaN so
-        Prometheus' cardinality stays stable across cycles.
-        """
+        """Every stage in cold-start: NaN gauges, no INFO log fires."""
         emit_bottleneck_score(
-            service_times_s={"a": math.nan, "b": math.nan},
+            d_k_by_stage={"a": math.nan, "b": math.nan},
+            bottleneck_identity=_disengaged_identity(),
             pipeline_name="test_pipeline",
         )
 
@@ -237,20 +283,21 @@ class TestEmitBottleneckScore:
             f"no INFO log must fire when every stage is in cold-start; got {[r.message for r in info_logs]}"
         )
 
-    def test_zero_service_time_treated_as_cold(
+    def test_zero_d_k_treated_as_cold(
         self,
         gauge_observations: list[tuple[float, dict[str, str]]],
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A 0.0 service time folds into the cold-start sentinel.
+        """A non-positive D_k observes NaN on the gauge.
 
-        Setup: ``{"a": 0.0, "b": 1.0}`` -> stage "a" comes from
-        ``processing_speed_tasks_per_second == 0`` where
-        ``S_k = 1 / 0`` is undefined. The gauge for "a" observes
-        NaN and "a" is excluded from the argmax; "b" wins.
+        Setup: ``{"a": 0.0, "b": 1.0}`` -> stage "a" is treated as
+        cold-start (gauge observes NaN, excluded from finite scores).
+        With only one finite stage, the engagement gate stays
+        disengaged and no INFO log fires.
         """
         emit_bottleneck_score(
-            service_times_s={"a": 0.0, "b": 1.0},
+            d_k_by_stage={"a": 0.0, "b": 1.0},
+            bottleneck_identity=_disengaged_identity(),
             pipeline_name="test_pipeline",
         )
 
@@ -259,8 +306,32 @@ class TestEmitBottleneckScore:
         assert observations_by_stage["b"] == pytest.approx(1.0)
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
-        assert len(info_logs) == 1
-        assert "bottleneck stage: 'b'" in info_logs[0].message
+        assert info_logs == [], (
+            f"single-finite-stage cycles must not fire an INFO log; got {[r.message for r in info_logs]}"
+        )
+
+    def test_disengaged_identity_suppresses_log_even_with_finite_d_k(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Operator log is silenced whenever ``identify_bottleneck`` did not engage.
+
+        Pins the contract that the INFO log uses the planner's
+        engagement verdict, not a strict argmax over finite D_k. A
+        homogeneous pipeline (ratio close to 1.0) sets
+        ``engaged=False`` and the log must stay silent so the
+        operator never sees a "bottleneck" claim contradicted by
+        the planner decision.
+        """
+        emit_bottleneck_score(
+            d_k_by_stage={"a": 1.0, "b": 1.01, "c": 0.99},
+            bottleneck_identity=_disengaged_identity(),
+            pipeline_name="test_pipeline",
+        )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
 
     def test_log_format_pins_throughput_bound(
         self,
@@ -278,8 +349,10 @@ class TestEmitBottleneckScore:
         control characters surface escaped rather than corrupting
         the log line.
         """
+        d_k_by_stage = {"alpha": 0.04, "beta": 2.5}
         emit_bottleneck_score(
-            service_times_s={"alpha": 0.04, "beta": 2.5},
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
             pipeline_name="test_pipeline",
         )
 
@@ -315,33 +388,34 @@ class TestEmitBottleneckScore:
 
 
 class TestAutoscaleServiceTimeWiring:
-    """``autoscale()`` threads measured per-stage service times into ``emit_bottleneck_score``."""
+    """``autoscale()`` threads actor-normalized D_k into ``emit_bottleneck_score``."""
 
     def test_cold_start_passes_nan_per_stage(self) -> None:
         """No measurements observed yet -> helper sees ``{stage: NaN}`` (NOT empty).
 
-        The cold-start contract in ``bottleneck.py`` requires the
-        gauge cardinality stay stable across cycles, so the wiring
-        must pass an entry per stage even when no completed task has
-        produced a measurement yet. ``math.nan`` is the cold-start
-        sentinel folded into the cold-start branch downstream.
+        The cold-start contract requires the gauge cardinality stay
+        stable across cycles, so the wiring must pass an entry per
+        stage even when no completed task has produced a measurement
+        yet. ``math.nan`` is the cold-start sentinel folded into the
+        cold-start branch downstream.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
         with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
             scheduler.autoscale(time=0.0, problem_state=ps)
             assert mock_emit.call_count == 1
             kwargs = mock_emit.call_args.kwargs
-            service_times_s = kwargs["service_times_s"]
-            assert set(service_times_s.keys()) == {"hot"}
-            assert math.isnan(service_times_s["hot"])
+            d_k_by_stage = kwargs["d_k_by_stage"]
+            assert set(d_k_by_stage.keys()) == {"hot"}
+            assert math.isnan(d_k_by_stage["hot"])
 
-    def test_measurements_thread_finite_mean_to_helper(self) -> None:
-        """Measurement-driven mean ``S_k`` reaches the helper once a delta exists.
+    def test_measurements_thread_actor_normalized_d_k_to_helper(self) -> None:
+        """Measurement-driven D_k = S_k / c_k reaches the helper after a sample.
 
         Two ``update_with_measurements`` batches frame a per-cycle
         delta with known total duration / count. The helper must
-        observe ``mean = dsum / dcount`` rather than the cold-start
-        sentinel.
+        observe ``D_k = mean / effective_capacity``: with one CPU
+        worker and ``slots_per_worker = 1``, ``c_k = 1`` and
+        ``D_k = mean = 0.25``.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
 
@@ -371,15 +445,17 @@ class TestAutoscaleServiceTimeWiring:
         with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
             scheduler.autoscale(time=2.0, problem_state=ps)
             kwargs = mock_emit.call_args.kwargs
-            assert kwargs["service_times_s"]["hot"] == pytest.approx(0.25)
+            # Single stage with c_k=1; first finite sample replaces the
+            # NaN seed without blending so D_k = 0.25.
+            assert kwargs["d_k_by_stage"]["hot"] == pytest.approx(0.25)
 
-    def test_helper_and_heterogeneity_share_service_time_dict(self) -> None:
-        """Both observability helpers consume the SAME measured ``service_times_s``.
+    def test_helper_and_heterogeneity_share_d_k_dict(self) -> None:
+        """Both observability helpers consume the SAME actor-normalized ``d_k_by_stage``.
 
         Pins the wiring contract that ``emit_bottleneck_score`` and
-        ``compute_heterogeneity_ratio`` see identical per-stage
-        service-time data in a given cycle, so a regression that
-        threads only one of them stays caught.
+        ``compute_heterogeneity_ratio`` see identical per-stage D_k
+        in a given cycle, so a regression that threads only one of
+        them stays caught.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
         with (
@@ -389,8 +465,8 @@ class TestAutoscaleServiceTimeWiring:
             ) as mock_hetero,
         ):
             scheduler.autoscale(time=0.0, problem_state=ps)
-            emit_arg = mock_emit.call_args.kwargs["service_times_s"]
-            hetero_arg = mock_hetero.call_args.kwargs["service_times_s"]
+            emit_arg = mock_emit.call_args.kwargs["d_k_by_stage"]
+            hetero_arg = mock_hetero.call_args.kwargs["d_k_by_stage"]
             assert set(emit_arg.keys()) == set(hetero_arg.keys())
             for stage_name, emit_value in emit_arg.items():
                 hetero_value = hetero_arg[stage_name]
@@ -399,17 +475,34 @@ class TestAutoscaleServiceTimeWiring:
                 else:
                     assert emit_value == pytest.approx(hetero_value)
 
+    def test_emit_receives_engagement_identity_from_decision(self) -> None:
+        """The helper receives the same ``BottleneckIdentity`` the planner uses.
+
+        Pins that the operator-facing log cannot disagree with
+        ``identify_bottleneck`` because both consume one identity
+        produced once per cycle.
+        """
+        scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
+        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
+            scheduler.autoscale(time=0.0, problem_state=ps)
+            kwargs = mock_emit.call_args.kwargs
+            assert "bottleneck_identity" in kwargs
+            assert isinstance(kwargs["bottleneck_identity"], BottleneckIdentity)
+
     def test_gauge_observes_finite_value_after_measurements(
         self,
         gauge_observations: list[tuple[float, dict[str, str]]],
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Full path: measurements -> autoscale -> gauge fires with finite ``D_k`` + INFO log fires.
+        """Full path: measurements -> autoscale -> gauge observes finite ``D_k``.
 
         End-to-end check that exercises every layer (accumulator,
-        consumer, ``emit_bottleneck_score``, gauge, log) without
-        any patching of the helper itself, so a regression anywhere
-        in the chain breaks the test.
+        consumer, EWMA over S_k, ``compute_d_k`` per cycle, gauge)
+        without patching the helper itself, so a regression anywhere
+        in the chain breaks the test. With one CPU worker, c_k = 1
+        and D_k = S_k = 0.4. The single-stage cycle does not engage
+        the bottleneck gate, so no INFO log fires; the gauge value
+        is the contract under test.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
 
@@ -437,18 +530,11 @@ class TestAutoscaleServiceTimeWiring:
         scheduler.update_with_measurements(time=1.5, measurements=ms2)
         scheduler.autoscale(time=2.0, problem_state=ps)
 
-        # Gauge fired with finite D_k = mean(end - start) = 0.4s.
+        # Gauge fired with finite D_k = S_k / c_k = 0.4 / 1.
         assert len(gauge_observations) == 1
         value, tags = gauge_observations[0]
         assert value == pytest.approx(0.4)
         assert tags == {"stage": "hot", "pipeline": ""}
-
-        # INFO log line names "hot" with the matching D and throughput bound.
-        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO and "bottleneck" in r.message]
-        assert len(info_logs) == 1
-        assert "bottleneck stage: 'hot'" in info_logs[0].message
-        assert "D = 0.40s" in info_logs[0].message
-        assert "throughput bound = 2.50 tasks/s" in info_logs[0].message
 
 
 class TestIdentifyBottleneck:
@@ -817,3 +903,177 @@ class TestMaybeLogBottleneckEngagement:
         assert info_logs == []
         assert state.last_announced is True
         assert state.candidate_streak == 0
+
+
+class TestComputeDk:
+    """Pin the actor-normalized ``D_k = S_k / c_k`` helper contract.
+
+    Pure helper with no I/O or concurrency, so only adversarial
+    axes 1-3 (edge cases, failure handling, boundary conditions)
+    apply per ``.cursor/rules/test-creation.mdc``.
+    """
+
+    def test_d_k_divides_by_actor_count(self) -> None:
+        """``S_k = 10s, c_k = 5`` -> ``D_k = 2s`` -- the central contract."""
+        assert compute_d_k(10.0, 5) == pytest.approx(2.0)
+
+    def test_zero_actor_count_folds_to_nan(self) -> None:
+        """``c_k = 0`` is an undefined capacity signal; result is NaN."""
+        assert math.isnan(compute_d_k(2.0, 0))
+
+    def test_negative_actor_count_folds_to_nan(self) -> None:
+        """``c_k = -1`` is rejected at the boundary, not silently folded to ``c_k = 1``."""
+        assert math.isnan(compute_d_k(2.0, -1))
+
+    def test_negative_service_time_returns_nan(self) -> None:
+        """Negative service time cannot represent a physical sample; NaN."""
+        assert math.isnan(compute_d_k(-0.1, 4))
+
+    def test_zero_service_time_returns_nan(self) -> None:
+        """``S_k = 0`` from ``processing_speed_tasks_per_second == 0`` is undefined."""
+        assert math.isnan(compute_d_k(0.0, 4))
+
+    def test_inf_service_time_folds_to_nan(self) -> None:
+        """``+inf`` is non-finite and folds to the cold-start sentinel.
+
+        Pins the contract that the helper rejects every non-finite
+        sample at the boundary so a pathological measurement cannot
+        poison ``identify_bottleneck``'s argmax: a stage whose
+        service time was reported as ``+inf`` simply contributes
+        NaN to the gauge and is excluded from the bottleneck verdict.
+        """
+        assert math.isnan(compute_d_k(math.inf, 4))
+
+    def test_nan_service_time_returns_nan(self) -> None:
+        """The cold-start sentinel passes through unchanged."""
+        assert math.isnan(compute_d_k(math.nan, 4))
+
+    def test_spmd_group_capacity_drives_division(self) -> None:
+        """SPMD-style capacity: ``S_k = 16s, c_k = 8`` -> ``D_k = 2s``.
+
+        Pins the production-shape regression for SPMD stages: a
+        single worker_group with 8 allocations contributes ``c_k = 8``,
+        not ``c_k = 1``. With ``c_k = 1`` the stage would falsely
+        win the bottleneck argmax against a stage with ``S_k = 3, c_k = 1``.
+        """
+        assert compute_d_k(16.0, 8) == pytest.approx(2.0)
+
+
+class TestBottleneckArgmaxRegression:
+    """Pin the production-incident regression: multi-actor stages must not falsely win.
+
+    Reproduces the conditions where the bottleneck identification
+    incorrectly named an over-provisioned stage with many idle
+    actors: large raw ``S_k`` but high ``c_k`` should not win
+    against a smaller stage with low ``c_k``.
+    """
+
+    def test_multi_actor_stage_with_idle_capacity_is_not_bottleneck(self) -> None:
+        """Production-shape regression: high-S stage with many actors is not the bottleneck.
+
+        Setup: stage A has ``S=34s, c=13`` (D=2.64); stage B has
+        ``S=30s, c=2`` (D=15.0). Stage B must win the argmax even
+        though A has the larger raw ``S_k``.
+        """
+        d_a = compute_d_k(34.0, 13)
+        d_b = compute_d_k(30.0, 2)
+        d_k_by_stage = {"A": d_a, "B": d_b}
+        identity = identify_bottleneck(d_k_by_stage, heterogeneity_threshold=2.0)
+        assert identity.engaged is True
+        assert identity.stage_name == "B"
+        assert identity.max_d_k == pytest.approx(d_b)
+
+
+class TestEmitBottleneckScoreAdversarial:
+    """Adversarial axes for the operator-facing log emitter."""
+
+    def test_log_handles_special_characters_in_stage_names(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Stage names with quotes and newlines must not corrupt the log line.
+
+        The emitter renders the name via ``repr()`` so embedded
+        control characters surface escaped rather than breaking
+        the log-aggregation parser.
+        """
+        bad_name = 'Stage 09 "Caption"\nINJECTED'
+        d_k_by_stage = {bad_name: 2.0, "other": 0.1}
+        emit_bottleneck_score(
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
+            pipeline_name="test_pipeline",
+        )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1
+        message = info_logs[0].message
+        # repr() escapes the embedded newline so the log line stays
+        # single-line and the embedded "INJECTED" is visible only as
+        # part of the escaped string, not on a separate physical line.
+        assert "\n" not in message
+        assert "\\n" in message
+        assert "INJECTED" in message
+
+    def test_argmax_handles_large_stage_count_without_error(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """100 stages with a clear bottleneck finish without raising and name the right stage.
+
+        Smoke-tests the linear-in-stages cost. Uses a single
+        clearly-dominant stage so the near-tie tolerance does not
+        broaden the engaged set: stage-099 has ``D_k = 1000.0``
+        while every other stage sits at ``D_k`` < 100, leaving
+        stage-099 alone in the near-tie band.
+        """
+        d_k_by_stage: dict[str, float] = {f"stage-{idx:03d}": float(idx) + 1.0 for idx in range(99)}
+        d_k_by_stage["stage-099"] = 1000.0
+        emit_bottleneck_score(
+            d_k_by_stage=d_k_by_stage,
+            bottleneck_identity=_identity_for(d_k_by_stage),
+            pipeline_name="test_pipeline",
+        )
+        assert len(gauge_observations) == 100
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1
+        assert "bottleneck stage: 'stage-099'" in info_logs[0].message
+
+
+class TestHeterogeneityRatioActorNormalized:
+    """The heterogeneity ratio gauge consumes the same actor-normalized D_k as the decision."""
+
+    def test_ratio_uses_actor_normalized_d_k(self) -> None:
+        """Two stages with identical ``S_k`` but different ``c_k`` produce a finite ratio.
+
+        Setup: ``A: S=10, c=2 (D=5)``; ``B: S=10, c=10 (D=1)`` ->
+        ratio = max/min = 5.0. With raw ``S_k`` the ratio would be
+        1.0 (false homogeneity) and the gauge would mislead operators.
+        """
+        d_k_by_stage = {"A": compute_d_k(10.0, 2), "B": compute_d_k(10.0, 10)}
+        state = bottleneck.HeterogeneityWarnState()
+        bottleneck.compute_heterogeneity_ratio(
+            d_k_by_stage=d_k_by_stage,
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=2.0,
+            warn_streak_cycles=3,
+        )
+        # Streak counter increments because ratio (5.0) > threshold (2.0).
+        assert state.streak_cycles == 1
+
+    def test_ratio_consistent_with_bottleneck_label(self) -> None:
+        """The ratio's argmax stage matches identify_bottleneck's stage_name."""
+        d_k_by_stage = {
+            "fast_with_many_actors": compute_d_k(10.0, 10),
+            "slow_with_few_actors": compute_d_k(10.0, 2),
+            "average": compute_d_k(2.0, 1),
+        }
+        identity = identify_bottleneck(d_k_by_stage, heterogeneity_threshold=2.0)
+        # max(D_k) is on slow_with_few_actors (D=5.0); the heterogeneity
+        # gauge sees the same dict and would name the same stage in its
+        # streak-warning log line.
+        assert identity.engaged is True
+        assert identity.stage_name == "slow_with_few_actors"

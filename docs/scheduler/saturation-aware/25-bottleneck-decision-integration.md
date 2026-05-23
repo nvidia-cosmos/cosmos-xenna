@@ -2,19 +2,36 @@
 
 ## TL;DR
 
-The Forced-Flow-Law per-stage service demand `D_k` introduced as a
-pure-observability metric in
+The Forced-Flow-Law per-stage actor-normalized service demand
+`D_k = V_k × S_k / c_k` introduced as a pure-observability metric in
 [23 — Bottleneck score metric](23-bottleneck-score-metric.md) is now a
-first-class scheduler input. Each cycle the autoscaler computes an
-EWMA-smoothed `D_k_ewma[k]`, asks
+first-class scheduler input. Each cycle the autoscaler smooths the
+**intrinsic** per-task service time into `_s_k_ewma[k]` and divides
+by the **live** effective ready capacity `c_k` to produce the
+per-cycle mapping `_d_k_now[k]`. It then asks
 [`identify_bottleneck`](../../../cosmos_xenna/pipelines/private/scheduling_py/bottleneck.py)
 whether the cluster is heterogeneous enough to commit to a single
 bottleneck stage (`max / median` for `n ≥ 3` stages, `max / min` for
 `n = 2`, threshold `bottleneck_heterogeneity_threshold`), and feeds the
-result into two decisions:
+same `_d_k_now` mapping into four consumers in the same cycle:
+
+1. **`identify_bottleneck`** for the engagement and argmax verdict.
+2. **`emit_bottleneck_score`** for the per-stage gauge values plus
+   the operator-facing INFO log line (sharing the verdict guarantees
+   the log cannot disagree with the planner).
+3. **`compute_heterogeneity_ratio`** for the cluster-wide
+   `max_k D_k / min_k D_k` gauge and warn-streak log.
+4. **Phase C grow priority** sort and **Phase D shrink protection**
+   gate.
+
+Smoothing only the intrinsic component prevents actor-count changes
+(Phase A grow / shrink, Phase B floor, Phase D shrink) from leaking
+into the EWMA: those transitions update the per-cycle `c_k` only,
+so the next cycle's `D_k` reflects the new capacity immediately
+while the underlying service-time estimate stays stable.
 
 1. **Phase C grow priority.** When the gate is engaged, stages are
-   walked in `D_k_ewma` descending order so a scarce placement slot
+   walked in `D_k` descending order so a scarce placement slot
    lands on the true bottleneck regardless of DAG depth.
 2. **Phase D shrink protection.** When the gate is engaged, the
    bottleneck stage is **never shrunk** by negative intent alone; only
@@ -85,14 +102,26 @@ the matching phase's bottleneck awareness.
                   │  bottleneck calculation         │
                   │  ───────────────────────────    │
                   │  service_times_s = consume()    │
-                  │  _update_d_k_ewma(samples)      │
+                  │  _update_s_k_ewma(samples)      │
+                  │  effective_capacities = {       │
+                  │     k: effective_ready_capacity │
+                  │            (problem_state[k])   │
+                  │  }                              │
+                  │  d_k_now = {                    │
+                  │     k: compute_d_k(             │
+                  │            _s_k_ewma[k],        │
+                  │            effective_capacities │
+                  │              [k])               │
+                  │  }                              │
                   │  meta = identify_bottleneck(    │
-                  │      d_k_ewma=_d_k_ewma,        │
+                  │      d_k_by_stage=d_k_now,      │
                   │      heterogeneity_threshold=H) │
                   │  maybe_log_engagement(meta)     │
                   │                                 │
                   │  meta.engaged is the gate that  │
                   │  Phase C and Phase D consult.   │
+                  │  d_k_now feeds Phase C priority │
+                  │  + the heterogeneity gauge.     │
                   └─────────────────────────────────┘
                           │                │
                           ▼                ▼
