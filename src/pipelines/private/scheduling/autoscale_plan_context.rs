@@ -851,10 +851,7 @@ impl AutoscalePlanContext {
     ///   inconsistency (current_workers / current_worker_groups
     ///   entry missing for a stage), or the context has already
     ///   been drained by `into_solution()`.
-    pub fn remove_workers_atomically(
-        &mut self,
-        removals: Vec<(usize, String)>,
-    ) -> PyResult<bool> {
+    pub fn remove_workers_atomically(&mut self, removals: Vec<(usize, String)>) -> PyResult<bool> {
         self.ensure_not_drained("remove_workers_atomically")?;
         if removals.is_empty() {
             return Ok(true);
@@ -1317,11 +1314,7 @@ impl AutoscalePlanContext {
     /// a `PyRuntimeError`. The batch caller relies on the snapshot
     /// it captured before the loop to roll back any prior commits
     /// in this batch when this helper returns `Err`.
-    fn commit_validated_removal(
-        &mut self,
-        stage_index: usize,
-        worker_id: &str,
-    ) -> PyResult<()> {
+    fn commit_validated_removal(&mut self, stage_index: usize, worker_id: &str) -> PyResult<()> {
         let stage = self.stages[stage_index].clone();
         let stage_name = stage.name;
 
@@ -4489,8 +4482,7 @@ mod batch_removal_and_probe_tests {
         // try_remove_worker calls would. Pins linear-in-batch-size
         // cost and rules out accidental quadratic snapshot work.
         let (mut ctx, ids) = ctx_with_cpu_workers(100);
-        let removals: Vec<(usize, String)> =
-            ids.iter().map(|id| (0, id.clone())).collect();
+        let removals: Vec<(usize, String)> = ids.iter().map(|id| (0, id.clone())).collect();
 
         let result = ctx.remove_workers_atomically(removals).unwrap();
 
@@ -4530,7 +4522,10 @@ mod batch_removal_and_probe_tests {
         let (ctx, _ids) = ctx_with_cpu_workers(1);
         let result = ctx.probe_add_after_removals(Vec::new(), 0).unwrap();
         assert!(result.feasible, "fresh placement fits without removals");
-        assert!(result.reject_reason.is_none(), "no reject reason on success");
+        assert!(
+            result.reject_reason.is_none(),
+            "no reject reason on success"
+        );
     }
 
     #[test]

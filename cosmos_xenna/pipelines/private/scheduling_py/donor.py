@@ -134,14 +134,13 @@ def find_saturation_donor(
     stage_configs: dict[str, SaturationAwareStageConfig],
     cycle: int,
     last_donation_cycle: dict[str, int],
-    donations_received_this_cycle: dict[str, int],
     excluded_worker_ids: frozenset[str] | None = None,
 ) -> DonorCandidate | None:
-    """Pick a donor for saturation-driven Phase C growth, with five anti-flap layers.
+    """Pick a donor for saturation-driven Phase C growth.
 
     The non-negotiable donor-floor rule from
     :func:`select_youngest_eligible_donor` applies unchanged. On top
-    of it, five layers reject donors that would oscillate:
+    of it, three layers of anti-flap protection still apply:
 
       1. Donor classifier must be ``OVER_PROVISIONED`` with at least
          ``stage_cfg.over_provisioned_streak_min_cycles`` full
@@ -152,25 +151,21 @@ def find_saturation_donor(
       3. Receiver must not have donated within the last
          ``config.cross_stage_donor_anti_flap_cycles`` (prevents
          donate-then-receive ping-pong).
-      4. Receiver must not have already absorbed
-         ``config.cross_stage_donor_max_per_cycle`` donations this
-         cycle.
-      5. Donor must not have donated within the last
-         ``config.cross_stage_donor_min_donation_interval_cycles``
-         (donor-side cooldown between consecutive donations).
 
     The master toggle ``config.enable_cross_stage_donor`` short-
     circuits the whole helper to ``None`` when disabled. The
-    ``config.donor_must_be_strictly_upstream`` flag (separate from
-    the five anti-flap layers, but applied here) restricts donors to
-    stages with strictly smaller DAG depth when True.
+    ``config.donor_must_be_strictly_upstream`` flag restricts donors
+    to stages with strictly smaller DAG depth when True. Per-cycle
+    receiver absorption is naturally bounded by the receiver's
+    Phase C intent (capped by ``aggressive_growth_max_per_cycle``);
+    a separate cross-stage cap is redundant. Donor-side cooldown is
+    subsumed by the OVER_PROVISIONED + streak gate above.
 
     Args:
         receiver_stage_index: Index of the stage that needs the
             extra worker.
         receiver_stage_name: Name of the receiver stage. Used for
-            the layer 3 / 4 lookups against the per-stage cycle
-            dicts.
+            the receiver-side anti-flap lookup.
         stage_names: Stage names in problem order; the i-th entry
             is the name of the stage at index ``i``.
         stage_floors: Per-stage donor floors. A missing entry
@@ -181,19 +176,15 @@ def find_saturation_donor(
         worker_ages: Cluster-wide worker ages keyed by worker id.
             Missing entries default to ``0``.
         stage_states: Per-stage runtime state keyed by stage name.
-            Drives the layer 1 / 2 classifier and growth-mode
-            checks.
-        config: Cluster-wide configuration. Carries the master
-            toggle, the upstream-only flag, and all five anti-flap
-            cycle counts.
+            Drives the classifier and growth-mode checks.
+        config: Cluster-wide configuration.
         stage_configs: Per-stage effective configs keyed by stage
-            name. Drives the layer 1 streak threshold.
-        cycle: Current monotonic cycle number, against which
-            cross-cycle cooldowns are evaluated.
+            name. Drives the streak threshold.
+        cycle: Current monotonic cycle number, against which the
+            anti-flap cooldown is evaluated.
         last_donation_cycle: Per-stage record of the cycle at which
-            each stage most recently donated.
-        donations_received_this_cycle: Per-stage receiver counter,
-            reset at the top of every autoscale cycle.
+            each stage most recently donated. Read only by the
+            receiver-was-recent-donor anti-flap gate.
         excluded_worker_ids: Optional set of worker ids to drop
             from the candidate pool before donor selection.
             Saturation-aware callers populate this with the donor
@@ -207,10 +198,9 @@ def find_saturation_donor(
 
     Returns:
         The selected ``DonorCandidate`` or ``None`` when the master
-        toggle is disabled, the receiver is itself in cooldown, the
-        receiver has hit its per-cycle absorption cap, no donor
-        stage passes every filter, or every potential donor worker
-        is in ``excluded_worker_ids``.
+        toggle is disabled, the receiver is itself in cooldown, no
+        donor stage passes every filter, or every potential donor
+        worker is in ``excluded_worker_ids``.
 
     Raises:
         ValueError: If ``stage_names`` and ``worker_ids_by_stage``
@@ -245,9 +235,6 @@ def find_saturation_donor(
     ):
         return None
 
-    if donations_received_this_cycle.get(receiver_stage_name, 0) >= config.cross_stage_donor_max_per_cycle:
-        return None
-
     eligible_stages: list[int] = []
     for donor_index, donor_workers in enumerate(worker_ids_by_stage):
         if donor_index == receiver_stage_index:
@@ -270,12 +257,6 @@ def find_saturation_donor(
             if donor_state.classifier_streak < donor_cfg.over_provisioned_streak_min_cycles:
                 continue
         if config.cross_stage_donor_exclude_hold_state and donor_state.growth_mode is GrowthMode.HOLD:
-            continue
-        donor_last_donation = last_donation_cycle.get(donor_name)
-        if (
-            donor_last_donation is not None
-            and cycle - donor_last_donation < config.cross_stage_donor_min_donation_interval_cycles
-        ):
             continue
 
         eligible_stages.append(donor_index)

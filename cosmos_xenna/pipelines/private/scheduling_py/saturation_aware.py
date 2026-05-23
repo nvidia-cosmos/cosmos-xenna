@@ -341,14 +341,13 @@ class SaturationAwareScheduler:
         self._stuck_plan_detector: StuckPlanDetector = StuckPlanDetector()
         # Saturation-mode cross-stage donor anti-flap state.
         # ``_cycle_counter`` is monotonic and increments at the top of every
-        # ``autoscale()`` call. ``_last_donation_cycle`` records the cycle at
-        # which each stage most recently donated; missing entries mean the
-        # stage has never donated. ``_donations_received_this_cycle`` resets
-        # on each ``autoscale()`` and bounds receiver donations under
-        # ``cross_stage_donor_max_per_cycle``.
+        # ``autoscale()`` call. ``_last_donation_cycle`` records the cycle
+        # at which each stage most recently donated; missing entries mean
+        # the stage has never donated. The dict is read only by the
+        # receiver-was-recent-donor anti-flap gate; it is no longer a
+        # donor-side cooldown.
         self._cycle_counter: int = 0
         self._last_donation_cycle: dict[str, int] = {}
-        self._donations_received_this_cycle: dict[str, int] = {}
         # Per-stage stabilization-window buffer. Allocated at ``setup()`` once
         # the pipeline shape is known; the per-cycle pipeline reads this map
         # via :meth:`_compute_intent_deltas` and relies on the same

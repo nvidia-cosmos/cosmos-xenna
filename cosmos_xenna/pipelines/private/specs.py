@@ -856,14 +856,12 @@ class SaturationAwareConfig:
     cross_stage_donor_exclude_hold_state: bool = True
     # Cycles a stage must wait after donating before it can receive via
     # cross-stage logic. Cross-field: must dominate the longest stage's
-    # over_provisioned_streak_min_cycles.
+    # over_provisioned_streak_min_cycles. The receiver-was-recent-donor
+    # ledger is the only across-cycle anti-flap safeguard for the donor
+    # path; the per-cycle receiver cap and the donor-side cooldown are
+    # subsumed by the OVER_PROVISIONED + streak gate (across cycles)
+    # and the natural per-receiver intent bound (within one cycle).
     cross_stage_donor_anti_flap_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
-    # Maximum cross-stage donations a single receiver may absorb in one cycle.
-    cross_stage_donor_max_per_cycle: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
-    # Cycles a donor must wait between consecutive donations.
-    cross_stage_donor_min_donation_interval_cycles: int = attrs.field(
-        default=30, validator=attrs_utils.validate_positive_int
-    )
     # Number of consecutive cycles the minimum-worker floor enforcement may
     # fail without receiver progress (cluster placement exhausted AND no
     # eligible cross-stage donor) before raising ``RuntimeError`` and failing
