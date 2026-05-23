@@ -4265,3 +4265,347 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod batch_removal_and_probe_tests {
+    //! Cover `remove_workers_atomically`, `cluster_snapshot`, and
+    //! `probe_add_after_removals` -- the additive Rust surface used
+    //! by the cross-stage donor and Phase B floor transfer paths.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_empty_cluster(num_nodes: usize, cpus_per_node: f32) -> rds::ClusterResources {
+        let mut nodes: HashMap<String, rds::NodeResources> = HashMap::new();
+        for i in 0..num_nodes {
+            nodes.insert(
+                format!("node{i}"),
+                rds::NodeResources {
+                    used_cpus: rds::FixedUtil::ZERO,
+                    total_cpus: rds::FixedUtil::from_num(cpus_per_node),
+                    gpus: Vec::new(),
+                    name: format!("node{i}").into(),
+                },
+            );
+        }
+        rds::ClusterResources { nodes }
+    }
+
+    fn make_cpu_stage(name: &str) -> ds::ProblemStage {
+        ds::ProblemStage {
+            name: name.to_string(),
+            stage_batch_size: 1,
+            worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                num_cpus: rds::FixedUtil::ONE,
+            }),
+            requested_num_workers: None,
+            over_provision_factor: None,
+        }
+    }
+
+    fn make_cpu_stage_state_with_workers(
+        name: &str,
+        num_workers: usize,
+        node_id: &str,
+    ) -> ds::ProblemStageState {
+        let worker_groups = (0..num_workers)
+            .map(|i| ds::ProblemWorkerGroupState {
+                id: format!("{name}_worker_{i}"),
+                resources: vec![rds::WorkerResources {
+                    node: node_id.to_string(),
+                    cpus: rds::FixedUtil::ONE,
+                    gpus: Vec::new(),
+                }],
+                num_used_slots: 0,
+            })
+            .collect();
+        ds::ProblemStageState {
+            stage_name: name.to_string(),
+            worker_groups,
+            slots_per_worker: 1,
+            is_finished: false,
+            ..Default::default()
+        }
+    }
+
+    /// Build a context with one CPU stage seeded with ``num_workers``
+    /// workers on ``node0`` and return the deterministic worker ids.
+    fn ctx_with_cpu_workers(num_workers: usize) -> (AutoscalePlanContext, Vec<String>) {
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, num_workers as f32 + 4.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers(
+                "stage_a",
+                num_workers,
+                "node0",
+            )],
+        };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        let ids: Vec<String> = (0..num_workers)
+            .map(|i| format!("stage_a_worker_{i}"))
+            .collect();
+        (ctx, ids)
+    }
+
+    #[test]
+    fn remove_workers_atomically_empty_list_is_noop() {
+        // Trivial atomic batch: empty input must succeed without
+        // touching any planner state. Pins the contract so callers
+        // do not need to guard around empty plans.
+        let (mut ctx, _ids) = ctx_with_cpu_workers(2);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        let result = ctx.remove_workers_atomically(Vec::new()).unwrap();
+
+        assert!(result, "empty batch returns Ok(true)");
+        assert_eq!(
+            ctx.cluster.nodes["node0"].used_cpus, baseline_used,
+            "cluster bookkeeping unchanged after empty batch",
+        );
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            2,
+            "current_workers untouched after empty batch",
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_unknown_worker_returns_false_without_mutation() {
+        // Pre-validation must catch missing worker ids before any
+        // mutation runs, so the caller can fall back to a different
+        // plan without re-seeding state.
+        let (mut ctx, ids) = ctx_with_cpu_workers(2);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        let result = ctx
+            .remove_workers_atomically(vec![(0, ids[0].clone()), (0, "missing_id".to_string())])
+            .unwrap();
+
+        assert!(!result, "unknown worker id returns Ok(false)");
+        assert_eq!(
+            ctx.cluster.nodes["node0"].used_cpus, baseline_used,
+            "first removal must not commit when batch fails pre-validation",
+        );
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            2,
+            "current_workers untouched on pre-validation failure",
+        );
+        assert!(
+            ctx.pending_removes["stage_a"].is_empty(),
+            "no pending removes staged when batch is rejected",
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_index_error_for_out_of_range_stage() {
+        // Inspecting a PyErr's type goes through Python, so the test
+        // must initialize the interpreter once. Idempotent across tests.
+        pyo3::prepare_freethreaded_python();
+
+        let (mut ctx, _ids) = ctx_with_cpu_workers(1);
+        let result = ctx.remove_workers_atomically(vec![(99, "any".to_string())]);
+        assert!(
+            matches!(result, Err(ref err) if Python::with_gil(|py| err.is_instance_of::<pyo3::exceptions::PyIndexError>(py))),
+            "out-of-range stage_index must raise PyIndexError, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_commits_full_batch_and_releases_resources() {
+        // Happy path: every requested removal completes, the cluster
+        // releases resources, and the workers move from current_workers
+        // into pending_removes (stage-for-removal branch since they
+        // were seeded, not freshly added).
+        let (mut ctx, ids) = ctx_with_cpu_workers(3);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        let result = ctx
+            .remove_workers_atomically(vec![(0, ids[0].clone()), (0, ids[1].clone())])
+            .unwrap();
+
+        assert!(result, "full batch commit returns Ok(true)");
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            1,
+            "two workers removed, one remains",
+        );
+        assert_eq!(
+            ctx.pending_removes["stage_a"].len(),
+            2,
+            "both removals staged for removal",
+        );
+        let used_after = ctx.cluster.nodes["node0"].used_cpus;
+        assert!(
+            (baseline_used - used_after).to_num::<f32>() > 1.99,
+            "cluster used_cpus drops by 2 (got {} -> {})",
+            baseline_used.to_num::<f32>(),
+            used_after.to_num::<f32>(),
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_cancels_pending_add_for_same_cycle_worker() {
+        // Worker added earlier in the same cycle; removing it cancels
+        // the pending add (both pending lists end empty, age entry
+        // dropped) -- matches try_remove_worker's same-cycle semantics.
+        let (mut ctx, _ids) = ctx_with_cpu_workers(0);
+        // Add a fresh worker via the planner so it appears in
+        // pending_adds with age 0.
+        let placement = ctx
+            .try_add_worker(0)
+            .expect("CPU placement succeeds on empty stage")
+            .expect("placement object returned");
+        let new_id = placement.id.clone();
+        assert!(ctx.pending_adds["stage_a"].iter().any(|p| p.id == new_id));
+        assert!(ctx.worker_ages.contains_key(&new_id));
+
+        let result = ctx
+            .remove_workers_atomically(vec![(0, new_id.clone())])
+            .unwrap();
+
+        assert!(result, "cancel-pending-add path returns Ok(true)");
+        assert!(
+            !ctx.pending_adds["stage_a"].iter().any(|p| p.id == new_id),
+            "fresh worker no longer in pending_adds",
+        );
+        assert!(
+            ctx.pending_removes["stage_a"].is_empty(),
+            "no pending remove staged for cancel-pending-add path",
+        );
+        assert!(
+            !ctx.worker_ages.contains_key(&new_id),
+            "age entry dropped for cancel-pending-add path",
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_one_hundred_removals_completes() {
+        // Stress smoke: 100 removals in one batch must complete and
+        // produce exactly the same end state as 100 sequential
+        // try_remove_worker calls would. Pins linear-in-batch-size
+        // cost and rules out accidental quadratic snapshot work.
+        let (mut ctx, ids) = ctx_with_cpu_workers(100);
+        let removals: Vec<(usize, String)> =
+            ids.iter().map(|id| (0, id.clone())).collect();
+
+        let result = ctx.remove_workers_atomically(removals).unwrap();
+
+        assert!(result, "100-removal batch commits");
+        assert!(
+            ctx.current_workers["stage_a"].is_empty(),
+            "every worker removed",
+        );
+        assert_eq!(
+            ctx.pending_removes["stage_a"].len(),
+            100,
+            "every removal staged",
+        );
+    }
+
+    #[test]
+    fn cluster_snapshot_returns_clone_not_reference() {
+        // Mutating the snapshot must not leak into the planner.
+        // Verifies the accessor clones so allocation diagnostics
+        // can format the snapshot freely without corrupting state.
+        let (ctx, _ids) = ctx_with_cpu_workers(1);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        let mut snapshot = ctx.cluster_snapshot();
+        let node = snapshot.nodes.get_mut("node0").expect("node present");
+        node.used_cpus += rds::FixedUtil::ONE;
+
+        assert_eq!(
+            ctx.cluster.nodes["node0"].used_cpus, baseline_used,
+            "planner state unchanged after snapshot mutation",
+        );
+    }
+
+    #[test]
+    fn probe_add_after_removals_no_op_returns_feasible_when_capacity_exists() {
+        // Empty removals on a cluster with free capacity -> feasible.
+        let (ctx, _ids) = ctx_with_cpu_workers(1);
+        let result = ctx.probe_add_after_removals(Vec::new(), 0).unwrap();
+        assert!(result.feasible, "fresh placement fits without removals");
+        assert!(result.reject_reason.is_none(), "no reject reason on success");
+    }
+
+    #[test]
+    fn probe_add_after_removals_simulates_release_to_unblock_placement() {
+        // Cluster sized so capacity is exactly consumed by current
+        // workers. probe with the 1-worker stage at full capacity:
+        // a fresh add fails (no_placement); after simulating one
+        // removal, the same probe succeeds.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+
+        // Without removals: cluster has zero free CPU on node0, FGD fails.
+        let no_remove = ctx.probe_add_after_removals(Vec::new(), 0).unwrap();
+        assert!(!no_remove.feasible);
+        assert_eq!(no_remove.reject_reason.as_deref(), Some("no_placement"));
+
+        // With the single worker simulated as removed: the cluster clone
+        // has free CPU, FGD finds a placement.
+        let with_remove = ctx
+            .probe_add_after_removals(vec![(0, "stage_a_worker_0".to_string())], 0)
+            .unwrap();
+        assert!(with_remove.feasible, "release simulated -> placement fits");
+        assert!(with_remove.reject_reason.is_none());
+
+        // Planner state is unchanged (the probe is non-mutating).
+        assert_eq!(ctx.current_workers["stage_a"].len(), 1);
+        assert!(ctx.pending_removes["stage_a"].is_empty());
+    }
+
+    #[test]
+    fn probe_add_after_removals_unknown_worker_reports_reject_reason() {
+        let (ctx, _ids) = ctx_with_cpu_workers(1);
+        let result = ctx
+            .probe_add_after_removals(vec![(0, "missing".to_string())], 0)
+            .unwrap();
+        assert!(!result.feasible);
+        assert_eq!(result.reject_reason.as_deref(), Some("worker_not_found"));
+    }
+
+    #[test]
+    fn probe_add_after_removals_out_of_range_stage_index_raises() {
+        // Inspecting a PyErr's type goes through Python, so the test
+        // must initialize the interpreter once. Idempotent across tests.
+        pyo3::prepare_freethreaded_python();
+
+        let (ctx, _ids) = ctx_with_cpu_workers(1);
+        let result = ctx.probe_add_after_removals(Vec::new(), 99);
+        assert!(matches!(
+            result,
+            Err(ref err) if Python::with_gil(|py| err.is_instance_of::<pyo3::exceptions::PyIndexError>(py))
+        ));
+    }
+
+    #[test]
+    fn probe_add_after_removals_does_not_mutate_planner_after_many_calls() {
+        // 100 sequential probes on the same context must not leak
+        // state into self.cluster: the snapshot at the end equals
+        // the snapshot at the start.
+        let (ctx, ids) = ctx_with_cpu_workers(2);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+        let baseline_workers = ctx.current_workers["stage_a"].len();
+
+        for _ in 0..100 {
+            let _ = ctx
+                .probe_add_after_removals(vec![(0, ids[0].clone())], 0)
+                .unwrap();
+        }
+
+        assert_eq!(ctx.cluster.nodes["node0"].used_cpus, baseline_used);
+        assert_eq!(ctx.current_workers["stage_a"].len(), baseline_workers);
+    }
+}
