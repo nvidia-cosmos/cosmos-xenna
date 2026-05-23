@@ -185,8 +185,6 @@ class TestSaturationDonorWarmupFilter:
             # Use the minimums so a high ``cycle`` value (10_000) leaves us
             # outside any cooldown window for the purposes of the tests.
             cross_stage_donor_anti_flap_cycles=30,
-            cross_stage_donor_min_donation_interval_cycles=30,
-            cross_stage_donor_max_per_cycle=1,
             cross_stage_donor_require_over_provisioned=True,
             cross_stage_donor_exclude_hold_state=True,
             donor_must_be_strictly_upstream=True,
@@ -217,7 +215,6 @@ class TestSaturationDonorWarmupFilter:
             # Cycle far enough out that no cooldown window applies.
             "cycle": 10_000,
             "last_donation_cycle": {},
-            "donations_received_this_cycle": {},
         }
 
     def test_excluded_donor_skipped(self, base_kwargs: dict[str, Any]) -> None:

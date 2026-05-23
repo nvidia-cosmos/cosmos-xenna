@@ -184,7 +184,6 @@ def _scheduler_with_node_churn_defaults(
     stabilization_window_cycles_up: int = 1,
     stabilization_window_cycles_down: int = 30,
     cross_stage_donor_anti_flap_cycles: int = 30,
-    cross_stage_donor_min_donation_interval_cycles: int = 30,
     num_nodes: int = 2,
 ) -> SaturationAwareScheduler:
     """Build a multi-stage scheduler with conservative churn-friendly defaults.
@@ -207,7 +206,6 @@ def _scheduler_with_node_churn_defaults(
     """
     cfg = SaturationAwareConfig(
         cross_stage_donor_anti_flap_cycles=cross_stage_donor_anti_flap_cycles,
-        cross_stage_donor_min_donation_interval_cycles=cross_stage_donor_min_donation_interval_cycles,
         stage_defaults=SaturationAwareStageConfig(
             setup_phase_quiescence_enabled=quiescence_enabled,
             worker_warmup_measurement_grace_s=grace_s,

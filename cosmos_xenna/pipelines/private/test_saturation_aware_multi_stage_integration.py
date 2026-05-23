@@ -146,7 +146,6 @@ def _build_scheduler(
     enable_dag_priority_growth: bool = True,
     enable_cross_stage_donor: bool = True,
     cross_stage_donor_anti_flap_cycles: int = 30,
-    cross_stage_donor_min_donation_interval_cycles: int = 30,
     min_workers: int | None = 1,
     max_scale_down_fraction_per_cycle: float = 1.0,
     quiescence_enabled: bool = False,
@@ -158,7 +157,6 @@ def _build_scheduler(
         enable_dag_priority_growth=enable_dag_priority_growth,
         enable_cross_stage_donor=enable_cross_stage_donor,
         cross_stage_donor_anti_flap_cycles=cross_stage_donor_anti_flap_cycles,
-        cross_stage_donor_min_donation_interval_cycles=cross_stage_donor_min_donation_interval_cycles,
         stage_defaults=SaturationAwareStageConfig(
             min_workers=min_workers,
             min_data_points=min_data_points,

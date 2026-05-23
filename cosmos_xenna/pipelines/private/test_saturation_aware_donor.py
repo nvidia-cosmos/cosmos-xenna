@@ -31,6 +31,7 @@ Two layers are pinned:
 from typing import cast
 from unittest.mock import patch
 
+import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
@@ -40,6 +41,14 @@ from cosmos_xenna.pipelines.private.scheduling_py.donor import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+@attrs.frozen
+class _ProbeResult:
+    """Stand-in for ``rust_apc.PlacementProbeResult`` in fake planners."""
+
+    feasible: bool
+    reject_reason: str | None = None
 
 
 def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 16) -> resources.ClusterResources:
@@ -619,16 +628,26 @@ class TestPhaseBDonorFallbackAdversarial:
                 problem_state=_problem_state([("A", 0, 1, False)]),
             )
 
-    def test_retry_failure_names_donor_without_logging_success(self) -> None:
-        """A failed post-donation retry raises immediately, even when grace is enabled."""
+    def test_probe_infeasible_donor_does_not_remove_and_raises_floor_unmet(self) -> None:
+        """An infeasible probe leaves the donor in place and raises the floor-unmet message.
+
+        Pins the new contract: the floor mode runs
+        ``probe_add_after_removals`` before any removal. When the
+        probe says the receiver still cannot fit (donor's freed slot
+        does not match the receiver's shape), the donor stays in
+        place and the floor-unmet ``RuntimeError`` carries the
+        donor metadata so the operator can correlate the failure
+        with the candidate.
+        """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem([("donor", None), ("receiver", None)]))
 
-        class _RetryExhaustedContext:
-            """Fake planner where donor removal works but receiver placement still fails."""
+        class _InfeasibleProbeContext:
+            """Fake planner whose probe always reports the receiver as infeasible."""
 
             def __init__(self) -> None:
                 self._worker_ids_by_stage = [["donor-w0", "donor-w1"], []]
+                self.removed_workers: list[tuple[int, str]] = []
 
             def worker_ids_by_stage(self) -> list[list[str]]:
                 return self._worker_ids_by_stage
@@ -640,18 +659,24 @@ class TestPhaseBDonorFallbackAdversarial:
                 del stage_index
                 return None
 
-            def try_remove_worker(self, stage_index: int, worker_id: str) -> bool:
-                self._worker_ids_by_stage[stage_index].remove(worker_id)
+            def probe_add_after_removals(self, removals: object, add_stage_index: int) -> object:
+                del removals, add_stage_index
+                return _ProbeResult(feasible=False, reject_reason="no_placement")
+
+            def remove_workers_atomically(self, removals: list[tuple[int, str]]) -> bool:
+                self.removed_workers.extend(removals)
                 return True
 
+        ctx = _InfeasibleProbeContext()
         expected = r"post-donation retry returned no placement .*donor_stage_index=0, donor_worker_id='donor-w0'"
         with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.info") as info:
             with pytest.raises(RuntimeError, match=expected):
                 scheduler._run_phase_b_floor(
-                    cast(data_structures.AutoscalePlanContext, _RetryExhaustedContext()),
+                    cast(data_structures.AutoscalePlanContext, ctx),
                     _problem_state([("donor", 2, 1, False), ("receiver", 0, 1, False)]),
                 )
 
+        assert ctx.removed_workers == [], "infeasible probe must not remove any donor worker"
         donor_success_logs = [
             call
             for call in info.call_args_list

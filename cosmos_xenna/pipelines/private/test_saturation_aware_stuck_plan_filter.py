@@ -16,7 +16,7 @@
 
 """Caller-side tests for the value-diff filter on the stuck-plan invariant.
 
-``SaturationAwareScheduler._run_phase_c_grow`` has three early-return
+``SaturationAwareScheduler._run_phase_c_grow`` has two early-return
 branches that bypass the per-stage ``_set_stuck_plan_counter`` call at
 the bottom of the per-stage loop:
 
@@ -24,12 +24,9 @@ the bottom of the per-stage loop:
     ``_try_add_worker_with_defense`` raised ``AllocationError``),
   * post-donor allocation-failure absorption (the second
     ``_try_add_worker_with_defense`` after a successful donation
-    raised ``AllocationError``),
-  * donor-retry-failed synthetic absorption (both ``try_add_worker``
-    calls returned ``None``; the freed donor placement did not match
-    the receiver shape).
+    raised ``AllocationError``).
 
-All three leave the bailed stage's counter at its prior cycle's value.
+Both leave the bailed stage's counter at its prior cycle's value.
 The post-Phase-D invariant call site filters ``curr_counters`` to
 non-finished stages whose value differs from the cycle-start snapshot
 ``prev_stuck_plan_counters``; the helper itself stays strict (only
@@ -123,31 +120,6 @@ def _problem_state_with_one_worker() -> data_structures.ProblemState:
 
 class TestEarlyReturnPathsPreserveCounter:
     """The three Phase C bail paths leave the bailed stage's counter at its prior value."""
-
-    def test_donor_retry_failed_synthetic_absorption_preserves_counter(self) -> None:
-        """Both ``try_add`` calls return ``None``, donor succeeds in between.
-
-        The synthetic ``RuntimeError("donor-retry-failed: ...")`` is built
-        and routed through ``_absorb_allocation_failure``; the function
-        returns from the donor-retry-failed branch BEFORE the per-stage
-        counter setter at the bottom of the loop runs, so the bailed
-        stage keeps its prior counter and ``curr == prev`` filters the
-        no-op transition out of the invariant assertion.
-        """
-        scheduler = _scheduler()
-        ps = _problem_state_with_one_worker()
-        scheduler._stuck_plan_counters["stage"] = 13
-
-        try_add_returns = iter([None, None])
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
-            with patch(
-                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
-                side_effect=lambda *_a, **_k: next(try_add_returns),
-            ):
-                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value="stage"):
-                    scheduler.autoscale(time=0.0, problem_state=ps)
-
-        assert scheduler._stuck_plan_counters["stage"] == 13, "the bailed stage's counter must stay at its prior value"
 
     def test_pre_donor_allocation_failure_preserves_counter(self) -> None:
         """First ``try_add`` raises ``AllocationError``; loop returns from the pre-donor branch.

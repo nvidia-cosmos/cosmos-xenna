@@ -27,6 +27,7 @@ from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py import allocation_failures
+from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
@@ -293,64 +294,41 @@ class TestAllocationErrorDefense:
         assert scheduler._stuck_plan_counters["stage"] == 1, "No-fit must increment the stuck counter"
 
 
-class TestDonorRetryTransactionality:
-    """Pin the contract that donor retry failures roll into a Phase C allocation failure.
+class TestDonorRetryInvariant:
+    """Pin the contract that probe-validated donor retries cannot fail silently.
 
-    Background:
-        ``_attempt_cross_stage_donation`` removes the donor worker from
-        the planner via ``ctx.try_remove_worker`` BEFORE the receiver
-        retry runs. If the post-donation ``try_add_worker`` retry
-        returns ``None`` (the freed placement does not match the
-        receiver shape), we cannot roll back the donor removal.
-
-    Contract (post-fix):
-        On a donor-retry failure the scheduler must NOT silently log
-        and break, because that produces a one-sided shrink (donor
-        gone, receiver did not grow). Instead it routes the failure
-        through ``_absorb_allocation_failure`` so the allocation
-        counter increments, the cycle aborts under the kill switch,
-        and the operator-visible log carries the standard
-        fragmentation snapshot. Donation bookkeeping is NOT updated
-        because the donation did not land end-to-end.
+    The donor commit path runs a non-mutating
+    ``probe_add_after_removals`` before any donor removal. The probe
+    uses the same FGD/SPMD allocator that ``try_add_worker`` would
+    consult on the live cluster, so an approved probe followed by a
+    failed receiver placement means the planner snapshot diverged
+    between the dry-run and the commit. That divergence is a
+    scheduler defect, not a benign cluster-full event, and surfaces
+    as ``SchedulerInvariantError`` regardless of the
+    ``skip_cycle_on_allocation_error`` kill switch (which only
+    governs the absorbed-allocation-failure path).
     """
 
-    def test_donor_retry_failure_increments_allocation_counter(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Retry returning ``None`` after a successful donation increments the failure counter."""
+    def test_post_donation_retry_failure_raises_invariant_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A probe-approved donor whose retry returns ``None`` raises ``SchedulerInvariantError``.
+
+        Pins that the synthetic donor-retry-failed absorb path is
+        gone: a divergence between probe and commit must surface as
+        a hard scheduler defect rather than as an absorbed allocation
+        failure with a partial-shrink residue.
+        """
         fake_counter = _FakeCounter()
         monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
 
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
 
-        # First try_add_worker call (initial Phase C add attempt) returns None
-        # to exhaust the cluster; the second call (post-donation retry) also
-        # returns None to model the donor's freed placement not matching the
-        # receiver shape. The cross-stage donation helper succeeds in between.
-        try_add_returns = iter([None, None])
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
-            with patch(
-                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
-                side_effect=lambda *_a, **_k: next(try_add_returns),
-            ):
-                with patch.object(
-                    scheduler,
-                    "_attempt_cross_stage_donation",
-                    return_value="stage",
-                ):
-                    scheduler.autoscale(time=0.0, problem_state=ps)
-
-        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}], (
-            "donor-retry failure must increment the standard allocation-failure counter"
-        )
-
-    def test_donor_retry_failure_does_not_record_donation_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Donation bookkeeping (cooldown / per-cycle counter) is not updated when retry fails."""
-        fake_counter = _FakeCounter()
-        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
-
-        scheduler = _scheduler()
-        ps = _problem_state_with_one_worker()
-
+        # Both ``try_add_worker`` calls return ``None`` to model the
+        # cluster being unable to grow the receiver. The probe runs
+        # against the underlying FGD allocator and is unaffected by
+        # the patch, so it reports feasible; the post-commit retry
+        # then fails, which the new code routes through
+        # ``SchedulerInvariantError``.
         try_add_returns = iter([None, None])
         with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
             with patch(
@@ -359,32 +337,14 @@ class TestDonorRetryTransactionality:
             ):
                 with patch.object(scheduler, "_attempt_cross_stage_donation", return_value="stage"):
                     with patch.object(scheduler, "_record_donation_success") as record_mock:
-                        scheduler.autoscale(time=0.0, problem_state=ps)
+                        with pytest.raises(SchedulerInvariantError, match="planner state diverged"):
+                            scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert record_mock.call_count == 0, (
-            "_record_donation_success must not be called for a donation that fails the receiver retry"
+            "_record_donation_success must not be called when the post-commit retry diverges"
         )
-
-    def test_donor_retry_failure_propagates_when_kill_switch_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``skip_cycle_on_allocation_error=False`` re-raises the synthetic donor-retry RuntimeError."""
-        fake_counter = _FakeCounter()
-        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
-
-        scheduler = _scheduler(skip_on_error=False)
-        ps = _problem_state_with_one_worker()
-
-        try_add_returns = iter([None, None])
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
-            with patch(
-                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
-                side_effect=lambda *_a, **_k: next(try_add_returns),
-            ):
-                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value="stage"):
-                    with pytest.raises(RuntimeError, match="donor-retry-failed"):
-                        scheduler.autoscale(time=0.0, problem_state=ps)
-
-        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}], (
-            "the standard allocation-failure log/counter must still fire before the re-raise"
+        assert fake_counter.calls == [], (
+            "SchedulerInvariantError must not increment the absorbed-allocation-failure counter"
         )
 
 

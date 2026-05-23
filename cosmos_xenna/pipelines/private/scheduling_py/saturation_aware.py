@@ -231,17 +231,13 @@ class SaturationAwareScheduler:
             aggressiveness lift) does not affect window sizes.
         _cycle_counter: Monotonic count of completed ``autoscale()``
             calls since ``setup()``. Used as the time index for the
-            saturation-mode cross-stage donor anti-flap layers.
+            saturation-mode cross-stage donor anti-flap layer.
         _last_donation_cycle: Per-stage record of the cycle at which
             each stage most recently donated a worker through the
-            saturation-mode cross-stage path. Drives both the
-            ``cross_stage_donor_min_donation_interval_cycles`` donor
-            cooldown and the ``cross_stage_donor_anti_flap_cycles``
-            receiver-was-recent-donor block.
-        _donations_received_this_cycle: Per-cycle bound on how many
-            cross-stage donations a single receiver may absorb.
-            Resets at the top of every ``autoscale()`` and is
-            consulted against ``cross_stage_donor_max_per_cycle``.
+            saturation-mode cross-stage path. Drives the
+            ``cross_stage_donor_anti_flap_cycles``
+            receiver-was-recent-donor block; missing entries mean the
+            stage has never donated.
 
     """
 
@@ -459,7 +455,6 @@ class SaturationAwareScheduler:
         self._bottleneck_protected_stages_logged = set()
         self._cycle_counter = 0
         self._last_donation_cycle = {}
-        self._donations_received_this_cycle = {}
         # Measurement accumulator reset; locked because
         # ``update_with_measurements`` and the per-cycle ``_consume_*``
         # helpers also acquire ``self._lock``.
@@ -935,7 +930,6 @@ class SaturationAwareScheduler:
 
             self._check_problem_state_shape_before_phase_a(problem_state)
             self._cycle_counter += 1
-            self._donations_received_this_cycle = {}
             # Refresh ready first-seen timestamps from this cycle's snapshot before
             # any phase reads them. The per-worker measurement grace consumes them
             # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
@@ -1984,14 +1978,17 @@ class SaturationAwareScheduler:
                 if self._phase_c_allocation_failure:
                     return
                 # Cluster placement exhausted. Try the saturation-mode
-                # cross-stage donor fallback before giving up. On donor
-                # success the planner has freed exactly one placement,
-                # so the very next ``try_add_worker`` for this receiver
-                # should succeed; if it does not (donor's freed slot
-                # does not match the receiver's shape), give up for the
-                # cycle without raising. The donor cooldown and
-                # receiver-per-cycle counters are updated only on a
-                # successfully completed donation+retry.
+                # cross-stage donor fallback before giving up. The donor
+                # path runs a non-mutating probe before any removal, so
+                # the post-donation ``try_add_worker`` is guaranteed to
+                # succeed when the donor commit returns a stage name; a
+                # failure there means the planner snapshot diverged
+                # between probe and commit and surfaces as a
+                # SchedulerInvariantError from
+                # ``_attempt_cross_stage_donation`` rather than a silent
+                # absorbed allocation failure. The anti-flap timestamp
+                # is updated only on a successfully completed
+                # donation+retry.
                 donor_stage_name = self._attempt_cross_stage_donation(
                     ctx=ctx,
                     receiver_stage_index=stage_index,
@@ -2007,43 +2004,19 @@ class SaturationAwareScheduler:
                     )
                     break
                 if self._try_add_worker_with_defense(ctx, stage_index, stage_name) is None:
-                    # ``_attempt_cross_stage_donation`` and the second
-                    # ``_try_add_worker_with_defense`` may both flip the
-                    # phase-C allocation-failure flag through
-                    # ``_absorb_allocation_failure``;
-                    allocation_failure_observed: bool = self._phase_c_allocation_failure
-                    if allocation_failure_observed:
+                    if self._phase_c_allocation_failure:
+                        # Cluster mutated externally during the cycle so
+                        # the post-probe commit can no longer place the
+                        # receiver; honour the configured absorb path.
                         return
-                    # The donor was already removed by ctx.try_remove_worker in
-                    # _attempt_cross_stage_donation. The post-donation retry
-                    # returning None means the freed placement did not match
-                    # the receiver shape, so we are about to leave the cluster
-                    # with one-sided shrink (donor gone, receiver did not
-                    # grow). Per the documented invariant on
-                    # ``floor_stuck_grace_cycles`` ("post-donation retry
-                    # failures raise immediately because the donor removal
-                    # cannot be rolled back safely"), surface this as a
-                    # synthetic allocation failure so the absorb path emits
-                    # the standard log and either raises or sets the
-                    # phase-C allocation-failure flag (under
-                    # ``skip_cycle_on_allocation_error``). Aborting Phase C
-                    # for the rest of the cycle prevents the next stage from
-                    # consuming the freed placement and stops the donation
-                    # bookkeeping from being updated for a donation that did
-                    # not complete end-to-end.
-                    deficit = intent - added
                     msg = (
-                        f"donor-retry-failed: stage {stage_name!r} intent {intent} "
-                        f"workers; donor stage {donor_stage_name!r} released a "
-                        f"placement but the receiver retry returned no placement "
-                        f"after {added} adds (deficit={deficit}); one-sided shrink "
-                        "rolled into a phase-C allocation failure."
+                        f"saturation-mode donation: probe approved donor "
+                        f"{donor_stage_name!r} for receiver {stage_name!r} but the "
+                        f"post-removal try_add_worker returned None at intent "
+                        f"{intent} after {added} adds; planner state diverged "
+                        "between probe and commit."
                     )
-                    self._absorb_allocation_failure(
-                        stage_name=stage_name,
-                        exc=RuntimeError(msg),
-                    )
-                    return
+                    raise SchedulerInvariantError(msg)
                 self._record_donation_success(
                     donor_stage_name=donor_stage_name,
                     receiver_stage_name=stage_name,
@@ -2064,25 +2037,31 @@ class SaturationAwareScheduler:
     ) -> str | None:
         """Try to free a placement for a saturation-driven receiver.
 
-        Selects an eligible donor via
-        :func:`find_saturation_donor` (five anti-flap layers + strict
-        upstream + master toggle) and removes it from the planner.
-        The donor cooldown and receiver per-cycle counters are NOT
-        updated here; the caller MUST advance them via
-        :meth:`_record_donation_success` only after the immediate
-        ``try_add_worker`` retry succeeds for the receiver. Recording
-        cooldowns before retry success would penalise the donor for
-        a transfer that never completed end-to-end.
+        Selects an eligible donor via :func:`find_saturation_donor`
+        (anti-flap + strict-upstream + master-toggle filters), proves
+        the donor's release would unblock the receiver via
+        ``ctx.probe_add_after_removals`` (no-op dry-run on a cloned
+        cluster), then commits the removal atomically via
+        ``ctx.remove_workers_atomically``. The
+        ``_last_donation_cycle`` ledger is NOT updated here; the
+        caller MUST advance it via :meth:`_record_donation_success`
+        only after the immediate ``try_add_worker`` retry succeeds
+        for the receiver, so a retry-failure path leaves the donor
+        stage eligible to be revisited on the next planning cycle.
 
         Returns:
             The donor stage name when a donor was selected and
             removed (the caller now owns the receiver retry and the
-            cooldown bookkeeping). ``None`` when the master toggle is
+            ledger bookkeeping). ``None`` when the master toggle is
             off, when no eligible donor exists, or when the planner
-            refuses the selected donor (defensive guard).
+            cannot prove the receiver would fit after the removal.
 
         Raises:
             RuntimeError: The scheduler has not been set up.
+            SchedulerInvariantError: ``remove_workers_atomically``
+                returned ``False`` after pre-validation reported the
+                donor as present, indicating mid-batch state
+                divergence.
 
         """
         if self._problem is None:
@@ -2107,20 +2086,32 @@ class SaturationAwareScheduler:
             stage_configs=stage_configs,
             cycle=self._cycle_counter,
             last_donation_cycle=self._last_donation_cycle,
-            donations_received_this_cycle=self._donations_received_this_cycle,
             excluded_worker_ids=self._donor_warmup_excluded_ids,
         )
         if donor is None:
             return None
 
         donor_stage_name = self._stage_names[donor.stage_index]
-        if not ctx.try_remove_worker(donor.stage_index, donor.worker_id):
-            logger.warning(
-                f"[scheduler] saturation-mode donor: stage {donor_stage_name!r} "
-                f"worker {donor.worker_id!r} selected by donor helper but planner "
-                "refused removal; donation cancelled and receiver retry skipped."
+        removals = [(donor.stage_index, donor.worker_id)]
+        probe = ctx.probe_add_after_removals(removals, receiver_stage_index)
+        if not probe.feasible:
+            logger.debug(
+                f"[scheduler] saturation-mode donor probe rejected: "
+                f"donor stage {donor_stage_name!r} worker {donor.worker_id!r} "
+                f"-> receiver {receiver_stage_name!r} reject_reason="
+                f"{probe.reject_reason!r}; donation skipped, receiver waits "
+                "for next cycle."
             )
             return None
+
+        if not ctx.remove_workers_atomically(removals):
+            msg = (
+                f"saturation-mode donation: pre-validated donor "
+                f"({donor.stage_index}, {donor.worker_id!r}) for receiver "
+                f"{receiver_stage_name!r} disappeared between probe and "
+                "atomic-removal; planner snapshot diverged mid-cycle."
+            )
+            raise SchedulerInvariantError(msg)
 
         logger.info(
             f"[scheduler] saturation-mode donation: donor stage {donor_stage_name!r} "
@@ -2135,20 +2126,23 @@ class SaturationAwareScheduler:
         donor_stage_name: str,
         receiver_stage_name: str,
     ) -> None:
-        """Advance donor cooldown and receiver per-cycle counter on retry success.
+        """Advance the donor-side anti-flap timestamp on retry success.
 
         Called by the receiver-side caller after the post-donation
         ``try_add_worker`` retry completes successfully. Keeping the
-        update split from
-        :meth:`_attempt_cross_stage_donation` ensures cooldown state
-        only reflects donations that placed a worker on the receiver,
-        so a retry-failure path leaves the donor eligible to be
-        revisited on the next planning cycle.
+        update split from :meth:`_attempt_cross_stage_donation`
+        ensures the anti-flap timestamp only reflects donations that
+        placed a worker on the receiver; a retry-failure path leaves
+        the donor stage eligible to be revisited on the next planning
+        cycle.
+
+        The ``receiver_stage_name`` argument is preserved for API
+        symmetry with the multi-donor path (where every donor stage
+        in the plan must be timestamped on success); it is unused by
+        the single-donor wiring.
         """
+        del receiver_stage_name
         self._last_donation_cycle[donor_stage_name] = self._cycle_counter
-        self._donations_received_this_cycle[receiver_stage_name] = (
-            self._donations_received_this_cycle.get(receiver_stage_name, 0) + 1
-        )
 
     def _run_phase_d_shrink(
         self,
@@ -2764,16 +2758,9 @@ class SaturationAwareScheduler:
                         )
                         stuck = True
                     break
-                if not ctx.try_remove_worker(donor.stage_index, donor.worker_id):
-                    msg = (
-                        f"Cross-stage floor donor: planner snapshot inconsistency - "
-                        f"try_remove_worker(stage_index={donor.stage_index}, "
-                        f"worker_id={donor.worker_id!r}) returned False even though the "
-                        "worker is present in the live snapshot. This is a scheduler "
-                        "defect; report it with the autoscale cycle's problem_state."
-                    )
-                    raise RuntimeError(msg)
-                if ctx.try_add_worker(stage_index) is None:
+                removals = [(donor.stage_index, donor.worker_id)]
+                probe = ctx.probe_add_after_removals(removals, stage_index)
+                if not probe.feasible:
                     msg = self._format_floor_unmet_message(
                         stage_name=problem_stage.name,
                         target_min=target_min,
@@ -2784,6 +2771,23 @@ class SaturationAwareScheduler:
                         donor=donor,
                     )
                     raise RuntimeError(msg)
+                if not ctx.remove_workers_atomically(removals):
+                    msg = (
+                        f"Cross-stage floor donor: planner snapshot inconsistency - "
+                        f"remove_workers_atomically(stage_index={donor.stage_index}, "
+                        f"worker_id={donor.worker_id!r}) returned False even though the "
+                        "worker was probe-validated as present. This is a scheduler "
+                        "defect; report it with the autoscale cycle's problem_state."
+                    )
+                    raise RuntimeError(msg)
+                if ctx.try_add_worker(stage_index) is None:
+                    msg = (
+                        f"Cross-stage floor donor: probe approved donor "
+                        f"({donor.stage_index}, {donor.worker_id!r}) for receiver "
+                        f"{problem_stage.name!r} but post-removal try_add_worker "
+                        "returned None; planner state diverged between probe and commit."
+                    )
+                    raise SchedulerInvariantError(msg)
                 logger.info(
                     f"[scheduler] {problem_stage.name!r}: cross-stage minimum-floor donor "
                     f"accepted (donor_stage_index={donor.stage_index}, "

@@ -16,24 +16,20 @@
 
 """Tests for ``find_saturation_donor`` and the Phase C cross-stage donor fallback.
 
-The helper layer is exercised in isolation to pin each of the five
-anti-flap layers, the master toggle, and the strict-upstream filter.
-The integration layer is exercised through
+The helper layer is exercised in isolation to pin each anti-flap
+layer, the master toggle, and the strict-upstream filter. The
+integration layer is exercised through
 ``SaturationAwareScheduler.autoscale`` to pin the user-stuck-cluster
 regression: a receiver that wants to grow because it is SATURATED
 sees a successful donation when a valid donor exists and a clean
 non-fatal log when every other stage is at its own floor.
 
-The five anti-flap layers under test:
+The anti-flap layers under test:
 
     1. Donor must be OVER_PROVISIONED with full streak.
     2. Donor must not be in HOLD growth mode.
     3. Receiver-was-recent-donor cooldown
        (``cross_stage_donor_anti_flap_cycles``).
-    4. Receiver per-cycle absorption cap
-       (``cross_stage_donor_max_per_cycle``).
-    5. Donor between-donations cooldown
-       (``cross_stage_donor_min_donation_interval_cycles``).
 """
 
 from unittest.mock import patch
@@ -42,6 +38,7 @@ import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, find_saturation_donor
+from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
@@ -98,8 +95,6 @@ def _config(**overrides: object) -> SaturationAwareConfig:
         "cross_stage_donor_require_over_provisioned": True,
         "cross_stage_donor_exclude_hold_state": True,
         "cross_stage_donor_anti_flap_cycles": 30,
-        "cross_stage_donor_max_per_cycle": 1,
-        "cross_stage_donor_min_donation_interval_cycles": 30,
     }
     base.update(overrides)
     return SaturationAwareConfig(**base)  # type: ignore[arg-type]
@@ -118,7 +113,6 @@ def _find_donor(
     stage_configs: dict[str, SaturationAwareStageConfig] | None = None,
     cycle: int = 100,
     last_donation_cycle: dict[str, int] | None = None,
-    donations_received_this_cycle: dict[str, int] | None = None,
 ) -> DonorCandidate | None:
     """Call ``find_saturation_donor`` with a two-stage eligible default."""
     if stage_names is None:
@@ -137,8 +131,6 @@ def _find_donor(
         stage_configs = {name: _stage_cfg() for name in stage_names}
     if last_donation_cycle is None:
         last_donation_cycle = {}
-    if donations_received_this_cycle is None:
-        donations_received_this_cycle = {}
     return find_saturation_donor(
         receiver_stage_index=receiver_stage_index,
         receiver_stage_name=receiver_stage_name,
@@ -151,7 +143,6 @@ def _find_donor(
         stage_configs=stage_configs,
         cycle=cycle,
         last_donation_cycle=last_donation_cycle,
-        donations_received_this_cycle=donations_received_this_cycle,
     )
 
 
@@ -222,8 +213,6 @@ def _scheduler_for_donation(
 ) -> SaturationAwareScheduler:
     """Build a setup-completed scheduler with A eligible to donate to B."""
     cfg = _config(
-        cross_stage_donor_max_per_cycle=max_per_cycle,
-        cross_stage_donor_min_donation_interval_cycles=min_interval_cycles,
         stage_defaults=SaturationAwareStageConfig(
             min_workers=1,
             over_provisioned_streak_min_cycles=3,
@@ -276,7 +265,6 @@ class TestFindSaturationDonorMasterToggle:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -306,7 +294,6 @@ class TestFindSaturationDonorClassifierLayer:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -328,7 +315,6 @@ class TestFindSaturationDonorClassifierLayer:
             stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -350,7 +336,6 @@ class TestFindSaturationDonorClassifierLayer:
             stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is not None
@@ -378,7 +363,6 @@ class TestFindSaturationDonorHoldLayer:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -405,7 +389,6 @@ class TestFindSaturationDonorReceiverAntiFlap:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=120,
             last_donation_cycle={"B": 100},  # B donated at cycle 100; window of 30 spans through 130
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -428,18 +411,22 @@ class TestFindSaturationDonorReceiverAntiFlap:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=131,  # 31 cycles since B's last donation; window cleared
             last_donation_cycle={"B": 100},
-            donations_received_this_cycle={},
         )
 
         assert donor is not None
 
 
-class TestFindSaturationDonorReceiverPerCycleCap:
-    """Layer 4: receiver has already absorbed ``max_per_cycle`` donations this cycle."""
+class TestFindSaturationDonorSameDonorEligibleAcrossCycles:
+    """Same donor stage stays eligible the cycle after a successful donation.
 
-    def test_receiver_at_per_cycle_cap_is_blocked(self) -> None:
-        """A receiver that already absorbed the configured per-cycle cap is rejected."""
-        config = _config(cross_stage_donor_max_per_cycle=1)
+    Pins the policy choice that the OVER_PROVISIONED + streak gate is
+    the single across-cycle safety net for the donor side: as long as
+    the donor stage remains classified OVER_PROVISIONED with a full
+    streak, it can contribute again on the very next cycle. There is
+    no fixed donor-side cooldown.
+    """
+
+    def test_donor_eligible_immediately_after_prior_donation(self) -> None:
         donor = find_saturation_donor(
             receiver_stage_index=1,
             receiver_stage_name="B",
@@ -451,41 +438,14 @@ class TestFindSaturationDonorReceiverPerCycleCap:
                 "A": _over_provisioned_state("A"),
                 "B": _saturated_state("B"),
             },
-            config=config,
+            config=_config(),
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
-            cycle=100,
-            last_donation_cycle={},
-            donations_received_this_cycle={"B": 1},
-        )
-
-        assert donor is None
-
-
-class TestFindSaturationDonorDonorCooldown:
-    """Layer 5: donor donated recently and is on cooldown."""
-
-    def test_donor_within_min_interval_is_filtered(self) -> None:
-        """A donor whose ``last_donation_cycle`` is too recent is rejected."""
-        config = _config(cross_stage_donor_min_donation_interval_cycles=30)
-        donor = find_saturation_donor(
-            receiver_stage_index=1,
-            receiver_stage_name="B",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            stage_states={
-                "A": _over_provisioned_state("A"),
-                "B": _saturated_state("B"),
-            },
-            config=config,
-            stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
-            cycle=120,
+            cycle=101,
             last_donation_cycle={"A": 100},
-            donations_received_this_cycle={},
         )
 
-        assert donor is None
+        assert donor is not None
+        assert donor.stage_index == 0
 
 
 class TestFindSaturationDonorStrictUpstream:
@@ -508,7 +468,6 @@ class TestFindSaturationDonorStrictUpstream:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -530,7 +489,6 @@ class TestFindSaturationDonorStrictUpstream:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is not None
@@ -558,7 +516,6 @@ class TestFindSaturationDonorFloorPreservation:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is None
@@ -589,7 +546,6 @@ class TestFindSaturationDonorYoungestSelection:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg(), "C": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
-            donations_received_this_cycle={},
         )
 
         assert donor is not None
@@ -617,16 +573,6 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
             config=_config(cross_stage_donor_anti_flap_cycles=30),
             cycle=130,
             last_donation_cycle={"B": 100},
-        )
-
-        assert donor is not None
-
-    def test_donor_min_interval_allows_at_exact_window_boundary(self) -> None:
-        """Layer 5 blocks ``< interval`` only; equality is eligible."""
-        donor = _find_donor(
-            config=_config(cross_stage_donor_min_donation_interval_cycles=30),
-            cycle=130,
-            last_donation_cycle={"A": 100},
         )
 
         assert donor is not None
@@ -748,7 +694,6 @@ class TestSaturationDonorPhaseCOrchestration:
         assert [worker.id for worker in solution.stages[0].deleted_workers] == ["A-w0"]
         assert len(solution.stages[1].new_workers) == 1
         assert scheduler._last_donation_cycle == {"A": 1}
-        assert scheduler._donations_received_this_cycle == {"B": 1}
         assert scheduler._stuck_plan_counters["B"] == 0
 
     def test_no_eligible_donor_sticks_without_mutating_donor_state(self) -> None:
@@ -762,61 +707,48 @@ class TestSaturationDonorPhaseCOrchestration:
         assert solution.stages[0].deleted_workers == []
         assert solution.stages[1].new_workers == []
         assert scheduler._last_donation_cycle == {}
-        assert scheduler._donations_received_this_cycle == {}
         assert scheduler._stuck_plan_counters["B"] == 1
         assert any("cluster placement exhausted" in call.args[0] for call in warning.call_args_list)
 
-    def test_planner_refuses_selected_donor_without_success_state(self) -> None:
-        """A stale selected donor emits warnings but does not record a donation."""
+    def test_atomic_remove_failure_after_probe_raises_invariant(self) -> None:
+        """Atomic-remove returning False after a feasible probe is a scheduler defect.
+
+        Pins that a planner snapshot divergence between the
+        non-mutating probe and the atomic commit surfaces as
+        ``SchedulerInvariantError`` rather than as a silent absorbed
+        donation. This case is unreachable under non-pathological
+        cluster mutations; the test mocks ``remove_workers_atomically``
+        directly to exercise the raise path.
+        """
         scheduler = _scheduler_for_donation()
         state = _problem_state([("A", 3), ("B", 1)])
 
-        with (
-            patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.warning",
-            ) as warning,
-            patch.object(data_structures.AutoscalePlanContext, "try_remove_worker", return_value=False),
-        ):
-            solution = _autoscale_with_intents(scheduler, state, {"B": 1})
+        with patch.object(data_structures.AutoscalePlanContext, "remove_workers_atomically", return_value=False):
+            with pytest.raises(SchedulerInvariantError, match="planner snapshot diverged mid-cycle"):
+                _autoscale_with_intents(scheduler, state, {"B": 1})
 
-        assert solution.stages[0].deleted_workers == []
-        assert solution.stages[1].new_workers == []
         assert scheduler._last_donation_cycle == {}
-        assert scheduler._donations_received_this_cycle == {}
-        assert scheduler._stuck_plan_counters["B"] == 1
-        assert any("planner refused removal" in call.args[0] for call in warning.call_args_list)
 
-    def test_receiver_per_cycle_cap_blocks_second_donation_for_same_intent(self) -> None:
-        """A receiver may absorb only the configured number of donations per cycle."""
-        scheduler = _scheduler_for_donation(max_per_cycle=1)
-        state = _problem_state([("A", 3), ("B", 1)])
+    def test_receiver_can_absorb_multiple_donations_in_one_cycle(self) -> None:
+        """A saturated receiver absorbs up to its intent cap per cycle.
+
+        Per-cycle absorption is naturally bounded by the receiver's
+        Phase C intent (capped by ``aggressive_growth_max_per_cycle``);
+        a separate cross-stage cap is redundant. Pins that two
+        donations land in one cycle when the donor stage remains
+        eligible across the back-to-back attempts.
+        """
+        scheduler = _scheduler_for_donation(total_cpus_per_node=5)
+        state = _problem_state([("A", 4), ("B", 1)])
 
         solution = _autoscale_with_intents(scheduler, state, {"B": 2})
 
-        assert len(solution.stages[0].deleted_workers) == 1
-        assert len(solution.stages[1].new_workers) == 1
-        assert scheduler._donations_received_this_cycle == {"B": 1}
-        assert scheduler._stuck_plan_counters["B"] == 1
-
-    def test_donor_cooldown_blocks_repeat_donation_across_cycles(self) -> None:
-        """A donor cannot donate again before ``min_interval`` cycles elapse."""
-        scheduler = _scheduler_for_donation(min_interval_cycles=30)
-        first_state = _problem_state([("A", 3), ("B", 1)])
-        second_state = _problem_state([("A", 2), ("B", 2)])
-
-        first_solution = _autoscale_with_intents(scheduler, first_state, {"B": 1})
-        second_solution = _autoscale_with_intents(scheduler, second_state, {"B": 1})
-
-        assert len(first_solution.stages[0].deleted_workers) == 1
-        assert len(first_solution.stages[1].new_workers) == 1
-        assert second_solution.stages[0].deleted_workers == []
-        assert second_solution.stages[1].new_workers == []
-        assert scheduler._last_donation_cycle == {"A": 1}
-        assert scheduler._donations_received_this_cycle == {}
-        assert scheduler._stuck_plan_counters["B"] == 1
+        assert len(solution.stages[0].deleted_workers) == 2
+        assert len(solution.stages[1].new_workers) == 2
+        assert scheduler._stuck_plan_counters["B"] == 0
 
     def test_setup_resets_cross_stage_donor_state(self) -> None:
-        """``setup`` clears donation history and the per-cycle receiver cap."""
+        """``setup`` clears donation history."""
         scheduler = _scheduler_for_donation()
         _autoscale_with_intents(scheduler, _problem_state([("A", 3), ("B", 1)]), {"B": 1})
 
@@ -824,32 +756,23 @@ class TestSaturationDonorPhaseCOrchestration:
 
         assert scheduler._cycle_counter == 0
         assert scheduler._last_donation_cycle == {}
-        assert scheduler._donations_received_this_cycle == {}
         assert scheduler._stuck_plan_counters == {}
 
-    def test_post_donation_retry_failure_does_not_record_success_cooldowns(self) -> None:
-        """A failed post-donation retry must not record success-only cooldown state."""
-        scheduler = _scheduler_for_donation()
+    def test_no_donation_when_initial_try_add_succeeds(self) -> None:
+        """Donor path is dormant when the receiver fits without rebalancing.
+
+        When ``try_add_worker`` returns a placement on the first
+        attempt, the donor helper is never invoked; the anti-flap
+        ledger stays empty.
+        """
+        scheduler = _scheduler_for_donation(total_cpus_per_node=8)
         state = _problem_state([("A", 3), ("B", 1)])
 
-        with patch.object(data_structures.AutoscalePlanContext, "try_add_worker", return_value=None):
-            _autoscale_with_intents(scheduler, state, {"B": 1})
+        solution = _autoscale_with_intents(scheduler, state, {"B": 1})
 
+        assert solution.stages[0].deleted_workers == []
+        assert len(solution.stages[1].new_workers) == 1
         assert scheduler._last_donation_cycle == {}
-        assert scheduler._donations_received_this_cycle == {}
-
-    def test_post_donation_retry_failure_still_emits_donor_removal(self) -> None:
-        """Retry failure leaves donor cooldown clean while still surfacing the donor removal."""
-        scheduler = _scheduler_for_donation()
-        state = _problem_state([("A", 3), ("B", 1)])
-
-        with patch.object(data_structures.AutoscalePlanContext, "try_add_worker", return_value=None):
-            solution = _autoscale_with_intents(scheduler, state, {"B": 1})
-
-        assert len(solution.stages[0].deleted_workers) == 1
-        assert solution.stages[1].new_workers == []
-        assert scheduler._last_donation_cycle == {}
-        assert scheduler._donations_received_this_cycle == {}
 
 
 class TestShapeValidation:

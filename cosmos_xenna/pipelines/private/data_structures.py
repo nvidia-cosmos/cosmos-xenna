@@ -28,6 +28,7 @@ from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: i
 )
 from cosmos_xenna.pipelines.private import resources
 
+
 class ProblemStage:
     """Static autoscaling description of one pipeline stage.
 

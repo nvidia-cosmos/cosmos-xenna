@@ -322,8 +322,6 @@ class TestSaturationAwareConfigPositiveIntValidators:
     @pytest.fixture(
         params=[
             "cross_stage_donor_anti_flap_cycles",
-            "cross_stage_donor_max_per_cycle",
-            "cross_stage_donor_min_donation_interval_cycles",
             "stuck_plan_detection_cycles",
             "cluster_heterogeneity_warn_streak",
         ]

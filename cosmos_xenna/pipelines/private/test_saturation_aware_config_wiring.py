@@ -895,8 +895,6 @@ class TestConfigWiringMetaCoverage:
         "cross_stage_donor_require_over_provisioned",
         "cross_stage_donor_exclude_hold_state",
         "cross_stage_donor_anti_flap_cycles",
-        "cross_stage_donor_max_per_cycle",
-        "cross_stage_donor_min_donation_interval_cycles",
         "floor_stuck_grace_cycles",
         "cycle_time_warn_threshold",
         "enable_memory_pressure_gate",
