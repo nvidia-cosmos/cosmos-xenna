@@ -346,7 +346,15 @@ class TestMinDataPointsTrustGate:
 
     def test_min_data_points_three_suppresses_until_third_valid_sample(self) -> None:
         """With ``min_data_points=3`` the first two valid samples produce zero intent; the third fires."""
+        # Disable regime-aware aggressiveness so the third cycle does
+        # not coincide with the default ``regime_transition_streak_cycles=3``
+        # transition, which (by design) resets the trust-gate counter
+        # via ``_update_regime_aware_aggressiveness`` and would otherwise
+        # require this test to run extra cycles for the gate to rebuild.
+        # The test's contract is the ``min_data_points`` trust gate,
+        # not the regime detector, so we silence regime detection.
         sat_cfg = SaturationAwareConfig(
+            enable_regime_aware_aggressiveness=False,
             stage_defaults=SaturationAwareStageConfig(
                 min_data_points=3,
                 worker_warmup_measurement_grace_s=0.0,

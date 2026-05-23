@@ -88,6 +88,7 @@ problem_state ─► _aggregate_cluster_regime_signal  ─► RegimeSignal
                           ▼
               drop resolved_thresholds for every stage
               reset classifier_state + classifier_streak
+              reset valid_signal_samples (trust-gate counter)
               clear stabilization recommendation buffer
                           │
                           ▼
@@ -123,11 +124,17 @@ problem_state ─► _aggregate_cluster_regime_signal  ─► RegimeSignal
 
 4. **On transition.** `_update_regime_aware_aggressiveness` drops
    every stage's `resolved_thresholds`, resets each stage's
-   threshold-relative classifier state and streak, and clears the
-   stabilization-window recommendation buffer.
-   `_ensure_thresholds_resolved` re-derives thresholds with the
-   new `_effective_aggressiveness` value on the same cycle, so the
-   new bias takes effect immediately rather than next cycle.
+   threshold-relative classifier state and streak, resets each
+   stage's `valid_signal_samples` trust-gate counter to zero, and
+   clears the stabilization-window recommendation buffer. The
+   trust-gate reset forces the post-transition cycles to re-accrue
+   `min_data_points` consecutive warmup-excluded valid samples
+   before a non-zero recommendation may pass; without it the gate
+   would carry forward freshness consensus built against the old
+   threshold band. `_ensure_thresholds_resolved` re-derives
+   thresholds with the new `_effective_aggressiveness` value on
+   the same cycle, so the new bias takes effect immediately rather
+   than next cycle.
 
 5. **Lift application.** `_effective_aggressiveness(base)` returns
    `base + super_halfin_whitt_aggressiveness_lift` while

@@ -496,18 +496,41 @@ class BottleneckEngagementState:
 
     Attributes:
         last_announced: Last engagement state announced via INFO log;
-            None until the first announcement.
-        candidate_streak: Consecutive cycles whose engagement differs
-            from ``last_announced``; resets on any agreement cycle.
+            ``None`` until the first announcement.
+        candidate_streak: Cycle counter whose semantic depends on
+            ``last_announced``:
+
+              * ``last_announced is None`` (cold-start seeding):
+                consecutive cycles whose engagement matches
+                ``last_candidate``. A value flip resets the counter
+                to ``1``.
+              * ``last_announced is not None`` (post-seeded): consecutive
+                cycles whose engagement differs from ``last_announced``;
+                resets on any agreement cycle.
+
+            In both phases the counter advances to
+            ``persistence_cycles`` before the gate fires.
+        last_candidate: Most recently observed candidate value during
+            the cold-start seeding phase; ``None`` until the first
+            cycle. Used to detect value flips so a noisy mixed
+            sequence (e.g. ``True, False, True`` with
+            ``persistence_cycles=3``) cannot get its
+            ``persistence_cycles``'th cycle's arbitrary value
+            seeded as the announced state. Not consulted once
+            ``last_announced`` is set (the post-seeded branch
+            already gets consecutive-identical semantics for free
+            because ``engaged: bool`` has only one "other" value).
     """
 
     last_announced: bool | None = None
     candidate_streak: int = 0
+    last_candidate: bool | None = None
 
     def reset(self) -> None:
         """Reset to a fresh ledger."""
         self.last_announced = None
         self.candidate_streak = 0
+        self.last_candidate = None
 
 
 def identify_bottleneck(
@@ -623,7 +646,17 @@ def maybe_log_bottleneck_engagement(
         pipeline_name: Pipeline identifier for the log line.
     """
     if state.last_announced is None:
-        state.candidate_streak += 1
+        # Cold-start seeding: count only consecutive identical
+        # candidate values. A noisy mixed sequence (True, False,
+        # True, ...) must not seed ``last_announced`` based on
+        # whichever value happens to land on the
+        # ``persistence_cycles``'th cycle - the gate's contract is
+        # persistence-based debouncing, not just "wait N cycles".
+        if state.last_candidate is None or identity.engaged == state.last_candidate:
+            state.candidate_streak += 1
+        else:
+            state.candidate_streak = 1
+        state.last_candidate = identity.engaged
         if state.candidate_streak >= persistence_cycles:
             state.last_announced = identity.engaged
             state.candidate_streak = 0

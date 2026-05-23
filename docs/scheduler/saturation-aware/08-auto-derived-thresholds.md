@@ -129,7 +129,7 @@ log distinguishes "auto" from "manual override" without guesswork.
 
 **Why lazy + one-shot.** Resolution runs on the first `autoscale()`
 cycle because that is the earliest cycle at which Xenna populates
-the runtime `slots_per_worker` (config defaults may differ).
+the runtime `slots_per_actor` (config defaults may differ).
 Re-resolving on every cycle would silently invalidate the EWMA
 decay, the asymmetric streak counters, and the growth-mode state
 machine, all of which are calibrated against the threshold band in
@@ -165,7 +165,7 @@ To reproduce pre-auto-derivation behaviour exactly, pin both
   the regime detector lifts the effective `K` when the cluster enters
   super-Halfin-Whitt, and is the only mechanism that re-runs
   resolution mid-pipeline.
-- [05 — State classifier](05-state-classifier.md) — the five-zone
+- [05 — State classifier](05-state-classifier.md) — the four-zone
   classifier that consumes the resolved thresholds.
 - [02 — Configuration model](02-configuration-model.md) — where
   `SaturationAwareStageConfig` is composed and how the three-tier

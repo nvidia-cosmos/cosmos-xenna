@@ -16,22 +16,10 @@
 
 """Integration-level negative tests for ``SaturationAwareScheduler``.
 
-These scenarios verify error context and state containment across
-**multiple** autoscale cycles. Single-cycle helper-level negative
-contracts (allocator absorption, raw invariant helpers, config
-validators, streaming-signal validators) are already covered by
-``test_saturation_aware_allocation_error.py``,
-``test_saturation_aware_phase_invariants.py``,
-``test_saturation_aware_stuck_plan_filter.py``, and
-``test_streaming_slot_signals.py``.
-
-Scenarios:
-
-  * ``test_problem_state_shape_mismatch_after_successful_cycle_raises_contextual_error``
-  * ``test_stage_name_with_curly_braces_in_multicycle_error_is_safe_in_repr``
-  * ``test_allocation_failure_skip_cycle_preserves_previous_worker_age_and_recovers_next_cycle``
-  * ``test_allocation_failure_propagates_without_mutating_state_when_kill_switch_disabled``
-  * ``test_corrupted_mid_cycle_metric_state_blocks_next_cycle_and_recovers_after_reinitialization``
+Each test verifies error context and state containment across
+multiple autoscale cycles: shape-mismatch error reporting, hostile
+format-string-bearing stage names, allocator-failure absorption and
+propagation under recovery, and corrupted-EWMA fixture containment.
 """
 
 import math

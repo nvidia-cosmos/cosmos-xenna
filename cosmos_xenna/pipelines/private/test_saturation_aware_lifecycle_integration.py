@@ -16,12 +16,10 @@
 
 """Lifecycle integration tests for ``SaturationAwareScheduler``.
 
-These tests exercise FEATURE INTERACTIONS over multiple consecutive
-``autoscale()`` cycles inside a single test. Per-feature mechanics
-are already covered by focused unit tests in this directory; this
-module's job is to pin the cross-feature behaviours that only show
-up when the same scheduler instance is driven through several
-cycles in sequence:
+Each test drives the same scheduler instance through several
+consecutive ``autoscale()`` cycles and pins one cross-feature seam:
+
+::
 
     cold-start quiescence
             |
@@ -40,20 +38,6 @@ cycles in sequence:
             v
     floor protection
 
-Each test method pins ONE specific multi-cycle behaviour. Helpers
-follow the same convention as the rest of the directory: each test
-file copies the small per-file fixtures locally rather than relying
-on a shared module, so a regression in one test file does not
-break the others.
-
-Why integration tests matter here: every existing focused test
-isolates one feature (quiescence, warmup grace, classifier streak,
-recommendation history, etc.). Regressions tend to hide in the
-SEAMS between features -- e.g. a quiescence release that does not
-arm the trust gate cleanly, a stabilization window that drifts after
-30 quiet cycles, or a Phase D shrink that crosses the floor when the
-classifier was just leaving SATURATED_CRITICAL. These tests pin those
-seams.
 """
 
 from collections.abc import Callable, Iterable
@@ -65,12 +49,7 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, Saturati
 
 
 def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 64) -> resources.ClusterResources:
-    """Build a CPU-only cluster sized for multi-cycle grow scenarios.
-
-    The default capacity is intentionally generous so the placer
-    cannot be the bottleneck during Phase C grow; tests that target
-    placement exhaustion shrink this themselves.
-    """
+    """Build a CPU-only cluster sized generously so placement never bottlenecks Phase C."""
     return resources.ClusterResources(
         nodes={
             f"node-{i}": resources.NodeResources(
@@ -113,17 +92,7 @@ def _stage_state(
     num_pending_actors: int,
     is_finished: bool = False,
 ) -> data_structures.ProblemStageState:
-    """Build a ``ProblemStageState`` with every signal field explicit.
-
-    Tests in this module exercise cycle-to-cycle signal evolution, so
-    every field is a required keyword: omitting one would make the
-    fixture intent ambiguous and obscure which signal channel the
-    scenario was meant to drive.
-
-    Worker-group ``num_used_slots`` is filled symmetrically so the
-    warmup-filter helper sees a self-consistent per-group view of
-    occupancy that matches the stage-level slot signal.
-    """
+    """Build a ``ProblemStageState``; per-worker slot occupancy mirrors the stage-level signal."""
     used_per_worker = (num_used_slots // num_workers) if num_workers > 0 else 0
     worker_groups = [
         data_structures.ProblemWorkerGroupState.make(
@@ -160,14 +129,14 @@ def _build_scheduler(
     min_workers: int | None = 1,
     cluster: resources.ClusterResources | None = None,
 ) -> SaturationAwareScheduler:
-    """Build a configured scheduler over the given stages.
+    """Build a scheduler whose defaults fire Phase D after two over-provisioned cycles.
 
-    Defaults pin the minimum-valid asymmetric stabilization tuple
-    so lifecycle tests can fire Phase D after two consecutive
-    over-provisioned cycles. When ``donor_warmup_grace_s`` is
-    omitted it is set equal to ``worker_warmup_measurement_grace_s``
-    to satisfy the cross-field validator on
-    :class:`SaturationAwareStageConfig`.
+    Args:
+        donor_warmup_grace_s: When ``None``, defaults to
+            ``worker_warmup_measurement_grace_s`` so the cross-field
+            validator on :class:`SaturationAwareStageConfig` accepts
+            the resulting pair.
+
     """
     effective_donor_grace = worker_warmup_measurement_grace_s if donor_warmup_grace_s is None else donor_warmup_grace_s
     cfg = SaturationAwareConfig(
@@ -198,11 +167,7 @@ def _run_cycles(
     cycle_interval_s: float = 10.0,
     start_time_s: float = 0.0,
 ) -> list[data_structures.Solution]:
-    """Drive ``num_cycles`` ``autoscale()`` cycles and return every ``Solution``.
-
-    Wall-clock time advances by ``cycle_interval_s`` between cycles
-    so warmup and donor grace fields consume realistic deltas.
-    """
+    """Drive ``num_cycles`` cycles spaced ``cycle_interval_s`` apart; return every ``Solution``."""
     solutions: list[data_structures.Solution] = []
     for cycle_idx in range(num_cycles):
         ps = state_factory(cycle_idx)
@@ -211,14 +176,14 @@ def _run_cycles(
     return solutions
 
 
-def _count_adds(solutions: Iterable[data_structures.Solution], stage_index: int = 0) -> int:
-    """Sum ``len(new_workers)`` for ``stage_index`` across every solution."""
-    return sum(len(sol.stages[stage_index].new_workers) for sol in solutions)
+def _new_workers_per_stage(solutions: Iterable[data_structures.Solution], stage_index: int) -> list[int]:
+    """Per-cycle list of ``len(new_workers)`` for one stage index."""
+    return [len(sol.stages[stage_index].new_workers) for sol in solutions]
 
 
-def _count_deletes(solutions: Iterable[data_structures.Solution], stage_index: int = 0) -> int:
-    """Sum ``len(deleted_workers)`` for ``stage_index`` across every solution."""
-    return sum(len(sol.stages[stage_index].deleted_workers) for sol in solutions)
+def _deleted_workers_per_stage(solutions: Iterable[data_structures.Solution], stage_index: int) -> list[int]:
+    """Per-cycle list of ``len(deleted_workers)`` for one stage index."""
+    return [len(sol.stages[stage_index].deleted_workers) for sol in solutions]
 
 
 def _saturated(
@@ -228,19 +193,14 @@ def _saturated(
     slots_per_worker: int = 8,
     num_pending_actors: int = 0,
 ) -> data_structures.ProblemStageState:
-    """Build a SATURATED-shaped slot signal for the stage.
-
-    ``empty / total = 1 / (workers * slots)`` drives the classifier into
-    SATURATED_CRITICAL on the first cycle; the exact ratio is irrelevant
-    to the lifecycle tests, only the resulting positive intent direction.
-    """
+    """Build a SATURATED_CRITICAL-shaped slot signal for the stage."""
     total = num_workers * slots_per_worker
     return _stage_state(
         name=name,
         num_workers=num_workers,
         slots_per_worker=slots_per_worker,
-        num_used_slots=max(total - 1, 0),
-        num_empty_slots=1 if total else 0,
+        num_used_slots=total,
+        num_empty_slots=0,
         input_queue_depth=5,
         num_pending_actors=num_pending_actors,
     )
@@ -253,13 +213,7 @@ def _over_provisioned(
     slots_per_worker: int = 8,
     num_pending_actors: int = 0,
 ) -> data_structures.ProblemStageState:
-    """Build an OVER_PROVISIONED-shaped slot signal for the stage.
-
-    Idle slots with a non-empty input queue is the canonical
-    OVER_PROVISIONED shape (the classifier also accepts a drained
-    queue here, but a non-empty queue is what most scale-down
-    scenarios in production look like).
-    """
+    """Build an OVER_PROVISIONED-shaped slot signal: mostly idle with a non-empty queue."""
     total = num_workers * slots_per_worker
     return _stage_state(
         name=name,
@@ -279,13 +233,7 @@ def _normal(
     slots_per_worker: int = 8,
     num_pending_actors: int = 0,
 ) -> data_structures.ProblemStageState:
-    """Build a NORMAL-shaped slot signal mid-band between the two extremes.
-
-    The empty ratio sits well above the auto-derived saturation
-    threshold for ``slots_per_actor=8`` (~0.21) and well below the
-    over-provisioned threshold (default 0.50), so the classifier
-    stays in NORMAL across the whole steady-state run.
-    """
+    """Build a NORMAL-shaped slot signal at 50 % occupancy with a small input queue."""
     total = num_workers * slots_per_worker
     used = total // 2
     return _stage_state(
@@ -443,7 +391,7 @@ class TestSteadyState30CyclesNoOscillation:
         # is already above the implicit floor=1; verify that NO cycle
         # produces Phase D deletes and NO cycle past the initial floor
         # cycle produces a Phase C add.
-        total_deletes = _count_deletes(solutions)
+        total_deletes = sum(_deleted_workers_per_stage(solutions, stage_index=0))
         assert total_deletes == 0, (
             f"steady NORMAL signal must not trigger Phase D shrink across 30 cycles, got {total_deletes} deletes"
         )
@@ -491,7 +439,7 @@ class TestDemandSpikeStabilizationHoldsNewLevel:
         # history both ripen.
         solutions = _run_cycles(scheduler, state_factory, num_cycles=5)
 
-        total_adds = _count_adds(solutions)
+        total_adds = sum(_new_workers_per_stage(solutions, stage_index=0))
         assert total_adds >= 1, (
             f"sustained SATURATED signal must fire Phase C grow at least once across "
             f"{len(solutions)} cycles, got {total_adds} adds"
@@ -534,7 +482,7 @@ class TestDemandDropStabilizationHoldsFloor:
 
         solutions = _run_cycles(scheduler, state_factory, num_cycles=6)
 
-        total_deletes = _count_deletes(solutions)
+        total_deletes = sum(_deleted_workers_per_stage(solutions, stage_index=0))
         assert total_deletes >= 1, (
             f"sustained OVER_PROVISIONED signal must fire Phase D shrink at least once "
             f"across {len(solutions)} cycles, got {total_deletes} deletes"

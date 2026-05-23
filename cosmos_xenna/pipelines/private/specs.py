@@ -890,11 +890,14 @@ class SaturationAwareConfig:
     )
 
     # When True, ``MemoryPressureMonitor`` polls Ray's cluster object-store
-    # memory and freezes Phase C scale-up when used fraction exceeds the
-    # critical threshold below.
+    # memory and freezes Phase C scale-up when used fraction is at or above
+    # the critical threshold below (comparison uses ``>=``).
     enable_memory_pressure_gate: bool = True
-    # Fraction of cluster object-store memory above which the gate freezes
-    # Phase C scale-up.
+    # Fraction of cluster object-store memory at or above which the gate
+    # freezes Phase C scale-up. The comparison uses ``>=`` so the
+    # closed-right end of the validator interval ``(0.0, 1.0]`` is
+    # meaningful (a configured ``1.0`` trips when the object store
+    # reports fully saturated).
     memory_pressure_critical_threshold: float = attrs.field(
         default=0.85,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),

@@ -16,24 +16,11 @@
 
 """Cluster-perturbation integration tests for ``SaturationAwareScheduler``.
 
-The public scheduler API freezes ``cluster_resources`` at
-:meth:`SaturationAwareScheduler.setup`. Real cluster scale-in /
-scale-out events therefore manifest only as changes to the per-cycle
-``ProblemState.worker_groups`` snapshot fed by the streaming layer.
-
-This module focuses on whole-pipeline survival across such events,
-where multiple SAT features (Phase B floor, Phase C grow, Phase D
-shrink, per-worker bookkeeping, classifier EWMA) must compose
-correctly across N cycles. Single-feature node-churn mechanics are
-already covered by ``test_node_churn.py``; the assertions here are
-integration-level (no crashes, intent decisions still flow, no
-phantom worker ids in state, floor + survivor invariants hold).
-
-Scenarios:
-
-  * ``test_node_disappearance_does_not_crash_running_pipeline``
-  * ``test_cluster_scale_out_drives_growth_into_new_nodes``
-  * ``test_cluster_scale_in_consolidates_remaining_capacity``
+``SaturationAwareScheduler.setup`` freezes ``cluster_resources``, so
+real cluster scale-in / scale-out manifests only as changes to the
+per-cycle ``ProblemState.worker_groups`` snapshot. Each test pins
+one whole-pipeline invariant under such a perturbation (no crash,
+no phantom worker ids, floor + survivor counts respected).
 """
 
 from collections.abc import Callable
@@ -43,7 +30,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import Satura
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
-def _multi_node_cluster(*, num_nodes: int = 2, total_cpus_per_node: int = 4) -> resources.ClusterResources:
+def _cluster(*, num_nodes: int = 2, total_cpus_per_node: int = 4) -> resources.ClusterResources:
     """Build a CPU-only cluster with ``num_nodes`` identical nodes."""
     return resources.ClusterResources(
         nodes={
@@ -141,16 +128,20 @@ def _build_scheduler(
     stabilization_window_cycles_down: int = 2,
     max_scale_down_fraction_per_cycle: float = 1.0,
 ) -> SaturationAwareScheduler:
-    """Build a scheduler over the given stages with churn-friendly defaults.
+    """Build a scheduler whose defaults disable warmup grace, quiescence and Phase D shrink cap.
 
-    Disables warmup grace and setup-phase quiescence so signals from
-    the per-cycle ``ProblemState`` reach the classifier on every
-    cycle without filtering. Lifts ``max_scale_down_fraction_per_cycle``
-    so Phase D's per-cycle bound is set entirely by the per-stage
-    intent.
+    Regime-aware aggressiveness is disabled so the trust-gate reset
+    that runs on every Halfin-Whitt regime transition
+    (``_update_regime_aware_aggressiveness``) does not interfere with
+    these cluster-placement scenarios. The tests in this file pin
+    per-node placement behaviour, not regime adaptation; without the
+    silencer the saturated-stage fixtures would (per design) trip a
+    regime transition that resets ``valid_signal_samples`` and gates
+    Phase C for further cycles than the short scenarios run.
     """
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
+        enable_regime_aware_aggressiveness=False,
         stage_defaults=SaturationAwareStageConfig(
             min_workers=min_workers,
             setup_phase_quiescence_enabled=False,
@@ -200,7 +191,7 @@ class TestNodeDisappearanceDoesNotCrashRunningPipeline:
           * Continue to honour each stage's floor on the surviving
             (node-0) workers.
         """
-        cluster = _multi_node_cluster(num_nodes=2, total_cpus_per_node=4)
+        cluster = _cluster(num_nodes=2, total_cpus_per_node=4)
         scheduler = _build_scheduler(["A", "B", "C"], cluster)
 
         full_layout = {"node-0": 1, "node-1": 1}
@@ -253,7 +244,7 @@ class TestClusterScaleOutDrivesGrowthIntoNewNodes:
         Across a few Phase C cycles the placer must use the idle
         node-1 capacity for at least one new worker.
         """
-        cluster = _multi_node_cluster(num_nodes=2, total_cpus_per_node=4)
+        cluster = _cluster(num_nodes=2, total_cpus_per_node=4)
         scheduler = _build_scheduler(["hot"], cluster)
 
         def saturated_on_nodes(nodes: dict[str, int]) -> data_structures.ProblemState:
@@ -286,7 +277,7 @@ class TestClusterScaleOutDrivesGrowthIntoNewNodes:
         node-1, proving the placer does not starve the alternate
         node when the saturated node already hosts a worker.
         """
-        cluster = _multi_node_cluster(num_nodes=2, total_cpus_per_node=2)
+        cluster = _cluster(num_nodes=2, total_cpus_per_node=2)
         scheduler = _build_scheduler(["A", "B"], cluster)
 
         live: dict[str, dict[str, int]] = {
@@ -335,7 +326,7 @@ class TestClusterScaleInConsolidatesRemainingCapacity:
           * Never emit a delete for a worker that already vanished.
           * Keep the live count at-or-above ``min_workers``.
         """
-        cluster = _multi_node_cluster(num_nodes=2, total_cpus_per_node=4)
+        cluster = _cluster(num_nodes=2, total_cpus_per_node=4)
         scheduler = _build_scheduler(
             ["hot"],
             cluster,

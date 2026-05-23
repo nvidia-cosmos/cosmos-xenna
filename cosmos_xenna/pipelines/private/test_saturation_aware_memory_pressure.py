@@ -18,10 +18,10 @@
 
 The gate is a cluster-wide kill switch on the saturation-aware
 scheduler's Phase C scale-up: when the polled Ray object-store
-``used_fraction`` exceeds
+``used_fraction`` reaches
 ``SaturationAwareConfig.memory_pressure_critical_threshold``
-(default ``0.85``), every stage's positive intent is frozen for the
-cycle. The pinned contract:
+(default ``0.85``; comparison uses ``>=``), every stage's positive
+intent is frozen for the cycle. The pinned contract:
 
   * Phase C scale-up is frozen cluster-wide when pressure is
     active.

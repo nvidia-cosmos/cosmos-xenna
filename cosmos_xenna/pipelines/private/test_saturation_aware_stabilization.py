@@ -553,6 +553,38 @@ class TestSchedulerIntegration:
             scheduler._update_regime_aware_aggressiveness(empty_state)
         assert len(scheduler._recommendation_histories["only"]) == 0
 
+    def test_regime_transition_resets_valid_signal_samples_trust_gate(self) -> None:
+        """Crossing a Halfin-Whitt regime boundary zeroes the per-stage trust-gate counter.
+
+        ``valid_signal_samples`` is the freshness counter consulted by
+        ``_compute_intent_deltas``: a non-zero recommendation is
+        clamped to zero until at least ``min_data_points`` strictly
+        consecutive warmup-excluded samples have been observed under
+        the *current* threshold band. Pre-transition samples were
+        collected against a different threshold band, so leaving the
+        counter intact across a regime transition would let the next
+        cycle's recommendation fire on stale freshness consensus and
+        defeat the rebuild-from-scratch invariant the regime
+        transition is meant to enforce. The clear must happen
+        alongside the existing ``resolved_thresholds`` /
+        ``classifier_state`` / ``classifier_streak`` resets so the
+        trust gate and the classifier hysteresis come back online
+        together rather than the trust gate carrying forward.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(self._problem_with_stage("only"))
+        runtime = scheduler._stage_states["only"]
+        runtime.valid_signal_samples = 7
+
+        scheduler._regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
+        empty_state = data_structures.ProblemState([])
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.update_regime_state",
+            return_value=True,
+        ):
+            scheduler._update_regime_aware_aggressiveness(empty_state)
+        assert runtime.valid_signal_samples == 0
+
 
 @pytest.fixture
 def history_for_capacity_test() -> _RecommendationHistory:

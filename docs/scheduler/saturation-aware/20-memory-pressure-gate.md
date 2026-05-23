@@ -47,8 +47,12 @@ view is structurally unable to see.
 
 Adopt a **single cluster-level kill switch** on Phase C, gated
 on Ray's reported object-store usage. The gate produces one
-boolean per cycle (`phase_c_frozen = used_fraction > threshold`)
-that Phase C consults before emitting any positive intent.
+boolean per cycle (`phase_c_frozen = used_fraction >= threshold`)
+that Phase C consults before emitting any positive intent. The
+comparison uses `>=` (not strict `>`) so a configured
+`threshold = 1.0` - the closed-right end of the validator range
+`(0.0, 1.0]` - still fires when the object store reports fully
+saturated;
 
 ```
    object-store used fraction (over autoscale cycles)
@@ -121,7 +125,7 @@ either direction.
               │    interval_s                                │
               │  ─ used_fraction = used / total              │
               │  ─ phase_c_frozen = enable_memory_pressure_  │
-              │     gate  AND  used_fraction > threshold     │
+              │     gate  AND  used_fraction >= threshold    │
               └──────────────────────────────────────────────┘
                                      │
                                      ▼
@@ -178,7 +182,7 @@ All fields live on `SaturationAwareConfig` in
 | Field                                  | Default | Effect |
 |---|---|---|
 | `enable_memory_pressure_gate`          | `True`  | Master switch. When `False`, Phase C never freezes regardless of memory pressure. |
-| `memory_pressure_critical_threshold`   | `0.85`  | Fraction in `(0.0, 1.0]`. When `used_fraction > threshold`, Phase C is frozen for the cycle. |
+| `memory_pressure_critical_threshold`   | `0.85`  | Fraction in `(0.0, 1.0]`. When `used_fraction >= threshold`, Phase C is frozen for the cycle (the closed-right `1.0` is meaningful). |
 | `memory_pressure_polling_interval_s`   | `5.0`   | Minimum interval (seconds) between Ray cluster-memory queries; the cached gauge is reused inside this window. |
 
 Push `memory_pressure_critical_threshold` toward `0.95` on

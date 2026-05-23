@@ -497,10 +497,10 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
     kind = mode_specific.scheduler
     match kind:
         case specs.SchedulerKind.FRAGMENTATION_BASED:
-            return autoscaling_algorithms.FragmentationBasedAutoscaler(
-                mode_specific.autoscale_speed_estimation_window_duration_s,
-                mode_specific.autoscale_speed_estimation_min_data_points,
-            )
+        return autoscaling_algorithms.FragmentationBasedAutoscaler(
+            mode_specific.autoscale_speed_estimation_window_duration_s,
+            mode_specific.autoscale_speed_estimation_min_data_points,
+        )
         case specs.SchedulerKind.SATURATION_AWARE:
             # Deferred import keeps the fragmentation-based path free of metric series it never observes.
             from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler

@@ -811,12 +811,17 @@ class TestPhaseDShrinkLogWarmupBranch:
         )
         assert not fraction_logs, "fraction cap is 1.0 (default); branch must not fire"
 
+        # Stage 1 reports its own post-clamp output: actual_remove=4 (not
+        # effective_remove=2). The relation deficit + left_removed == requested_remove
+        # (6 + 4 == 10) holds independently of Stage 2's further shrinkage.
         floor_msg = floor_logs[0].message
         assert "intent -10 workers" in floor_msg
-        assert "floor cap left 2 removed" in floor_msg
+        assert "floor cap left 4 removed" in floor_msg
         assert "deficit=6" in floor_msg
         assert "floor=2" in floor_msg
 
+        # Stage 2 reports its own post-clamp output: effective_remove=2 (after the
+        # warmup-grace filter excluded {w2..w5}). deficit=actual_remove-effective_remove.
         warmup_msg = warmup_logs[0].message
         assert "intent -10 workers" in warmup_msg
         assert "donor warmup grace left 2 removed" in warmup_msg

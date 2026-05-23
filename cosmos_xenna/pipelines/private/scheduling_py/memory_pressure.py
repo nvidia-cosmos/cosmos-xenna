@@ -21,7 +21,7 @@ per-stage. Two stages can each respect their own slot contract while
 the sum of their per-task footprints saturates Ray's object store -
 no per-stage observable can see that. The gate watches Ray's
 reported object-store usage and freezes Phase C scale-up when the
-``used_fraction`` rises above a configured critical threshold.
+``used_fraction`` reaches a configured critical threshold.
 
 ::
 
@@ -32,7 +32,7 @@ reported object-store usage and freezes Phase C scale-up when the
                     / cluster_object_store
                    |
                    v
-    pressure_active = used_fraction > critical_threshold
+    pressure_active = used_fraction >= critical_threshold
                    |
                    v
     Phase B floor enforcement  --- RUNS (structural; recovery path)
@@ -80,8 +80,10 @@ class MemoryPressureMonitor:
         polling_interval_s: Minimum seconds between Ray cluster
             resource queries. Cached values are reused inside this
             window.
-        critical_threshold: ``used_fraction`` above which the
-            monitor reports pressure as active.
+        critical_threshold: ``used_fraction`` at or above which the
+            monitor reports pressure as active. The comparison uses
+            ``>=`` so a configured ``critical_threshold = 1.0`` trips
+            when the object store reports fully saturated.
         pipeline_name: Tag value attached to the two emitted gauges
             so multi-pipeline deployments can be distinguished in
             Prometheus.
@@ -102,11 +104,14 @@ class MemoryPressureMonitor:
                 resource polls. Must be > 0; the field validator on
                 ``SaturationAwareConfig.memory_pressure_polling_interval_s``
                 enforces this at the config layer.
-            critical_threshold: ``used_fraction`` strictly above
-                which the monitor reports pressure as active. Must
-                be in ``(0.0, 1.0]``; the field validator on
+            critical_threshold: ``used_fraction`` at or above which
+                the monitor reports pressure as active (comparison
+                uses ``>=``). Must be in ``(0.0, 1.0]``; the field
+                validator on
                 ``SaturationAwareConfig.memory_pressure_critical_threshold``
-                enforces this at the config layer.
+                enforces this at the config layer. The closed-right
+                bound ``1.0`` is meaningful because the gate fires
+                when ``used_fraction == critical_threshold``.
             pipeline_name: Optional tag attached to emitted gauges
                 so multi-pipeline operators can distinguish each
                 pipeline's signal in Prometheus.
@@ -157,11 +162,11 @@ class MemoryPressureMonitor:
                 stored alongside the cached fraction.
 
         Returns:
-            True when the cached ``used_fraction`` is strictly
-            greater than ``critical_threshold``. A polling failure
-            (Ray API raises) degrades to ``False`` to avoid
-            blocking scheduling on a transient Ray-reporter
-            outage.
+            True when the cached ``used_fraction`` is at or above
+            ``critical_threshold`` (comparison uses ``>=``). A
+            polling failure (Ray API raises) degrades to ``False``
+            to avoid blocking scheduling on a transient
+            Ray-reporter outage.
 
         """
         if self._last_poll_at is None or (now - self._last_poll_at) >= self.polling_interval_s:
@@ -255,20 +260,20 @@ class MemoryPressureMonitor:
         used_fraction = _compute_used_fraction(cluster_resources, available_resources)
         previous_active = self._cached_pressure_active
         self._cached_used_fraction = used_fraction
-        self._cached_pressure_active = used_fraction > self.critical_threshold
+        self._cached_pressure_active = used_fraction >= self.critical_threshold
         self._last_poll_at = now
 
         if self._cached_pressure_active and not previous_active:
             logger.warning(
                 "memory pressure gate: ACTIVE - cluster object-store "
-                f"used_fraction={used_fraction:.4f} exceeds "
+                f"used_fraction={used_fraction:.4f} is at or above "
                 f"critical_threshold={self.critical_threshold:.4f}; "
                 "Phase C scale-up will be frozen until pressure clears."
             )
         elif previous_active and not self._cached_pressure_active:
             logger.info(
                 "memory pressure gate: CLEARED - cluster object-store "
-                f"used_fraction={used_fraction:.4f} now within "
+                f"used_fraction={used_fraction:.4f} now below "
                 f"critical_threshold={self.critical_threshold:.4f}; "
                 "Phase C scale-up resumes."
             )

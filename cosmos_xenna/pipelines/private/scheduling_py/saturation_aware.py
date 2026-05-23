@@ -874,31 +874,31 @@ class SaturationAwareScheduler:
         # 22-prometheus-metrics.md row
         # ``xenna_scheduler_cycle_phase_duration_seconds``).
         with self._phase_timer("pre_phase_setup"):
-            if self._problem is None:
-                msg = "SaturationAwareScheduler.autoscale() called before setup()"
-                raise RuntimeError(msg)
+        if self._problem is None:
+            msg = "SaturationAwareScheduler.autoscale() called before setup()"
+            raise RuntimeError(msg)
 
             self._check_problem_state_shape_before_phase_a(problem_state)
-            self._cycle_counter += 1
-            self._donations_received_this_cycle = {}
+        self._cycle_counter += 1
+        self._donations_received_this_cycle = {}
             # Refresh ready first-seen timestamps from this cycle's snapshot before
             # any phase reads them. The per-worker measurement grace consumes them
             # inside _compute_intent_deltas; Phase D shrink and the saturation-mode
             # cross-stage donor consult the resulting warmup-grace excluded set.
             self._refresh_worker_ready_first_seen(problem_state, now=time)
-            # Snapshot the stuck-plan counters before Phase C mutates them so the
-            # post-Phase-D monotonicity check can compare prev vs. curr without an
+        # Snapshot the stuck-plan counters before Phase C mutates them so the
+        # post-Phase-D monotonicity check can compare prev vs. curr without an
             # in-flight Phase C state. The same snapshot is also reused as the
             # caller-side filter: stages whose ``curr == prev`` were not touched
             # by ``_set_stuck_plan_counter`` and are excluded from the assertion.
-            prev_stuck_plan_counters = dict(self._stuck_plan_counters)
-            self._update_regime_aware_aggressiveness(problem_state)
-            self._ensure_thresholds_resolved(problem_state)
-            ctx = data_structures.AutoscalePlanContext.from_problem_state(
-                self._problem,
-                problem_state,
-                worker_ages=self._next_cycle_worker_ages(),
-            )
+        prev_stuck_plan_counters = dict(self._stuck_plan_counters)
+        self._update_regime_aware_aggressiveness(problem_state)
+        self._ensure_thresholds_resolved(problem_state)
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(
+            self._problem,
+            problem_state,
+            worker_ages=self._next_cycle_worker_ages(),
+        )
             # Cache the per-cycle donor warmup excluded set immediately after
             # AutoscalePlanContext.from_problem_state() seeds the planner from
             # ``problem_state``. ``ctx.worker_ids_by_stage()`` at this point
@@ -938,13 +938,13 @@ class SaturationAwareScheduler:
             )
 
         with self._phase_timer("phase_a"):
-            self._run_phase_a_delete(ctx, problem_state)
-            self._run_phase_a_grow(ctx, problem_state)
-            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
+        self._run_phase_a_delete(ctx, problem_state)
+        self._run_phase_a_grow(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=self._problem, ctx=ctx)
 
         with self._phase_timer("phase_b"):
-            self._run_phase_b_floor(ctx, problem_state)
-            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
+        self._run_phase_b_floor(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_B, problem=self._problem, ctx=ctx)
 
         # Bottleneck calculation block runs BEFORE the intent loop so the
         # per-stage decision pipeline observes a populated
@@ -1010,37 +1010,37 @@ class SaturationAwareScheduler:
         # pins the "always observe" guarantee for the per-phase
         # histogram contract.
         with self._phase_timer("phase_c"):
-            self._run_phase_c_grow(ctx, problem_state)
-            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
-            check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
-                stage_runtime_states=self._stage_states,
-            )
+        self._run_phase_c_grow(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_C, problem=self._problem, ctx=ctx)
+        check_no_nan_in_classifier_state(
+            phase_name=PhaseBoundary.PHASE_C,
+            stage_runtime_states=self._stage_states,
+        )
 
         with self._phase_timer("phase_d"):
-            # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
-            # post-Phase-D floor invariant can distinguish "Phase D reduced below
-            # floor" (a defect) from "Phase B left the stage below floor" (a
-            # grace-window scenario Phase D leaves untouched).
-            pre_phase_d_worker_counts = {
-                stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
-            }
-            self._run_phase_d_shrink(ctx, problem_state)
-            check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
-            # Recompute floors once for the Phase D invariant check; the helper is
-            # O(num_stages) over an immutable Problem so the second call is cheap
-            # and avoids threading a precomputed dict through
-            # ``_run_phase_d_shrink``'s signature.
-            num_nodes = len(self._problem.rust.cluster_resources.nodes)
-            stage_floors = self._compute_stage_floors(num_nodes)
-            check_floor_after_phase_d(
-                phase_name=PhaseBoundary.PHASE_D,
-                problem=self._problem,
-                problem_state=problem_state,
-                ctx=ctx,
-                stage_floors=stage_floors,
-                pre_phase_d_worker_counts=pre_phase_d_worker_counts,
-            )
+        # Capture pre-Phase-D worker counts BEFORE the shrink runs so the
+        # post-Phase-D floor invariant can distinguish "Phase D reduced below
+        # floor" (a defect) from "Phase B left the stage below floor" (a
+        # grace-window scenario Phase D leaves untouched).
+        pre_phase_d_worker_counts = {
+            stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(ctx.worker_ids_by_stage())
+        }
+        self._run_phase_d_shrink(ctx, problem_state)
+        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_D, problem=self._problem, ctx=ctx)
+        # Recompute floors once for the Phase D invariant check; the helper is
+        # O(num_stages) over an immutable Problem so the second call is cheap
+        # and avoids threading a precomputed dict through
+        # ``_run_phase_d_shrink``'s signature.
+        num_nodes = len(self._problem.rust.cluster_resources.nodes)
+        stage_floors = self._compute_stage_floors(num_nodes)
+        check_floor_after_phase_d(
+            phase_name=PhaseBoundary.PHASE_D,
+            problem=self._problem,
+            problem_state=problem_state,
+            ctx=ctx,
+            stage_floors=stage_floors,
+            pre_phase_d_worker_counts=pre_phase_d_worker_counts,
+        )
 
         self._record_post_commit_executed_deltas(
             ctx=ctx,
@@ -1062,14 +1062,14 @@ class SaturationAwareScheduler:
             # ``prev_counters`` is not filtered: the helper iterates
             # ``curr_counters`` only and looks up ``prev_counters`` by key,
             # so stale entries there are inert.
-            active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
+        active_stage_names = {stage.stage_name for stage in problem_state.rust.stages if not stage.is_finished}
             changed_counters = {
                 name: curr
                 for name, curr in self._stuck_plan_counters.items()
                 if name in active_stage_names and curr != prev_stuck_plan_counters.get(name, 0)
             }
-            check_stuck_plan_monotonicity(
-                prev_counters=prev_stuck_plan_counters,
+        check_stuck_plan_monotonicity(
+            prev_counters=prev_stuck_plan_counters,
                 curr_counters=changed_counters,
             )
 
@@ -1094,9 +1094,9 @@ class SaturationAwareScheduler:
         )
 
         with self._phase_timer("into_solution"):
-            solution = ctx.into_solution()
-            check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
-            self._persist_worker_ages(ctx)
+        solution = ctx.into_solution()
+        check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=self._problem, solution=solution)
+        self._persist_worker_ages(ctx)
 
         self._emit_cycle_summary()
 
@@ -2386,19 +2386,22 @@ class SaturationAwareScheduler:
             cap_kwargs = ""
         deficit_reported = False
         # Stage 1: actual_remove (post-clamp request) vs requested_remove (pre-clamp).
+        # The "left N removed" count reports Stage 1's own output (actual_remove), so
+        # the relation `deficit + left_removed == requested_remove` holds even when
+        # Stage 2 (warmup grace) further shrinks actual_remove to effective_remove.
         if actual_remove < requested_remove:
             deficit = requested_remove - actual_remove
             fraction_bound = fraction_cap < allowed_by_floor and fraction_cap == actual_remove
             if fraction_bound:
                 logger.info(
-                    f"{preamble}; per-cycle fraction cap left {effective_remove} removed "
+                    f"{preamble}; per-cycle fraction cap left {actual_remove} removed "
                     f"(deficit={deficit}, current={current}, "
                     f"max_scale_down_fraction_per_cycle={max_scale_down_fraction_per_cycle}"
                     f"{cap_kwargs})."
                 )
             else:
                 logger.info(
-                    f"{preamble}; floor cap left {effective_remove} removed "
+                    f"{preamble}; floor cap left {actual_remove} removed "
                     f"(deficit={deficit}, current={current}, floor={floor}{cap_kwargs})."
                 )
             deficit_reported = True
@@ -2912,16 +2915,19 @@ class SaturationAwareScheduler:
         Computes the per-cycle regime signal, applies hysteresis via
         ``update_regime_state``, and on a regime transition drops
         every stage's ``resolved_thresholds``, threshold-relative
-        classifier history, and stabilization-window recommendation
-        buffer so the next call to ``_ensure_thresholds_resolved``
-        re-derives thresholds with the appropriate effective
-        aggressiveness and the post-transition cycles must rebuild
-        gate consensus from scratch (pre-transition recommendations
-        consumed a different threshold band and would otherwise let
-        stale consensus leak into the new regime). Cycles whose
-        signal is unavailable (some active stage has not populated
-        ``num_used_slots`` / ``num_empty_slots`` yet) leave the regime
-        state and resolved thresholds untouched. Respects the
+        classifier history, trust-gate counter
+        (``valid_signal_samples``), and stabilization-window
+        recommendation buffer so the next call to
+        ``_ensure_thresholds_resolved`` re-derives thresholds with
+        the appropriate effective aggressiveness and the
+        post-transition cycles must rebuild both the trust gate and
+        the stabilization consensus from scratch (pre-transition
+        samples consumed a different threshold band and would
+        otherwise let stale freshness or stale consensus leak into
+        the new regime). Cycles whose signal is unavailable (some
+        active stage has not populated ``num_used_slots`` /
+        ``num_empty_slots`` yet) leave the regime state and resolved
+        thresholds untouched. Respects the
         ``enable_regime_aware_aggressiveness`` flag.
 
         """
@@ -2944,6 +2950,7 @@ class SaturationAwareScheduler:
             runtime.resolved_thresholds = None
             runtime.classifier_state = StageState.NORMAL
             runtime.classifier_streak = 0
+            runtime.valid_signal_samples = 0
         for history in self._recommendation_histories.values():
             history.clear()
 

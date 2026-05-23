@@ -715,3 +715,105 @@ class TestMaybeLogBottleneckEngagement:
         assert info_logs == []
         assert state.last_announced is True
         assert state.candidate_streak == 0
+
+    def test_cold_start_mixed_sequence_does_not_seed_last_announced(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Noisy cold-start (True, False, True) must not seed ``last_announced``.
+
+        The persistence gate's contract is "wait until a candidate
+        value holds for ``persistence_cycles`` consecutive cycles",
+        not "wait ``persistence_cycles`` cycles total". A naive
+        implementation that increments the streak on every cycle
+        (regardless of candidate value) would seed
+        ``last_announced = True`` on the third cycle of the
+        ``True, False, True`` sequence because the streak happens
+        to reach ``persistence_cycles=3``. The fix tracks the most
+        recently observed candidate and resets the streak on a
+        value flip so a noisy mixed sequence is correctly debounced
+        during the cold-start seeding phase.
+        """
+        state = bottleneck.BottleneckEngagementState()
+        engaged = bottleneck.BottleneckIdentity(
+            engaged=True,
+            stage_name="caption",
+            max_d_k=2.0,
+            median_d_k=0.5,
+            heterogeneity_ratio=4.0,
+        )
+        disengaged = bottleneck.BottleneckIdentity(
+            engaged=False,
+            stage_name=None,
+            max_d_k=math.nan,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
+        )
+
+        for identity in (engaged, disengaged, engaged):
+            bottleneck.maybe_log_bottleneck_engagement(
+                identity=identity,
+                state=state,
+                persistence_cycles=3,
+                pipeline_name="p1",
+            )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+        assert state.last_announced is None, (
+            f"mixed cold-start sequence must not seed last_announced; got {state.last_announced}"
+        )
+        assert state.candidate_streak == 1, (
+            f"flip on the final cycle must reset the streak to 1; got {state.candidate_streak}"
+        )
+        assert state.last_candidate is True, (
+            f"last_candidate must track the most recently observed value; got {state.last_candidate}"
+        )
+
+    def test_cold_start_consecutive_identical_candidates_seeds_last_announced(
+        self,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """After a flip in cold-start, the streak rebuilds and eventually seeds.
+
+        Demonstrates that the consecutive-identical-candidate rule
+        does not block legitimate seeding: once the candidate value
+        stabilises for ``persistence_cycles`` cycles in a row, the
+        cold-start phase concludes and ``last_announced`` is set.
+        Pairs with ``test_cold_start_mixed_sequence_does_not_seed_last_announced``
+        to bracket the gate's behaviour at both extremes.
+        """
+        state = bottleneck.BottleneckEngagementState()
+        engaged = bottleneck.BottleneckIdentity(
+            engaged=True,
+            stage_name="caption",
+            max_d_k=2.0,
+            median_d_k=0.5,
+            heterogeneity_ratio=4.0,
+        )
+        disengaged = bottleneck.BottleneckIdentity(
+            engaged=False,
+            stage_name=None,
+            max_d_k=math.nan,
+            median_d_k=math.nan,
+            heterogeneity_ratio=math.nan,
+        )
+
+        # Noisy preamble: streak rebuilds on the False that follows
+        # the True, then again on the True that follows the False.
+        bottleneck.maybe_log_bottleneck_engagement(
+            identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1"
+        )
+        bottleneck.maybe_log_bottleneck_engagement(
+            identity=disengaged, state=state, persistence_cycles=3, pipeline_name="p1"
+        )
+        # Three consecutive engaged cycles must seed last_announced.
+        for _ in range(3):
+            bottleneck.maybe_log_bottleneck_engagement(
+                identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1"
+            )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+        assert state.last_announced is True
+        assert state.candidate_streak == 0

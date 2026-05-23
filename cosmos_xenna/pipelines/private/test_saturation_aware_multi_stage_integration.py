@@ -16,25 +16,14 @@
 
 """Multi-stage DAG integration tests for ``SaturationAwareScheduler``.
 
-These tests cover scenarios where the scheduling decision for one
-stage depends on the live state of another stage in the same
-pipeline. The DAG is always a linear chain
-``A -> B -> C [-> D]`` because Xenna's streaming-mode topology is
-linear by construction; the integration aspect comes from the
-cross-stage interactions:
-
-  * DAG-priority grow order under simultaneous saturation
-  * Cross-stage donor cascade when the cluster is at capacity
-  * Finished-stage isolation under downstream demand spikes
-  * Mixed manual / auto / finished stages running steady for many cycles
-  * Bottleneck identity moving from one stage to another mid-run
-
-Each test pins ONE specific multi-stage behaviour. Helpers follow
-the existing per-file convention: copy the small fixture functions
-locally instead of reaching across modules.
+Each test drives a linear chain ``A -> B -> C [-> D]`` and pins one
+cross-stage interaction: DAG-priority grow order, cross-stage donor
+cascade, finished-stage isolation, mixed manual / auto / finished
+stability, or bottleneck-identity shift.
 """
 
 from collections.abc import Callable, Iterable
+from unittest.mock import patch
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
@@ -97,12 +86,7 @@ def _stage_state(
     num_pending_actors: int = 0,
     is_finished: bool = False,
 ) -> data_structures.ProblemStageState:
-    """Build a ``ProblemStageState`` with explicit signal channels.
-
-    Worker-group ``num_used_slots`` is computed symmetrically from
-    the stage-level total so the warmup filter that inspects per-group
-    slot occupancy sees a self-consistent view.
-    """
+    """Build a ``ProblemStageState``; per-worker slot occupancy mirrors the stage-level signal."""
     used_per_worker = (num_used_slots // num_workers) if num_workers > 0 else 0
     worker_groups = [
         data_structures.ProblemWorkerGroupState.make(
@@ -125,14 +109,7 @@ def _stage_state(
 
 
 def _saturated(name: str, *, num_workers: int, slots_per_worker: int = 8) -> data_structures.ProblemStageState:
-    """Build a SATURATED_CRITICAL-shaped slot signal for the stage.
-
-    Uses ``empty_ratio = 0`` so the classifier is below the
-    auto-derived ``activation_threshold`` regardless of the
-    slot-count's auto-derivation; lifecycle multi-stage tests do
-    not need to distinguish SATURATED from SATURATED_CRITICAL
-    because both produce a positive Phase C intent.
-    """
+    """Build a SATURATED_CRITICAL-shaped slot signal for the stage."""
     total = num_workers * slots_per_worker
     return _stage_state(
         name=name,
@@ -175,13 +152,7 @@ def _build_scheduler(
     quiescence_enabled: bool = False,
     min_data_points: int = 1,
 ) -> SaturationAwareScheduler:
-    """Build a multi-stage scheduler with integration-friendly defaults.
-
-    The defaults turn DAG priority and cross-stage donor ON because
-    those are the cross-stage features under test in this module.
-    Per-stage warmup graces stay at 0.0 (single-stage warmup behaviour
-    has its own dedicated test file).
-    """
+    """Build a multi-stage scheduler with DAG priority and cross-stage donor enabled by default."""
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
         enable_dag_priority_growth=enable_dag_priority_growth,
@@ -215,12 +186,13 @@ def _run_cycles(
     start_time_s: float = 0.0,
     before_cycle: Callable[[int, SaturationAwareScheduler], None] | None = None,
 ) -> list[data_structures.Solution]:
-    """Drive N cycles and capture each Solution.
+    """Drive ``num_cycles`` cycles and capture each ``Solution``.
 
-    ``before_cycle`` (optional) runs immediately before each
-    ``autoscale()`` call. The bottleneck-shift test uses it to mutate
-    ``_d_k_ewma`` so the next cycle's ``identify_bottleneck`` call
-    observes a different argmax.
+    Args:
+        before_cycle: Optional hook invoked immediately before each
+            ``autoscale()`` call; used to mutate scheduler internal
+            state under test (for example to seed an EWMA).
+
     """
     solutions: list[data_structures.Solution] = []
     for cycle_idx in range(num_cycles):
@@ -357,8 +329,6 @@ class TestDonorCascadeReleasesUpstreamForDownstream:
         # without depending on signal-driven intent ramp. Without the
         # injection the recommendation history would absorb a single
         # cycle's vote and Phase C would observe intent=0 still.
-        from unittest.mock import patch
-
         def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
             return {"B": 1}
 
