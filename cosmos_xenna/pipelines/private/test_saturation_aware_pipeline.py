@@ -334,6 +334,53 @@ class TestZeroActorsCarryForward:
         # Classifier must have re-classified using the cached value.
         assert state.classifier_state is StageState.SATURATED
 
+    def test_zero_actor_carry_forward_returns_zero_delta_without_relying_on_trust_gate(
+        self,
+        cfg: SaturationAwareStageConfig,
+    ) -> None:
+        """Zero-actor carry-forward MUST return delta=0 from the helper itself.
+
+        Pre-clamp, the carry-forward EWMA could drive
+        ``should_fire_action(SATURATED, streak, ...)`` to True and
+        ``compute_delta`` to a non-zero recommendation; only the
+        scheduler's downstream trust-gate clamp prevented Phase C from
+        acting on it. This test pins the helper-level contract: when
+        ``current_workers == 0`` AND no fresh slot sample exists, the
+        helper itself returns 0 regardless of the carry-forward
+        classifier streak. The classifier state machine is still
+        allowed to re-classify (covered by the test above) -- only
+        the recommendation delta is forced to 0.
+        """
+        state = _fresh_state(cfg)
+        # Build streak by repeatedly observing SATURATED so that
+        # ``should_fire_action(SATURATED, streak, ...)`` would return
+        # True on the very next cycle.
+        for _ in range(cfg.saturated_streak_min_cycles + 1):
+            run_per_stage_pipeline(
+                stage_state=state,
+                num_used_slots=10,
+                num_empty_slots=1,
+                input_queue_depth=10,
+                current_workers=4,
+                config=cfg,
+            )
+        assert state.classifier_state is StageState.SATURATED
+        assert state.classifier_streak >= cfg.saturated_streak_min_cycles
+
+        delta = run_per_stage_pipeline(
+            stage_state=state,
+            num_used_slots=0,
+            num_empty_slots=0,
+            input_queue_depth=10,
+            current_workers=0,
+            config=cfg,
+        )
+        assert delta == 0, "zero-actor carry-forward must return delta=0 from the helper itself"
+        # The classifier state machine must still reflect carry-forward
+        # tracking (the prior test pins the same invariant for a single
+        # transient cycle; this test verifies it survives the clamp).
+        assert state.classifier_state is StageState.SATURATED
+
 
 class TestEwmaSmoothing:
     """Repeated samples converge the EWMA monotonically toward the steady-state value."""

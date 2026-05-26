@@ -263,7 +263,17 @@ class TestClusterExhaustion:
         assert added > 0
 
     def test_int_max_intent_terminates_at_cluster_exhaustion(self) -> None:
-        """An ``intent`` of ``sys.maxsize`` terminates at cluster exhaustion (no infinite loop)."""
+        """An ``intent`` of ``sys.maxsize`` terminates at cluster exhaustion (no infinite loop).
+
+        The 8-CPU cluster minus the 1 pre-seeded 1-CPU worker leaves
+        exactly 7 free CPU slots. An ``intent=sys.maxsize`` must add
+        exactly 7 workers before ``ctx.try_add_worker`` returns the
+        first ``None`` (cluster full); the loop must terminate at that
+        point. Asserting equality (``== 7``) instead of an upper bound
+        (``<= 7``) catches a regression that would silently early-exit
+        with partial progress (e.g. 5 adds) and otherwise hide the
+        cluster-exhaustion-only termination contract.
+        """
         import sys
 
         scheduler = _scheduler([("A", None)])
@@ -272,7 +282,11 @@ class TestClusterExhaustion:
         solution = _autoscale_with_intents(scheduler, state, {"A": sys.maxsize})
 
         added = len(solution.stages[0].new_workers)
-        assert added <= 7
+        assert added == 7, (
+            f"Phase C must add exactly 7 workers (8 CPUs total - 1 seeded) before "
+            f"hitting cluster exhaustion; got {added} adds. A smaller value indicates "
+            "a regression that early-exits before exhausting cluster capacity."
+        )
 
     def test_warning_logged_on_cluster_exhaustion(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
         """Operators see exactly one WARNING with stage name + intent + actual + deficit on partial grows."""

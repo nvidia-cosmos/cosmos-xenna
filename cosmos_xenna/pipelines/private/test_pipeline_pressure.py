@@ -560,7 +560,10 @@ class TestClassifierTraceLogging:
         assert len(transitions) == 1, f"expected one transition INFO; got: {transitions}"
         msg = transitions[0]
         assert "stage='TestStage'" in msg
-        assert "NORMAL ->" in msg, "transition log must record the prev->new arrow"
+        assert "NORMAL -> SATURATED_CRITICAL" in msg, (
+            "transition log must record the exact destination state SATURATED_CRITICAL "
+            f"(prev_state -> new_state); got: {msg!r}"
+        )
 
     def test_steady_state_does_not_log_info(
         self,

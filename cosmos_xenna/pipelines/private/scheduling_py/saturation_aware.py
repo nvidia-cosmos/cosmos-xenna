@@ -400,6 +400,16 @@ class SaturationAwareScheduler:
         self._s_k_ewma: dict[str, float] = {}
         self._d_k_now: dict[str, float] = {}
         self._effective_capacities: dict[str, int] = {}
+        # Per-stage "channels per worker group" multiplier captured at
+        # start-of-cycle (= ``slots_per_worker * K`` where K is the
+        # SPMD allocation count, or ``slots_per_worker`` for non-SPMD).
+        # Used by the end-of-cycle balance regression check to convert
+        # post-cycle worker counts into the same channel units as
+        # ``_d_k_now`` / ``_effective_capacities``. Falls back to
+        # ``slots_per_worker`` when a stage starts with zero ready
+        # workers; the donor commit gate's
+        # ``_compute_post_plan_d_k`` documents the same simplification.
+        self._channels_per_worker_group: dict[str, int] = {}
         # Cycle-start balance snapshot used by the per-cycle balance
         # regression invariant; refreshed in ``_autoscale_body`` right
         # after ``identify_bottleneck`` and consumed at end-of-cycle
@@ -459,6 +469,7 @@ class SaturationAwareScheduler:
         self._s_k_ewma = {name: math.nan for name in self._stage_names}
         self._d_k_now = {}
         self._effective_capacities = {}
+        self._channels_per_worker_group = {}
         self._balance_score_start = math.nan
         self._last_bottleneck_meta = None
         self._bottleneck_engagement_state.reset()
@@ -1025,6 +1036,23 @@ class SaturationAwareScheduler:
             self._effective_capacities = {
                 stage.stage_name: self._effective_ready_capacity(stage) for stage in problem_state.rust.stages
             }
+            # Capture per-stage "channels per worker group" so the
+            # end-of-cycle balance regression check can convert
+            # post-cycle worker counts to the same channel units
+            # ``_d_k_now`` was computed in. For stages with at least
+            # one start-of-cycle worker_group the ratio is exact
+            # (full SPMD K + slots_per_worker baked in); for stages
+            # that start at zero the fallback is ``slots_per_worker``
+            # (matches ``_compute_post_plan_d_k``'s donor-gate
+            # simplification when group structure is unobservable).
+            self._channels_per_worker_group = {
+                stage.stage_name: (
+                    self._effective_capacities[stage.stage_name] // len(stage.worker_groups)
+                    if stage.worker_groups
+                    else stage.slots_per_worker
+                )
+                for stage in problem_state.rust.stages
+            }
             self._d_k_now = {
                 name: compute_d_k(self._s_k_ewma.get(name, math.nan), self._effective_capacities.get(name, 0))
                 for name in self._stage_names
@@ -1194,10 +1222,20 @@ class SaturationAwareScheduler:
         # enforces.
         emit_balance_score(self._d_k_now, pipeline_name=self._pipeline_name)
         post_cycle_worker_counts = ctx.worker_ids_by_stage()
+        # Convert post-cycle worker_group counts into service-channel
+        # capacity using the same per-stage multiplier captured when
+        # ``_d_k_now`` was computed at start-of-cycle. Without this
+        # the comparison would mix raw worker counts (here) against
+        # full ``slots_per_worker * K`` channels (in
+        # ``_balance_score_start``) and read regressions on any
+        # SPMD or ``slots_per_worker > 1`` stage as soon as Phase B /
+        # C / D commit a count change.
         d_k_end = {
             stage_name: compute_d_k(
                 self._s_k_ewma.get(stage_name, math.nan),
-                len(post_cycle_worker_counts[stage_index]) if stage_index < len(post_cycle_worker_counts) else 0,
+                (len(post_cycle_worker_counts[stage_index]) * self._channels_per_worker_group.get(stage_name, 0))
+                if stage_index < len(post_cycle_worker_counts)
+                else 0,
             )
             for stage_index, stage_name in enumerate(self._stage_names)
             if stage_name in self._d_k_now
@@ -1679,7 +1717,18 @@ class SaturationAwareScheduler:
                 # block for the all-warmup-gap case, keeping the
                 # "consecutive valid samples" contract uniform across
                 # both no-signal-gap paths (skip + in-pipeline).
+                #
+                # Drop the per-stage stabilization window too. Without
+                # this, pre-gap +1/-1 entries can vote alongside post-gap
+                # entries the moment the first ready actor emerges,
+                # letting the asymmetric-window gate fire on a mixed
+                # history that no longer reflects current cluster state.
+                # The stabilization buffer is allocated alongside the
+                # runtime state in ``setup()``; missing entries fail
+                # loudly via KeyError because they signal a problem /
+                # problem_state shape mismatch the caller must surface.
                 stage_state.valid_signal_samples = 0
+                self._recommendation_histories[stage_name].clear()
                 logger.debug(
                     f"saturation-aware: stage {stage_name!r} cold-start quiescent "
                     f"(pending={pending_actors}, ready=0); skipping intent pipeline."
@@ -1735,7 +1784,14 @@ class SaturationAwareScheduler:
                 # ``last_valid_slots_empty_ratio_ewma`` carry-forward
                 # of a worker mix that no longer reflects current
                 # state.
+                #
+                # Drop the per-stage stabilization window too so any
+                # pre-gap +1/-1 entries cannot vote alongside post-gap
+                # entries when the gap closes; mirrors the cold-start
+                # quiescent block above to keep both no-signal-gap
+                # paths uniform.
                 stage_state.valid_signal_samples = 0
+                self._recommendation_histories[stage_name].clear()
             stage_state.capacity_target_workers = self._refresh_capacity_target_workers(
                 stage_state=stage_state,
                 stage_cfg=stage_cfg,
@@ -2931,12 +2987,24 @@ class SaturationAwareScheduler:
                     max_plan_combinations=self._config.cross_stage_donor_max_plan_combinations,
                 )
                 if donor_plan is None:
-                    if made_progress and self._config.floor_stuck_grace_cycles > 0:
-                        self._warn_floor_partial_progress(
-                            stage_name=problem_stage.name,
-                            target_min=target_min,
-                            current=current,
-                        )
+                    # Partial progress (some workers added before donor
+                    # exhaustion) is not a hard failure regardless of
+                    # ``floor_stuck_grace_cycles``: when grace > 0 the
+                    # operator sees a soft WARN, when grace == 0 the
+                    # cycle silently accepts the partial commit and
+                    # the next cycle re-evaluates against any newly
+                    # freed capacity. Only a fully stuck floor (no
+                    # progress AND no donor plan) trips the stuck
+                    # latch, which gates the long-running operator
+                    # WARN / floor-unmet RuntimeError after
+                    # ``floor_stuck_grace_cycles``.
+                    if made_progress:
+                        if self._config.floor_stuck_grace_cycles > 0:
+                            self._warn_floor_partial_progress(
+                                stage_name=problem_stage.name,
+                                target_min=target_min,
+                                current=current,
+                            )
                     else:
                         self._on_floor_stuck(
                             stage_name=problem_stage.name,

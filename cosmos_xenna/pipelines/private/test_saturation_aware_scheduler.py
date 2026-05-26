@@ -953,18 +953,39 @@ class TestAutoscalePlanContextLifecycle:
         seed step did not actually consume cluster capacity, a future
         phase that called ``ctx.try_add_worker`` could over-commit
         the cluster. This test exercises seeding for several worker
-        counts to pin that the constructor accepts the snapshot.
+        counts to pin that the constructor accepts the snapshot AND
+        that the seeded cluster reports the correct remaining
+        capacity (8 CPUs - 5 used = 3 free) by probing with
+        ``try_add_worker``: three 1-CPU adds must succeed before
+        the fourth returns ``None``.
         """
+        problem = _problem_with_stages(["A", "B"])
+        ps = _problem_state([("A", 4, 2), ("B", 1, 1)])
+
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
-        scheduler.setup(_problem_with_stages(["A", "B"]))
-        solution = scheduler.autoscale(
-            time=0.0,
-            problem_state=_problem_state([("A", 4, 2), ("B", 1, 1)]),
-        )
+        scheduler.setup(problem)
+        solution = scheduler.autoscale(time=0.0, problem_state=ps)
         # Sanity: 5 1-CPU workers fit in the 8-CPU cluster; the
         # constructor would have raised if the seed allocations did
         # not match the cluster shape.
         assert [s.slots_per_worker for s in solution.stages] == [2, 1]
+
+        # Seeded-capacity probe: build a fresh ``AutoscalePlanContext``
+        # from the same problem / problem_state and verify the cluster
+        # reports exactly 3 free CPU slots. A regression that failed
+        # to subtract the seeded workers from cluster capacity would
+        # let the probe return non-None on the fourth call (overcommit).
+        ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, ps)
+        for add_index in range(3):
+            placement = ctx.try_add_worker(0)
+            assert placement is not None, (
+                f"add #{add_index + 1} of 3 failed despite 3 free CPU slots; "
+                f"seeded cluster did not reflect 8 - 5 = 3 remaining capacity"
+            )
+        assert ctx.try_add_worker(0) is None, (
+            "fourth try_add_worker must return None (cluster exhausted at 8/8 CPUs); "
+            "non-None here indicates the seed step double-counted free capacity"
+        )
 
     def test_autoscale_raises_when_called_before_setup(self) -> None:
         """Defensive guard: ``autoscale()`` requires a prior ``setup()`` call."""

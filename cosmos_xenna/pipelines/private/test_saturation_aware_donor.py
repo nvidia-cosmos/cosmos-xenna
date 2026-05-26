@@ -379,12 +379,15 @@ class TestPhaseBDonorFallback:
                 problem_state=_problem_state([("A", 2, 1, False), ("B", 0, 1, False)]),
             )
 
-    def test_truly_infeasible_min_workers_raises_immediately(self) -> None:
-        """A receiver whose floor exceeds total cluster capacity raises.
+    def test_truly_infeasible_min_workers_raises_on_first_zero_progress_cycle(self) -> None:
+        """A receiver whose floor exceeds total cluster capacity raises after one graced cycle.
 
         Cluster has room for 2 1-CPU workers; stage A is the only stage and
-        its ``min_workers=5`` cannot fit. No donor candidates exist. Grace=0
-        bypasses the stuck-window so the immediate-raise contract is visible.
+        its ``min_workers=5`` cannot fit. Grace=0 means a cycle that
+        achieves zero progress raises on its first attempt. The first
+        cycle adds 2 workers (partial progress) and is graced; the
+        second cycle starts at 2/5 with the cluster still full, makes
+        no further progress, and raises.
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
@@ -392,10 +395,14 @@ class TestPhaseBDonorFallback:
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)], total_cpus_per_node=2))
+        scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 0, 1, False)]),
+        )
         with pytest.raises(RuntimeError, match="target_min=5"):
             scheduler.autoscale(
                 time=0.0,
-                problem_state=_problem_state([("A", 0, 1, False)]),
+                problem_state=_problem_state([("A", 2, 1, False)]),
             )
 
     def test_no_donor_message_lists_no_eligible_clause(self) -> None:
@@ -753,8 +760,11 @@ class TestPhaseBDonorFallbackAdversarial:
         """Repeated donations stop when the donor reaches its own floor.
 
         Cluster has 4 CPUs; stage A holds 4 (floor=1; can give 3);
-        stage B (receiver, floor=5) starts at 0. The loop donates 3 times
-        until A is at its floor, then has no donor and raises.
+        stage B (receiver, floor=5) starts at 0. Cycle 1 commits 3
+        donations (B=3, A=1) and is graced because B made progress.
+        Cycle 2 starts with A already at its floor and B still short
+        (3<5); zero further progress is possible, so the no-eligible-
+        donor RuntimeError fires.
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
@@ -763,10 +773,14 @@ class TestPhaseBDonorFallbackAdversarial:
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None), ("B", None)], total_cpus_per_node=4))
+        scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 4, 1, False), ("B", 0, 1, False)]),
+        )
         with pytest.raises(RuntimeError, match=r"no eligible cross-stage donor"):
             scheduler.autoscale(
                 time=0.0,
-                problem_state=_problem_state([("A", 4, 1, False), ("B", 0, 1, False)]),
+                problem_state=_problem_state([("A", 1, 1, False), ("B", 3, 1, False)]),
             )
 
     def test_donation_sequence_two_receivers(self) -> None:
@@ -815,17 +829,27 @@ class TestPhaseBDonorFallbackAdversarial:
         assert "ages=" in msg
 
     def test_no_eligible_donor_message_includes_remediation_hint(self) -> None:
-        """The no-donor error message tells the operator how to recover."""
+        """The no-donor error message tells the operator how to recover.
+
+        First cycle adds 2 workers (partial progress, graced under
+        ``floor_stuck_grace_cycles=0``); second cycle starts at 2/10
+        with the cluster full and no donor stage, so it raises with
+        the operator-actionable remediation hint.
+        """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
             stage_defaults=SaturationAwareStageConfig(min_workers=10),
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)], total_cpus_per_node=2))
+        scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 0, 1, False)]),
+        )
         with pytest.raises(RuntimeError, match=r"Reduce min_workers / min_workers_per_node"):
             scheduler.autoscale(
                 time=0.0,
-                problem_state=_problem_state([("A", 0, 1, False)]),
+                problem_state=_problem_state([("A", 2, 1, False)]),
             )
 
     def test_probe_infeasible_donor_does_not_remove_and_raises_floor_unmet(self) -> None:

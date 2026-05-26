@@ -226,17 +226,36 @@ def run_per_stage_pipeline(
     # no-op (see that function's body).
     effective_growth_mode = stage_state.growth_mode if config.enable_growth_mode_state_machine else GrowthMode.TRACKING
 
-    should_fire = should_fire_action(new_classifier_state, stage_state.classifier_streak, config)
-    if should_fire:
-        delta = compute_delta(
-            new_classifier_state,
-            effective_growth_mode,
-            current_workers,
-            stage_state.capacity_target_workers,
-            config,
-        )
-    else:
+    # Freshness clamp for zero-actor carry-forward cycles. With no
+    # fresh slot sample AND zero current actors, the classifier state
+    # machine is still tracking via carry-forward EWMA but Phase B
+    # floor (not the helper) owns the bootstrap from zero workers; any
+    # recommendation derived from stale EWMA + carry-forward streak
+    # would be either meaningless (cannot shrink below 0) or routed
+    # to the wrong path (Phase C cannot grow a zero-worker stage).
+    # Skipping the should_fire / compute_delta calls here matches the
+    # carry-forward comment above ("carry-forward cycle is always a
+    # no-action cycle on Phase C / Phase D") at the helper boundary
+    # itself rather than relying solely on the scheduler's downstream
+    # trust-gate clamp. The warmup-only carry-forward case (no fresh
+    # sample but current_workers > 0) keeps the existing path so the
+    # streak / classifier_state continue evolving for stages whose
+    # actors are about to exit ``worker_warmup_measurement_grace_s``.
+    if not cycle_has_fresh_sample and current_workers == 0:
+        should_fire = False
         delta = 0
+    else:
+        should_fire = should_fire_action(new_classifier_state, stage_state.classifier_streak, config)
+        if should_fire:
+            delta = compute_delta(
+                new_classifier_state,
+                effective_growth_mode,
+                current_workers,
+                stage_state.capacity_target_workers,
+                config,
+            )
+        else:
+            delta = 0
 
     if recommendation_history is not None:
         # Record-then-gate is encapsulated in ``apply_stabilization_gate`` so

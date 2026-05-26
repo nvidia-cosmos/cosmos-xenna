@@ -81,6 +81,20 @@ def _candidates(*specs: tuple[int, str, int]) -> list[DonorWorker]:
     return [DonorWorker(stage_index=s, worker_id=w, age=a) for s, w, a in specs]
 
 
+def _unbounded_budget(candidates: list[DonorWorker]) -> dict[int, int]:
+    """Per-stage budget that allows every candidate to be removed.
+
+    Mirrors a floor=0 configuration so the budget gate is a no-op
+    and the test asserts the search behaviour itself rather than the
+    budget filter. Tests that exercise the budget filter MUST build
+    a tighter mapping by hand.
+    """
+    counts: dict[int, int] = {}
+    for worker in candidates:
+        counts[worker.stage_index] = counts.get(worker.stage_index, 0) + 1
+    return counts
+
+
 def _all_feasible(_removals: list[tuple[int, str]], _idx: int) -> bool:
     return True
 
@@ -103,6 +117,7 @@ class TestEmptyOrInvalidInputs:
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=4,
             max_plan_combinations=32,
+            removable_by_stage={},
         )
 
         assert plan is None
@@ -111,14 +126,16 @@ class TestEmptyOrInvalidInputs:
     def test_zero_max_plan_size_returns_none(self) -> None:
         """``max_plan_size < 1`` is meaningless and short-circuits before any probe."""
         ctx = _ScriptedCtx(predicate=_all_feasible)
+        candidates = _candidates((0, "a-w0", 5))
 
         plan = _resource_fit_plan(
             receiver_stage_index=1,
-            candidates=_candidates((0, "a-w0", 5)),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=0,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is None
@@ -127,14 +144,16 @@ class TestEmptyOrInvalidInputs:
     def test_zero_max_plan_combinations_returns_none(self) -> None:
         """``max_plan_combinations < 1`` blocks every probe -> ``None``."""
         ctx = _ScriptedCtx(predicate=_all_feasible)
+        candidates = _candidates((0, "a-w0", 5))
 
         plan = _resource_fit_plan(
             receiver_stage_index=1,
-            candidates=_candidates((0, "a-w0", 5)),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=4,
             max_plan_combinations=0,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is None
@@ -147,18 +166,20 @@ class TestSingleWorkerPlan:
     def test_first_feasible_single_worker_wins_with_deterministic_tiebreak(self) -> None:
         """``(age ASC, worker_id ASC, stage_index ASC)`` resolves the order."""
         ctx = _ScriptedCtx(predicate=_all_feasible)
+        candidates = _candidates(
+            (0, "a-w0", 10),
+            (0, "a-w1", 7),
+            (1, "b-w0", 7),
+        )
 
         plan = _resource_fit_plan(
             receiver_stage_index=2,
-            candidates=_candidates(
-                (0, "a-w0", 10),
-                (0, "a-w1", 7),
-                (1, "b-w0", 7),
-            ),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=4,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         # Sorted by (age, worker_id, stage_index): a-w1 (7,a-w1,0) wins
@@ -180,14 +201,16 @@ class TestMultiWorkerPlan:
             return len(removals) >= 2
 
         ctx = _ScriptedCtx(predicate=predicate)
+        candidates = _candidates((0, "a-w0", 5), (1, "b-w0", 3))
 
         plan = _resource_fit_plan(
             receiver_stage_index=2,
-            candidates=_candidates((0, "a-w0", 5), (1, "b-w0", 3)),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=4,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is not None
@@ -213,18 +236,20 @@ class TestLocalityIteration:
             "a-w1": "node-1",
             "b-w0": "node-0",
         }
+        candidates = _candidates(
+            (0, "a-w0", 1),
+            (0, "a-w1", 1),
+            (1, "b-w0", 1),
+        )
 
         plan = _resource_fit_plan(
             receiver_stage_index=2,
-            candidates=_candidates(
-                (0, "a-w0", 1),
-                (0, "a-w1", 1),
-                (1, "b-w0", 1),
-            ),
+            candidates=candidates,
             worker_nodes=worker_nodes,
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=2,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is not None
@@ -238,18 +263,20 @@ class TestMaxPlanCombinationsCap:
     def test_combinations_cap_stops_phase_one_iteration(self) -> None:
         """A cap of 1 per plan_size means at most one probe at plan_size=1."""
         ctx = _ScriptedCtx(predicate=_all_infeasible)
+        candidates = _candidates(
+            (0, "a-w0", 1),
+            (0, "a-w1", 2),
+            (0, "a-w2", 3),
+        )
 
         plan = _resource_fit_plan(
             receiver_stage_index=1,
-            candidates=_candidates(
-                (0, "a-w0", 1),
-                (0, "a-w1", 2),
-                (0, "a-w2", 3),
-            ),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=1,
             max_plan_combinations=1,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is None
@@ -262,14 +289,16 @@ class TestExhaustionReturnsNone:
     def test_all_infeasible_exhausts_search_and_returns_none(self) -> None:
         """``max_plan_size=2`` with 2 candidates probes 3 combos: 2 single + 1 pair."""
         ctx = _ScriptedCtx(predicate=_all_infeasible)
+        candidates = _candidates((0, "a-w0", 5), (1, "b-w0", 3))
 
         plan = _resource_fit_plan(
             receiver_stage_index=2,
-            candidates=_candidates((0, "a-w0", 5), (1, "b-w0", 3)),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=2,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan is None
@@ -287,17 +316,19 @@ class TestSmallestSizeWinsAcrossSizes:
             return removals == [(0, "a-w0")]
 
         ctx = _ScriptedCtx(predicate=predicate)
+        candidates = _candidates(
+            (0, "a-w0", 1),
+            (0, "a-w1", 2),
+        )
 
         plan = _resource_fit_plan(
             receiver_stage_index=1,
-            candidates=_candidates(
-                (0, "a-w0", 1),
-                (0, "a-w1", 2),
-            ),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=4,
             max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         assert plan == DonorPlan(
@@ -315,20 +346,145 @@ class TestParametricBoundedness:
     def test_search_never_runs_combinations_larger_than_cap(self, max_size: int) -> None:
         """Verify no probe call has ``len(removals) > max_plan_size``."""
         ctx = _ScriptedCtx(predicate=_all_infeasible)
+        candidates = _candidates(
+            (0, "a-w0", 1),
+            (0, "a-w1", 2),
+            (1, "b-w0", 3),
+        )
 
         _resource_fit_plan(
             receiver_stage_index=2,
-            candidates=_candidates(
-                (0, "a-w0", 1),
-                (0, "a-w1", 2),
-                (1, "b-w0", 3),
-            ),
+            candidates=candidates,
             worker_nodes={},
             ctx=ctx,  # type: ignore[arg-type]
             max_plan_size=max_size,
             max_plan_combinations=64,
+            removable_by_stage=_unbounded_budget(candidates),
         )
 
         observed_sizes = {len(removals) for removals, _ in ctx.probe_calls}
         if observed_sizes:
             assert max(observed_sizes) <= max_size
+
+
+class TestPhaseTwoCrossNodeFallback:
+    """Phase 2 (cross-node combinations) takes over when no node alone has enough candidates."""
+
+    def test_cross_node_pair_returned_when_each_node_has_one_candidate(self) -> None:
+        """3 candidates on 3 distinct nodes, plan_size=2 -> Phase 1 finds nothing, Phase 2 wins.
+
+        Pins the fallback path: Phase 1 iterates each per-node bucket
+        but cannot form a 2-worker plan (only 1 candidate per node), so
+        the search advances to Phase 2 and probes cross-node pairs.
+        The first feasible cross-node pair is returned.
+        """
+
+        def predicate(removals: list[tuple[int, str]], _idx: int) -> bool:
+            return len(removals) >= 2
+
+        ctx = _ScriptedCtx(predicate=predicate)
+        worker_nodes = {"a-w0": "node-0", "b-w0": "node-1", "c-w0": "node-2"}
+        candidates = _candidates((0, "a-w0", 1), (1, "b-w0", 2), (2, "c-w0", 3))
+
+        plan = _resource_fit_plan(
+            receiver_stage_index=3,
+            candidates=candidates,
+            worker_nodes=worker_nodes,
+            ctx=ctx,  # type: ignore[arg-type]
+            max_plan_size=4,
+            max_plan_combinations=32,
+            removable_by_stage=_unbounded_budget(candidates),
+        )
+
+        assert plan is not None
+        assert len(plan.removals) == 2
+        # Phase 2 enumeration order over the sorted candidate list yields
+        # the lexicographically smallest 2-worker pair: (a-w0, b-w0).
+        assert {w.worker_id for w in plan.removals} == {"a-w0", "b-w0"}
+
+
+class TestDonorPlanInvariant:
+    """``DonorPlan`` rejects empty ``removals`` at construction."""
+
+    def test_empty_removals_raises_value_error(self) -> None:
+        """An empty plan is meaningless -- ``None`` is the canonical 'no donation' sentinel."""
+        with pytest.raises(ValueError, match=r"removals must contain at least one DonorWorker"):
+            DonorPlan(removals=(), receiver_stage_index=0)
+
+
+class TestPerStageRemovableBudget:
+    """The per-stage budget filter blocks combos that violate a donor floor."""
+
+    def test_two_donor_combo_from_one_stage_skipped_when_budget_is_one(self) -> None:
+        """Stage 0 has 2 candidates but budget=1 -> the (0,0) pair is never probed.
+
+        The pair-from-one-stage probe is the bug Finding 2 closes:
+        without the budget filter the resource-fit search could
+        return a 2-worker plan drawing both workers from a single
+        donor stage, dropping it below its own floor. With
+        ``removable_by_stage[0]=1`` the pair is filtered before
+        the probe round-trip, and the predicate is only invoked
+        on cross-stage combos that respect every donor's budget.
+        """
+
+        def predicate(removals: list[tuple[int, str]], _idx: int) -> bool:
+            return len(removals) >= 2
+
+        ctx = _ScriptedCtx(predicate=predicate)
+        candidates = _candidates(
+            (0, "a-w0", 1),
+            (0, "a-w1", 2),
+            (1, "b-w0", 3),
+        )
+
+        plan = _resource_fit_plan(
+            receiver_stage_index=2,
+            candidates=candidates,
+            worker_nodes={},
+            ctx=ctx,  # type: ignore[arg-type]
+            max_plan_size=2,
+            max_plan_combinations=32,
+            removable_by_stage={0: 1, 1: 1},
+        )
+
+        assert plan is not None
+        # Only cross-stage pairs survive the budget filter; the (0,0)
+        # combo (both workers from stage 0) was skipped because it
+        # would consume the entire stage-0 budget at once.
+        stage_indices = sorted(w.stage_index for w in plan.removals)
+        assert stage_indices == [0, 1], f"plan must respect the per-stage budget; got stage_indices={stage_indices}"
+        for removals_arg, _ in ctx.probe_calls:
+            stages_in_combo = sorted(s for s, _w in removals_arg)
+            assert stages_in_combo != [0, 0], (
+                f"a (0,0) combo should never be probed under budget {{0: 1}}; got {removals_arg}"
+            )
+
+    def test_missing_stage_in_budget_defaults_to_zero(self) -> None:
+        """A stage absent from ``removable_by_stage`` is treated as having no removable workers.
+
+        Pins the documented default: missing entries -> 0. A combo
+        containing any worker from that stage is skipped before the
+        probe round-trip.
+        """
+        ctx = _ScriptedCtx(predicate=_all_feasible)
+        candidates = _candidates((0, "a-w0", 1), (1, "b-w0", 2))
+
+        plan = _resource_fit_plan(
+            receiver_stage_index=2,
+            candidates=candidates,
+            worker_nodes={},
+            ctx=ctx,  # type: ignore[arg-type]
+            max_plan_size=2,
+            max_plan_combinations=32,
+            removable_by_stage={0: 1},
+        )
+
+        assert plan is not None
+        # Stage 1 is not in the budget map -> default 0 -> b-w0 is
+        # never selected. The single-worker (a-w0,) plan from stage 0
+        # wins because it is the only combo whose stage distribution
+        # respects the (implicit) budget.
+        assert plan == DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
+            receiver_stage_index=2,
+        )

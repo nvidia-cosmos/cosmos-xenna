@@ -159,11 +159,12 @@ def select_youngest_eligible_donor(
         workers donated to this receiver in the plan must be at
         least the donor's own floor (``stage_floors.get(idx, 1)``);
         prevents cascading rescue. The bounded resource-fit search
-        in :func:`_resource_fit_plan` enforces this per-plan
-        because it sorts deterministically by ``(age ASC, ...)``
-        and the first feasible probe ends the search; multi-worker
-        plans drawing from one donor stage stop at the
-        ``len(workers) - floor`` boundary.
+        in :func:`_resource_fit_plan` enforces the per-stage
+        budget explicitly via the ``removable_by_stage`` parameter
+        the caller computes here as
+        ``len(workers) - stage_floors.get(i, 1)``; a multi-donor
+        combo whose ``stage_index`` distribution exceeds any
+        donor's budget is skipped before probing.
       - Upstream donors (stage index strictly less than
         ``receiver_stage_index``) are preferred. When no upstream
         donor is eligible, candidates from any non-receiver stage
@@ -233,6 +234,18 @@ def select_youngest_eligible_donor(
     if not candidates:
         return None
 
+    # Per-stage donor budget: each donor stage can spare at most
+    # ``len(workers) - floor`` workers in one combo. The pool-level
+    # eligibility filter above only proves at least ONE worker is
+    # spare (``len(workers) - 1 >= floor``); without an explicit
+    # per-stage cap the bounded resource-fit search could pull
+    # several workers from one donor and silently drop it below its
+    # own floor.
+    removable_by_stage = {
+        stage_index: max(0, len(worker_ids_by_stage[stage_index]) - stage_floors.get(stage_index, 1))
+        for stage_index in pool
+    }
+
     return _resource_fit_plan(
         receiver_stage_index=receiver_stage_index,
         candidates=candidates,
@@ -240,6 +253,7 @@ def select_youngest_eligible_donor(
         ctx=ctx,
         max_plan_size=max_plan_size,
         max_plan_combinations=max_plan_combinations,
+        removable_by_stage=removable_by_stage,
     )
 
 
@@ -251,6 +265,7 @@ def _resource_fit_plan(
     ctx: "AutoscalePlanContext",
     max_plan_size: int,
     max_plan_combinations: int,
+    removable_by_stage: Mapping[int, int],
 ) -> DonorPlan | None:
     """Bounded multi-donor search for the smallest feasible donor plan.
 
@@ -259,22 +274,28 @@ def _resource_fit_plan(
     ``worker_nodes`` to group; an empty mapping collapses to flat
     iteration), then cross-node, capping evaluations at
     ``max_plan_combinations`` per ``plan_size``. Each candidate
-    combination is probed via ``ctx.probe_add_after_removals``; the
-    first feasible probe wins. Within a fixed size the deterministic
+    combination is filtered against the per-stage donor budget,
+    then probed via ``ctx.probe_add_after_removals``; the first
+    feasible probe wins. Within a fixed size the deterministic
     tiebreak is ``(age ASC, worker_id ASC, stage_index ASC)`` -
     ``itertools.combinations`` over a list pre-sorted on that key
     produces the lexicographically smallest combinations first.
 
     The Rust planner's probe is the source of truth for placement
-    feasibility (FGD / SPMD reuse rules); this helper does no shape
-    arithmetic of its own.
+    feasibility (FGD / SPMD reuse rules). The helper itself enforces
+    the per-stage donor floor: previously the budget was implicit
+    (the caller's ``len(workers) - 1 >= floor`` filter only proves
+    that ONE worker can be spared, so multi-donor combos drawing
+    several workers from the same stage could silently violate the
+    floor), now an explicit ``removable_by_stage`` map caps the
+    contribution of each donor stage to any combo.
 
     Args:
         receiver_stage_index: Position of the receiver stage in
             problem order; passed verbatim to
             ``ctx.probe_add_after_removals``.
         candidates: Already gate-filtered donor workers (anti-flap,
-            classifier-streak, floor-preservation, warmup-exclude
+            classifier-streak, floor-eligibility, warmup-exclude
             checks already applied by the caller).
         worker_nodes: Mapping ``worker_id -> node_id``. Empty
             mapping -> all candidates collapse into a single
@@ -286,6 +307,15 @@ def _resource_fit_plan(
         max_plan_combinations: Per-``plan_size`` cap on probes
             evaluated. Bounds search depth on pathological clusters
             (e.g. dozens of fragmented donors).
+        removable_by_stage: Per-stage donor budget keyed by donor
+            ``stage_index``. The caller MUST populate this with
+            ``max(0, len(worker_ids_by_stage[i]) - stage_floors.get(i, 1))``
+            for every stage that contributes candidates; missing
+            entries default to ``0`` (the stage is assumed unable
+            to spare any worker, which collapses the search to
+            single-stage combos drawn from explicitly budgeted
+            stages). A combo whose ``stage_index`` distribution
+            exceeds any stage's budget is skipped without probing.
 
     Returns:
         The first feasible ``DonorPlan`` whose removals satisfy the
@@ -324,7 +354,16 @@ def _resource_fit_plan(
 
     for plan_size in range(1, max_plan_size + 1):
         evaluations = 0
-        seen_combos: set[tuple[str, ...]] = set()
+        # Dedup key uses the full planner identity ``(stage_index,
+        # worker_id)`` rather than ``worker_id`` alone. While Ray
+        # actor ids are globally unique today, the rest of the donor
+        # path commits removals as ``(stage_index, worker_id)`` tuples
+        # (``probe_add_after_removals`` / ``remove_workers_atomically``),
+        # so the dedup key SHOULD use the same identity. Any future
+        # change that introduces stage-scoped ids (e.g. a test fixture
+        # that reuses ids across stages) would otherwise silently
+        # collapse distinct combos and skew the per-cycle search.
+        seen_combos: set[tuple[tuple[int, str], ...]] = set()
 
         # Phase 1: same-node combinations. Each node contributes its
         # own combinations; ordering within a node follows
@@ -337,7 +376,16 @@ def _resource_fit_plan(
             for combo in itertools.combinations(same_node, plan_size):
                 if evaluations >= max_plan_combinations:
                     break
-                combo_key = tuple(w.worker_id for w in combo)
+                if _combo_violates_stage_budget(combo, removable_by_stage):
+                    # Cheaper than a probe round-trip and necessary
+                    # for correctness: a multi-donor combo could
+                    # otherwise pull every spare worker from one
+                    # donor stage and drop it below floor. Skipped
+                    # combos do not consume the evaluation cap so
+                    # the search keeps making progress on combos
+                    # that respect every stage's budget.
+                    continue
+                combo_key = tuple((w.stage_index, w.worker_id) for w in combo)
                 seen_combos.add(combo_key)
                 evaluations += 1
                 removals = [(w.stage_index, w.worker_id) for w in combo]
@@ -357,7 +405,9 @@ def _resource_fit_plan(
         for combo in itertools.combinations(sorted_candidates, plan_size):
             if evaluations >= max_plan_combinations:
                 break
-            combo_key = tuple(w.worker_id for w in combo)
+            if _combo_violates_stage_budget(combo, removable_by_stage):
+                continue
+            combo_key = tuple((w.stage_index, w.worker_id) for w in combo)
             if combo_key in seen_combos:
                 continue
             seen_combos.add(combo_key)
@@ -371,6 +421,37 @@ def _resource_fit_plan(
                 )
 
     return None
+
+
+def _combo_violates_stage_budget(
+    combo: tuple[DonorWorker, ...],
+    removable_by_stage: Mapping[int, int],
+) -> bool:
+    """Return ``True`` when ``combo`` exceeds any donor stage's removable budget.
+
+    A combo's ``stage_index`` distribution must respect every donor
+    stage's per-cycle removable count
+    (``len(workers) - stage_floors.get(stage_index, 1)``). Without
+    this guard a multi-donor resource-fit search could draw several
+    workers from a single donor stage and drop it below its own
+    floor, cascading the rescue.
+
+    Args:
+        combo: Candidate donor workers under consideration this
+            iteration. Ordering does not matter.
+        removable_by_stage: Per-stage budget keyed by ``stage_index``;
+            entries missing from the map default to ``0`` (no
+            removable workers from that stage).
+
+    Returns:
+        ``True`` when at least one stage_index appears in ``combo``
+        more times than ``removable_by_stage`` allows; ``False``
+        when every stage's contribution fits its budget.
+    """
+    stage_counts: dict[int, int] = {}
+    for worker in combo:
+        stage_counts[worker.stage_index] = stage_counts.get(worker.stage_index, 0) + 1
+    return any(count > removable_by_stage.get(stage_index, 0) for stage_index, count in stage_counts.items())
 
 
 def _donor_cost(
@@ -1167,6 +1248,18 @@ def find_saturation_donor(
         _emit_reject(RejectReason.NO_CANDIDATES)
         return None
 
+    # Per-stage donor budget. Mirrors the floor-mode caller's
+    # convention (``len(workers) - floor``) so a multi-donor saturation
+    # plan cannot pull more workers from one donor stage than that
+    # stage can spare without violating its own floor. The budget is
+    # computed from the planner's full live worker count for the
+    # stage; ``excluded_worker_ids`` only narrows the candidate pool
+    # (warmup grace), it does not raise the floor.
+    removable_by_stage = {
+        donor_index: max(0, len(worker_ids_by_stage[donor_index]) - stage_floors.get(donor_index, 1))
+        for donor_index in eligible_stages
+    }
+
     plan = _resource_fit_plan(
         receiver_stage_index=receiver_stage_index,
         candidates=candidates,
@@ -1174,6 +1267,7 @@ def find_saturation_donor(
         ctx=ctx,
         max_plan_size=config.cross_stage_donor_max_plan_size,
         max_plan_combinations=config.cross_stage_donor_max_plan_combinations,
+        removable_by_stage=removable_by_stage,
     )
     if plan is None:
         _emit_reject(RejectReason.RESOURCE_FIT)

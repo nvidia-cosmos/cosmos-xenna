@@ -106,7 +106,7 @@ the stage**, so it is the only `c` that produces a stable threshold.
               │  runtime.resolved_thresholds                 │
               │  ─ one INFO log per stage with provenance    │
               │  ─ later cycles short-circuit on the cache   │
-              │  ─ mid-run slots_per_worker changes do NOT   │
+              │  ─ mid-run slots_per_actor changes do NOT    │
               │    re-resolve                                │
               └──────────────────────────────────────────────┘
 ```

@@ -89,8 +89,26 @@ def _stage_state(
     num_empty_slots: int | None = None,
     input_queue_depth: int = 0,
 ) -> data_structures.ProblemStageState:
-    """Build a ``ProblemStageState`` with ``num_workers`` worker_groups on node-0."""
-    workers = [_worker_group(name, i) for i in range(num_workers)]
+    """Build a ``ProblemStageState`` with ``num_workers`` worker_groups on node-0.
+
+    Distributes ``num_used_slots`` across the worker_groups so the
+    per-worker sum equals the stage-level total. The previous
+    helper passed ``num_used_slots=0`` to every ``_worker_group``
+    while reporting a non-zero stage total, which let the warmup-
+    excluding aggregator (which sums per-worker counts) silently
+    disagree with the stage-level signal whenever a test fed a
+    non-zero stage total. Base/remainder split keeps the
+    distribution as even as integer arithmetic allows.
+    """
+    if num_workers > 0:
+        base_used = num_used_slots // num_workers
+        remainder = num_used_slots % num_workers
+    else:
+        base_used = 0
+        remainder = 0
+    workers = [
+        _worker_group(name, i, num_used_slots=base_used + (1 if i < remainder else 0)) for i in range(num_workers)
+    ]
     total = num_workers * slots_per_worker
     empty = num_empty_slots if num_empty_slots is not None else max(0, total - num_used_slots)
     return data_structures.ProblemStageState(

@@ -257,7 +257,7 @@ shape on the stage's resource spec.
 - **Pinning `saturation_threshold` directly when
   `saturation_aggressiveness` would do.** The aggressiveness
   knob preserves the `K / √c` shape across stages with different
-  `slots_per_actor`; pinning the threshold sets the same value
+  `slots_per_worker`; pinning the threshold sets the same value
   for every stage and silently mis-calibrates most of them.
 - **Setting `min_workers` to "just be safe".** The implicit
   floor of 1 is correct in almost every case. Use `min_workers`

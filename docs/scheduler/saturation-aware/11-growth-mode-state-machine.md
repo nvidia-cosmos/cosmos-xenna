@@ -66,9 +66,10 @@ in three places:
    the executed delta is `0` and the stage stays in its current
    mode.
 2. **Hard caps / fractional clamps.** A recommended `+5` that
-   the per-stage hard worker cap or `max_scale_down_fraction_per_cycle`
-   throttled to `+2` advances the timer by `+2`, not by the
-   recommended `+5`.
+   the per-stage hard worker cap throttled to `+2` advances the
+   timer by `+2`, not by the recommended `+5`. Likewise, a
+   recommended `-5` that `max_scale_down_fraction_per_cycle`
+   clamps to `-2` is recorded as `-2`.
 3. **Allocation failures.** A recommended `+3` that aborted
    after one successful add (with the rest of the cycle failing
    the absorb path) reflects `+1` into the timer, not the full

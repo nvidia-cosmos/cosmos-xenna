@@ -247,13 +247,25 @@ class TestPhaseBFloor:
         assert len(solution.stages[1].new_workers) == 3
 
     def test_capacity_exhausted_raises_runtime_error(self) -> None:
-        """A min_workers floor exceeding cluster capacity raises with operator context."""
+        """A min_workers floor exceeding cluster capacity raises with operator context.
+
+        Cycle 1 makes partial progress (adds 4 of 10 workers) and is
+        graced under the per-cycle progress contract; cycle 2 starts
+        with the cluster already full, makes zero progress, and
+        raises with the operator-actionable target_min message. Test
+        drives both cycles so the assertion targets the cycle that
+        legitimately stuck with no further options.
+        """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
             stage_defaults=SaturationAwareStageConfig(min_workers=10),
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)], total_cpus_per_node=4))
+        scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 0, 1, False)]),
+        )
         expected = (
             r"target_min=10 \(achieved=4; from min_workers=10, "
             r"min_workers_per_node=None, num_nodes=1\)\. Cluster placement exhausted"
@@ -261,17 +273,26 @@ class TestPhaseBFloor:
         with pytest.raises(RuntimeError, match=expected):
             scheduler.autoscale(
                 time=0.0,
-                problem_state=_problem_state([("A", 0, 1, False)]),
+                problem_state=_problem_state([("A", 4, 1, False)]),
             )
 
     def test_capacity_exhausted_error_identifies_per_node_floor_source(self) -> None:
-        """A per-node floor failure names the per-node knob and cluster size."""
+        """A per-node floor failure names the per-node knob and cluster size.
+
+        Cycle 1 reaches 2 of 4 floor workers (one per node) and is
+        graced; cycle 2 starts with the cluster full, makes no further
+        progress, and raises naming the per-node knob.
+        """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
             stage_defaults=SaturationAwareStageConfig(min_workers_per_node=2),
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)], num_nodes=2, total_cpus_per_node=1))
+        scheduler.autoscale(
+            time=0.0,
+            problem_state=_problem_state([("A", 0, 1, False)], num_nodes=2),
+        )
 
         expected = (
             r"target_min=4 \(achieved=2; from min_workers=None, "
@@ -280,7 +301,7 @@ class TestPhaseBFloor:
         with pytest.raises(RuntimeError, match=expected):
             scheduler.autoscale(
                 time=0.0,
-                problem_state=_problem_state([("A", 0, 1, False)], num_nodes=2),
+                problem_state=_problem_state([("A", 2, 1, False)], num_nodes=2),
             )
 
     def test_floor_uses_donor_when_cluster_is_full(self) -> None:

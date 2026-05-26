@@ -417,6 +417,13 @@ class TestMemoryPressureGate:
             ),
         )
 
+        # Re-read the monitor reference: ``setup()`` currently calls
+        # ``self._memory_pressure_monitor.reset()`` (mutates in place),
+        # but a future refactor that swaps the instance for a fresh
+        # one must not silently leave this test asserting on the
+        # pre-setup object. Re-resolving the attribute keeps the
+        # assertion targeting whatever monitor is live after setup.
+        monitor = scheduler._memory_pressure_monitor
         after_active = monitor.last_pressure_active
         after_poll_at = monitor.last_poll_at
         after_used_fraction = monitor.last_used_fraction

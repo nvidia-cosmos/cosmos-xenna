@@ -48,6 +48,7 @@ from cosmos_xenna.pipelines.private.scheduling_py import bottleneck
 from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
     HeterogeneityWarnState,
     compute_heterogeneity_ratio,
+    identify_bottleneck,
 )
 
 
@@ -288,4 +289,55 @@ class TestComputeHeterogeneityRatio:
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert len(info_logs) == 2, (
             f"second streak after drop+climb must fire one new INFO log, got {[r.message for r in info_logs]}"
+        )
+
+    def test_warn_log_names_same_stage_as_identify_bottleneck_on_near_tie(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Near-tied D_k -- warn log MUST name the same stage Phase C/D engages.
+
+        Two stages within ``near_tie_tolerance`` (default 0.05) of
+        the leader; lex-stable tie-break picks the smaller name in
+        both helpers. Pinning this contract guards against the raw
+        ``max(...)`` insertion-order bug where the warn log named
+        whichever stage hashed first while the engagement selector
+        picked the lex-smallest.
+
+        ``"big_slow"`` and ``"big_slowwer"`` are within 1% of each
+        other (well inside the 5% tolerance band); insertion order
+        puts ``"big_slow"`` first in the dict literal but lex order
+        does too -- to make the regression visible, the leader is
+        the second-inserted ``"big_slowwer"`` and the lex-smaller
+        ``"big_slow"`` must win for both helpers.
+        """
+        d_k_by_stage = {"big_slowwer": 1.00, "big_slow": 0.99, "tiny": 0.05}
+
+        state = HeterogeneityWarnState()
+        warn_streak = 1
+        compute_heterogeneity_ratio(
+            d_k_by_stage=d_k_by_stage,
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=5.0,
+            warn_streak_cycles=warn_streak,
+        )
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1, f"streak completion must fire one INFO log, got {[r.message for r in info_logs]}"
+
+        # ``identify_bottleneck`` for n=3 uses ``max/median``; with two
+        # near-tied leaders that ratio is close to 1.0, so the test
+        # uses the smallest finite engagement threshold above 1.0 to
+        # exercise the tie-break path. A higher threshold would short-
+        # circuit before the lex-stable selection ever runs.
+        identity = identify_bottleneck(d_k_by_stage, heterogeneity_threshold=1.005)
+        assert identity.engaged is True
+        assert identity.stage_name == "big_slow", (
+            "lex-stable tie-break selects the lex-smallest stage in the tolerance band"
+        )
+
+        warn_message = info_logs[0].message
+        assert "stage 'big_slow'" in warn_message, (
+            f"warn log must name the same stage Phase C/D engages ({identity.stage_name!r}); got {warn_message!r}"
         )

@@ -92,13 +92,30 @@ def _stage_state(
     num_pending_actors: int,
     is_finished: bool = False,
 ) -> data_structures.ProblemStageState:
-    """Build a ``ProblemStageState``; per-worker slot occupancy mirrors the stage-level signal."""
-    used_per_worker = (num_used_slots // num_workers) if num_workers > 0 else 0
+    """Build a ``ProblemStageState``; per-worker slot occupancy mirrors the stage-level signal.
+
+    Distributes ``num_used_slots`` across ``num_workers`` so that the
+    per-worker sum exactly equals the stage-level total. Floor division
+    alone would lose the remainder (e.g. 10 slots / 3 workers -> 3 each
+    -> sum=9 != 10), making the warmup-excluding aggregator
+    (:meth:`SaturationAwareScheduler._aggregate_slot_signals_excluding_warmup`)
+    disagree with the stage-level signal whenever the test driver feeds
+    a non-divisible total. The base/remainder split assigns the extra
+    slots to the first ``remainder`` workers so the sum is exact and
+    the per-worker distribution stays as even as integer arithmetic
+    allows.
+    """
+    if num_workers > 0:
+        base_used = num_used_slots // num_workers
+        remainder = num_used_slots % num_workers
+    else:
+        base_used = 0
+        remainder = 0
     worker_groups = [
         data_structures.ProblemWorkerGroupState.make(
             f"{name}-w{i}",
             [resources.WorkerResourcesInternal(node="node-0", cpus=1.0, gpus=[])],
-            num_used_slots=used_per_worker,
+            num_used_slots=base_used + (1 if i < remainder else 0),
         )
         for i in range(num_workers)
     ]
@@ -463,9 +480,12 @@ class TestDemandDropStabilizationHoldsFloor:
 
         Starts at 5 workers with ``min_workers=1`` and drives
         sustained OVER_PROVISIONED signal long enough to ripen the
-        asymmetric stabilization window. Across the run Phase D
-        fires at least once and no per-cycle delete request
-        exceeds ``live - floor``.
+        asymmetric stabilization window. The driver thread the
+        live worker count through cycles (decrementing by each
+        cycle's deletes, clamped at the floor) so the assertion
+        actually proves cumulative floor protection across the
+        run rather than per-cycle floor protection against a
+        constant feedstock that masks the cumulative invariant.
         """
         scheduler = _build_scheduler(
             ["hot"],
@@ -476,26 +496,48 @@ class TestDemandDropStabilizationHoldsFloor:
             min_workers=1,
         )
 
-        def state_factory(_cycle: int) -> data_structures.ProblemState:
-            # 5 idle workers; floor=1; expected to scale down toward floor.
-            return data_structures.ProblemState([_over_provisioned("hot", num_workers=5)])
+        floor = 1
+        live_per_cycle: list[int] = []
+        current_live = 5
 
-        solutions = _run_cycles(scheduler, state_factory, num_cycles=6)
+        def state_factory(_cycle: int) -> data_structures.ProblemState:
+            live_per_cycle.append(current_live)
+            return data_structures.ProblemState([_over_provisioned("hot", num_workers=current_live)])
+
+        # Run cycles manually so we can update ``current_live`` after
+        # each cycle from that cycle's deletes (clamped at the floor).
+        # ``_run_cycles`` ignores its return value when deletes are
+        # observed elsewhere, but here we need to feed the post-cycle
+        # count back into the next cycle's snapshot.
+        solutions: list[data_structures.Solution] = []
+        for cycle_idx in range(6):
+            ps = state_factory(cycle_idx)
+            sol = scheduler.autoscale(time=cycle_idx * 10.0, problem_state=ps)
+            solutions.append(sol)
+            deletes_this_cycle = len(sol.stages[0].deleted_workers)
+            current_live = max(floor, current_live - deletes_this_cycle)
 
         total_deletes = sum(_deleted_workers_per_stage(solutions, stage_index=0))
         assert total_deletes >= 1, (
             f"sustained OVER_PROVISIONED signal must fire Phase D shrink at least once "
             f"across {len(solutions)} cycles, got {total_deletes} deletes"
         )
-        # Floor protection: across the entire run, the per-cycle delete
-        # request must not exceed (live - floor). Live count is the worker
-        # count we feed in per cycle (constant 5 here); floor is 1.
-        live_per_cycle = 5
-        floor = 1
+        # Cumulative floor protection: per-cycle deletes must respect
+        # the live worker count at THAT cycle, not a constant. With
+        # the threading above, the live count converges toward the
+        # floor and the per-cycle delete must respect each cycle's
+        # ``live - floor`` headroom.
         per_cycle_deletes = [len(sol.stages[0].deleted_workers) for sol in solutions]
-        assert all(d <= live_per_cycle - floor for d in per_cycle_deletes), (
-            f"Phase D must not request deletes that would cross floor={floor} "
-            f"with live={live_per_cycle}: {per_cycle_deletes}"
+        for cycle_idx, (live, deletes) in enumerate(zip(live_per_cycle, per_cycle_deletes, strict=True)):
+            assert deletes <= max(0, live - floor), (
+                f"cycle {cycle_idx}: Phase D requested {deletes} deletes against "
+                f"live={live} workers (floor={floor}); deletes must respect live - floor"
+            )
+        # Final state: cumulative shrink must have driven the live
+        # count down to the floor (or be on its way there).
+        assert current_live == floor, (
+            f"sustained OVER_PROVISIONED signal must converge live count to floor={floor}; "
+            f"trace={live_per_cycle}, final={current_live}"
         )
         runtime = scheduler._stage_states["hot"]
         assert runtime.classifier_state is StageState.OVER_PROVISIONED

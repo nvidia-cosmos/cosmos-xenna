@@ -392,6 +392,61 @@ def emit_balance_score(d_k_by_stage: Mapping[str, float], *, pipeline_name: str)
     return score
 
 
+_BOTTLENECK_NEAR_TIE_TOLERANCE: float = 0.05
+"""Default ``near_tie_tolerance`` for bottleneck stage selection.
+
+Shared by :func:`identify_bottleneck` (the Phase C/D engagement
+selector) and :func:`compute_heterogeneity_ratio` (the operator-
+facing warn log) so both name the same stage when two or more
+``D_k`` values are within the tolerance band of the leader.
+Drift between the two would surface as a warn log that points at
+a different stage than the scheduler is acting on.
+"""
+
+
+def _pick_lex_stable_argmax(
+    finite_scores: Mapping[str, float],
+    *,
+    near_tie_tolerance: float,
+) -> str:
+    """Pick the bottleneck stage with lex-stable near-tie resolution.
+
+    Returns the lexicographically-smallest stage whose ``D_k`` is
+    within ``near_tie_tolerance`` of the leader. Sharing this
+    primitive between :func:`identify_bottleneck` and
+    :func:`compute_heterogeneity_ratio` keeps Phase C/D engagement
+    and the operator-facing heterogeneity warn log naming the same
+    stage on near-ties; using raw ``max(...)`` in either place
+    would resolve ties by dict insertion order and drift away from
+    the lex pick.
+
+    Args:
+        finite_scores: Per-stage finite, positive ``D_k`` values
+            (caller is responsible for filtering NaN / non-positive
+            entries up front).
+        near_tie_tolerance: Fractional tie band in ``[0.0, 1.0)``;
+            ``0.0`` collapses to a strict-argmax with lex tie-break
+            still applied.
+
+    Returns:
+        Stage name selected as the bottleneck.
+
+    Raises:
+        ValueError: ``finite_scores`` is empty or
+            ``near_tie_tolerance`` is outside ``[0.0, 1.0)``.
+    """
+    if not finite_scores:
+        msg = "finite_scores must contain at least one entry"
+        raise ValueError(msg)
+    if not 0.0 <= near_tie_tolerance < 1.0:
+        msg = f"near_tie_tolerance must be in [0.0, 1.0), got {near_tie_tolerance}"
+        raise ValueError(msg)
+
+    max_d = max(finite_scores.values())
+    near_tie_floor = max_d * (1.0 - near_tie_tolerance)
+    return min(name for name, d in finite_scores.items() if d >= near_tie_floor)
+
+
 @attrs.define
 class HeterogeneityWarnState:
     """Per-instance streak + once-per-spike latch for the heterogeneity warn log.
@@ -538,10 +593,11 @@ def compute_heterogeneity_ratio(
     if state.streak_cycles < warn_streak_cycles or state.has_fired:
         return
 
-    bottleneck_name, bottleneck_score = max(
-        finite_scores.items(),
-        key=lambda item: item[1],
+    bottleneck_name = _pick_lex_stable_argmax(
+        finite_scores,
+        near_tie_tolerance=_BOTTLENECK_NEAR_TIE_TOLERANCE,
     )
+    bottleneck_score = finite_scores[bottleneck_name]
     logger.info(
         f"high cluster heterogeneity (ratio={ratio:.1f} for "
         f"{state.streak_cycles} cycles); consider raising "
@@ -641,7 +697,7 @@ def identify_bottleneck(
     d_k_by_stage: Mapping[str, float],
     *,
     heterogeneity_threshold: float,
-    near_tie_tolerance: float = 0.05,
+    near_tie_tolerance: float = _BOTTLENECK_NEAR_TIE_TOLERANCE,
 ) -> BottleneckIdentity:
     """Identify the engaged bottleneck stage from actor-normalized ``D_k``.
 
@@ -720,11 +776,12 @@ def identify_bottleneck(
             heterogeneity_ratio=ratio,
         )
 
-    near_tie_floor = max_d * (1.0 - near_tie_tolerance)
-    tied = sorted(name for name, d in finite_scores.items() if d >= near_tie_floor)
     return BottleneckIdentity(
         engaged=True,
-        stage_name=tied[0],
+        stage_name=_pick_lex_stable_argmax(
+            finite_scores,
+            near_tie_tolerance=near_tie_tolerance,
+        ),
         max_d_k=max_d,
         median_d_k=median_d,
         heterogeneity_ratio=ratio,

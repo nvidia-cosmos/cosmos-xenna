@@ -225,11 +225,18 @@ def _run_both_schedulers(
     # which scheduler raised on which fixture (legacy raises Rust
     # ``PanicException``, saturation-aware raises ``RuntimeError``;
     # bare Python tracebacks would otherwise hide the attribution).
+    # ``FragmentationBasedAutoscaler`` raises Rust ``PanicException``
+    # on infeasible fixtures; ``PanicException`` inherits directly
+    # from ``BaseException``, NOT ``Exception``. ``except Exception``
+    # would silently let the panic escape with an unattributed Rust
+    # traceback that hides which scheduler / fixture combination
+    # blew up. Catching ``BaseException`` here is intentional and
+    # narrowly scoped to the single autoscale call below.
     legacy = FragmentationBasedAutoscaler()
     legacy.setup(problem)
     try:
         legacy_sol = legacy.autoscale(time=0.0, problem_state=state)
-    except Exception as e:
+    except BaseException as e:
         msg = f"legacy FragmentationBasedAutoscaler raised on this fixture: {e!r}"
         raise AssertionError(msg) from e
 
@@ -237,7 +244,7 @@ def _run_both_schedulers(
     new.setup(problem)
     try:
         new_sol = new.autoscale(time=0.0, problem_state=state)
-    except Exception as e:
+    except BaseException as e:
         msg = f"SaturationAwareScheduler raised on this fixture: {e!r}"
         raise AssertionError(msg) from e
     return legacy_sol, new_sol, cfg

@@ -869,7 +869,15 @@ impl AutoscalePlanContext {
         // Pre-validate: every removal targets an in-range stage, and
         // every worker id is present in the matching planner map.
         // Missing worker ids return `Ok(false)` without mutating any
-        // state so the caller can fall back to a different plan.
+        // state so the caller can fall back to a different plan; a
+        // MISSING stage entry in current_workers / current_worker_groups
+        // is a planner-state inconsistency (the structural seeding in
+        // `from_problem_state` should have populated every stage) and
+        // surfaces as `PyRuntimeError` so the defect is loud rather
+        // than silently swallowed by the same `Ok(false)` fall-back
+        // path callers reserve for routine missing-worker retries.
+        // Mirrors the contract of the single-worker `try_remove_worker`
+        // path, which already distinguishes these two failure modes.
         for (stage_index, worker_id) in &removals {
             if *stage_index >= self.stages.len() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(format!(
@@ -882,14 +890,30 @@ impl AutoscalePlanContext {
             let stage = &self.stages[*stage_index];
             let stage_name = &stage.name;
             let present = match stage.worker_shape {
-                rds::WorkerShape::SpmdNodeMultiple(_) => self
-                    .current_worker_groups
-                    .get(stage_name)
-                    .is_some_and(|m| m.contains_key(worker_id)),
-                _ => self
-                    .current_workers
-                    .get(stage_name)
-                    .is_some_and(|m| m.contains_key(worker_id)),
+                rds::WorkerShape::SpmdNodeMultiple(_) => {
+                    match self.current_worker_groups.get(stage_name) {
+                        Some(map) => map.contains_key(worker_id),
+                        None => {
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "AutoscalePlanContext.remove_workers_atomically: \
+                             current_worker_groups entry missing for stage {} (worker {}); \
+                             planner snapshot inconsistency.",
+                                stage_name, worker_id
+                            )));
+                        }
+                    }
+                }
+                _ => match self.current_workers.get(stage_name) {
+                    Some(map) => map.contains_key(worker_id),
+                    None => {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "AutoscalePlanContext.remove_workers_atomically: \
+                             current_workers entry missing for stage {} (worker {}); \
+                             planner snapshot inconsistency.",
+                            stage_name, worker_id
+                        )));
+                    }
+                },
             };
             if !present {
                 return Ok(false);
@@ -4415,6 +4439,80 @@ mod batch_removal_and_probe_tests {
             result.map(|_| ())
         );
     }
+
+    #[test]
+    fn remove_workers_atomically_unknown_worker_returns_ok_false_without_mutation() {
+        // Unknown worker id (stage entry exists, but the id is not in
+        // the map) is a routine fallback path: callers can probe a
+        // candidate they no longer hold and recover by trying a
+        // different plan. No state mutates.
+        let (mut ctx, _ids) = ctx_with_cpu_workers(2);
+        let baseline_workers = ctx.current_workers["stage_a"].len();
+
+        let result = ctx
+            .remove_workers_atomically(vec![(0, "ghost_worker".to_string())])
+            .unwrap();
+
+        assert!(!result, "unknown worker id must return Ok(false), not Err");
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            baseline_workers,
+            "current_workers must not mutate on the Ok(false) fallback path",
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_missing_current_workers_entry_raises_runtime_error() {
+        // Planner-state inconsistency: current_workers does NOT contain
+        // an entry for a non-SPMD stage that should have been seeded by
+        // from_problem_state. The pre-validation raises PyRuntimeError
+        // with a descriptive message naming the stage and worker id;
+        // this surfaces the defect loudly rather than collapsing it
+        // into the same Ok(false) fall-back the caller uses for
+        // routine missing-worker retries. Mirrors the contract of the
+        // single-worker try_remove_worker path.
+        pyo3::prepare_freethreaded_python();
+
+        let (mut ctx, _ids) = ctx_with_cpu_workers(1);
+        // Inject the inconsistency: drop the stage entry from
+        // current_workers without touching cluster state. The live
+        // from_problem_state seeding cannot produce this shape but a
+        // future planner regression could.
+        ctx.current_workers.remove("stage_a");
+
+        let result = ctx.remove_workers_atomically(vec![(0, "stage_a_worker_0".to_string())]);
+
+        let err =
+            result.expect_err("missing current_workers stage entry must raise, not return Ok");
+        let (err_type, err_message) = Python::with_gil(|py| {
+            let type_name = err
+                .get_type(py)
+                .name()
+                .map(|cow| cow.to_string())
+                .unwrap_or_else(|_| String::from("<unknown>"));
+            (type_name, err.value(py).to_string())
+        });
+        assert_eq!(
+            err_type, "RuntimeError",
+            "missing stage entry must surface as PyRuntimeError; got {err_type}: {err_message}"
+        );
+        assert!(
+            err_message.contains("current_workers entry missing for stage stage_a"),
+            "the error must name the stage; got: {err_message}",
+        );
+        assert!(
+            err_message.contains("stage_a_worker_0"),
+            "the error must name the worker id; got: {err_message}",
+        );
+    }
+
+    // Note: the SPMD branch (`current_worker_groups` lookup) follows
+    // the same contract as the non-SPMD branch above -- missing stage
+    // entry raises PyRuntimeError, present-but-unknown-worker returns
+    // Ok(false). Test fixtures for SPMD ProblemState live in the
+    // sibling `mod tests` block and are not accessible from this
+    // module without exporting them; the symmetric code path keeps
+    // both branches in sync.
 
     #[test]
     fn remove_workers_atomically_commits_full_batch_and_releases_resources() {

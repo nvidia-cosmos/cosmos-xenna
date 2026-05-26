@@ -52,7 +52,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.donor import (
     _signal_trust,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
-from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
 def _state(
@@ -774,3 +774,125 @@ class TestRejectionPathEmitsDebug:
         assert decision is None
         assert len(emitted) == 1
         assert "reject_reason='master_toggle_off'" in emitted[0]
+
+    def test_resource_fit_failure_emits_one_debug_line(self) -> None:
+        """An always-infeasible probe drives ``find_saturation_donor`` to the resource_fit DEBUG path."""
+        from unittest.mock import patch
+
+        import attrs
+
+        from cosmos_xenna.pipelines.private.scheduling_py.donor import find_saturation_donor
+
+        @attrs.frozen
+        class _InfeasibleProbe:
+            feasible: bool = False
+            reject_reason: str = "no_placement"
+
+        @attrs.define
+        class _AlwaysInfeasibleCtx:
+            def probe_add_after_removals(
+                self,
+                removals: list[tuple[int, str]],
+                add_stage_index: int,
+            ) -> _InfeasibleProbe:
+                del removals, add_stage_index
+                return _InfeasibleProbe()
+
+        cfg = _config()
+        states = {
+            "A": _state("A", streak=60),
+            "B": _state("B", classifier=StageState.SATURATED),
+        }
+        stage_configs = {name: SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3) for name in ("A", "B")}
+        emitted: list[str] = []
+
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.donor.logger.debug",
+            lambda msg: emitted.append(msg),
+        ):
+            decision = find_saturation_donor(
+                receiver_stage_index=1,
+                receiver_stage_name="B",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
+                worker_ages={"a-w0": 5, "a-w1": 3, "b-w0": 2},
+                worker_nodes={},
+                stage_states=states,
+                config=cfg,
+                stage_configs=stage_configs,
+                cycle=100,
+                last_donation_cycle={},
+                ctx=_AlwaysInfeasibleCtx(),  # type: ignore[arg-type]
+                receiver_intent=1,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
+                slots_per_worker_by_stage={},
+            )
+
+        assert decision is None
+        assert len(emitted) == 1
+        assert "reject_reason='resource_fit'" in emitted[0]
+
+    def test_economic_gate_rejection_emits_debug_line_through_find_saturation_donor(self) -> None:
+        """A gate rejection (not a layered filter) reaches the find_saturation_donor wrapper's DEBUG path."""
+        from unittest.mock import patch
+
+        import attrs
+
+        from cosmos_xenna.pipelines.private.scheduling_py.donor import find_saturation_donor
+
+        @attrs.frozen
+        class _AlwaysFeasibleProbe:
+            feasible: bool = True
+            reject_reason: str = ""
+
+        @attrs.define
+        class _AlwaysFeasibleCtx:
+            def probe_add_after_removals(
+                self,
+                removals: list[tuple[int, str]],
+                add_stage_index: int,
+            ) -> _AlwaysFeasibleProbe:
+                del removals, add_stage_index
+                return _AlwaysFeasibleProbe()
+
+        # Spread threshold high enough that the chosen plan fails the
+        # spread gate (donor_cost ~0, receiver_value ~0 -> spread=0).
+        cfg = _config(cross_stage_donor_spread_threshold=10.0)
+        states = {
+            "A": _state("A", slots_empty_ewma=0.0, streak=60),
+            "B": _state("B", pressure_ewma=0.0, streak=60),
+        }
+        stage_configs = {name: SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3) for name in ("A", "B")}
+        emitted: list[str] = []
+
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.donor.logger.debug",
+            lambda msg: emitted.append(msg),
+        ):
+            decision = find_saturation_donor(
+                receiver_stage_index=1,
+                receiver_stage_name="B",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
+                worker_ages={"a-w0": 5, "a-w1": 3, "b-w0": 2},
+                worker_nodes={},
+                stage_states=states,
+                config=cfg,
+                stage_configs=stage_configs,
+                cycle=100,
+                last_donation_cycle={},
+                ctx=_AlwaysFeasibleCtx(),  # type: ignore[arg-type]
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
+                slots_per_worker_by_stage={},
+            )
+
+        assert decision is None
+        assert len(emitted) == 1
+        assert "reject_reason='spread_below_threshold'" in emitted[0]

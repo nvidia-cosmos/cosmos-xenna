@@ -461,6 +461,26 @@ class TestProductionIncidentReplay:
             f"single-cycle 4 -> 1 shrink failed to free any whole H100; "
             f"surviving worker nodes were {sorted(survivor_nodes)}"
         )
+        # Per-stage floor assertion: every stage must reach exactly
+        # ``min_workers=1`` after the aggressive single-cycle shrink.
+        # The whole-GPU-free assertion above is necessary but not
+        # sufficient -- it would still pass if Phase D failed to drain
+        # one stage all the way to its floor while another stage
+        # over-shrunk to compensate. Computing per-stage survivors
+        # directly catches that asymmetry.
+        for stage_index, stage_state in enumerate(state.rust.stages):
+            survivor_count = (
+                len(stage_state.worker_groups)
+                - len(solution.stages[stage_index].deleted_workers)
+                + len(solution.stages[stage_index].new_workers)
+            )
+            assert survivor_count == 1, (
+                f"stage {stage_state.stage_name!r} must reach min_workers=1 in one cycle; "
+                f"got {survivor_count} survivors "
+                f"(start={len(stage_state.worker_groups)}, "
+                f"deletes={len(solution.stages[stage_index].deleted_workers)}, "
+                f"adds={len(solution.stages[stage_index].new_workers)})"
+            )
 
     def test_multi_cycle_intent_minus_one_converges_with_free_gpu(
         self,
@@ -511,6 +531,25 @@ class TestProductionIncidentReplay:
             f"multi-cycle convergence ended with every H100 still allocated; "
             f"surviving worker nodes were {sorted(survivor_nodes)}"
         )
+        # Per-stage floor assertion: convergence must leave every
+        # stage at exactly ``min_workers=1``. The loop exit condition
+        # was "no deletes this cycle" -- which a buggy Phase D could
+        # also satisfy by stalling above floor (e.g. failing to find a
+        # victim). Asserting the per-stage post-loop worker count
+        # catches that stall mode directly.
+        for stage_index, stage_state in enumerate(state.rust.stages):
+            survivor_count = (
+                len(stage_state.worker_groups)
+                - len(solution.stages[stage_index].deleted_workers)
+                + len(solution.stages[stage_index].new_workers)
+            )
+            assert survivor_count == 1, (
+                f"stage {stage_state.stage_name!r} did not converge to min_workers=1 "
+                f"in {cycles_run} cycles; got {survivor_count} survivors "
+                f"(start_of_last_cycle={len(stage_state.worker_groups)}, "
+                f"deletes_last_cycle={len(solution.stages[stage_index].deleted_workers)}, "
+                f"adds_last_cycle={len(solution.stages[stage_index].new_workers)})"
+            )
 
     def test_per_stage_drainage_targets_lowest_fraction_gpu_each_cycle(
         self,
