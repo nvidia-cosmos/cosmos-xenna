@@ -37,11 +37,18 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorCandidate, find_saturation_donor
+from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorPlan, DonorWorker, find_saturation_donor
 from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _single_donor(plan: DonorPlan | None) -> DonorWorker:
+    """Assert the plan is a single-worker plan and return its sole removal."""
+    assert plan is not None, "selector returned None"
+    assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
+    return plan.removals[0]
 
 
 def _saturated_state(name: str, *, streak: int = 99) -> _StageRuntimeState:
@@ -113,7 +120,7 @@ def _find_donor(
     stage_configs: dict[str, SaturationAwareStageConfig] | None = None,
     cycle: int = 100,
     last_donation_cycle: dict[str, int] | None = None,
-) -> DonorCandidate | None:
+) -> DonorPlan | None:
     """Call ``find_saturation_donor`` with a two-stage eligible default."""
     if stage_names is None:
         stage_names = ["A", "B"]
@@ -144,6 +151,11 @@ def _find_donor(
         cycle=cycle,
         last_donation_cycle=last_donation_cycle,
     )
+
+
+def _find_donor_worker(**kwargs: object) -> DonorWorker:
+    """Run ``_find_donor`` and unwrap the single-worker plan it returns."""
+    return _single_donor(_find_donor(**kwargs))  # type: ignore[arg-type]
 
 
 def _cluster(*, total_cpus_per_node: int = 4) -> resources.ClusterResources:
@@ -321,24 +333,25 @@ class TestFindSaturationDonorClassifierLayer:
 
     def test_over_provisioned_with_full_streak_is_eligible(self) -> None:
         """A donor with classifier_state=OVER_PROVISIONED and full streak is selected."""
-        donor = find_saturation_donor(
-            receiver_stage_index=1,
-            receiver_stage_name="B",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            stage_states={
-                "A": _over_provisioned_state("A", streak=30),
-                "B": _saturated_state("B"),
-            },
-            config=_config(),
-            stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
-            cycle=100,
-            last_donation_cycle={},
+        donor = _single_donor(
+            find_saturation_donor(
+                receiver_stage_index=1,
+                receiver_stage_name="B",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+                worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
+                stage_states={
+                    "A": _over_provisioned_state("A", streak=30),
+                    "B": _saturated_state("B"),
+                },
+                config=_config(),
+                stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
+                cycle=100,
+                last_donation_cycle={},
+            )
         )
 
-        assert donor is not None
         assert donor.stage_index == 0
         assert donor.worker_id == "A-w1"
 
@@ -396,21 +409,23 @@ class TestFindSaturationDonorReceiverAntiFlap:
     def test_receiver_recent_donor_outside_anti_flap_window_is_allowed(self) -> None:
         """A receiver whose last donation is older than ``anti_flap_cycles`` is no longer blocked."""
         config = _config(cross_stage_donor_anti_flap_cycles=30)
-        donor = find_saturation_donor(
-            receiver_stage_index=1,
-            receiver_stage_name="B",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            stage_states={
-                "A": _over_provisioned_state("A"),
-                "B": _saturated_state("B"),
-            },
-            config=config,
-            stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
-            cycle=131,  # 31 cycles since B's last donation; window cleared
-            last_donation_cycle={"B": 100},
+        donor = _single_donor(
+            find_saturation_donor(
+                receiver_stage_index=1,
+                receiver_stage_name="B",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+                worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
+                stage_states={
+                    "A": _over_provisioned_state("A"),
+                    "B": _saturated_state("B"),
+                },
+                config=config,
+                stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
+                cycle=131,  # 31 cycles since B's last donation; window cleared
+                last_donation_cycle={"B": 100},
+            )
         )
 
         assert donor is not None
@@ -427,24 +442,25 @@ class TestFindSaturationDonorSameDonorEligibleAcrossCycles:
     """
 
     def test_donor_eligible_immediately_after_prior_donation(self) -> None:
-        donor = find_saturation_donor(
-            receiver_stage_index=1,
-            receiver_stage_name="B",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            stage_states={
-                "A": _over_provisioned_state("A"),
-                "B": _saturated_state("B"),
-            },
-            config=_config(),
-            stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
-            cycle=101,
-            last_donation_cycle={"A": 100},
+        donor = _single_donor(
+            find_saturation_donor(
+                receiver_stage_index=1,
+                receiver_stage_name="B",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+                worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
+                stage_states={
+                    "A": _over_provisioned_state("A"),
+                    "B": _saturated_state("B"),
+                },
+                config=_config(),
+                stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
+                cycle=101,
+                last_donation_cycle={"A": 100},
+            )
         )
 
-        assert donor is not None
         assert donor.stage_index == 0
 
 
@@ -474,24 +490,25 @@ class TestFindSaturationDonorStrictUpstream:
 
     def test_downstream_donor_allowed_when_strict_upstream_off(self) -> None:
         """With ``donor_must_be_strictly_upstream=False`` a downstream donor is eligible."""
-        donor = find_saturation_donor(
-            receiver_stage_index=0,
-            receiver_stage_name="A",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0"], ["B-w0", "B-w1"]],
-            worker_ages={"A-w0": 5, "B-w0": 3, "B-w1": 2},
-            stage_states={
-                "A": _saturated_state("A"),
-                "B": _over_provisioned_state("B"),
-            },
-            config=_config(donor_must_be_strictly_upstream=False),
-            stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
-            cycle=100,
-            last_donation_cycle={},
+        donor = _single_donor(
+            find_saturation_donor(
+                receiver_stage_index=0,
+                receiver_stage_name="A",
+                stage_names=["A", "B"],
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0"], ["B-w0", "B-w1"]],
+                worker_ages={"A-w0": 5, "B-w0": 3, "B-w1": 2},
+                stage_states={
+                    "A": _saturated_state("A"),
+                    "B": _over_provisioned_state("B"),
+                },
+                config=_config(donor_must_be_strictly_upstream=False),
+                stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
+                cycle=100,
+                last_donation_cycle={},
+            )
         )
 
-        assert donor is not None
         assert donor.stage_index == 1
         assert donor.worker_id == "B-w1"  # younger of B-w0(age=3) and B-w1(age=2)
 
@@ -526,41 +543,41 @@ class TestFindSaturationDonorYoungestSelection:
 
     def test_youngest_worker_across_eligible_donors_wins(self) -> None:
         """Two eligible donor stages: the youngest worker overall is selected."""
-        donor = find_saturation_donor(
-            receiver_stage_index=2,
-            receiver_stage_name="C",
-            stage_names=["A", "B", "C"],
-            stage_floors={0: 1, 1: 1, 2: 1},
-            worker_ids_by_stage=[
-                ["A-w0", "A-w1"],
-                ["B-w0", "B-w1"],
-                ["C-w0"],
-            ],
-            worker_ages={"A-w0": 5, "A-w1": 4, "B-w0": 2, "B-w1": 3, "C-w0": 1},
-            stage_states={
-                "A": _over_provisioned_state("A"),
-                "B": _over_provisioned_state("B"),
-                "C": _saturated_state("C"),
-            },
-            config=_config(),
-            stage_configs={"A": _stage_cfg(), "B": _stage_cfg(), "C": _stage_cfg()},
-            cycle=100,
-            last_donation_cycle={},
+        donor = _single_donor(
+            find_saturation_donor(
+                receiver_stage_index=2,
+                receiver_stage_name="C",
+                stage_names=["A", "B", "C"],
+                stage_floors={0: 1, 1: 1, 2: 1},
+                worker_ids_by_stage=[
+                    ["A-w0", "A-w1"],
+                    ["B-w0", "B-w1"],
+                    ["C-w0"],
+                ],
+                worker_ages={"A-w0": 5, "A-w1": 4, "B-w0": 2, "B-w1": 3, "C-w0": 1},
+                stage_states={
+                    "A": _over_provisioned_state("A"),
+                    "B": _over_provisioned_state("B"),
+                    "C": _saturated_state("C"),
+                },
+                config=_config(),
+                stage_configs={"A": _stage_cfg(), "B": _stage_cfg(), "C": _stage_cfg()},
+                cycle=100,
+                last_donation_cycle={},
+            )
         )
 
-        assert donor is not None
         assert donor.stage_index == 1
         assert donor.worker_id == "B-w0"
         assert donor.age == 2
 
     def test_equal_worker_ages_choose_lexicographically_smallest_worker_id(self) -> None:
         """Equal-age candidates fall back to worker id for deterministic output."""
-        donor = _find_donor(
+        donor = _find_donor_worker(
             worker_ids_by_stage=[["A-w2", "A-w1", "A-w0"], ["B-w0"]],
             worker_ages={"A-w0": 7, "A-w1": 7, "A-w2": 7, "B-w0": 1},
         )
 
-        assert donor is not None
         assert donor.worker_id == "A-w0"
 
 
@@ -569,7 +586,7 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
 
     def test_receiver_anti_flap_allows_at_exact_window_boundary(self) -> None:
         """Layer 3 blocks ``< window`` only; equality is eligible."""
-        donor = _find_donor(
+        donor = _find_donor_worker(
             config=_config(cross_stage_donor_anti_flap_cycles=30),
             cycle=130,
             last_donation_cycle={"B": 100},
@@ -579,7 +596,7 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
 
     def test_non_over_provisioned_donor_allowed_when_requirement_disabled(self) -> None:
         """Disabling layer 1 permits a NORMAL donor that still satisfies floor rules."""
-        donor = _find_donor(
+        donor = _find_donor_worker(
             config=_config(cross_stage_donor_require_over_provisioned=False),
             stage_states={
                 "A": _StageRuntimeState(
@@ -593,12 +610,11 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
             },
         )
 
-        assert donor is not None
         assert donor.stage_index == 0
 
     def test_hold_donor_allowed_when_hold_exclusion_disabled(self) -> None:
         """Disabling layer 2 permits a HOLD donor that otherwise qualifies."""
-        donor = _find_donor(
+        donor = _find_donor_worker(
             config=_config(cross_stage_donor_exclude_hold_state=False),
             stage_states={
                 "A": _over_provisioned_state("A", growth_mode=GrowthMode.HOLD),
@@ -606,7 +622,6 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
             },
         )
 
-        assert donor is not None
         assert donor.stage_index == 0
 
 
@@ -627,9 +642,8 @@ class TestFindSaturationDonorMalformedInternalSnapshots:
 
     def test_missing_stage_floor_defaults_to_one_worker_floor(self) -> None:
         """A donor missing from ``stage_floors`` can donate only above the implicit floor."""
-        donor = _find_donor(stage_floors={1: 1})
+        donor = _find_donor_worker(stage_floors={1: 1})
 
-        assert donor is not None
         assert donor.stage_index == 0
 
     def test_large_pipeline_selection_is_deterministic(self) -> None:
@@ -678,7 +692,11 @@ class TestFindSaturationDonorMalformedInternalSnapshots:
             stage_configs=stage_configs,
         )
 
-        assert first == second == DonorCandidate(stage_index=42, worker_id=winner, age=0)
+        expected_plan = DonorPlan(
+            removals=(DonorWorker(stage_index=42, worker_id=winner, age=0),),
+            receiver_stage_index=receiver_stage_index,
+        )
+        assert first == second == expected_plan
 
 
 class TestSaturationDonorPhaseCOrchestration:

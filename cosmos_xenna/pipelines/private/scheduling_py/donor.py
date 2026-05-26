@@ -46,12 +46,60 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, Saturati
 
 
 @attrs.frozen
-class DonorCandidate:
-    """A worker selected for donation to a receiver stage."""
+class DonorWorker:
+    """One worker removal in a multi-donor plan.
+
+    Carries the planner indices needed to translate the symbolic
+    choice into ``ctx.probe_add_after_removals`` and
+    ``ctx.remove_workers_atomically`` arguments, plus the
+    deterministic age tiebreaker the resource-fit search shares
+    with the floor selector.
+
+    Attributes:
+        stage_index: Position of the donor stage in problem order.
+        worker_id: Planner-assigned worker identifier on that stage.
+        age: Worker age in autoscale cycles. Older workers are
+            preferred during deterministic tie-breaking; freshly
+            observed workers default to ``0``.
+
+    """
 
     stage_index: int
     worker_id: str
     age: int
+
+
+@attrs.frozen
+class DonorPlan:
+    """A non-empty group of donor worker removals targeting one receiver.
+
+    Phase B floor and Phase C saturation paths both consume this
+    type. Single-worker plans are valid (and the only shape the
+    selection helpers emit until the multi-donor resource-fit
+    search in 3c.4 lands); larger plans are the structural runway
+    for that follow-up. Distinct donor stages in ``removals`` each
+    have their anti-flap timestamps advanced on commit so a single
+    multi-stage donation does not silently allow one stage to
+    repeatedly donate within the anti-flap window.
+
+    Attributes:
+        removals: Workers to remove, in commit order. The tuple
+            MUST be non-empty: ``None`` represents "no donation",
+            an empty ``DonorPlan`` is never constructed.
+        receiver_stage_index: Position of the receiver stage in
+            problem order; carried alongside ``removals`` so the
+            planner probe / commit path does not need to re-derive
+            it from caller-side state.
+
+    """
+
+    removals: tuple[DonorWorker, ...]
+    receiver_stage_index: int
+
+    def __attrs_post_init__(self) -> None:
+        if not self.removals:
+            msg = "DonorPlan.removals must contain at least one DonorWorker; pass None to signal no donation"
+            raise ValueError(msg)
 
 
 def select_youngest_eligible_donor(
@@ -60,7 +108,7 @@ def select_youngest_eligible_donor(
     stage_floors: dict[int, int],
     worker_ids_by_stage: list[list[str]],
     worker_ages: dict[str, int],
-) -> DonorCandidate | None:
+) -> DonorPlan | None:
     """Pick the youngest eligible donor across stages, with upstream preference.
 
     Eligibility rules:
@@ -76,7 +124,9 @@ def select_youngest_eligible_donor(
 
     Among the remaining candidates, ``(age ASC, worker_id ASC)``
     selects the youngest worker; the ``worker_id`` tiebreaker keeps
-    the choice deterministic when ages are uniform.
+    the choice deterministic when ages are uniform. The chosen
+    worker is wrapped in a single-worker ``DonorPlan`` so floor
+    enforcement and the saturation planner share one return type.
 
     Args:
         receiver_stage_index: Index of the stage that needs the
@@ -91,7 +141,7 @@ def select_youngest_eligible_donor(
             observed).
 
     Returns:
-        The selected ``DonorCandidate`` or ``None`` when no stage can
+        A single-worker ``DonorPlan`` or ``None`` when no stage can
         donate without violating its own floor.
 
     """
@@ -107,7 +157,7 @@ def select_youngest_eligible_donor(
     pool = upstream if upstream else eligible_stages
 
     candidates = [
-        DonorCandidate(
+        DonorWorker(
             stage_index=stage_index,
             worker_id=wid,
             age=worker_ages.get(wid, 0),
@@ -118,7 +168,8 @@ def select_youngest_eligible_donor(
     if not candidates:
         return None
 
-    return min(candidates, key=operator.attrgetter("age", "worker_id"))
+    chosen = min(candidates, key=operator.attrgetter("age", "worker_id"))
+    return DonorPlan(removals=(chosen,), receiver_stage_index=receiver_stage_index)
 
 
 def find_saturation_donor(
@@ -135,7 +186,7 @@ def find_saturation_donor(
     cycle: int,
     last_donation_cycle: dict[str, int],
     excluded_worker_ids: frozenset[str] | None = None,
-) -> DonorCandidate | None:
+) -> DonorPlan | None:
     """Pick a donor for saturation-driven Phase C growth.
 
     The non-negotiable donor-floor rule from
@@ -197,10 +248,12 @@ def find_saturation_donor(
             the candidate pool unfiltered.
 
     Returns:
-        The selected ``DonorCandidate`` or ``None`` when the master
+        A single-worker ``DonorPlan`` or ``None`` when the master
         toggle is disabled, the receiver is itself in cooldown, no
         donor stage passes every filter, or every potential donor
-        worker is in ``excluded_worker_ids``.
+        worker is in ``excluded_worker_ids``. The multi-donor
+        resource-fit search lands in a follow-up change; this
+        helper currently emits one-worker plans only.
 
     Raises:
         ValueError: If ``stage_names`` and ``worker_ids_by_stage``
@@ -266,7 +319,7 @@ def find_saturation_donor(
 
     excluded = excluded_worker_ids or frozenset()
     candidates = [
-        DonorCandidate(
+        DonorWorker(
             stage_index=donor_index,
             worker_id=wid,
             age=worker_ages.get(wid, 0),
@@ -278,4 +331,5 @@ def find_saturation_donor(
     if not candidates:
         return None
 
-    return min(candidates, key=operator.attrgetter("age", "worker_id"))
+    chosen = min(candidates, key=operator.attrgetter("age", "worker_id"))
+    return DonorPlan(removals=(chosen,), receiver_stage_index=receiver_stage_index)

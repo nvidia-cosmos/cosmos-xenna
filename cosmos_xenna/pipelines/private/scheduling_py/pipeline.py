@@ -69,17 +69,19 @@ def run_per_stage_pipeline(
     recommendation_history: _RecommendationHistory | None = None,
     observed_throughput_sample: float = 0.0,
     pipeline_name: str = "",
+    signal_noise_smoothing_level: float | None = None,
 ) -> int:
     """Compute the per-stage scaling recommendation for one cycle.
 
     Mutates ``stage_state`` in place (classifier state, classifier
-    streak, EWMA cache, ``pressure_ewma``, ``prev_workers``); returns
-    the (possibly stabilization-gated) recommended delta. The
-    growth-mode state machine is NOT advanced here. The caller is the
-    only component that knows what the planner actually executed; it
-    must call ``record_executed_delta`` after Phase C / Phase D
-    commit so HOLD / ACQUIRING / TRACKING timers observe the
-    post-commit delta rather than the pre-commit recommendation.
+    streak, EWMA cache, ``pressure_ewma``, ``prev_workers``,
+    ``classifier_signal_noise_ewma``); returns the (possibly
+    stabilization-gated) recommended delta. The growth-mode state
+    machine is NOT advanced here. The caller is the only component
+    that knows what the planner actually executed; it must call
+    ``record_executed_delta`` after Phase C / Phase D commit so HOLD
+    / ACQUIRING / TRACKING timers observe the post-commit delta
+    rather than the pre-commit recommendation.
 
     Args:
         stage_state: Per-stage runtime state. Mutated in place.
@@ -98,6 +100,14 @@ def run_per_stage_pipeline(
         observed_throughput_sample: Per-cycle completed-task rate
             (tasks/sec). ``0.0`` is the cold-start signal.
         pipeline_name: ``pipeline`` Prometheus tag for the pressure gauges.
+        signal_noise_smoothing_level: EWMA smoothing factor in
+            ``(0.0, 1.0]`` applied to the classifier-signal-noise
+            tracker that backs the donor signal-trust gate. ``None``
+            (default; used by helper-direct fixtures and unit tests
+            that never exercise the donor planner) skips the noise
+            update entirely so the field stays in its cold-start
+            ``None`` state. Production callers pass
+            ``SaturationAwareConfig.classifier_signal_noise_smoothing_level``.
 
     Returns:
         Signed recommendation delta: positive to add, negative to
@@ -122,6 +132,12 @@ def run_per_stage_pipeline(
             "resolved_thresholds via _resolve_auto_thresholds(...) at fixture time."
         )
         raise RuntimeError(msg)
+
+    # Snapshot the previous EWMA BEFORE _resolve_classifier_signal mutates it.
+    # The noise tracker compares the prev/next pair for the same stage to
+    # measure classifier flicker; sampling after the update would always
+    # yield zero delta and falsely report a quiet classifier.
+    prev_slots_empty_ratio_ewma = stage_state.slots_empty_ratio_ewma
 
     classifier_input = _resolve_classifier_signal(
         stage_state=stage_state,
@@ -165,6 +181,18 @@ def run_per_stage_pipeline(
             stage_name=stage_state.stage_name,
             pipeline_name=pipeline_name,
         )
+        # Noise update follows the same fresh-sample gating as pressure: a
+        # carry-forward cycle (no new sample) cannot contribute a real delta,
+        # and feeding the noise EWMA with zero deltas during long zero-actor
+        # periods would falsely collapse the tracker toward zero. Cold-start
+        # (prev is None) yields no usable delta either; the first valid delta
+        # then seeds the EWMA via update_ewma's None-as-seed semantics.
+        if signal_noise_smoothing_level is not None and prev_slots_empty_ratio_ewma is not None:
+            stage_state.classifier_signal_noise_ewma = update_ewma(
+                stage_state.classifier_signal_noise_ewma,
+                abs(classifier_input - prev_slots_empty_ratio_ewma),
+                signal_noise_smoothing_level,
+            )
     else:
         # Carry-forward path: reuse the prior pressure EWMA. ``None``
         # collapses to ``0.0`` for the classifier (no-pressure means

@@ -27,6 +27,7 @@ from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py import allocation_failures
+from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorPlan, DonorWorker
 from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
@@ -330,12 +331,16 @@ class TestDonorRetryInvariant:
         # then fails, which the new code routes through
         # ``SchedulerInvariantError``.
         try_add_returns = iter([None, None])
+        donor_plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="stage-w0", age=0),),
+            receiver_stage_index=0,
+        )
         with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=lambda *_a, **_k: next(try_add_returns),
             ):
-                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value="stage"):
+                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value=donor_plan):
                     with patch.object(scheduler, "_record_donation_success") as record_mock:
                         with pytest.raises(SchedulerInvariantError, match="planner state diverged"):
                             scheduler.autoscale(time=0.0, problem_state=ps)

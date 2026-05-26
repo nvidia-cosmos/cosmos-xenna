@@ -146,6 +146,19 @@ class _StageRuntimeState:
             :func:`run_per_stage_pipeline`. ``None`` until the first
             cycle that observes a finite ``D_k`` sample; the cold-start
             sentinel triggers ``compute_delta``'s discrete +/-1 fallback.
+        classifier_signal_noise_ewma: EWMA over absolute deltas in
+            ``slots_empty_ratio_ewma`` between consecutive fresh
+            classifier samples. ``None`` until the second fresh
+            sample arrives (the first usable delta seeds the EWMA
+            via :func:`update_ewma` without alpha-blending). Cycles
+            that re-use the carry-forward EWMA skip the update so
+            zero-actor periods do not push the noise tracker toward
+            zero. Preserved across classifier transitions so a stage
+            that has been historically noisy is not falsely promoted
+            to "quiet" on re-entry. Consumed by the donor signal-trust
+            gate: small values indicate stable classifier output,
+            large values indicate flickering signals that should not
+            drive cross-stage donations.
 
     """
 
@@ -164,6 +177,7 @@ class _StageRuntimeState:
         factory=BottleneckCycleContext,
     )
     capacity_target_workers: int | None = None
+    classifier_signal_noise_ewma: float | None = None
 
 
 def compute_slots_empty_ratio(num_used_slots: int, num_empty_slots: int) -> float:

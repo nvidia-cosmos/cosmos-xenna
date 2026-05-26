@@ -36,11 +36,19 @@ import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorCandidate,
+    DonorPlan,
+    DonorWorker,
     select_youngest_eligible_donor,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _single_donor(plan: DonorPlan | None) -> DonorWorker:
+    """Assert the plan is a single-worker plan and return its sole removal."""
+    assert plan is not None, "selector returned None"
+    assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
+    return plan.removals[0]
 
 
 @attrs.frozen
@@ -151,80 +159,87 @@ class TestSelectYoungestEligibleDonor:
 
         Both have spare workers; the helper returns the upstream donor.
         """
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=2,
-            stage_floors={0: 1, 1: 99, 2: 1, 4: 1},
-            worker_ids_by_stage=[
-                ["upstream-w0", "upstream-w1"],
-                [],
-                ["receiver-w0"],
-                [],
-                ["downstream-w0", "downstream-w1"],
-            ],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=2,
+                stage_floors={0: 1, 1: 99, 2: 1, 4: 1},
+                worker_ids_by_stage=[
+                    ["upstream-w0", "upstream-w1"],
+                    [],
+                    ["receiver-w0"],
+                    [],
+                    ["downstream-w0", "downstream-w1"],
+                ],
+                worker_ages={},
+            )
         )
-        assert donor is not None
         assert donor.stage_index == 0
 
     def test_downstream_donor_used_when_no_upstream_eligible(self) -> None:
         """Receiver is stage 0 (no upstream exists); downstream stage donates."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=0,
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0"], ["B-w0", "B-w1"]],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=0,
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0"], ["B-w0", "B-w1"]],
+                worker_ages={},
+            )
         )
-        assert donor is not None
         assert donor.stage_index == 1
         assert donor.worker_id == "B-w0"
 
     def test_youngest_age_wins_within_eligible_pool(self) -> None:
         """Multiple eligible upstream candidates; the youngest is selected."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=2,
-            stage_floors={0: 1, 1: 1, 2: 1},
-            worker_ids_by_stage=[
-                ["A-w0", "A-w1"],
-                ["B-w0", "B-w1"],
-                [],
-            ],
-            worker_ages={"A-w0": 10, "A-w1": 7, "B-w0": 2, "B-w1": 9},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=2,
+                stage_floors={0: 1, 1: 1, 2: 1},
+                worker_ids_by_stage=[
+                    ["A-w0", "A-w1"],
+                    ["B-w0", "B-w1"],
+                    [],
+                ],
+                worker_ages={"A-w0": 10, "A-w1": 7, "B-w0": 2, "B-w1": 9},
+            )
         )
-        assert donor is not None
         assert donor.worker_id == "B-w0"
         assert donor.age == 2
 
     def test_age_tie_falls_back_to_worker_id_order(self) -> None:
         """Two candidates with the same age fall back to ``worker_id`` ASC."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=2,
-            stage_floors={0: 1, 1: 1, 2: 1},
-            worker_ids_by_stage=[["B-w1", "A-w0"], [], []],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=2,
+                stage_floors={0: 1, 1: 1, 2: 1},
+                worker_ids_by_stage=[["B-w1", "A-w0"], [], []],
+                worker_ages={},
+            )
         )
-        assert donor is not None
         assert donor.worker_id == "A-w0"
 
     def test_missing_floor_defaults_to_one(self) -> None:
         """A stage missing from ``stage_floors`` is assumed to have floor=1."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={},  # Nothing set
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=1,
+                stage_floors={},  # Nothing set
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+                worker_ages={},
+            )
         )
-        assert donor is not None
         assert donor.stage_index == 0
 
-    def test_returns_donor_candidate_with_full_metadata(self) -> None:
-        """The returned ``DonorCandidate`` exposes stage_index, worker_id, and age."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3},
+    def test_returns_donor_worker_with_full_metadata(self) -> None:
+        """The returned ``DonorWorker`` exposes stage_index, worker_id, and age."""
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=1,
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+                worker_ages={"A-w0": 5, "A-w1": 3},
+            )
         )
-        assert donor == DonorCandidate(stage_index=0, worker_id="A-w1", age=3)
+        assert donor == DonorWorker(stage_index=0, worker_id="A-w1", age=3)
 
 
 class TestPhaseBDonorFallback:
@@ -449,11 +464,13 @@ class TestSelectYoungestEligibleDonorAdversarial:
 
     def test_receiver_stage_index_out_of_range_does_not_pick_self(self) -> None:
         """If the receiver index is out of range, no stage is excluded; donor still picks correctly."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=99,  # Out of range; the helper does not validate this.
-            stage_floors={0: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"]],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=99,  # Out of range; the helper does not validate this.
+                stage_floors={0: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"]],
+                worker_ages={},
+            )
         )
         # The helper does not raise on out-of-range receiver; it treats every stage as eligible.
         # This is documented behaviour: the caller is expected to pass a valid receiver index.
@@ -466,36 +483,40 @@ class TestSelectYoungestEligibleDonorAdversarial:
         The helper does not enforce a positive floor; it is the caller's
         responsibility to set ``stage_floors`` to safe values.
         """
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={0: 0, 1: 1},
-            worker_ids_by_stage=[["A-w0"], []],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=1,
+                stage_floors={0: 0, 1: 1},
+                worker_ids_by_stage=[["A-w0"], []],
+                worker_ages={},
+            )
         )
         # 1 - 1 = 0 >= 0, eligible.
-        assert donor is not None
         assert donor.stage_index == 0
 
     def test_negative_floor_treated_as_floor_zero(self) -> None:
         """Negative floors are not clamped; the comparison still works correctly."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={0: -5, 1: 1},
-            worker_ids_by_stage=[["A-w0"], []],
-            worker_ages={},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=1,
+                stage_floors={0: -5, 1: 1},
+                worker_ids_by_stage=[["A-w0"], []],
+                worker_ages={},
+            )
         )
         # 1 - 1 = 0 >= -5, eligible.
         assert donor is not None
 
     def test_huge_age_values_sort_correctly(self) -> None:
         """Workers with very large ages still sort correctly against younger ones."""
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=2,
-            stage_floors={0: 1, 1: 1, 2: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0", "B-w1"], []],
-            worker_ages={"A-w0": 10**18, "A-w1": 10**18, "B-w0": 1, "B-w1": 5},
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=2,
+                stage_floors={0: 1, 1: 1, 2: 1},
+                worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0", "B-w1"], []],
+                worker_ages={"A-w0": 10**18, "A-w1": 10**18, "B-w0": 1, "B-w1": 5},
+            )
         )
-        assert donor is not None
         assert donor.worker_id == "B-w0"
         assert donor.age == 1
 
@@ -506,13 +527,14 @@ class TestSelectYoungestEligibleDonorAdversarial:
         # Inject one worker with age 0 in stage 25.
         worker_ages["S25-w0"] = 0
         # Receiver is stage 49 (last); stage 25 is upstream; floor=1 everywhere.
-        donor = select_youngest_eligible_donor(
-            receiver_stage_index=49,
-            stage_floors={s: 1 for s in range(50)},
-            worker_ids_by_stage=worker_ids_by_stage,
-            worker_ages=worker_ages,
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=49,
+                stage_floors={s: 1 for s in range(50)},
+                worker_ids_by_stage=worker_ids_by_stage,
+                worker_ages=worker_ages,
+            )
         )
-        assert donor is not None
         assert donor.worker_id == "S25-w0"
         assert donor.age == 0
 
@@ -607,12 +629,15 @@ class TestPhaseBDonorFallbackAdversarial:
         donor_calls = [
             call
             for call in info.call_args_list
-            if "cross-stage minimum-floor donor accepted" in (call.args[0] if call.args else "")
+            if "cross-stage minimum-floor donor plan accepted" in (call.args[0] if call.args else "")
         ]
         assert len(donor_calls) == 1
         msg = donor_calls[0].args[0]
-        assert "donor_stage_index=0" in msg
-        assert "donor_age=" in msg
+        # The structured DonorPlan log carries planner indices, not human stage names,
+        # plus the per-worker age list so operators can correlate with the worker
+        # ledger emitted elsewhere in the cycle.
+        assert "removals=[(0, " in msg
+        assert "ages=" in msg
 
     def test_no_eligible_donor_message_includes_remediation_hint(self) -> None:
         """The no-donor error message tells the operator how to recover."""
@@ -668,7 +693,7 @@ class TestPhaseBDonorFallbackAdversarial:
                 return True
 
         ctx = _InfeasibleProbeContext()
-        expected = r"post-donation retry returned no placement .*donor_stage_index=0, donor_worker_id='donor-w0'"
+        expected = r"post-donation retry returned no placement \(removals=\[\(0, 'donor-w0'\)\]\)"
         with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.info") as info:
             with pytest.raises(RuntimeError, match=expected):
                 scheduler._run_phase_b_floor(

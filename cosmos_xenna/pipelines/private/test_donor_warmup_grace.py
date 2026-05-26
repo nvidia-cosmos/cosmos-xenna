@@ -67,7 +67,8 @@ from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorCandidate,
+    DonorPlan,
+    DonorWorker,
     find_saturation_donor,
     select_youngest_eligible_donor,
 )
@@ -75,6 +76,13 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import Satura
 from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _single_donor(plan: DonorPlan | None) -> DonorWorker:
+    """Assert the plan is a single-worker plan and return its sole removal."""
+    assert plan is not None, "selector returned None"
+    assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
+    return plan.removals[0]
 
 
 def _stage_runtime_over_provisioned(
@@ -219,15 +227,16 @@ class TestSaturationDonorWarmupFilter:
 
     def test_excluded_donor_skipped(self, base_kwargs: dict[str, Any]) -> None:
         """An excluded donor candidate is skipped; the next eligible worker is picked."""
-        result = find_saturation_donor(
-            worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
-            excluded_worker_ids=frozenset({"a-w0"}),
-            **base_kwargs,
+        donor = _single_donor(
+            find_saturation_donor(
+                worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
+                excluded_worker_ids=frozenset({"a-w0"}),
+                **base_kwargs,
+            )
         )
 
-        assert isinstance(result, DonorCandidate)
-        assert result.worker_id != "a-w0"
-        assert result.worker_id in {"a-w1", "a-w2"}
+        assert donor.worker_id != "a-w0"
+        assert donor.worker_id in {"a-w1", "a-w2"}
 
     def test_full_donor_pool_excluded_returns_none(self, base_kwargs: dict[str, Any]) -> None:
         """When every donor stage's workers are excluded, no donor is selected."""
@@ -241,15 +250,16 @@ class TestSaturationDonorWarmupFilter:
 
     def test_none_excluded_set_includes_all_workers(self, base_kwargs: dict[str, Any]) -> None:
         """``excluded_worker_ids=None`` matches the unfiltered contract; every worker is eligible."""
-        result = find_saturation_donor(
-            worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-            excluded_worker_ids=None,
-            **base_kwargs,
+        donor = _single_donor(
+            find_saturation_donor(
+                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
+                excluded_worker_ids=None,
+                **base_kwargs,
+            )
         )
 
         # The youngest donor wins (a-w1 has age 1 vs a-w0 age 50).
-        assert isinstance(result, DonorCandidate)
-        assert result.worker_id == "a-w1"
+        assert donor.worker_id == "a-w1"
 
     def test_excluded_does_not_bypass_floor(self, base_kwargs: dict[str, Any]) -> None:
         """A stage at its floor is still ineligible regardless of the excluded set."""
@@ -297,16 +307,17 @@ class TestFloorDonorSelectionUnfiltered:
 
     def test_floor_donor_picks_warmup_worker_when_only_choice(self) -> None:
         """Even a freshly-ready worker is fair game for floor enforcement."""
-        result = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-            worker_ages={"a-w0": 50, "a-w1": 0},  # a-w1 is brand new
+        donor = _single_donor(
+            select_youngest_eligible_donor(
+                receiver_stage_index=1,
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
+                worker_ages={"a-w0": 50, "a-w1": 0},  # a-w1 is brand new
+            )
         )
 
-        assert isinstance(result, DonorCandidate)
         # The youngest donor wins regardless of "warmup" status.
-        assert result.worker_id == "a-w1"
+        assert donor.worker_id == "a-w1"
 
     def test_floor_donor_signature_has_no_excluded_param(self) -> None:
         """Defensive: floor donor's call signature pins the contract.

@@ -862,6 +862,94 @@ class SaturationAwareConfig:
     # subsumed by the OVER_PROVISIONED + streak gate (across cycles)
     # and the natural per-receiver intent bound (within one cycle).
     cross_stage_donor_anti_flap_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+
+    # Streak bonus applied to donor cost so long-OVER_PROVISIONED stages
+    # are perceived as cheaper donors. Cost expression:
+    # ``donor_cost = slots_empty_ratio_ewma * num_workers
+    #                - cross_stage_donor_streak_bonus * min(streak, streak_cap)``.
+    # A larger value tilts selection toward stages with sustained idle slots.
+    cross_stage_donor_streak_bonus: float = attrs.field(default=0.05, validator=attrs.validators.ge(0.0))
+    # Bottleneck-severity weight applied to receiver value. Value expression:
+    # ``receiver_value = pressure_ewma * num_workers
+    #                    + cross_stage_donor_bottleneck_weight * (D_k - median_D_k)
+    #                    + cross_stage_donor_intent_weight * receiver_intent``.
+    # A larger value pulls demand toward stages with high ``D_k`` relative
+    # to the cluster median.
+    cross_stage_donor_bottleneck_weight: float = attrs.field(default=1.0, validator=attrs.validators.ge(0.0))
+    # Intent weight applied to receiver value (same expression as
+    # ``cross_stage_donor_bottleneck_weight``). A larger value lets a
+    # higher-intent receiver outbid a comparably saturated peer.
+    cross_stage_donor_intent_weight: float = attrs.field(default=0.5, validator=attrs.validators.ge(0.0))
+    # Upper bound on the ``classifier_streak`` term in donor_cost. Prevents
+    # one stage with an arbitrarily long streak from dominating the score.
+    cross_stage_donor_streak_cap: int = attrs.field(default=60, validator=attrs_utils.validate_positive_int)
+    # Minimum ``receiver_value - donor_cost`` required to commit a donation.
+    cross_stage_donor_spread_threshold: float = attrs.field(default=0.5, validator=attrs.validators.ge(0.0))
+
+    # Maximum allowed regression in pipeline throughput estimate
+    # ``1.0 / max_k(D_k)`` before the donor commit gate rejects a plan.
+    cross_stage_donor_throughput_tolerance: float = attrs.field(
+        default=0.01,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Maximum amount a donor stage's post-plan ``D_k`` may exceed the
+    # pre-plan ``max_k(D_k)`` before the donor-flip guard fires.
+    cross_stage_donor_donor_flip_tolerance: float = attrs.field(
+        default=0.10,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Maximum allowed regression in ``balance_score = 1 / max(1, heterogeneity_ratio)``
+    # when ``throughput_estimate`` is tied within ``cross_stage_donor_throughput_tolerance``.
+    cross_stage_donor_balance_tolerance: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.ge(0.0),
+    )
+
+    # Minimum ``signal_trust`` a donor must clear before its classifier
+    # signal is trusted enough to drive a donation. Signal trust is
+    # ``min(streak, trust_streak_cap) / (1 + classifier_signal_noise_ewma)``;
+    # noisy classifiers fail the gate even if their streak is long.
+    cross_stage_donor_min_trust: float = attrs.field(
+        default=1.0,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Upper bound on the streak term in signal_trust. Mirrors the
+    # ``cross_stage_donor_streak_cap`` clamp but is tunable independently
+    # so trust and marginal-value scoring can evolve separately.
+    cross_stage_donor_trust_streak_cap: int = attrs.field(
+        default=60,
+        validator=attrs_utils.validate_positive_int,
+    )
+    # EWMA smoothing level for the per-stage classifier-signal-noise
+    # tracker driving ``signal_trust``. Smaller values respond more slowly
+    # to flicker; uses the same ``(0, 1]`` interval as the other
+    # ``_smoothing_level`` fields.
+    classifier_signal_noise_smoothing_level: float = attrs.field(
+        default=0.2,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Maximum number of donor workers in one DonorPlan. Bounds the
+    # resource-fit search width.
+    cross_stage_donor_max_plan_size: int = attrs.field(
+        default=4,
+        validator=attrs_utils.validate_positive_int,
+    )
+    # Maximum number of candidate combinations probed per plan size.
+    # Bounds the resource-fit search depth on pathological clusters.
+    cross_stage_donor_max_plan_combinations: int = attrs.field(
+        default=32,
+        validator=attrs_utils.validate_positive_int,
+    )
+
+    # End-of-cycle ``balance_score`` regression tolerance. When the
+    # post-cycle score drops below the pre-cycle score by more than this
+    # amount, one WARN log fires. No hard failure; balance is a secondary
+    # objective and the autoscaler does not raise on regression.
+    cross_stage_donor_balance_regression_tolerance: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.ge(0.0),
+    )
     # Number of consecutive cycles the minimum-worker floor enforcement may
     # fail without receiver progress (cluster placement exhausted AND no
     # eligible cross-stage donor) before raising ``RuntimeError`` and failing

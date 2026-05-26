@@ -715,6 +715,38 @@ class TestBottleneckDecisionFields:
         assert scheduler._s_k_ewma["A"] == pytest.approx(5.0)
         assert scheduler._s_k_ewma["B"] == pytest.approx(0.5)
 
+    def test_classifier_signal_noise_smoothing_level_one_latches_to_latest_delta(self) -> None:
+        """``classifier_signal_noise_smoothing_level=1.0`` makes the noise EWMA latch onto the latest delta.
+
+        Drives the scheduler through two autoscale cycles with distinct slot
+        ratios. With ``slots_empty_ratio_smoothing_level=1.0`` the raw EWMA
+        equals the raw sample, so the absolute delta seen by the noise
+        tracker is deterministic. The wiring contract pinned here is that
+        the scheduler reads ``self._config.classifier_signal_noise_smoothing_level``
+        and passes it down to ``run_per_stage_pipeline`` -- the noise EWMA
+        only updates when the kwarg is forwarded.
+        """
+        sat_cfg = SaturationAwareConfig(
+            classifier_signal_noise_smoothing_level=1.0,
+            stage_defaults=SaturationAwareStageConfig(
+                slots_empty_ratio_smoothing_level=1.0,
+                min_data_points=1,
+                worker_warmup_measurement_grace_s=0.0,
+            ),
+        )
+        scheduler = SaturationAwareScheduler(sat_cfg)
+        scheduler.setup(_problem(["S"]))
+
+        # Cycle 1: ratio = 6 / 8 = 0.75. Cold-start -> no delta -> noise stays None.
+        ps1 = _problem_state_with_signals([("S", 1, 8, 2, 6)], input_queue_depth=10)
+        scheduler.autoscale(time=0.0, problem_state=ps1)
+        assert scheduler._stage_states["S"].classifier_signal_noise_ewma is None
+
+        # Cycle 2: ratio = 2 / 8 = 0.25. Delta = |0.25 - 0.75| = 0.50. Latched.
+        ps2 = _problem_state_with_signals([("S", 1, 8, 6, 2)], input_queue_depth=10)
+        scheduler.autoscale(time=1.0, problem_state=ps2)
+        assert scheduler._stage_states["S"].classifier_signal_noise_ewma == pytest.approx(0.50)
+
     def test_bottleneck_heterogeneity_threshold_above_ratio_disengages(self) -> None:
         """A threshold larger than the computed ratio leaves engagement off."""
         # max=3.0, median=1.0 (n=3) -> ratio=3.0.
@@ -863,6 +895,7 @@ class TestConfigWiringMetaCoverage:
         "bottleneck_d_k_smoothing_level",
         "bottleneck_heterogeneity_threshold",
         "bottleneck_engagement_persistence_cycles",
+        "classifier_signal_noise_smoothing_level",
     }
 
     _STAGE_BEHAVIOR_TESTS: ClassVar[set[str]] = {
@@ -906,6 +939,23 @@ class TestConfigWiringMetaCoverage:
         "cluster_heterogeneity_warn_streak",
         "stage_defaults",
         "per_stage_overrides",
+        # Donor-economics fields. Consumed by the saturation-mode
+        # cross-stage donor planner; behavior tests land alongside
+        # the donor planner's economics wiring and remove these
+        # entries one by one.
+        "cross_stage_donor_streak_bonus",
+        "cross_stage_donor_bottleneck_weight",
+        "cross_stage_donor_intent_weight",
+        "cross_stage_donor_streak_cap",
+        "cross_stage_donor_spread_threshold",
+        "cross_stage_donor_throughput_tolerance",
+        "cross_stage_donor_donor_flip_tolerance",
+        "cross_stage_donor_balance_tolerance",
+        "cross_stage_donor_min_trust",
+        "cross_stage_donor_trust_streak_cap",
+        "cross_stage_donor_max_plan_size",
+        "cross_stage_donor_max_plan_combinations",
+        "cross_stage_donor_balance_regression_tolerance",
     }
 
     _KNOWN_COVERAGE_GAPS_STAGE_BEHAVIOR: ClassVar[set[str]] = {
