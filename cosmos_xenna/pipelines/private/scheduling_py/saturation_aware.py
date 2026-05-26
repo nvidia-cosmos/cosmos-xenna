@@ -74,8 +74,10 @@ from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
     BottleneckEngagementState,
     BottleneckIdentity,
     HeterogeneityWarnState,
+    compute_balance_score,
     compute_d_k,
     compute_heterogeneity_ratio,
+    emit_balance_score,
     emit_bottleneck_score,
     identify_bottleneck,
     maybe_log_bottleneck_engagement,
@@ -83,6 +85,8 @@ from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
 from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_grow_priority_order
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
     DonorPlan,
+    RejectReason,
+    _format_donor_decision_log,
     find_saturation_donor,
     select_youngest_eligible_donor,
 )
@@ -396,6 +400,11 @@ class SaturationAwareScheduler:
         self._s_k_ewma: dict[str, float] = {}
         self._d_k_now: dict[str, float] = {}
         self._effective_capacities: dict[str, int] = {}
+        # Cycle-start balance snapshot used by the per-cycle balance
+        # regression invariant; refreshed in ``_autoscale_body`` right
+        # after ``identify_bottleneck`` and consumed at end-of-cycle
+        # before ``into_solution``.
+        self._balance_score_start: float = math.nan
         self._last_bottleneck_meta: BottleneckIdentity | None = None
         self._bottleneck_engagement_state: BottleneckEngagementState = BottleneckEngagementState()
         # Per-stage latch for the Phase D bottleneck-protection INFO log.
@@ -450,6 +459,7 @@ class SaturationAwareScheduler:
         self._s_k_ewma = {name: math.nan for name in self._stage_names}
         self._d_k_now = {}
         self._effective_capacities = {}
+        self._balance_score_start = math.nan
         self._last_bottleneck_meta = None
         self._bottleneck_engagement_state.reset()
         self._bottleneck_protected_stages_logged = set()
@@ -1023,6 +1033,13 @@ class SaturationAwareScheduler:
                 self._d_k_now,
                 heterogeneity_threshold=self._config.bottleneck_heterogeneity_threshold,
             )
+            # Capture the cycle's start-of-cycle balance score so the
+            # post-Phase-D invariant can detect a regression introduced
+            # by this cycle's combined manual / floor / saturation /
+            # shrink mutations. The end-of-cycle check fires before
+            # ``into_solution`` so an operator sees the WARN aligned
+            # with the same cycle counter that produced the regression.
+            self._balance_score_start = compute_balance_score(self._d_k_now)
             self._refresh_cycle_bottleneck_context()
             # Engagement log is silenced when both decision toggles are off:
             # disabling both decision paths must not introduce a new
@@ -1162,6 +1179,30 @@ class SaturationAwareScheduler:
             warn_threshold=self._config.cluster_heterogeneity_warn_threshold,
             warn_streak_cycles=self._config.cluster_heterogeneity_warn_streak,
         )
+        # Pipeline balance gauge + soft regression invariant.
+        # Gauge value follows the heterogeneity gauge convention --
+        # observe the cycle's measured ``D_k`` snapshot so operators
+        # see "current cluster balance" graphed alongside the
+        # heterogeneity ratio. The regression check separately
+        # simulates an end-of-cycle ``D_k`` from the planner's
+        # post-Phase-D worker counts (intrinsic ``S_k`` held fixed)
+        # so it can detect cumulative regressions from this cycle's
+        # combined manual / floor / saturation / shrink decisions
+        # before they show up in the NEXT cycle's measurement. The
+        # WARN does NOT raise - balance is a secondary objective
+        # behind the throughput gate the donor planner already
+        # enforces.
+        emit_balance_score(self._d_k_now, pipeline_name=self._pipeline_name)
+        post_cycle_worker_counts = ctx.worker_ids_by_stage()
+        d_k_end = {
+            stage_name: compute_d_k(
+                self._s_k_ewma.get(stage_name, math.nan),
+                len(post_cycle_worker_counts[stage_index]) if stage_index < len(post_cycle_worker_counts) else 0,
+            )
+            for stage_index, stage_name in enumerate(self._stage_names)
+            if stage_name in self._d_k_now
+        }
+        self._maybe_warn_balance_regression(compute_balance_score(d_k_end))
 
         with self._phase_timer("into_solution"):
             solution = ctx.into_solution()
@@ -1181,6 +1222,40 @@ class SaturationAwareScheduler:
             f"heterogeneity_fired={self._heterogeneity_state.has_fired}, "
             f"phase_c_allocation_failure={self._phase_c_allocation_failure}"
         )
+
+    def _maybe_warn_balance_regression(self, balance_score_end: float) -> None:
+        """Emit one WARN log when end-of-cycle balance regressed beyond tolerance.
+
+        Balance is a secondary objective behind throughput, so a
+        regression is informational only - the donor commit gate
+        already enforces throughput non-regression on every plan.
+        Operators see this WARN when the cycle's combined
+        manual / floor / saturation / shrink decisions cumulatively
+        worsened pipeline balance by more than
+        ``cross_stage_donor_balance_regression_tolerance``.
+
+        Args:
+            balance_score_end: End-of-cycle balance score from
+                :func:`emit_balance_score`.
+        """
+        # NaN comparisons short-circuit to False, so cold-start
+        # cycles (fewer than two stages with finite ``D_k``) never
+        # fire the WARN even though ``balance_score_start`` and
+        # ``balance_score_end`` are both NaN.
+        if (
+            math.isfinite(self._balance_score_start)
+            and math.isfinite(balance_score_end)
+            and balance_score_end
+            < self._balance_score_start - self._config.cross_stage_donor_balance_regression_tolerance
+        ):
+            logger.warning(
+                f"[scheduler] pipeline balance regression: "
+                f"pipeline={self._pipeline_name!r} "
+                f"cycle={self._cycle_counter} "
+                f"balance_score_start={self._balance_score_start:.4f} "
+                f"balance_score_end={balance_score_end:.4f} "
+                f"tolerance={self._config.cross_stage_donor_balance_regression_tolerance:.4f}"
+            )
 
     def _next_cycle_worker_ages(self) -> dict[str, int]:
         """Build the planner's age seed for the next autoscale cycle.
@@ -2008,6 +2083,7 @@ class SaturationAwareScheduler:
                 # donation+retry.
                 donor_plan = self._attempt_cross_stage_donation(
                     ctx=ctx,
+                    problem_state=problem_state,
                     receiver_stage_index=stage_index,
                     receiver_stage_name=stage_name,
                 )
@@ -2047,19 +2123,24 @@ class SaturationAwareScheduler:
         self,
         *,
         ctx: data_structures.AutoscalePlanContext,
+        problem_state: data_structures.ProblemState,
         receiver_stage_index: int,
         receiver_stage_name: str,
     ) -> DonorPlan | None:
         """Try to free a placement for a saturation-driven receiver.
 
         Selects an eligible donor plan via
-        :func:`find_saturation_donor` (anti-flap + strict-upstream +
-        master-toggle filters), proves the planned removals would
-        unblock the receiver via ``ctx.probe_add_after_removals``
-        (no-op dry-run on a cloned cluster), then commits every
-        removal atomically via ``ctx.remove_workers_atomically``.
-        The ``_last_donation_cycle`` ledger is NOT updated here;
-        the caller MUST advance it via
+        :func:`find_saturation_donor`, which runs the bounded
+        multi-donor resource-fit search internally using
+        ``ctx.probe_add_after_removals`` as the feasibility oracle;
+        the search returns the smallest feasible plan honouring
+        anti-flap, strict-upstream, master-toggle, donor-floor, and
+        warmup-exclusion gates. This method then re-runs the probe
+        for the chosen plan as a defence-in-depth check (no-op
+        dry-run on a cloned cluster) and commits every removal
+        atomically via ``ctx.remove_workers_atomically``. The
+        ``_last_donation_cycle`` ledger is NOT updated here; the
+        caller MUST advance it via
         :meth:`_record_donation_success` only after the immediate
         ``try_add_worker`` retry succeeds for the receiver, so a
         retry-failure path leaves every donor stage eligible to be
@@ -2070,9 +2151,10 @@ class SaturationAwareScheduler:
             selected, probe-validated, and atomically removed (the
             caller now owns the receiver retry and the ledger
             bookkeeping). ``None`` when the master toggle is off,
-            when no eligible donor exists, or when the planner
-            cannot prove the receiver would fit after the planned
-            removals.
+            when no eligible donor plan exists at any plan_size up
+            to ``cross_stage_donor_max_plan_size``, or when the
+            second-pass probe cannot reproduce the planner's
+            feasibility decision (placement raced).
 
         Raises:
             RuntimeError: The scheduler has not been set up.
@@ -2090,54 +2172,120 @@ class SaturationAwareScheduler:
         stage_floors = self._compute_stage_floors(num_nodes)
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
+        worker_nodes = self._build_worker_node_map(problem_state)
         stage_configs = {name: self._stage_cfg(name) for name in self._stage_names}
 
-        plan = find_saturation_donor(
+        decision = find_saturation_donor(
             receiver_stage_index=receiver_stage_index,
             receiver_stage_name=receiver_stage_name,
             stage_names=self._stage_names,
             stage_floors=stage_floors,
             worker_ids_by_stage=worker_ids_by_stage,
             worker_ages=worker_ages,
+            worker_nodes=worker_nodes,
             stage_states=self._stage_states,
             config=self._config,
             stage_configs=stage_configs,
             cycle=self._cycle_counter,
             last_donation_cycle=self._last_donation_cycle,
+            ctx=ctx,
+            receiver_intent=self._last_intent_deltas.get(receiver_stage_name, 0),
+            d_k_now=self._d_k_now,
+            effective_capacities=self._effective_capacities,
+            s_k_ewma=self._s_k_ewma,
             excluded_worker_ids=self._donor_warmup_excluded_ids,
         )
-        if plan is None:
+        if decision is None:
             return None
 
+        plan = decision.plan
         removals = [(w.stage_index, w.worker_id) for w in plan.removals]
-        donor_stage_names = sorted({self._stage_names[w.stage_index] for w in plan.removals})
+        capacity_before = decision.receiver_capacity_before
+        capacity_after = capacity_before + len(plan.removals)
+        receiver_state = self._stage_states.get(receiver_stage_name)
+        receiver_d_k = self._d_k_now.get(receiver_stage_name, math.nan)
+        receiver_intent = self._last_intent_deltas.get(receiver_stage_name, 0)
+
+        # Defence-in-depth re-probe: ``_resource_fit_plan`` already
+        # selected this plan via a feasible probe, but a concurrent
+        # cluster mutation between selection and commit could
+        # invalidate that result. The repeat probe is cheap (cloned
+        # cluster, no mutation) and a failure here surfaces as a
+        # logged DEBUG miss rather than a SchedulerInvariantError.
         probe = ctx.probe_add_after_removals(removals, receiver_stage_index)
         if not probe.feasible:
             logger.debug(
-                f"[scheduler] saturation-mode donor probe rejected: "
-                f"donor_plan={[(self._stage_names[w.stage_index], w.worker_id) for w in plan.removals]!r} "
-                f"-> receiver {receiver_stage_name!r} reject_reason="
-                f"{probe.reject_reason!r}; donation skipped, receiver waits "
-                "for next cycle."
+                _format_donor_decision_log(
+                    receiver_name=receiver_stage_name,
+                    receiver_state=receiver_state,
+                    receiver_d_k=receiver_d_k,
+                    receiver_intent=receiver_intent,
+                    capacity_before=capacity_before,
+                    capacity_after=capacity_before,
+                    plan=plan,
+                    stage_names=self._stage_names,
+                    gate_result=decision.gate_result,
+                    spread_threshold=self._config.cross_stage_donor_spread_threshold,
+                    reject_reason=RejectReason.RESOURCE_FIT.value,
+                    placement_reject_reason=probe.reject_reason or "",
+                )
             )
             return None
 
         if not ctx.remove_workers_atomically(removals):
             msg = (
                 f"saturation-mode donation: pre-validated donor plan "
-                f"{[(w.stage_index, w.worker_id) for w in plan.removals]!r} for receiver "
-                f"{receiver_stage_name!r} disappeared between probe and "
-                "atomic-removal; planner snapshot diverged mid-cycle."
+                f"{removals!r} for receiver {receiver_stage_name!r} disappeared "
+                "between probe and atomic-removal; planner snapshot diverged "
+                "mid-cycle."
             )
             raise SchedulerInvariantError(msg)
 
         logger.info(
-            f"[scheduler] saturation-mode donation: donor_stages={donor_stage_names!r} "
-            f"workers={[(self._stage_names[w.stage_index], w.worker_id, w.age) for w in plan.removals]!r} "
-            f"-> receiver stage {receiver_stage_name!r} at cycle "
-            f"{self._cycle_counter} (pending retry)."
+            _format_donor_decision_log(
+                receiver_name=receiver_stage_name,
+                receiver_state=receiver_state,
+                receiver_d_k=receiver_d_k,
+                receiver_intent=receiver_intent,
+                capacity_before=capacity_before,
+                capacity_after=capacity_after,
+                plan=plan,
+                stage_names=self._stage_names,
+                gate_result=decision.gate_result,
+                spread_threshold=self._config.cross_stage_donor_spread_threshold,
+                reject_reason=None,
+            )
         )
         return plan
+
+    @staticmethod
+    def _build_worker_node_map(problem_state: data_structures.ProblemState) -> dict[str, str]:
+        """Return ``worker_id -> node_id`` for every worker_group in the cycle snapshot.
+
+        The donor resource-fit search consumes this mapping to
+        prefer same-node combinations: freeing a whole-GPU
+        receiver shape from one node's freed allocations is more
+        likely to succeed than freeing the same total GPUs spread
+        across nodes (the FGD/SPMD allocator binds a worker to one
+        node at a time).
+
+        For multi-allocation worker groups (SPMD groups with one
+        ``WorkerResourcesInternal`` per actor) every allocation
+        shares the same node by construction; the helper reads the
+        first allocation's node and trusts the SPMD-placement
+        invariant the planner already enforces. Worker groups with
+        no allocations contribute no entry; the resource-fit search
+        treats missing entries as "unknown locality" and groups
+        them into a single bucket alongside other unknown-node
+        workers.
+        """
+        worker_nodes: dict[str, str] = {}
+        for stage in problem_state.rust.stages:
+            for worker_group in stage.worker_groups:
+                if not worker_group.resources:
+                    continue
+                worker_nodes[worker_group.id] = worker_group.resources[0].node
+        return worker_nodes
 
     def _record_donation_success(self, *, plan: DonorPlan) -> None:
         """Advance the donor-side anti-flap timestamp on retry success.
@@ -2735,6 +2883,12 @@ class SaturationAwareScheduler:
             raise RuntimeError(msg)
         num_nodes = self._problem.rust.cluster_resources.num_nodes()
         stage_floors = self._compute_stage_floors(num_nodes)
+        # The worker_nodes map is recomputed once at phase entry; donor
+        # commits within this loop mutate the planner's working state
+        # but the per-cycle problem_state snapshot stays fixed, so the
+        # locality input for ``_resource_fit_plan`` is the cycle-start
+        # node assignment for every stage's pre-cycle workers.
+        worker_nodes = self._build_worker_node_map(problem_state)
         for stage_index, problem_stage in enumerate(self._problem.rust.stages):
             if problem_stage.requested_num_workers is not None:
                 # Manual stages have their worker count owned by the manual-shrink/grow path.
@@ -2756,11 +2910,19 @@ class SaturationAwareScheduler:
                     continue
                 # Cluster is full for the receiver's shape; attempt the
                 # cross-stage donor fallback before deciding whether to raise.
+                # Floor mode shares the bounded multi-donor resource-fit
+                # search with saturation mode but skips the economic gate;
+                # the only filters are floor preservation, upstream
+                # preference, and resource-fit feasibility.
                 donor_plan = select_youngest_eligible_donor(
                     receiver_stage_index=stage_index,
                     stage_floors=stage_floors,
                     worker_ids_by_stage=ctx.worker_ids_by_stage(),
                     worker_ages=ctx.worker_ages(),
+                    worker_nodes=worker_nodes,
+                    ctx=ctx,
+                    max_plan_size=self._config.cross_stage_donor_max_plan_size,
+                    max_plan_combinations=self._config.cross_stage_donor_max_plan_combinations,
                 )
                 if donor_plan is None:
                     if made_progress and self._config.floor_stuck_grace_cycles > 0:

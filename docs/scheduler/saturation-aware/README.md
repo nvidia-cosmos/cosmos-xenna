@@ -29,8 +29,10 @@ cycle (`A → B → C → D`) the scheduler runs every tick:
   counters that gate every decision.
 - **Growth & Scale (green)** — the `ACQUIRING → TRACKING → HOLD`
   growth-mode state machine, three-layer slow-start, multi-target
-  DAG growth, the five-layer anti-flap cross-stage donor, and
-  youngest-first / idle-first victim selection.
+  DAG growth, the four-layer eligibility funnel + bounded multi-donor
+  resource-fit search + throughput-first commit gate that drives
+  cross-stage donations, and youngest-first / idle-first victim
+  selection.
 - **Safeguards (red)** — hard caps and floors, phase invariants,
   loop watchdog, cluster-wide memory-pressure gate, and
   allocation-error tolerance. These run *around* every phase and
@@ -106,9 +108,10 @@ adjust a knob in production, jump to:
 | [10-slow-start-mechanisms.md](10-slow-start-mechanisms.md) | Three layers that suppress cold-start overshoot |
 | [11-growth-mode-state-machine.md](11-growth-mode-state-machine.md) | `ACQUIRING` → `TRACKING` → `HOLD` |
 | [12-multi-target-dag-growth.md](12-multi-target-dag-growth.md) | Why all saturated stages grow per cycle |
-| [13-cross-stage-donor.md](13-cross-stage-donor.md) | Five-layer anti-flap donor protocol |
+| [13-cross-stage-donor.md](13-cross-stage-donor.md) | Four-layer anti-flap donor eligibility funnel |
 | [14-worker-age-tracking.md](14-worker-age-tracking.md) | Youngest-first donor selection substrate |
 | [15-idle-first-scale-down.md](15-idle-first-scale-down.md) | Phase D consolidation-aware victim ordering |
+| [29-cross-stage-donor-resource-fit.md](29-cross-stage-donor-resource-fit.md) | Bounded multi-donor resource-fit search + throughput-first commit gate |
 
 ### Safeguards
 

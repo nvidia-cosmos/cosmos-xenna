@@ -25,7 +25,7 @@ plus the one end-to-end wiring point in
     Law ``D_k = V_k * S_k / c_k`` (with ``V_k = 1`` for Xenna's
     linear DAG, so ``D_k = S_k / c_k``).
   * The INFO log names the bottleneck stage selected by
-    :func:`identify_bottleneck` -- the operator-facing log cannot
+    :func:`identify_bottleneck` - the operator-facing log cannot
     disagree with the planner's near-tie verdict.
   * Cold-start stages (NaN or non-positive ``D_k``) observe
     ``math.nan`` on the gauge and are excluded from the argmax.
@@ -37,7 +37,7 @@ plus the one end-to-end wiring point in
   * :meth:`SaturationAwareScheduler.autoscale` invokes the helper
     exactly once per cycle.
 
-The helper is pure observability -- these tests do not exercise
+The helper is pure observability - these tests do not exercise
 any autoscaler behaviour beyond confirming the wire-up point in
 ``autoscale()``.
 """
@@ -914,7 +914,7 @@ class TestComputeDk:
     """
 
     def test_d_k_divides_by_actor_count(self) -> None:
-        """``S_k = 10s, c_k = 5`` -> ``D_k = 2s`` -- the central contract."""
+        """``S_k = 10s, c_k = 5`` -> ``D_k = 2s`` - the central contract."""
         assert compute_d_k(10.0, 5) == pytest.approx(2.0)
 
     def test_zero_actor_count_folds_to_nan(self) -> None:
@@ -1077,3 +1077,66 @@ class TestHeterogeneityRatioActorNormalized:
         # streak-warning log line.
         assert identity.engaged is True
         assert identity.stage_name == "slow_with_few_actors"
+
+
+class TestComputeBalanceScore:
+    """``compute_balance_score`` returns ``1 / max(1, max/min)`` over finite-positive ``D_k``."""
+
+    def test_perfectly_balanced_pipeline_scores_one(self) -> None:
+        """Identical ``D_k`` across stages -> ratio=1 -> balance=1.0."""
+        d_k_by_stage = {"A": 1.0, "B": 1.0}
+
+        assert bottleneck.compute_balance_score(d_k_by_stage) == 1.0
+
+    def test_severe_bottleneck_drops_score_well_below_one(self) -> None:
+        """``max/min = 10`` -> balance = 0.1."""
+        d_k_by_stage = {"A": 1.0, "B": 10.0}
+
+        assert math.isclose(bottleneck.compute_balance_score(d_k_by_stage), 0.1, rel_tol=1e-9)
+
+    def test_cold_start_returns_nan(self) -> None:
+        """Fewer than two finite-positive stages -> NaN, not 0 / 1."""
+        d_k_by_stage = {"A": math.nan, "B": 0.0}
+
+        assert math.isnan(bottleneck.compute_balance_score(d_k_by_stage))
+
+
+class TestEmitBalanceScore:
+    """``emit_balance_score`` updates the gauge AND returns the scalar for the caller."""
+
+    def test_returns_scalar_and_observes_gauge(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The helper hands the scalar back AND observes the gauge with the same value."""
+        # Monkeypatch ``set`` to capture (value, tags) so the wire format
+        # is asserted explicitly, not via reading the gauge's private
+        # name / tag-keys attrs.
+        captured: list[tuple[float, dict[str, str]]] = []
+
+        def fake_set(value: float, *, tags: dict[str, str] | None = None) -> None:
+            captured.append((value, tags or {}))
+
+        monkeypatch.setattr(bottleneck._BALANCE_SCORE_GAUGE, "set", fake_set)
+
+        observed = bottleneck.emit_balance_score({"A": 1.0, "B": 4.0}, pipeline_name="test_pipeline")
+
+        # 1 / max(1, 4/1) = 0.25.
+        assert math.isclose(observed, 0.25, rel_tol=1e-9)
+        assert len(captured) == 1
+        gauge_value, gauge_tags = captured[0]
+        assert math.isclose(gauge_value, 0.25, rel_tol=1e-9)
+        assert gauge_tags == {"pipeline": "test_pipeline"}
+
+    def test_cold_start_observes_nan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cold-start cluster observes NaN so the gauge cardinality stays stable."""
+        captured: list[tuple[float, dict[str, str]]] = []
+
+        def fake_set(value: float, *, tags: dict[str, str] | None = None) -> None:
+            captured.append((value, tags or {}))
+
+        monkeypatch.setattr(bottleneck._BALANCE_SCORE_GAUGE, "set", fake_set)
+
+        observed = bottleneck.emit_balance_score({"A": math.nan, "B": math.nan}, pipeline_name="test_pipeline")
+
+        assert math.isnan(observed)
+        assert len(captured) == 1
+        gauge_value, _ = captured[0]
+        assert math.isnan(gauge_value)

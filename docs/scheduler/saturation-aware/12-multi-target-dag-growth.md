@@ -145,7 +145,10 @@ Phase C also consumes the cross-stage donor toggles on
 `SaturationAwareConfig` when the cluster is full but a
 downstream stage still has positive intent. See
 [13 — cross-stage donor](13-cross-stage-donor.md) for the
-five-layer anti-flap protocol that gates donor selection.
+four-layer eligibility funnel that builds the candidate pool, and
+[29 — cross-stage donor resource-fit](29-cross-stage-donor-resource-fit.md)
+for the bounded multi-donor search and the throughput-first commit
+gate that decide which candidate combination commits.
 
 ## See also
 

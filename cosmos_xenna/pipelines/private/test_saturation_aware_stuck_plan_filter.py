@@ -37,7 +37,7 @@ Pin the contract:
   1. Each early-return path leaves the bailed stage's counter unchanged
      and does NOT raise the strict-+1-or-0 invariant.
   2. A stage Phase C touched with an illegal increment (``curr != prev``
-     and not a valid transition) STILL raises -- the value-diff filter
+     and not a valid transition) STILL raises - the value-diff filter
      does not weaken the helper's strict rule.
   3. ``is_finished`` exclusion still wins: a finished stage carrying a
      stuck counter from a prior cycle never reaches the invariant.

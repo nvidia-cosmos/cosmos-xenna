@@ -34,19 +34,65 @@ The anti-flap layers under test:
 
 from unittest.mock import patch
 
+import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorPlan, DonorWorker, find_saturation_donor
+from cosmos_xenna.pipelines.private.scheduling_py.donor import (
+    DonorDecision,
+    DonorPlan,
+    DonorWorker,
+    find_saturation_donor,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
-def _single_donor(plan: DonorPlan | None) -> DonorWorker:
-    """Assert the plan is a single-worker plan and return its sole removal."""
-    assert plan is not None, "selector returned None"
+@attrs.frozen
+class _AlwaysFeasibleProbeResult:
+    """Stand-in for ``rust_apc.PlacementProbeResult`` that always reports feasible."""
+
+    feasible: bool = True
+    reject_reason: str = ""
+
+
+@attrs.define
+class _AlwaysFeasibleCtx:
+    """Fake autoscale planner context for unit tests of ``find_saturation_donor``.
+
+    The donor planner now consumes ``ctx.probe_add_after_removals`` to
+    drive the resource-fit search. Tests that exercise gating logic
+    (anti-flap, classifier streak, floor preservation, master toggle)
+    do not need to model placement feasibility; the always-feasible
+    fake makes the bounded search return the first candidate at
+    ``plan_size=1``, mirroring the previous single-min selection.
+    Tests that need to model probe rejection should construct their
+    own fake.
+    """
+
+    probe_calls: list[tuple[list[tuple[int, str]], int]] = attrs.field(factory=list)
+
+    def probe_add_after_removals(
+        self,
+        removals: list[tuple[int, str]],
+        add_stage_index: int,
+    ) -> _AlwaysFeasibleProbeResult:
+        self.probe_calls.append((list(removals), add_stage_index))
+        return _AlwaysFeasibleProbeResult()
+
+
+def _single_donor(value: DonorDecision | DonorPlan | None) -> DonorWorker:
+    """Assert the value resolves to a single-worker plan and return its sole removal.
+
+    Accepts either the public ``DonorDecision`` returned by
+    ``find_saturation_donor`` or a bare ``DonorPlan`` so existing
+    test call sites that wrap the helper directly do not need to
+    branch on the new return type.
+    """
+    assert value is not None, "selector returned None"
+    plan = value.plan if isinstance(value, DonorDecision) else value
     assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
     return plan.removals[0]
 
@@ -115,13 +161,28 @@ def _find_donor(
     stage_floors: dict[int, int] | None = None,
     worker_ids_by_stage: list[list[str]] | None = None,
     worker_ages: dict[str, int] | None = None,
+    worker_nodes: dict[str, str] | None = None,
     stage_states: dict[str, _StageRuntimeState] | None = None,
     config: SaturationAwareConfig | None = None,
     stage_configs: dict[str, SaturationAwareStageConfig] | None = None,
     cycle: int = 100,
     last_donation_cycle: dict[str, int] | None = None,
+    ctx: object | None = None,
+    receiver_intent: int = 0,
+    d_k_now: dict[str, float] | None = None,
+    effective_capacities: dict[str, int] | None = None,
+    s_k_ewma: dict[str, float] | None = None,
 ) -> DonorPlan | None:
-    """Call ``find_saturation_donor`` with a two-stage eligible default."""
+    """Call ``find_saturation_donor`` with a two-stage eligible default.
+
+    The ``ctx`` argument defaults to an :class:`_AlwaysFeasibleCtx`
+    so existing tests that exercise gating logic (anti-flap, streak,
+    floor, toggle) do not need to model placement feasibility; the
+    bounded resource-fit search short-circuits at ``plan_size=1``
+    and returns the first single-worker probe (which the always-
+    feasible fake accepts), preserving the prior single-min
+    selection behaviour those tests assert on.
+    """
     if stage_names is None:
         stage_names = ["A", "B"]
     if stage_floors is None:
@@ -130,6 +191,8 @@ def _find_donor(
         worker_ids_by_stage = [["A-w0", "A-w1"], ["B-w0"]]
     if worker_ages is None:
         worker_ages = {"A-w0": 5, "A-w1": 3, "B-w0": 2}
+    if worker_nodes is None:
+        worker_nodes = {}
     if stage_states is None:
         stage_states = {"A": _over_provisioned_state("A"), "B": _saturated_state("B")}
     if config is None:
@@ -138,19 +201,40 @@ def _find_donor(
         stage_configs = {name: _stage_cfg() for name in stage_names}
     if last_donation_cycle is None:
         last_donation_cycle = {}
-    return find_saturation_donor(
+    if ctx is None:
+        ctx = _AlwaysFeasibleCtx()
+    if d_k_now is None:
+        # Cold-start defaults: empty mappings collapse the gate's
+        # throughput / donor-flip / balance checks to NaN-tolerant
+        # short-circuits, so existing tests that exercise only the
+        # layer 1-4 gating logic see the gate as transparent.
+        # Tests that need to exercise the throughput-first economic
+        # gate must pass explicit d_k_now / capacities / s_k_ewma.
+        d_k_now = {}
+    if effective_capacities is None:
+        effective_capacities = {}
+    if s_k_ewma is None:
+        s_k_ewma = {}
+    decision = find_saturation_donor(
         receiver_stage_index=receiver_stage_index,
         receiver_stage_name=receiver_stage_name,
         stage_names=stage_names,
         stage_floors=stage_floors,
         worker_ids_by_stage=worker_ids_by_stage,
         worker_ages=worker_ages,
+        worker_nodes=worker_nodes,
         stage_states=stage_states,
         config=config,
         stage_configs=stage_configs,
         cycle=cycle,
         last_donation_cycle=last_donation_cycle,
+        ctx=ctx,  # type: ignore[arg-type]
+        receiver_intent=receiver_intent,
+        d_k_now=d_k_now,
+        effective_capacities=effective_capacities,
+        s_k_ewma=s_k_ewma,
     )
+    return decision.plan if decision is not None else None
 
 
 def _find_donor_worker(**kwargs: object) -> DonorWorker:
@@ -277,6 +361,12 @@ class TestFindSaturationDonorMasterToggle:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -306,6 +396,12 @@ class TestFindSaturationDonorClassifierLayer:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -327,6 +423,12 @@ class TestFindSaturationDonorClassifierLayer:
             stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -349,6 +451,12 @@ class TestFindSaturationDonorClassifierLayer:
                 stage_configs={"A": _stage_cfg(over_provisioned_streak=30), "B": _stage_cfg()},
                 cycle=100,
                 last_donation_cycle={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -376,6 +484,12 @@ class TestFindSaturationDonorHoldLayer:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -394,6 +508,7 @@ class TestFindSaturationDonorReceiverAntiFlap:
             stage_floors={0: 1, 1: 1},
             worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
             worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
+            worker_nodes={},
             stage_states={
                 "A": _over_provisioned_state("A"),
                 "B": _saturated_state("B"),
@@ -401,7 +516,13 @@ class TestFindSaturationDonorReceiverAntiFlap:
             config=config,
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=120,
-            last_donation_cycle={"B": 100},  # B donated at cycle 100; window of 30 spans through 130
+            # B donated at cycle 100; window of 30 spans through 130
+            last_donation_cycle={"B": 100},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -425,6 +546,12 @@ class TestFindSaturationDonorReceiverAntiFlap:
                 stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
                 cycle=131,  # 31 cycles since B's last donation; window cleared
                 last_donation_cycle={"B": 100},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -458,6 +585,12 @@ class TestFindSaturationDonorSameDonorEligibleAcrossCycles:
                 stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
                 cycle=101,
                 last_donation_cycle={"A": 100},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -484,6 +617,12 @@ class TestFindSaturationDonorStrictUpstream:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -506,6 +645,12 @@ class TestFindSaturationDonorStrictUpstream:
                 stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
                 cycle=100,
                 last_donation_cycle={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -533,6 +678,12 @@ class TestFindSaturationDonorFloorPreservation:
             stage_configs={"A": _stage_cfg(), "B": _stage_cfg()},
             cycle=100,
             last_donation_cycle={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert donor is None
@@ -564,6 +715,12 @@ class TestFindSaturationDonorYoungestSelection:
                 stage_configs={"A": _stage_cfg(), "B": _stage_cfg(), "C": _stage_cfg()},
                 cycle=100,
                 last_donation_cycle={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -595,14 +752,19 @@ class TestFindSaturationDonorBoundaryAndToggleCases:
         assert donor is not None
 
     def test_non_over_provisioned_donor_allowed_when_requirement_disabled(self) -> None:
-        """Disabling layer 1 permits a NORMAL donor that still satisfies floor rules."""
+        """Disabling layer 1 permits a NORMAL donor that still satisfies floor rules.
+
+        The NORMAL donor must still clear the signal-trust gate (layer 4),
+        so the test fixture sets ``classifier_streak=99`` - the streak
+        gate is independent of the classifier state when layer 1 is off.
+        """
         donor = _find_donor_worker(
             config=_config(cross_stage_donor_require_over_provisioned=False),
             stage_states={
                 "A": _StageRuntimeState(
                     stage_name="A",
                     classifier_state=StageState.NORMAL,
-                    classifier_streak=0,
+                    classifier_streak=99,
                     growth_mode=GrowthMode.TRACKING,
                     growth_streak=0,
                 ),

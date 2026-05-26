@@ -59,6 +59,34 @@ class _ProbeResult:
     reject_reason: str | None = None
 
 
+@attrs.frozen
+class _AlwaysFeasibleProbeResult:
+    """Stand-in for ``rust_apc.PlacementProbeResult`` that always reports feasible."""
+
+    feasible: bool = True
+    reject_reason: str = ""
+
+
+@attrs.define
+class _AlwaysFeasibleCtx:
+    """Fake autoscale planner context whose probe always reports feasible.
+
+    Floor-mode tests that exercise ``select_youngest_eligible_donor``'s
+    candidate filters do not need to model placement feasibility; the
+    bounded resource-fit search short-circuits at ``plan_size=1`` and
+    accepts the first single-worker probe, preserving the prior
+    single-min selection behaviour those tests assert on.
+    """
+
+    def probe_add_after_removals(
+        self,
+        removals: list[tuple[int, str]],
+        add_stage_index: int,
+    ) -> _AlwaysFeasibleProbeResult:
+        del removals, add_stage_index
+        return _AlwaysFeasibleProbeResult()
+
+
 def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 16) -> resources.ClusterResources:
     """Multi-node cluster sized to fit each test fixture exactly."""
     return resources.ClusterResources(
@@ -140,6 +168,10 @@ class TestSelectYoungestEligibleDonor:
             stage_floors={0: 2, 1: 1},
             worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
             worker_ages={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
         )
         assert donor is None
 
@@ -150,6 +182,10 @@ class TestSelectYoungestEligibleDonor:
             stage_floors={0: 3, 1: 1},
             worker_ids_by_stage=[["A-w0", "A-w1", "A-w2"], ["B-w0"]],
             worker_ages={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
         )
         # A is at exact floor; B is the receiver. Nothing else qualifies.
         assert donor is None
@@ -171,6 +207,10 @@ class TestSelectYoungestEligibleDonor:
                     ["downstream-w0", "downstream-w1"],
                 ],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.stage_index == 0
@@ -183,6 +223,10 @@ class TestSelectYoungestEligibleDonor:
                 stage_floors={0: 1, 1: 1},
                 worker_ids_by_stage=[["A-w0"], ["B-w0", "B-w1"]],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.stage_index == 1
@@ -200,6 +244,10 @@ class TestSelectYoungestEligibleDonor:
                     [],
                 ],
                 worker_ages={"A-w0": 10, "A-w1": 7, "B-w0": 2, "B-w1": 9},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.worker_id == "B-w0"
@@ -213,6 +261,10 @@ class TestSelectYoungestEligibleDonor:
                 stage_floors={0: 1, 1: 1, 2: 1},
                 worker_ids_by_stage=[["B-w1", "A-w0"], [], []],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.worker_id == "A-w0"
@@ -225,6 +277,10 @@ class TestSelectYoungestEligibleDonor:
                 stage_floors={},  # Nothing set
                 worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.stage_index == 0
@@ -237,6 +293,10 @@ class TestSelectYoungestEligibleDonor:
                 stage_floors={0: 1, 1: 1},
                 worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
                 worker_ages={"A-w0": 5, "A-w1": 3},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor == DonorWorker(stage_index=0, worker_id="A-w1", age=3)
@@ -449,6 +509,93 @@ class TestPhaseBDonorFallback:
         assert solution.stages[2].deleted_workers == []
 
 
+class TestSelectYoungestEligibleDonorResourceFit:
+    """Floor mode goes through ``_resource_fit_plan``.
+
+    Multi-worker plans are emitted when a single donor cannot fit the
+    receiver's shape, and the search returns ``None`` when every probe
+    up to ``max_plan_size`` reports infeasible.
+    """
+
+    def test_multi_worker_floor_plan_when_single_worker_infeasible(self) -> None:
+        """A receiver that needs two channels gets a 2-worker DonorPlan."""
+
+        @attrs.define
+        class _RequiresTwoCtx:
+            """Probe that only reports feasible for plans of size >= 2."""
+
+            def probe_add_after_removals(
+                self,
+                removals: list[tuple[int, str]],
+                add_stage_index: int,
+            ) -> _AlwaysFeasibleProbeResult:
+                del add_stage_index
+                return _AlwaysFeasibleProbeResult(feasible=len(removals) >= 2)
+
+        plan = select_youngest_eligible_donor(
+            receiver_stage_index=2,
+            stage_floors={0: 1, 1: 1, 2: 1},
+            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0", "B-w1"], []],
+            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2, "B-w1": 4},
+            worker_nodes={},
+            ctx=_RequiresTwoCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
+        )
+
+        assert plan is not None
+        # A 2-worker plan is the smallest feasible plan; deterministic
+        # tiebreak (age ASC, worker_id ASC) selects the youngest pair.
+        assert len(plan.removals) == 2
+        assert {w.worker_id for w in plan.removals} == {"B-w0", "A-w1"}
+
+    def test_resource_fit_failure_returns_none(self) -> None:
+        """If no probe up to ``max_plan_size`` reports feasible, no plan is selected."""
+
+        @attrs.define
+        class _AlwaysInfeasibleCtx:
+            def probe_add_after_removals(
+                self,
+                removals: list[tuple[int, str]],
+                add_stage_index: int,
+            ) -> _AlwaysFeasibleProbeResult:
+                del removals, add_stage_index
+                return _AlwaysFeasibleProbeResult(feasible=False)
+
+        plan = select_youngest_eligible_donor(
+            receiver_stage_index=1,
+            stage_floors={0: 1, 1: 1},
+            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
+            worker_ages={"A-w0": 5, "A-w1": 3},
+            worker_nodes={},
+            ctx=_AlwaysInfeasibleCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
+        )
+
+        assert plan is None
+
+    def test_floor_mode_skips_economic_gate(self) -> None:
+        """Floor mode does not accept any economic-gate inputs (no d_k, no s_k_ewma).
+
+        The ``select_youngest_eligible_donor`` signature deliberately
+        omits the gate parameters that ``find_saturation_donor``
+        accepts; their absence is the contract that floor enforcement
+        is non-negotiable and bypasses the throughput / spread /
+        signal-trust gates.
+        """
+        import inspect
+
+        signature = inspect.signature(select_youngest_eligible_donor)
+        param_names = set(signature.parameters)
+
+        # Floor mode must NOT take any of the economic-gate inputs.
+        assert "receiver_intent" not in param_names
+        assert "d_k_now" not in param_names
+        assert "effective_capacities" not in param_names
+        assert "s_k_ewma" not in param_names
+
+
 class TestSelectYoungestEligibleDonorAdversarial:
     """Pathological / boundary inputs to the pure helper."""
 
@@ -459,6 +606,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
             stage_floors={},
             worker_ids_by_stage=[],
             worker_ages={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
         )
         assert donor is None
 
@@ -470,6 +621,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
                 stage_floors={0: 1},
                 worker_ids_by_stage=[["A-w0", "A-w1"]],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         # The helper does not raise on out-of-range receiver; it treats every stage as eligible.
@@ -489,6 +644,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
                 stage_floors={0: 0, 1: 1},
                 worker_ids_by_stage=[["A-w0"], []],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         # 1 - 1 = 0 >= 0, eligible.
@@ -502,6 +661,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
                 stage_floors={0: -5, 1: 1},
                 worker_ids_by_stage=[["A-w0"], []],
                 worker_ages={},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         # 1 - 1 = 0 >= -5, eligible.
@@ -515,6 +678,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
                 stage_floors={0: 1, 1: 1, 2: 1},
                 worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0", "B-w1"], []],
                 worker_ages={"A-w0": 10**18, "A-w1": 10**18, "B-w0": 1, "B-w1": 5},
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.worker_id == "B-w0"
@@ -533,6 +700,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
                 stage_floors={s: 1 for s in range(50)},
                 worker_ids_by_stage=worker_ids_by_stage,
                 worker_ages=worker_ages,
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
         assert donor.worker_id == "S25-w0"
@@ -545,6 +716,10 @@ class TestSelectYoungestEligibleDonorAdversarial:
             stage_floors={0: 0, 1: 0, 2: 1},
             worker_ids_by_stage=[[], [], []],
             worker_ages={},
+            worker_nodes={},
+            ctx=_AlwaysFeasibleCtx(),
+            max_plan_size=4,
+            max_plan_combinations=32,
         )
         # All empty -> no candidates.
         assert donor is None
@@ -654,17 +829,21 @@ class TestPhaseBDonorFallbackAdversarial:
             )
 
     def test_probe_infeasible_donor_does_not_remove_and_raises_floor_unmet(self) -> None:
-        """An infeasible probe leaves the donor in place and raises the floor-unmet message.
+        """An infeasible probe rejects every donor plan and the floor-unmet message fires.
 
-        Pins the new contract: the floor mode runs
-        ``probe_add_after_removals`` before any removal. When the
-        probe says the receiver still cannot fit (donor's freed slot
-        does not match the receiver's shape), the donor stays in
-        place and the floor-unmet ``RuntimeError`` carries the
-        donor metadata so the operator can correlate the failure
-        with the candidate.
+        Pins the contract that the floor mode's bounded resource-fit
+        search is the single source of placement feasibility: when
+        every probe (single-worker AND multi-worker plans up to
+        ``cross_stage_donor_max_plan_size``) reports the receiver
+        still cannot fit, ``select_youngest_eligible_donor`` returns
+        ``None`` and the floor-unmet ``RuntimeError`` fires through
+        the no-grace path. No worker is ever removed because no plan
+        was committed.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        # Grace=0 makes the first failed cycle raise immediately so
+        # the test does not have to drive multiple cycles before the
+        # raise.
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig(floor_stuck_grace_cycles=0))
         scheduler.setup(_problem([("donor", None), ("receiver", None)]))
 
         class _InfeasibleProbeContext:
@@ -673,6 +852,7 @@ class TestPhaseBDonorFallbackAdversarial:
             def __init__(self) -> None:
                 self._worker_ids_by_stage = [["donor-w0", "donor-w1"], []]
                 self.removed_workers: list[tuple[int, str]] = []
+                self.probe_calls: list[tuple[list[tuple[int, str]], int]] = []
 
             def worker_ids_by_stage(self) -> list[list[str]]:
                 return self._worker_ids_by_stage
@@ -685,7 +865,7 @@ class TestPhaseBDonorFallbackAdversarial:
                 return None
 
             def probe_add_after_removals(self, removals: object, add_stage_index: int) -> object:
-                del removals, add_stage_index
+                self.probe_calls.append((list(removals), add_stage_index))  # type: ignore[arg-type]
                 return _ProbeResult(feasible=False, reject_reason="no_placement")
 
             def remove_workers_atomically(self, removals: list[tuple[int, str]]) -> bool:
@@ -693,19 +873,20 @@ class TestPhaseBDonorFallbackAdversarial:
                 return True
 
         ctx = _InfeasibleProbeContext()
-        expected = r"post-donation retry returned no placement \(removals=\[\(0, 'donor-w0'\)\]\)"
         with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.info") as info:
-            with pytest.raises(RuntimeError, match=expected):
+            with pytest.raises(RuntimeError, match=r"no eligible cross-stage donor"):
                 scheduler._run_phase_b_floor(
                     cast(data_structures.AutoscalePlanContext, ctx),
                     _problem_state([("donor", 2, 1, False), ("receiver", 0, 1, False)]),
                 )
 
         assert ctx.removed_workers == [], "infeasible probe must not remove any donor worker"
+        # The resource-fit search probed at least once before giving up.
+        assert ctx.probe_calls, "expected at least one probe call before the no-plan raise"
         donor_success_logs = [
             call
             for call in info.call_args_list
-            if "cross-stage minimum-floor donor accepted" in (call.args[0] if call.args else "")
+            if "cross-stage minimum-floor donor plan accepted" in (call.args[0] if call.args else "")
         ]
         assert donor_success_logs == []
 

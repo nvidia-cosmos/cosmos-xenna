@@ -15,9 +15,7 @@
 
 """Per-cycle Forced-Flow-Law bottleneck-score emission.
 
-The Forced Flow Law (Lazowska, Zahorjan, Graham, Sevcik 1984,
-*Quantitative System Performance*, Chapter 3) gives the per-stage
-service demand of a separable queueing network as::
+The per-stage service demand is defined as::
 
     D_k = V_k * S_k / c_k
 
@@ -50,8 +48,8 @@ The autoscaler's behaviour is unchanged whether the bottleneck
 score is observed or not; the metric is a diagnostic substrate for
 operators and (later) for a Dominant Resource Fairness donor pass.
 The single value-add is letting operators rank stages by
-bottleneck candidacy from one panel -- or one ``grep`` of the
-scheduler log -- instead of cross-correlating throughput, queue
+bottleneck candidacy from one panel - or one ``grep`` of the
+scheduler log - instead of cross-correlating throughput, queue
 depth, and per-task service time across many per-stage panels.
 
 Cold-start contract
@@ -114,7 +112,7 @@ Cluster heterogeneity ratio extension
 =====================================
 
 The Forced-Flow-Law per-stage view above is augmented by a
-**cluster-wide** scalar -- the ratio ``max_k D_k / min_k D_k``
+**cluster-wide** scalar - the ratio ``max_k D_k / min_k D_k``
 across stages whose service time was observed this cycle. The
 ratio is the operational analog of Liu & Ying 2026's heavy-traffic
 ``ksub`` / ``ksuper`` bounds: a homogeneous pipeline (ratio = 1)
@@ -132,7 +130,7 @@ lever. The streak gate prevents alert fatigue on transient spikes
 (a brief NaN cycle or one above-threshold cycle does not fire)
 while the once-per-streak semantics avoid flooding the log when
 the heterogeneous regime is sustained. The ratio gauge is tagged
-``{pipeline}`` only -- not per-stage -- because the ratio is a
+``{pipeline}`` only - not per-stage - because the ratio is a
 single-cluster scalar and adding a stage tag would multiply the
 metric cardinality without any new operator-relevant signal.
 """
@@ -236,7 +234,7 @@ def emit_bottleneck_score(
         Operators see the gauges go NaN; the bottleneck is
         unknown and the helper does not pretend otherwise.
 
-    The helper is pure observability -- it does NOT mutate any
+    The helper is pure observability - it does NOT mutate any
     scheduler state, does NOT influence the per-cycle ``Solution``,
     and is safe to call once per autoscale cycle from
     ``SaturationAwareScheduler.autoscale``.
@@ -247,7 +245,7 @@ def emit_bottleneck_score(
             :func:`identify_bottleneck` and
             :func:`compute_heterogeneity_ratio`). Consumed read-only.
             An empty mapping produces no observations and no log
-            line -- matching the cold-start contract for the very
+            line - matching the cold-start contract for the very
             first cycle.
         bottleneck_identity: Per-cycle identity from
             :func:`identify_bottleneck`. The INFO log uses
@@ -300,7 +298,7 @@ def emit_bottleneck_score(
 # Cluster heterogeneity ratio.
 #
 # Module-level Gauge for the cluster-wide ratio. ``tag_keys`` is
-# ``("pipeline",)`` only -- the ratio is a single scalar per cluster,
+# ``("pipeline",)`` only - the ratio is a single scalar per cluster,
 # so adding a ``stage`` tag would falsely multiply the cardinality
 # without any new operator-relevant signal. Reusing one Cython
 # handle across cycles keeps the per-cycle observation cost
@@ -321,6 +319,79 @@ _HETEROGENEITY_RATIO_GAUGE = Gauge(
 )
 
 
+# Cluster pipeline balance score (1.0 / max(1.0, heterogeneity_ratio)).
+#
+# Same per-cluster cardinality as the heterogeneity ratio; the
+# balance score is the inverse-ratio formulation operators reach
+# for when reasoning about "how close is this pipeline to
+# perfectly balanced". Score = 1.0 means perfectly balanced (or a
+# single-stage cluster); scores approaching 0 mean a single stage
+# is the dominant bottleneck. NaN samples mean fewer than two
+# stages had a finite D_k this cycle.
+_BALANCE_SCORE_GAUGE = Gauge(
+    "xenna_scheduler_pipeline_balance_score",
+    description=(
+        "Cluster pipeline balance score = 1.0 / max(1.0, heterogeneity_ratio). "
+        "Score = 1.0 means a perfectly balanced pipeline; scores approaching "
+        "0 mean a single bottleneck stage dominates throughput. NaN means "
+        "fewer than two stages had a finite D_k this cycle."
+    ),
+    tag_keys=("pipeline",),
+)
+
+
+def compute_balance_score(d_k_by_stage: Mapping[str, float]) -> float:
+    """Compute ``1.0 / max(1.0, max(D_k) / min(D_k))`` across stages with finite ``D_k``.
+
+    Filters ``d_k_by_stage`` to entries whose value is finite and
+    strictly positive (cold-start stages -- ``math.nan``, ``0.0``,
+    or negative values -- are excluded). When fewer than two stages
+    qualify the ratio is undefined and the helper returns
+    ``math.nan`` so callers comparing balance across cycles can
+    treat NaN as "no verdict" without distinguishing it from an
+    actual zero.
+
+    Args:
+        d_k_by_stage: Mapping from stage name to actor-normalized
+            ``D_k`` in seconds-per-channel. The same view that
+            :func:`compute_heterogeneity_ratio` consumes.
+
+    Returns:
+        The balance score in ``(0.0, 1.0]`` when at least two
+        stages have a finite positive ``D_k``; ``math.nan``
+        otherwise.
+
+    """
+    finite = [v for v in d_k_by_stage.values() if math.isfinite(v) and v > 0.0]
+    if len(finite) < 2:
+        return math.nan
+    ratio = max(finite) / min(finite)
+    return 1.0 / max(1.0, ratio)
+
+
+def emit_balance_score(d_k_by_stage: Mapping[str, float], *, pipeline_name: str) -> float:
+    """Emit ``xenna_scheduler_pipeline_balance_score`` and return the scalar.
+
+    Computes the score via :func:`compute_balance_score`, observes
+    it on ``_BALANCE_SCORE_GAUGE``, and hands the value back so the
+    caller can use it for the per-cycle balance regression check
+    without a second computation.
+
+    Args:
+        d_k_by_stage: Same view that :func:`emit_bottleneck_score`
+            and :func:`compute_heterogeneity_ratio` consume.
+        pipeline_name: ``pipeline`` Prometheus tag value.
+
+    Returns:
+        The observed balance score (or ``math.nan`` for cold-start
+        cycles).
+
+    """
+    score = compute_balance_score(d_k_by_stage)
+    _BALANCE_SCORE_GAUGE.set(score, tags={"pipeline": pipeline_name})
+    return score
+
+
 @attrs.define
 class HeterogeneityWarnState:
     """Per-instance streak + once-per-spike latch for the heterogeneity warn log.
@@ -339,7 +410,7 @@ class HeterogeneityWarnState:
             ``SaturationAwareConfig.cluster_heterogeneity_warn_threshold``.
             Resets to ``0`` the moment the ratio falls back to or
             below the threshold, or becomes ``math.nan`` (fewer
-            than two stages with a finite ``D_k`` -- there is no
+            than two stages with a finite ``D_k`` - there is no
             meaningful heterogeneity verdict on a cold-start
             cluster).
         has_fired: ``True`` once the streak has reached the
@@ -379,8 +450,8 @@ def compute_heterogeneity_ratio(
 
     Computes ``ratio = max_k D_k / min_k D_k`` across the stages in
     ``d_k_by_stage`` whose actor-normalized ``D_k`` is finite and
-    strictly positive (cold-start stages -- ``math.nan``, ``0.0``,
-    or negative values -- are excluded). When fewer than two stages
+    strictly positive (cold-start stages - ``math.nan``, ``0.0``,
+    or negative values - are excluded). When fewer than two stages
     have a finite ``D_k`` the ratio is undefined; the gauge then
     observes ``math.nan`` so its label cardinality stays stable
     across cycles, and the streak counter resets to 0 (a cold-start
@@ -405,7 +476,7 @@ def compute_heterogeneity_ratio(
         a transient cold-start cycle does not re-arm the log;
         only an actual drop to or below the threshold does.
 
-    The helper is pure observability -- it does NOT mutate any
+    The helper is pure observability - it does NOT mutate any
     scheduler state outside ``state``, does NOT influence the
     per-cycle ``Solution``, and is safe to call once per autoscale
     cycle from ``SaturationAwareScheduler.autoscale``.
@@ -414,7 +485,7 @@ def compute_heterogeneity_ratio(
         d_k_by_stage: Mapping from stage name to actor-normalized
             ``D_k`` in seconds-per-channel. Consumed read-only and
             shared with :func:`emit_bottleneck_score` and
-            :func:`identify_bottleneck` -- all three helpers see the
+            :func:`identify_bottleneck` - all three helpers see the
             same per-stage ``D_k`` view in a given cycle.
         pipeline_name: Pipeline identifier used as the
             ``pipeline`` Prometheus tag. The gauge is tagged
@@ -441,7 +512,7 @@ def compute_heterogeneity_ratio(
     if len(finite_scores) < 2:
         # Undefined ratio: emit NaN to keep cardinality stable, reset
         # streak (a cold-start cluster has no heterogeneity verdict).
-        # ``has_fired`` is intentionally NOT cleared -- only a real
+        # ``has_fired`` is intentionally NOT cleared - only a real
         # drop to or below the threshold re-arms a fresh INFO log.
         _HETEROGENEITY_RATIO_GAUGE.set(
             math.nan,

@@ -135,22 +135,28 @@ class TestConcurrentConstruction:
         assert [w.id for w in solution.stages[0].new_workers] == ["cross-thread"]
 
     def test_to_worker_group_works_across_threads(self) -> None:
-        """``to_worker_group()`` (the FFI call) is safe to invoke from a worker thread.
+        """``to_worker_group()`` (the FFI call) is safe to invoke from the main thread on a worker-built Solution.
 
         ``apply_autoscale_result_if_ready`` calls
         ``w.to_worker_group(pool.name)`` from the main thread on
-        Solutions built in a worker thread. Pin that the FFI is
-        safe across threads by exercising the worker thread path.
+        Solutions whose constituent workers were constructed inside
+        the autoscaler's ``ThreadPoolExecutor`` task. Pin that the
+        FFI is safe across the worker-thread -> main-thread handoff
+        by mirroring the exact production direction: build the whole
+        Solution (including the ``ProblemWorkerGroupState``) in the
+        worker thread, then exercise ``to_worker_group()`` on the
+        main thread.
         """
-        worker = _make_worker("threaded")
-        ss = data_structures.StageSolution.make(slots_per_worker=2, new_workers=[worker])
-        sol = data_structures.Solution.make(stages=[ss])
 
-        def call_to_worker_group_in_thread() -> object:
-            return sol.stages[0].new_workers[0].to_worker_group("StageX")
+        def build_in_worker_thread() -> data_structures.Solution:
+            worker = _make_worker("threaded")
+            ss = data_structures.StageSolution.make(slots_per_worker=2, new_workers=[worker])
+            return data_structures.Solution.make(stages=[ss])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            wg = pool.submit(call_to_worker_group_in_thread).result()
+            sol = pool.submit(build_in_worker_thread).result()
+
+        wg = sol.stages[0].new_workers[0].to_worker_group("StageX")
         assert wg is not None
 
 

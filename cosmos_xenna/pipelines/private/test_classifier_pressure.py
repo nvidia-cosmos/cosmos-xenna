@@ -43,6 +43,7 @@ def cfg() -> SaturationAwareStageConfig:
     return SaturationAwareStageConfig(
         saturation_threshold=0.15,
         activation_threshold=0.05,
+        over_provisioned_threshold=0.5,
         pressure_normal_threshold=0.3,
         pressure_saturation_threshold=1.0,
         pressure_critical_threshold=2.0,

@@ -481,7 +481,7 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         ps_fresh = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
         ps_stale = _problem_state_with_signals([("S", 0, 8, 0, 0)], input_queue_depth=100)
 
-        # Cycle 0: first fresh sample -- counter advances but gate
+        # Cycle 0: first fresh sample - counter advances but gate
         # stays closed (need 2 consecutive).
         scheduler.autoscale(time=0.0, problem_state=ps_fresh)
         assert scheduler._stage_states["S"].valid_signal_samples == 1
@@ -492,20 +492,20 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         assert scheduler._stage_states["S"].valid_signal_samples == 2
         assert scheduler._last_intent_deltas.get("S", 0) > 0
 
-        # Cycle 2: stale cycle invalidates trust -- counter resets and
+        # Cycle 2: stale cycle invalidates trust - counter resets and
         # delta is clamped to 0.
         scheduler.autoscale(time=2.0, problem_state=ps_stale)
         assert scheduler._stage_states["S"].valid_signal_samples == 0
         assert scheduler._last_intent_deltas.get("S", 0) == 0
 
-        # Cycle 3: a single post-gap fresh sample is not enough -- the
+        # Cycle 3: a single post-gap fresh sample is not enough - the
         # gate stays closed (counter back to 1, still < min_data_points).
         scheduler.autoscale(time=3.0, problem_state=ps_fresh)
         assert scheduler._stage_states["S"].valid_signal_samples == 1
         assert scheduler._last_intent_deltas.get("S", 0) == 0
 
         # Cycle 4: second consecutive post-gap fresh sample reopens
-        # the gate -- trust has fully rebuilt from scratch.
+        # the gate - trust has fully rebuilt from scratch.
         scheduler.autoscale(time=4.0, problem_state=ps_fresh)
         assert scheduler._stage_states["S"].valid_signal_samples == 2
         assert scheduler._last_intent_deltas.get("S", 0) > 0
@@ -723,7 +723,7 @@ class TestBottleneckDecisionFields:
         equals the raw sample, so the absolute delta seen by the noise
         tracker is deterministic. The wiring contract pinned here is that
         the scheduler reads ``self._config.classifier_signal_noise_smoothing_level``
-        and passes it down to ``run_per_stage_pipeline`` -- the noise EWMA
+        and passes it down to ``run_per_stage_pipeline`` - the noise EWMA
         only updates when the kwarg is forwarded.
         """
         sat_cfg = SaturationAwareConfig(
@@ -746,6 +746,64 @@ class TestBottleneckDecisionFields:
         ps2 = _problem_state_with_signals([("S", 1, 8, 6, 2)], input_queue_depth=10)
         scheduler.autoscale(time=1.0, problem_state=ps2)
         assert scheduler._stage_states["S"].classifier_signal_noise_ewma == pytest.approx(0.50)
+
+    def test_balance_regression_tolerance_fires_warn_above_threshold(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A balance drop greater than ``cross_stage_donor_balance_regression_tolerance`` fires one WARN."""
+        sat_cfg = SaturationAwareConfig(cross_stage_donor_balance_regression_tolerance=0.05)
+        scheduler = SaturationAwareScheduler(sat_cfg)
+        scheduler.setup(_problem(["S"]))
+        scheduler._balance_score_start = 0.90
+
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
+        try:
+            # 0.50 < 0.90 - 0.05 -> WARN.
+            scheduler._maybe_warn_balance_regression(0.50)
+        finally:
+            logger.remove(sink_id)
+
+        warn_lines = [line for line in log_lines if "pipeline balance regression" in line]
+        assert len(warn_lines) == 1
+        assert "balance_score_start=0.9000" in warn_lines[0]
+        assert "balance_score_end=0.5000" in warn_lines[0]
+        assert "tolerance=0.0500" in warn_lines[0]
+
+    def test_balance_regression_tolerance_does_not_fire_within_threshold(self) -> None:
+        """A balance drop within ``cross_stage_donor_balance_regression_tolerance`` is silent."""
+        sat_cfg = SaturationAwareConfig(cross_stage_donor_balance_regression_tolerance=0.05)
+        scheduler = SaturationAwareScheduler(sat_cfg)
+        scheduler.setup(_problem(["S"]))
+        scheduler._balance_score_start = 0.90
+
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
+        try:
+            # 0.88 >= 0.90 - 0.05 = 0.85 -> no WARN.
+            scheduler._maybe_warn_balance_regression(0.88)
+        finally:
+            logger.remove(sink_id)
+
+        assert not any("pipeline balance regression" in line for line in log_lines)
+
+    def test_balance_regression_does_not_fire_on_cold_start(self) -> None:
+        """NaN ``balance_score_start`` (cold-start) suppresses the WARN regardless of end value."""
+        sat_cfg = SaturationAwareConfig()
+        scheduler = SaturationAwareScheduler(sat_cfg)
+        scheduler.setup(_problem(["S"]))
+        # Cold-start: fewer than 2 stages with finite D_k -> NaN.
+        scheduler._balance_score_start = math.nan
+
+        log_lines: list[str] = []
+        sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
+        try:
+            scheduler._maybe_warn_balance_regression(0.10)
+        finally:
+            logger.remove(sink_id)
+
+        assert not any("pipeline balance regression" in line for line in log_lines)
 
     def test_bottleneck_heterogeneity_threshold_above_ratio_disengages(self) -> None:
         """A threshold larger than the computed ratio leaves engagement off."""
@@ -896,6 +954,7 @@ class TestConfigWiringMetaCoverage:
         "bottleneck_heterogeneity_threshold",
         "bottleneck_engagement_persistence_cycles",
         "classifier_signal_noise_smoothing_level",
+        "cross_stage_donor_balance_regression_tolerance",
     }
 
     _STAGE_BEHAVIOR_TESTS: ClassVar[set[str]] = {
@@ -955,7 +1014,6 @@ class TestConfigWiringMetaCoverage:
         "cross_stage_donor_trust_streak_cap",
         "cross_stage_donor_max_plan_size",
         "cross_stage_donor_max_plan_combinations",
-        "cross_stage_donor_balance_regression_tolerance",
     }
 
     _KNOWN_COVERAGE_GAPS_STAGE_BEHAVIOR: ClassVar[set[str]] = {

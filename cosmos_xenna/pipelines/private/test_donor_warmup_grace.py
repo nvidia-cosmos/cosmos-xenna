@@ -62,11 +62,13 @@ from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
 
+import attrs
 import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.donor import (
+    DonorDecision,
     DonorPlan,
     DonorWorker,
     find_saturation_donor,
@@ -78,9 +80,31 @@ from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, Stage
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
-def _single_donor(plan: DonorPlan | None) -> DonorWorker:
-    """Assert the plan is a single-worker plan and return its sole removal."""
-    assert plan is not None, "selector returned None"
+@attrs.frozen
+class _AlwaysFeasibleProbeResult:
+    """Stand-in for ``rust_apc.PlacementProbeResult`` that always reports feasible."""
+
+    feasible: bool = True
+    reject_reason: str = ""
+
+
+@attrs.define
+class _AlwaysFeasibleCtx:
+    """Fake autoscale planner context whose probe always reports feasible."""
+
+    def probe_add_after_removals(
+        self,
+        removals: list[tuple[int, str]],
+        add_stage_index: int,
+    ) -> _AlwaysFeasibleProbeResult:
+        del removals, add_stage_index
+        return _AlwaysFeasibleProbeResult()
+
+
+def _single_donor(value: DonorDecision | DonorPlan | None) -> DonorWorker:
+    """Assert the value resolves to a single-worker plan and return its sole removal."""
+    assert value is not None, "selector returned None"
+    plan = value.plan if isinstance(value, DonorDecision) else value
     assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
     return plan.removals[0]
 
@@ -211,6 +235,7 @@ class TestSaturationDonorWarmupFilter:
             "stage_names": ["A", "B"],
             "stage_floors": {0: 1, 1: 1},
             "worker_ages": {"a-w0": 50, "a-w1": 1, "a-w2": 1},
+            "worker_nodes": {},
             "stage_states": {
                 "A": _stage_runtime_over_provisioned(name="A", streak=30),
                 "B": _stage_runtime_saturated("B"),
@@ -223,6 +248,7 @@ class TestSaturationDonorWarmupFilter:
             # Cycle far enough out that no cooldown window applies.
             "cycle": 10_000,
             "last_donation_cycle": {},
+            "ctx": _AlwaysFeasibleCtx(),
         }
 
     def test_excluded_donor_skipped(self, base_kwargs: dict[str, Any]) -> None:
@@ -232,6 +258,10 @@ class TestSaturationDonorWarmupFilter:
                 worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
                 excluded_worker_ids=frozenset({"a-w0"}),
                 **base_kwargs,
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -244,6 +274,10 @@ class TestSaturationDonorWarmupFilter:
             worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
             excluded_worker_ids=frozenset({"a-w0", "a-w1", "a-w2"}),
             **base_kwargs,
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert result is None
@@ -255,6 +289,10 @@ class TestSaturationDonorWarmupFilter:
                 worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
                 excluded_worker_ids=None,
                 **base_kwargs,
+                receiver_intent=0,
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
             )
         )
 
@@ -268,6 +306,10 @@ class TestSaturationDonorWarmupFilter:
             worker_ids_by_stage=[["a-w0"], ["b-w0"]],
             excluded_worker_ids=frozenset(),
             **base_kwargs,
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert result is None
@@ -291,6 +333,10 @@ class TestSaturationDonorWarmupFilter:
             worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
             excluded_worker_ids=frozenset(),
             **kwargs,
+            receiver_intent=0,
+            d_k_now={},
+            effective_capacities={},
+            s_k_ewma={},
         )
 
         assert result is None
@@ -313,6 +359,10 @@ class TestFloorDonorSelectionUnfiltered:
                 stage_floors={0: 1, 1: 1},
                 worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
                 worker_ages={"a-w0": 50, "a-w1": 0},  # a-w1 is brand new
+                worker_nodes={},
+                ctx=_AlwaysFeasibleCtx(),
+                max_plan_size=4,
+                max_plan_combinations=32,
             )
         )
 
