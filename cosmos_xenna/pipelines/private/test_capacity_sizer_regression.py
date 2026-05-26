@@ -27,9 +27,9 @@ to capacity in a single decision (still capped by
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.decisions import compute_delta
-from cosmos_xenna.pipelines.private.scheduling_py.pressure import compute_capacity_target_workers
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.decisions import compute_delta
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import compute_capacity_target_workers
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import GrowthMode, StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 

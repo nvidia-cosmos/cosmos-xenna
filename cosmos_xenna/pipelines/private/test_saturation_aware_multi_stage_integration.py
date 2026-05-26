@@ -26,12 +26,15 @@ from collections.abc import Callable, Iterable
 from unittest.mock import patch
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import (
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
     GrowthMode,
+    GrowthState,
+    StageRuntimeState,
     StageState,
-    _StageRuntimeState,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_topology import project_stage_topology
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -289,19 +292,15 @@ class TestDonorCascadeReleasesUpstreamForDownstream:
         # Pre-seed the per-stage state so the donor classifier filter
         # accepts A immediately. The integration property under test
         # is the cross-stage donor cascade, not the classifier ramp.
-        scheduler._stage_states["A"] = _StageRuntimeState(
+        scheduler.ledgers.stage_states["A"] = StageRuntimeState(
             stage_name="A",
-            classifier_state=StageState.OVER_PROVISIONED,
-            classifier_streak=10,
-            growth_mode=GrowthMode.TRACKING,
-            growth_streak=10,
+            classifier=ClassifierState(state=StageState.OVER_PROVISIONED, streak=10),
+            growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
         )
-        scheduler._stage_states["B"] = _StageRuntimeState(
+        scheduler.ledgers.stage_states["B"] = StageRuntimeState(
             stage_name="B",
-            classifier_state=StageState.SATURATED,
-            classifier_streak=10,
-            growth_mode=GrowthMode.TRACKING,
-            growth_streak=10,
+            classifier=ClassifierState(state=StageState.SATURATED, streak=10),
+            growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
         )
 
         ps = data_structures.ProblemState(
@@ -327,10 +326,13 @@ class TestDonorCascadeReleasesUpstreamForDownstream:
         # without depending on signal-driven intent ramp. Without the
         # injection the recommendation history would absorb a single
         # cycle's vote and Phase C would observe intent=0 still.
-        def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
+        def _inject(_services: object, _cycle: object, **_kwargs: object) -> dict[str, int]:
             return {"B": 1}
 
-        with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            side_effect=_inject,
+        ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         a_solution = solution.stages[0]
@@ -466,16 +468,17 @@ class TestMixedManualAutoFinishedLongRunningStability:
 
 
 class TestBottleneckShiftEngagementMarkerFollowsSaturatedStage:
-    """``_last_bottleneck_meta`` and per-stage ``cycle_bottleneck_context`` track the EWMA shift."""
+    """``cycle.bottleneck.identity`` tracks the EWMA shift; per-stage projection follows."""
 
     def test_bottleneck_shift_engagement_marker_follows_saturated_stage(self) -> None:
         """3-stage chain: bottleneck argmax moves B -> C; per-stage upstream flag flips.
 
-        Two cycles. Before each ``autoscale()`` ``_s_k_ewma`` is
+        Two cycles. Before each ``autoscale()`` the ``S_k`` EWMA is
         seeded so :func:`identify_bottleneck` first picks B then C.
-        The per-stage ``cycle_bottleneck_context.is_upstream_of_bottleneck``
-        flag must track the shift: cycle 0 marks A upstream of B;
-        cycle 1 marks A and B upstream of C and clears C itself.
+        The per-stage ``StageTopologyContext`` projected from
+        ``cycle.bottleneck.identity`` must track the shift: cycle 0
+        marks A upstream of B; cycle 1 marks A and B upstream of C
+        and clears C itself.
         """
         scheduler = _build_scheduler(
             [("A", None), ("B", None), ("C", None)],
@@ -495,22 +498,39 @@ class TestBottleneckShiftEngagementMarkerFollowsSaturatedStage:
             # Heterogeneity ratio default threshold is 2.0; max/median of
             # the three samples must be >= 2.0 for engagement. The values
             # below produce ratio = 5.0 in each cycle, well past the gate.
-            if cycle_idx == 0:
-                sched._s_k_ewma = {"A": 0.1, "B": 1.0, "C": 0.2}
-            else:
-                sched._s_k_ewma = {"A": 0.1, "B": 0.2, "C": 1.0}
+            samples = {"A": 0.1, "B": 1.0, "C": 0.2} if cycle_idx == 0 else {"A": 0.1, "B": 0.2, "C": 1.0}
+            sched.ledgers.s_k_ewma.set_many(samples)
 
         _run_cycles(scheduler, state_factory, num_cycles=2, before_cycle=before_cycle)
 
-        # After cycle 1, _last_bottleneck_meta must reflect "C".
-        meta = scheduler._last_bottleneck_meta
+        # After cycle 1, the bottleneck snapshot must reflect "C".
+        meta = scheduler.last_cycle.bottleneck.identity
         assert meta is not None
         assert meta.engaged is True
         assert meta.stage_name == "C", f"engaged bottleneck must shift to 'C' on cycle 1, got {meta.stage_name!r}"
-        # Per-stage context: A and B are now upstream of C; C is not.
-        ctx_a = scheduler._stage_states["A"].cycle_bottleneck_context
-        ctx_b = scheduler._stage_states["B"].cycle_bottleneck_context
-        ctx_c = scheduler._stage_states["C"].cycle_bottleneck_context
+        # Per-stage projection: A and B are now upstream of C; C is not.
+        # The projection is computed at the call site (no per-stage mirror);
+        # asserting on the projection here pins the same contract that
+        # ``IntentPhase._compute_intent_deltas`` exercises at runtime.
+        stage_names = scheduler.pipeline.stage_names
+        ctx_a = project_stage_topology(
+            stage_index=stage_names.index("A"),
+            bottleneck_engaged=meta.engaged,
+            bottleneck_stage_name=meta.stage_name,
+            stage_names=stage_names,
+        )
+        ctx_b = project_stage_topology(
+            stage_index=stage_names.index("B"),
+            bottleneck_engaged=meta.engaged,
+            bottleneck_stage_name=meta.stage_name,
+            stage_names=stage_names,
+        )
+        ctx_c = project_stage_topology(
+            stage_index=stage_names.index("C"),
+            bottleneck_engaged=meta.engaged,
+            bottleneck_stage_name=meta.stage_name,
+            stage_names=stage_names,
+        )
         assert ctx_a.engaged is True and ctx_a.is_upstream_of_bottleneck is True
         assert ctx_b.engaged is True and ctx_b.is_upstream_of_bottleneck is True
         assert ctx_c.engaged is True and ctx_c.is_upstream_of_bottleneck is False

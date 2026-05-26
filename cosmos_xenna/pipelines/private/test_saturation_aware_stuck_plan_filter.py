@@ -16,8 +16,8 @@
 
 """Caller-side tests for the value-diff filter on the stuck-plan invariant.
 
-``SaturationAwareScheduler._run_phase_c_grow`` has two early-return
-branches that bypass the per-stage ``_set_stuck_plan_counter`` call at
+``phases.phase_c.run`` has two early-return
+branches that bypass the per-stage ``set_stuck_plan_counter`` call at
 the bottom of the per-stage loop:
 
   * pre-donor allocation-failure absorption (the first
@@ -49,9 +49,10 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorPlan, DonorWorker
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker
+from cosmos_xenna.pipelines.private.scheduling_py.phases.grow.services import GrowServices
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -120,40 +121,45 @@ def _problem_state_with_one_worker() -> data_structures.ProblemState:
 
 
 class TestEarlyReturnPathsPreserveCounter:
-    """The three Phase C bail paths leave the bailed stage's counter at its prior value."""
+    """The three Grow bail paths leave the bailed stage's counter at its prior value."""
 
     def test_pre_donor_allocation_failure_preserves_counter(self) -> None:
         """First ``try_add`` raises ``AllocationError``; loop returns from the pre-donor branch.
 
-        ``_run_phase_c_grow`` checks ``self._phase_c_allocation_failure``
-        immediately after the first ``_try_add_worker_with_defense``
-        call and returns when the absorb path set the flag, before the
+        ``phases.phase_c.run`` checks
+        ``scheduler.grow_allocation.aborted_cycle`` immediately
+        after the first ``_try_add_worker_with_defense`` call and
+        returns when the absorb path set the flag, before the
         per-stage counter setter runs.
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler._stuck_plan_counters["stage"] = 13
+        scheduler.ledgers.stuck_plan.set("stage", 13)
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=resources.AllocationError("synthetic placement failure"),
             ):
                 scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._stuck_plan_counters["stage"] == 13
+        assert scheduler.ledgers.stuck_plan.get_counter("stage") == 13
 
     def test_post_donor_allocation_failure_preserves_counter(self) -> None:
         """First ``try_add`` returns None, donor succeeds, second ``try_add`` raises ``AllocationError``.
 
         The post-donor allocation-failure branch checks the
-        ``_phase_c_allocation_failure`` flag set by the absorb path on
-        the second call and returns before the per-stage counter setter
-        runs, so the bailed stage keeps its prior counter.
+        ``allocation_failure_aborted_cycle`` flag set by the absorb
+        path on the second call and returns before the per-stage
+        counter setter runs, so the bailed stage keeps its prior
+        counter.
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler._stuck_plan_counters["stage"] = 13
+        scheduler.ledgers.stuck_plan.set("stage", 13)
 
         try_add_calls: list[int] = []
 
@@ -167,16 +173,32 @@ class TestEarlyReturnPathsPreserveCounter:
             removals=(DonorWorker(stage_index=0, worker_id="stage-w0", age=0),),
             receiver_stage_index=0,
         )
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+        from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorAcquireResult
+
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=_try_add,
             ):
-                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value=donor_plan):
+                with patch.object(
+                    DonorCoordinator,
+                    "acquire",
+                    return_value=DonorAcquireResult(
+                        plan=donor_plan,
+                        attempted_plan=donor_plan,
+                        reject_reason=None,
+                        placement_reject_reason="",
+                        gate_result=None,
+                    ),
+                ):
                     scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(try_add_calls) == 2, "both pre- and post-donor try_add calls must have been exercised"
-        assert scheduler._stuck_plan_counters["stage"] == 13
+        assert scheduler.ledgers.stuck_plan.get_counter("stage") == 13
 
 
 class TestStrictInvariantStillFiresOnIllegalIncrement:
@@ -192,17 +214,20 @@ class TestStrictInvariantStillFiresOnIllegalIncrement:
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler._stuck_plan_counters["stage"] = 13
+        scheduler.ledgers.stuck_plan.set("stage", 13)
 
-        original_set = scheduler._set_stuck_plan_counter
+        original_set = GrowServices.set_stuck_plan_counter
 
-        def _illegal_set(stage_name: str, value: int, *, last_intent: int) -> None:
+        def _illegal_set(self: GrowServices, stage_name: str, value: int, *, last_intent: int) -> None:
             if stage_name == "stage" and value == 0:
                 value = 18
-            original_set(stage_name, value, last_intent=last_intent)
+            original_set(self, stage_name, value, last_intent=last_intent)
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}):
-            with patch.object(scheduler, "_set_stuck_plan_counter", side_effect=_illegal_set):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 0},
+        ):
+            with patch.object(GrowServices, "set_stuck_plan_counter", autospec=True, side_effect=_illegal_set):
                 with pytest.raises(SchedulerInvariantError, match=r"stage 'stage' transitioned from 13 to 18"):
                     scheduler.autoscale(time=0.0, problem_state=ps)
 
@@ -219,7 +244,7 @@ class TestFinishedStageExcluded:
         ``SchedulerInvariantError``.
         """
         scheduler = _scheduler()
-        scheduler._stuck_plan_counters["stage"] = 13
+        scheduler.ledgers.stuck_plan.set("stage", 13)
 
         worker = data_structures.ProblemWorkerGroupState.make(
             "stage-w0",
@@ -241,7 +266,10 @@ class TestFinishedStageExcluded:
             ],
         )
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._stuck_plan_counters["stage"] == 13, "finished stages keep their counter"
+        assert scheduler.ledgers.stuck_plan.get_counter("stage") == 13, "finished stages keep their counter"

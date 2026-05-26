@@ -22,10 +22,10 @@ underpins every classifier verdict downstream.
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.state import (
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
     GrowthMode,
+    StageRuntimeState,
     StageState,
-    _StageRuntimeState,
     compute_slots_empty_ratio,
     update_ewma,
 )
@@ -57,21 +57,21 @@ class TestStageRuntimeStateDefaults:
 
     def test_default_classifier_state_is_normal(self) -> None:
         """First cycle's hysteresis logic needs a defined baseline."""
-        state = _StageRuntimeState(stage_name="A")
-        assert state.classifier_state is StageState.NORMAL
-        assert state.classifier_streak == 0
+        state = StageRuntimeState(stage_name="A")
+        assert state.classifier.state is StageState.NORMAL
+        assert state.classifier.streak == 0
 
     def test_default_growth_mode_is_acquiring(self) -> None:
         """New stages start in ACQUIRING (slow-start regime)."""
-        state = _StageRuntimeState(stage_name="A")
-        assert state.growth_mode is GrowthMode.ACQUIRING
-        assert state.growth_streak == 0
+        state = StageRuntimeState(stage_name="A")
+        assert state.growth.mode is GrowthMode.ACQUIRING
+        assert state.growth.streak == 0
 
     def test_default_ewma_is_unset(self) -> None:
         """The cold-start sentinel lets ``update_ewma`` skip the warmup tax."""
-        state = _StageRuntimeState(stage_name="A")
-        assert state.slots_empty_ratio_ewma is None
-        assert state.last_valid_slots_empty_ratio_ewma is None
+        state = StageRuntimeState(stage_name="A")
+        assert state.classifier.slots_empty_ratio_ewma is None
+        assert state.classifier.last_valid_slots_empty_ratio_ewma is None
 
 
 class TestComputeSlotsEmptyRatio:

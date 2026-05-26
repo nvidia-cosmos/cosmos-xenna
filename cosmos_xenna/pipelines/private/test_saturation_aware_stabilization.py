@@ -17,7 +17,7 @@
 """Tests for the asymmetric stabilization-window recommendation gate.
 
 The first set of tests pins the pure-data-structure contract of
-``_RecommendationHistory`` (record / gate / clear / capacity) without
+``RecommendationHistory`` (record / gate / clear / capacity) without
 any scheduler context. The integration tests at the bottom verify
 that ``run_per_stage_pipeline`` and ``SaturationAwareScheduler``
 honour the gate end-to-end: the raw delta is replaced with ``0`` when
@@ -36,25 +36,22 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
-    record_executed_delta,
-    run_per_stage_pipeline,
-)
-from cosmos_xenna.pipelines.private.scheduling_py.regime import Regime
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.stabilization import (
-    _RecommendationHistory,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stabilization import (
+    RecommendationHistory,
     apply_stabilization_gate,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import StageDecisionPipeline
+from cosmos_xenna.pipelines.private.scheduling_py.regime.regime import Regime
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import ClassifierState, StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
 @pytest.fixture
-def history_default() -> _RecommendationHistory:
+def history_default() -> RecommendationHistory:
     """A fresh history with the production-default asymmetric windows."""
-    return _RecommendationHistory(window_up=1, window_down=30)
+    return RecommendationHistory(window_up=1, window_down=30)
 
 
 class TestConstruction:
@@ -62,14 +59,14 @@ class TestConstruction:
 
     def test_reports_capacity_as_max_of_windows(self) -> None:
         """The buffer must hold enough cycles for the larger of the two windows."""
-        history = _RecommendationHistory(window_up=5, window_down=12)
+        history = RecommendationHistory(window_up=5, window_down=12)
         assert history.capacity == 12
         assert history.window_up == 5
         assert history.window_down == 12
 
     def test_starts_empty(self) -> None:
         """A freshly constructed buffer reports zero retained cycles."""
-        history = _RecommendationHistory(window_up=1, window_down=30)
+        history = RecommendationHistory(window_up=1, window_down=30)
         assert len(history) == 0
 
     @pytest.mark.parametrize(
@@ -79,7 +76,7 @@ class TestConstruction:
     def test_rejects_non_positive_windows(self, window_up: int, window_down: int) -> None:
         """Either window <= 0 must raise so misconfigured callers fail fast."""
         with pytest.raises(ValueError, match=r"window_(up|down) must be >= 1"):
-            _RecommendationHistory(window_up=window_up, window_down=window_down)
+            RecommendationHistory(window_up=window_up, window_down=window_down)
 
     def test_accepts_equal_windows(self) -> None:
         """Equal windows are valid at the primitive layer.
@@ -88,28 +85,28 @@ class TestConstruction:
         at the data-structure layer, so unit tests can use degenerate
         windows freely.
         """
-        history = _RecommendationHistory(window_up=4, window_down=4)
+        history = RecommendationHistory(window_up=4, window_down=4)
         assert history.capacity == 4
 
 
 class TestRecord:
     """``record`` maps the sign of the input onto the buffer."""
 
-    def test_positive_delta_records_up(self, history_default: _RecommendationHistory) -> None:
+    def test_positive_delta_records_up(self, history_default: RecommendationHistory) -> None:
         history_default.record(7)
         assert len(history_default) == 1
 
-    def test_negative_delta_records_down(self, history_default: _RecommendationHistory) -> None:
+    def test_negative_delta_records_down(self, history_default: RecommendationHistory) -> None:
         history_default.record(-3)
         assert len(history_default) == 1
 
-    def test_zero_delta_records_noop(self, history_default: _RecommendationHistory) -> None:
+    def test_zero_delta_records_noop(self, history_default: RecommendationHistory) -> None:
         history_default.record(0)
         assert len(history_default) == 1
 
     def test_buffer_drops_oldest_after_capacity(self) -> None:
         """A 3-cycle buffer must retain only the most recent 3 entries."""
-        history = _RecommendationHistory(window_up=3, window_down=3)
+        history = RecommendationHistory(window_up=3, window_down=3)
         for direction in (1, -1, 1, 0, -1):
             history.record(direction)
         # capacity = 3, so the first two records (1, -1) have been evicted.
@@ -125,26 +122,26 @@ class TestGateUp:
 
     def test_refuses_under_filled_window(self) -> None:
         """A buffer with fewer than ``window_up`` records must refuse."""
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         history.record(1)
         history.record(1)
         assert not history.gate_up_allowed()
 
     def test_allows_after_window_up_consecutive_ups(self) -> None:
         """``window_up`` consecutive ``+1`` records satisfy the gate exactly."""
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         for _ in range(3):
             history.record(1)
         assert history.gate_up_allowed()
 
-    def test_immediate_for_window_up_one(self, history_default: _RecommendationHistory) -> None:
+    def test_immediate_for_window_up_one(self, history_default: RecommendationHistory) -> None:
         """Default ``window_up = 1`` permits scale-up on a single cycle."""
         history_default.record(1)
         assert history_default.gate_up_allowed()
 
     def test_one_noop_in_window_breaks_consensus(self) -> None:
         """A single ``0`` cycle breaks the up-direction consensus."""
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         history.record(1)
         history.record(0)
         history.record(1)
@@ -152,7 +149,7 @@ class TestGateUp:
 
     def test_one_down_in_window_breaks_consensus(self) -> None:
         """A single ``-1`` cycle breaks the up-direction consensus."""
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         history.record(1)
         history.record(-1)
         history.record(1)
@@ -160,7 +157,7 @@ class TestGateUp:
 
     def test_post_recovery_after_mixed_window(self) -> None:
         """The gate re-allows after the buffer has slid past the broken cycles."""
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         history.record(1)
         history.record(0)
         history.record(1)
@@ -174,21 +171,21 @@ class TestGateDown:
 
     def test_refuses_under_filled_window(self) -> None:
         """Even 29 of 30 ``-1`` records must refuse: the buffer is not full yet."""
-        history = _RecommendationHistory(window_up=1, window_down=30)
+        history = RecommendationHistory(window_up=1, window_down=30)
         for _ in range(29):
             history.record(-1)
         assert not history.gate_down_allowed()
 
     def test_allows_after_window_down_consecutive_downs(self) -> None:
         """Exactly ``window_down`` ``-1`` cycles satisfy the gate."""
-        history = _RecommendationHistory(window_up=1, window_down=30)
+        history = RecommendationHistory(window_up=1, window_down=30)
         for _ in range(30):
             history.record(-1)
         assert history.gate_down_allowed()
 
     def test_one_up_in_window_resets_progress(self) -> None:
         """A single ``+1`` cycle within the window suppresses scale-down."""
-        history = _RecommendationHistory(window_up=1, window_down=30)
+        history = RecommendationHistory(window_up=1, window_down=30)
         for _ in range(29):
             history.record(-1)
         history.record(1)
@@ -196,7 +193,7 @@ class TestGateDown:
 
     def test_recovers_only_after_full_replay_of_downs(self) -> None:
         """After a flap the buffer must be fully refilled with downs."""
-        history = _RecommendationHistory(window_up=1, window_down=5)
+        history = RecommendationHistory(window_up=1, window_down=5)
         for _ in range(5):
             history.record(-1)
         assert history.gate_down_allowed()
@@ -214,12 +211,12 @@ class TestGateDown:
 class TestAsymmetricWindows:
     """The asymmetric default (1 / 30) protects shrink without delaying grow."""
 
-    def test_first_up_cycle_allows_grow_but_not_shrink(self, history_default: _RecommendationHistory) -> None:
+    def test_first_up_cycle_allows_grow_but_not_shrink(self, history_default: RecommendationHistory) -> None:
         history_default.record(1)
         assert history_default.gate_up_allowed()
         assert not history_default.gate_down_allowed()
 
-    def test_first_down_cycle_blocks_both_directions(self, history_default: _RecommendationHistory) -> None:
+    def test_first_down_cycle_blocks_both_directions(self, history_default: RecommendationHistory) -> None:
         history_default.record(-1)
         assert not history_default.gate_up_allowed()
         assert not history_default.gate_down_allowed()
@@ -229,23 +226,23 @@ class TestApplyStabilizationGate:
     """The free-function helper combines record + gate so callers cannot skip one."""
 
     def test_returns_zero_when_up_gate_refuses(self) -> None:
-        history = _RecommendationHistory(window_up=2, window_down=30)
+        history = RecommendationHistory(window_up=2, window_down=30)
         # First up cycle: window_up = 2, so the gate refuses on cycle 1.
         gated = apply_stabilization_gate(history, raw_delta=5)
         assert gated == 0
         # Buffer now holds one ``+1``; the call recorded it before gating.
         assert len(history) == 1
 
-    def test_returns_raw_delta_when_up_gate_allows(self, history_default: _RecommendationHistory) -> None:
+    def test_returns_raw_delta_when_up_gate_allows(self, history_default: RecommendationHistory) -> None:
         gated = apply_stabilization_gate(history_default, raw_delta=4)
         assert gated == 4
 
-    def test_returns_zero_when_down_gate_refuses(self, history_default: _RecommendationHistory) -> None:
+    def test_returns_zero_when_down_gate_refuses(self, history_default: RecommendationHistory) -> None:
         gated = apply_stabilization_gate(history_default, raw_delta=-3)
         # window_down = 30; first cycle cannot satisfy.
         assert gated == 0
 
-    def test_returns_zero_for_zero_delta(self, history_default: _RecommendationHistory) -> None:
+    def test_returns_zero_for_zero_delta(self, history_default: RecommendationHistory) -> None:
         """Zero recommendation always yields zero, regardless of gate state."""
         for _ in range(40):
             history_default.record(-1)
@@ -258,7 +255,7 @@ class TestApplyStabilizationGate:
         Without the record-before-gate ordering, the very first scale-up
         recommendation with ``window_up = 1`` would incorrectly refuse.
         """
-        history = _RecommendationHistory(window_up=1, window_down=30)
+        history = RecommendationHistory(window_up=1, window_down=30)
         gated = apply_stabilization_gate(history, raw_delta=2)
         assert gated == 2
         assert len(history) == 1
@@ -268,7 +265,7 @@ class TestClear:
     """Explicit reset is needed for tests and for structural worker-count changes."""
 
     def test_clear_drops_all_records(self) -> None:
-        history = _RecommendationHistory(window_up=2, window_down=4)
+        history = RecommendationHistory(window_up=2, window_down=4)
         for _ in range(4):
             history.record(-1)
         assert history.gate_down_allowed()
@@ -278,7 +275,7 @@ class TestClear:
         assert not history.gate_down_allowed()
 
     def test_can_be_repopulated_after_clear(self) -> None:
-        history = _RecommendationHistory(window_up=1, window_down=2)
+        history = RecommendationHistory(window_up=1, window_down=2)
         history.record(-1)
         history.clear()
         history.record(1)
@@ -289,7 +286,7 @@ class TestMultiCycleStreaks:
     """Stress-style coverage: long runs and rollover semantics."""
 
     def test_long_run_of_ups_keeps_up_gate_on(self) -> None:
-        history = _RecommendationHistory(window_up=3, window_down=10)
+        history = RecommendationHistory(window_up=3, window_down=10)
         for _ in range(100):
             history.record(1)
             assert history.gate_up_allowed() or len(history) < 3
@@ -297,7 +294,7 @@ class TestMultiCycleStreaks:
         assert not history.gate_down_allowed()
 
     def test_long_run_of_mixed_keeps_both_gates_off(self) -> None:
-        history = _RecommendationHistory(window_up=2, window_down=5)
+        history = RecommendationHistory(window_up=2, window_down=5)
         for cycle_index in range(50):
             history.record(1 if cycle_index % 2 == 0 else -1)
         assert not history.gate_up_allowed()
@@ -305,7 +302,7 @@ class TestMultiCycleStreaks:
 
     def test_alternating_direction_never_satisfies(self) -> None:
         """A pathological flap (+,-,+,-,...) cannot ever satisfy either gate."""
-        history = _RecommendationHistory(window_up=2, window_down=2)
+        history = RecommendationHistory(window_up=2, window_down=2)
         for cycle_index in range(20):
             history.record(1 if cycle_index % 2 == 0 else -1)
         assert not history.gate_up_allowed()
@@ -336,10 +333,10 @@ def _cfg(
     )
 
 
-def _stage_state(cfg: SaturationAwareStageConfig, name: str = "S") -> _StageRuntimeState:
+def _stage_state(cfg: SaturationAwareStageConfig, name: str = "S") -> StageRuntimeState:
     """Build a runtime state with thresholds pre-resolved for direct pipeline tests."""
     resolved = _resolve_auto_thresholds(cfg, slots_per_actor=8)
-    return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
+    return StageRuntimeState(stage_name=name, classifier=ClassifierState(resolved_thresholds=resolved))
 
 
 class TestPipelineStabilizationGate:
@@ -349,8 +346,8 @@ class TestPipelineStabilizationGate:
         """A SATURATED_CRITICAL classifier signal fires immediately under the default ``window_up = 1``."""
         cfg = _cfg(window_up=1, window_down=30)
         state = _stage_state(cfg)
-        history = _RecommendationHistory(window_up=1, window_down=30)
-        delta = run_per_stage_pipeline(
+        history = RecommendationHistory(window_up=1, window_down=30)
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=4,
             num_empty_slots=0,
@@ -366,11 +363,11 @@ class TestPipelineStabilizationGate:
         """``window_up = 3`` blocks the first two SATURATED_CRITICAL cycles and fires on the third."""
         cfg = _cfg(window_up=3, window_down=30)
         state = _stage_state(cfg)
-        history = _RecommendationHistory(window_up=3, window_down=30)
+        history = RecommendationHistory(window_up=3, window_down=30)
         deltas: list[int] = []
         for _ in range(3):
             deltas.append(
-                run_per_stage_pipeline(
+                StageDecisionPipeline().compute_recommendation(
                     stage_state=state,
                     num_used_slots=4,
                     num_empty_slots=0,
@@ -394,11 +391,11 @@ class TestPipelineStabilizationGate:
         """
         cfg = _cfg(window_up=1, window_down=5, saturated_streak_min=1, over_provisioned_streak_min=2)
         state = _stage_state(cfg)
-        history = _RecommendationHistory(window_up=1, window_down=5)
+        history = RecommendationHistory(window_up=1, window_down=5)
         deltas: list[int] = []
         for _ in range(7):
             deltas.append(
-                run_per_stage_pipeline(
+                StageDecisionPipeline().compute_recommendation(
                     stage_state=state,
                     num_used_slots=0,
                     num_empty_slots=10,
@@ -435,14 +432,14 @@ class TestPipelineStabilizationGate:
             over_provisioned_streak_min=2,
         )
         state = _stage_state(cfg)
-        history = _RecommendationHistory(window_up=1, window_down=10)
+        history = RecommendationHistory(window_up=1, window_down=10)
         # Two cycles so the over-provisioned streak fires on cycle 2; the
         # gate refuses both cycles because the down window is 10. The
         # second call to ``record_executed_delta`` models the scheduler
         # advancing the growth-mode timer for stages that participated
         # in the cycle.
         for _ in range(2):
-            delta = run_per_stage_pipeline(
+            delta = StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=0,
                 num_empty_slots=10,
@@ -451,18 +448,18 @@ class TestPipelineStabilizationGate:
                 config=cfg,
                 recommendation_history=history,
             )
-            record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
+            StageDecisionPipeline().record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
         # On a gated shrink cycle the growth mode must NOT have transitioned
         # to HOLD (which only happens on an executed shrink). The streak
         # advances because the cycle was effectively a no-op.
-        assert state.growth_mode.value == "ACQUIRING"
-        assert state.growth_streak >= 1
+        assert state.growth.mode.value == "ACQUIRING"
+        assert state.growth.streak >= 1
 
     def test_legacy_signature_without_history_is_unchanged(self) -> None:
         """Calling ``run_per_stage_pipeline`` without a history reverts to pre-gate semantics."""
         cfg = _cfg()
         state = _stage_state(cfg)
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=4,
             num_empty_slots=0,
@@ -508,8 +505,8 @@ class TestSchedulerIntegration:
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(self._problem_with_stage("only"))
-        assert "only" in scheduler._recommendation_histories
-        history = scheduler._recommendation_histories["only"]
+        assert "only" in scheduler.ledgers.recommendation_histories
+        history = scheduler.ledgers.recommendation_histories["only"]
         assert history.window_up == 2
         assert history.window_down == 7
         assert len(history) == 0
@@ -519,45 +516,46 @@ class TestSchedulerIntegration:
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(self._problem_with_stage("only"))
         # Prime the buffer so we can observe the reset.
-        history = scheduler._recommendation_histories["only"]
+        history = scheduler.ledgers.recommendation_histories["only"]
         for _ in range(5):
             history.record(-1)
         assert len(history) == 5
         scheduler.setup(self._problem_with_stage("only"))
-        assert len(scheduler._recommendation_histories["only"]) == 0
+        assert len(scheduler.ledgers.recommendation_histories["only"]) == 0
 
     def test_regime_transition_clears_recommendation_histories(self) -> None:
         """Crossing a Halfin-Whitt regime boundary throws away pre-transition consensus."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(self._problem_with_stage("only"))
-        history = scheduler._recommendation_histories["only"]
+        history = scheduler.ledgers.recommendation_histories["only"]
         for _ in range(8):
             history.record(-1)
         assert len(history) == 8
 
         # Drive the production transition handler with a forced
-        # ``update_regime_state`` return so the test exercises the real cleanup
-        # branch in ``_update_regime_aware_aggressiveness``. Patching the
-        # hysteresis function (instead of constructing a multi-stage signal
-        # that aggregates into a transitioning regime) keeps the test focused
-        # on the cleanup side effect that is the actual contract being pinned,
-        # while still walking the production code path that owns the clear.
-        scheduler._regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
-        for runtime in scheduler._stage_states.values():
-            runtime.classifier_streak = 5
+        # ``update_regime_state`` return so the test exercises the
+        # real cleanup branch in ``RegimeController.update``. Patching
+        # the hysteresis function (instead of constructing a multi-
+        # stage signal that aggregates into a transitioning regime)
+        # keeps the test focused on the cleanup side effect that is
+        # the actual contract being pinned, while still walking the
+        # production code path that owns the clear.
+        scheduler.ledgers.regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
+        for runtime in scheduler.ledgers.stage_states.values():
+            runtime.classifier.streak = 5
         empty_state = data_structures.ProblemState([])
         with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.update_regime_state",
+            "cosmos_xenna.pipelines.private.scheduling_py.regime.regime_controller.update_regime_state",
             return_value=True,
         ):
-            scheduler._update_regime_aware_aggressiveness(empty_state)
-        assert len(scheduler._recommendation_histories["only"]) == 0
+            scheduler._regime.update(empty_state)
+        assert len(scheduler.ledgers.recommendation_histories["only"]) == 0
 
     def test_regime_transition_resets_valid_signal_samples_trust_gate(self) -> None:
         """Crossing a Halfin-Whitt regime boundary zeroes the per-stage trust-gate counter.
 
         ``valid_signal_samples`` is the freshness counter consulted by
-        ``_compute_intent_deltas``: a non-zero recommendation is
+        ``intent_phase.compute``: a non-zero recommendation is
         clamped to zero until at least ``min_data_points`` strictly
         consecutive warmup-excluded samples have been observed under
         the *current* threshold band. Pre-transition samples were
@@ -573,34 +571,34 @@ class TestSchedulerIntegration:
         """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(self._problem_with_stage("only"))
-        runtime = scheduler._stage_states["only"]
-        runtime.valid_signal_samples = 7
+        runtime = scheduler.ledgers.stage_states["only"]
+        runtime.classifier.valid_signal_samples = 7
 
-        scheduler._regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
+        scheduler.ledgers.regime_state.current_regime = Regime.SUPER_HALFIN_WHITT
         empty_state = data_structures.ProblemState([])
         with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.update_regime_state",
+            "cosmos_xenna.pipelines.private.scheduling_py.regime.regime_controller.update_regime_state",
             return_value=True,
         ):
-            scheduler._update_regime_aware_aggressiveness(empty_state)
-        assert runtime.valid_signal_samples == 0
+            scheduler._regime.update(empty_state)
+        assert runtime.classifier.valid_signal_samples == 0
 
 
 @pytest.fixture
-def history_for_capacity_test() -> _RecommendationHistory:
+def history_for_capacity_test() -> RecommendationHistory:
     """Buffer for the regression-style tests below; default production window asymmetry."""
-    return _RecommendationHistory(window_up=1, window_down=30)
+    return RecommendationHistory(window_up=1, window_down=30)
 
 
 class TestRegressionFromShippedDefaults:
     """Pin the production-default behaviour against accidental drift."""
 
-    def test_default_window_up_one_grows_immediately(self, history_for_capacity_test: _RecommendationHistory) -> None:
+    def test_default_window_up_one_grows_immediately(self, history_for_capacity_test: RecommendationHistory) -> None:
         gated = apply_stabilization_gate(history_for_capacity_test, raw_delta=3)
         assert gated == 3
 
     def test_default_window_down_thirty_blocks_until_full_streak(
-        self, history_for_capacity_test: _RecommendationHistory
+        self, history_for_capacity_test: RecommendationHistory
     ) -> None:
         for _ in range(29):
             assert apply_stabilization_gate(history_for_capacity_test, raw_delta=-1) == 0

@@ -22,8 +22,8 @@ takes the cluster topology once at :meth:`SaturationAwareScheduler.setup`
 and treats it as static thereafter (``self._problem.rust.cluster_resources``
 is read every cycle but never mutated). Real "node leaves the cluster"
 events therefore manifest only as the node's workers disappearing
-from ``problem_state.rust.stages[*].worker_groups`` -- the actor pool
-no longer reports them as READY -- while the cluster_resources view
+from ``problem_state.rust.stages[*].worker_groups`` - the actor pool
+no longer reports them as READY - while the cluster_resources view
 stays stale. Hot-swapping ``cluster_resources`` mid-pipeline is not
 supported by the current public API; the architectural follow-up is
 tracked in ``jira/STORY-44-cluster-resources-hot-swap.md``.
@@ -42,16 +42,16 @@ The fixtures share the multi-node cluster + multi-cycle pattern of
 Per-cycle ``ProblemState`` objects compose ``ProblemStageState``
 rows built by :func:`_stage_state` so the test author controls
 exactly which ``worker_id``s are present in each cycle. Assertions
-read scheduler introspection state (``_worker_ages``,
-``_worker_ready_first_seen_at``, ``_last_intent_deltas``,
+read scheduler introspection state (``_worker_ages``, the
+``WarmupTracker`` query API, ``cycle.intent.deltas``,
 ``_floor_stuck_counters``, ``_stage_states``) to verify the contract.
 
 Why these tests matter: production node loss on Ray is handled at
 the actor-pool layer (Ray detects the dead actors and the streaming
 layer rebuilds ``worker_groups`` from survivors), so the scheduler
 sees a sudden change in the per-stage worker set. The two pruning
-hooks the scheduler relies on -- :meth:`_persist_worker_ages` and
-:meth:`_refresh_worker_ready_first_seen` -- guarantee per-worker
+hooks the scheduler relies on - :meth:`CycleFinalizer._persist_worker_ages` and
+:meth:`WarmupTracker.refresh` - guarantee per-worker
 state does not leak across cycles. The donor / Phase D / floor
 paths that consume that state must also degrade gracefully when
 the worker set shrinks unexpectedly. These tests pin both
@@ -61,7 +61,7 @@ properties end-to-end.
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -201,7 +201,7 @@ def _scheduler_with_node_churn_defaults(
 
     Streak / window defaults make the up path fire on a single
     cycle so a positive intent shows up in
-    ``_last_intent_deltas`` immediately once the EWMA crosses the
+    ``cycle.intent.deltas`` immediately once the EWMA crosses the
     activation threshold.
     """
     cfg = SaturationAwareConfig(
@@ -225,26 +225,28 @@ class TestGroupAWorkerDisappearance:
     """End-to-end checks for the "all workers on a node vanish" event."""
 
     def test_per_worker_dicts_drop_lost_ids(self) -> None:
-        """Both ``_worker_ages`` and ``_worker_ready_first_seen_at`` evict the lost ids in one cycle."""
+        """Both ``_worker_ages`` and the ``WarmupTracker`` evict the lost ids in one cycle."""
         scheduler = _scheduler_with_node_churn_defaults(["hot"])
         ps_full = data_structures.ProblemState([_stage_state(name="hot", workers_per_node={"node-0": 2, "node-1": 2})])
         ps_loss = data_structures.ProblemState([_stage_state(name="hot", workers_per_node={"node-0": 2})])
 
         scheduler.autoscale(time=0.0, problem_state=ps_full)
         assert {"hot-node-0-w0", "hot-node-0-w1", "hot-node-1-w0", "hot-node-1-w1"} <= set(
-            scheduler._worker_ready_first_seen_at
+            scheduler.ledgers.warmup.tracked_ids()
         )
-        assert {"hot-node-0-w0", "hot-node-0-w1", "hot-node-1-w0", "hot-node-1-w1"} <= set(scheduler._worker_ages)
+        assert {"hot-node-0-w0", "hot-node-0-w1", "hot-node-1-w0", "hot-node-1-w1"} <= set(
+            scheduler.ledgers.worker_ages
+        )
 
         scheduler.autoscale(time=10.0, problem_state=ps_loss)
 
-        assert "hot-node-1-w0" not in scheduler._worker_ready_first_seen_at
-        assert "hot-node-1-w1" not in scheduler._worker_ready_first_seen_at
-        assert "hot-node-1-w0" not in scheduler._worker_ages
-        assert "hot-node-1-w1" not in scheduler._worker_ages
+        assert not scheduler.ledgers.warmup.is_tracked("hot-node-1-w0")
+        assert not scheduler.ledgers.warmup.is_tracked("hot-node-1-w1")
+        assert "hot-node-1-w0" not in scheduler.ledgers.worker_ages
+        assert "hot-node-1-w1" not in scheduler.ledgers.worker_ages
         # Survivors keep their first-seen and have their ages incremented by one planner cycle.
-        assert scheduler._worker_ready_first_seen_at["hot-node-0-w0"] == 0.0
-        assert scheduler._worker_ready_first_seen_at["hot-node-0-w1"] == 0.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-0-w0") == 0.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-0-w1") == 0.0
 
     def test_loss_drives_below_floor_triggers_phase_b_grow(self) -> None:
         """A stage at floor=2 that loses one worker reappears at floor in the next cycle."""
@@ -299,32 +301,32 @@ class TestGroupAWorkerDisappearance:
         )
         scheduler.autoscale(time=10.0, problem_state=ps_after_loss)
 
-        runtime = scheduler._stage_states["hot"]
+        runtime = scheduler.ledgers.stage_states["hot"]
         # Only the surviving (saturated) workers contribute. EWMA was 0.5 after the half-empty cycle;
         # absorbing the loss-cycle's saturated reading (empty_ratio=0.0) must drag the EWMA below 0.5.
         # Exact alpha is implementation-specific, but the direction is the contract.
-        assert runtime.slots_empty_ratio_ewma is not None
-        assert runtime.slots_empty_ratio_ewma < 0.5, (
-            f"lost workers' contributions still pollute EWMA: {runtime.slots_empty_ratio_ewma}"
+        assert runtime.classifier.slots_empty_ratio_ewma is not None
+        assert runtime.classifier.slots_empty_ratio_ewma < 0.5, (
+            f"lost workers' contributions still pollute EWMA: {runtime.classifier.slots_empty_ratio_ewma}"
         )
 
     def test_loss_during_donor_warmup_grace_drops_lost_from_excluded_set(self) -> None:
-        """Donor warmup excluded set tracks the live worker map -- lost workers fall out."""
+        """Donor warmup excluded set tracks the live worker map - lost workers fall out."""
         scheduler = _scheduler_with_node_churn_defaults(["hot"], grace_s=120.0)
         ps_full = data_structures.ProblemState([_stage_state(name="hot", workers_per_node={"node-0": 2, "node-1": 2})])
         ps_loss = data_structures.ProblemState([_stage_state(name="hot", workers_per_node={"node-0": 2})])
 
         scheduler.autoscale(time=0.0, problem_state=ps_full)
         # During warmup, all 4 workers are excluded from donor / Phase D.
-        assert len(scheduler._donor_warmup_excluded_ids) == 4
+        assert len(scheduler.last_cycle.donor_warmup_excluded_ids) == 4
 
         scheduler.autoscale(time=30.0, problem_state=ps_loss)
 
         # node-1 workers gone -> excluded set must drop them.
-        assert "hot-node-1-w0" not in scheduler._donor_warmup_excluded_ids
-        assert "hot-node-1-w1" not in scheduler._donor_warmup_excluded_ids
+        assert "hot-node-1-w0" not in scheduler.last_cycle.donor_warmup_excluded_ids
+        assert "hot-node-1-w1" not in scheduler.last_cycle.donor_warmup_excluded_ids
         # node-0 workers still in warmup at t=30 (grace=120) -> still excluded.
-        assert {"hot-node-0-w0", "hot-node-0-w1"} <= set(scheduler._donor_warmup_excluded_ids)
+        assert {"hot-node-0-w0", "hot-node-0-w1"} <= set(scheduler.last_cycle.donor_warmup_excluded_ids)
 
     def test_loss_then_idle_phase_d_respects_floor_and_survivor_count(self) -> None:
         """A loss-driven Phase D shrink intent must respect floor and never inflate beyond survivor count.
@@ -403,8 +405,8 @@ class TestGroupAWorkerDisappearance:
             scheduler.autoscale(time=cycle * 10.0, problem_state=ps)
 
         # Each cycle replaces 2 worker ids; after 50 cycles only the 4 live ids remain.
-        assert len(scheduler._worker_ready_first_seen_at) == 4
-        assert len(scheduler._worker_ages) == 4
+        assert scheduler.ledgers.warmup.tracked_count() == 4
+        assert len(scheduler.ledgers.worker_ages) == 4
 
 
 class TestGroupBRecoveryAndFlap:
@@ -422,10 +424,10 @@ class TestGroupBRecoveryAndFlap:
         scheduler.autoscale(time=300.0, problem_state=ps_full)
 
         # Survivors keep their original first-seen.
-        assert scheduler._worker_ready_first_seen_at["hot-node-0-w0"] == 0.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-0-w0") == 0.0
         # Returning workers get the rejoin timestamp; they were absent at t=30.
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w0"] == 300.0
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w1"] == 300.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w0") == 300.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w1") == 300.0
 
     def test_repeated_flap_resets_warmup_grace_each_rejoin(self) -> None:
         """Loss-then-rejoin three times: each rejoin's first_seen is the latest ``now``."""
@@ -437,17 +439,17 @@ class TestGroupBRecoveryAndFlap:
         scheduler.autoscale(time=0.0, problem_state=ps_full)
         scheduler.autoscale(time=100.0, problem_state=ps_loss)
         scheduler.autoscale(time=200.0, problem_state=ps_full)
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w0"] == 200.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w0") == 200.0
 
         # Flap 2: 300 -> 400
         scheduler.autoscale(time=300.0, problem_state=ps_loss)
         scheduler.autoscale(time=400.0, problem_state=ps_full)
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w0"] == 400.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w0") == 400.0
 
         # Flap 3: 500 -> 600
         scheduler.autoscale(time=500.0, problem_state=ps_loss)
         scheduler.autoscale(time=600.0, problem_state=ps_full)
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w0"] == 600.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w0") == 600.0
 
     def test_survivor_age_preserved_when_peer_replaced(self) -> None:
         """The survivor on node-0 keeps its age while the node-1 peer is replaced with a fresh id."""
@@ -456,8 +458,8 @@ class TestGroupBRecoveryAndFlap:
             [_stage_state(name="hot", workers_per_node={"node-0": 1, "node-1": 1})]
         )
         scheduler.autoscale(time=0.0, problem_state=ps_initial)
-        survivor_first_seen_initial = scheduler._worker_ready_first_seen_at["hot-node-0-w0"]
-        survivor_age_initial = scheduler._worker_ages["hot-node-0-w0"]
+        survivor_first_seen_initial = scheduler.ledgers.warmup.first_seen_for("hot-node-0-w0")
+        survivor_age_initial = scheduler.ledgers.worker_ages["hot-node-0-w0"]
 
         # Cycle 2: node-1's worker is replaced by a fresh id.
         ps_replaced = data_structures.ProblemState(
@@ -479,17 +481,17 @@ class TestGroupBRecoveryAndFlap:
         scheduler.autoscale(time=10.0, problem_state=ps_replaced)
 
         # Survivor: same first_seen, age incremented.
-        assert scheduler._worker_ready_first_seen_at["hot-node-0-w0"] == survivor_first_seen_initial
-        assert scheduler._worker_ages["hot-node-0-w0"] == survivor_age_initial + 1
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-0-w0") == survivor_first_seen_initial
+        assert scheduler.ledgers.worker_ages["hot-node-0-w0"] == survivor_age_initial + 1
         # Old peer dropped, fresh peer gets first_seen=10.
-        assert "hot-node-1-w0" not in scheduler._worker_ready_first_seen_at
-        assert scheduler._worker_ready_first_seen_at["hot-node-1-w99"] == 10.0
-        # Fresh peer is registered in _worker_ages with age 0. ``_persist_worker_ages`` ran at the
+        assert not scheduler.ledgers.warmup.is_tracked("hot-node-1-w0")
+        assert scheduler.ledgers.warmup.first_seen_for("hot-node-1-w99") == 10.0
+        # Fresh peer is registered in _worker_ages with age 0. ``CycleFinalizer._persist_worker_ages`` ran at the
         # end of cycle 2 and the Rust planner assigns age 0 to a newly observed id. Pinning
         # the contract directly (key is present, value is 0) instead of ``.get(..., 0) == 0``
         # which would also pass if the key were silently missing.
-        assert "hot-node-1-w99" in scheduler._worker_ages
-        assert scheduler._worker_ages["hot-node-1-w99"] == 0
+        assert "hot-node-1-w99" in scheduler.ledgers.worker_ages
+        assert scheduler.ledgers.worker_ages["hot-node-1-w99"] == 0
 
     def test_replacement_worker_enters_donor_warmup_grace(self) -> None:
         """A worker that replaces a lost peer is donor-protected by warmup grace until its ready age elapses."""
@@ -500,17 +502,17 @@ class TestGroupBRecoveryAndFlap:
         scheduler.autoscale(time=0.0, problem_state=ps_full)
         # Wait past the original warmup window so node-0 workers are no longer protected.
         scheduler.autoscale(time=200.0, problem_state=ps_full)
-        assert "hot-node-0-w0" not in scheduler._donor_warmup_excluded_ids
+        assert "hot-node-0-w0" not in scheduler.last_cycle.donor_warmup_excluded_ids
 
         # node-1 workers vanish (loss) and reappear at t=210 (recovery).
         scheduler.autoscale(time=205.0, problem_state=ps_loss)
         scheduler.autoscale(time=210.0, problem_state=ps_full)
 
         # node-1 workers were observed first at t=210 and the grace is 180s -> they are still protected.
-        assert {"hot-node-1-w0", "hot-node-1-w1"} <= set(scheduler._donor_warmup_excluded_ids)
+        assert {"hot-node-1-w0", "hot-node-1-w1"} <= set(scheduler.last_cycle.donor_warmup_excluded_ids)
         # node-0 workers (first_seen=0) have age 210s, still > 180s -> not protected.
-        assert "hot-node-0-w0" not in scheduler._donor_warmup_excluded_ids
-        assert "hot-node-0-w1" not in scheduler._donor_warmup_excluded_ids
+        assert "hot-node-0-w0" not in scheduler.last_cycle.donor_warmup_excluded_ids
+        assert "hot-node-0-w1" not in scheduler.last_cycle.donor_warmup_excluded_ids
 
 
 class TestGroupCEdges:
@@ -533,14 +535,14 @@ class TestGroupCEdges:
         )
 
         scheduler.autoscale(time=0.0, problem_state=ps_full)
-        # Catastrophic loss -- the call must not raise.
+        # Catastrophic loss - the call must not raise.
         scheduler.autoscale(time=10.0, problem_state=ps_empty)
 
-        assert scheduler._worker_ready_first_seen_at == {}
+        assert scheduler.ledgers.warmup.tracked_count() == 0
         # _worker_ages is keyed off the planner snapshot. After the loss cycle the planner re-seeds an empty pool.
         # Either way no stale ids may remain.
         for stage_name in ("hot", "warm"):
-            for wid in scheduler._worker_ages:
+            for wid in scheduler.ledgers.worker_ages:
                 assert not wid.startswith(stage_name + "-node-")
         # Classifier state stays consistent: with zero workers in the snapshot every stage
         # has empty slot signal, the EWMA stays under both saturation and activation
@@ -548,7 +550,7 @@ class TestGroupCEdges:
         # presence) catches a future regression where the empty-pool path would emit a
         # spurious non-zero intent (NaN-derived, divide-by-zero coerced, or stale window
         # contents leaking through the recommendation history).
-        assert scheduler._last_intent_deltas == {"hot": 0, "warm": 0}
+        assert scheduler.last_cycle.intent.deltas == {"hot": 0, "warm": 0}
 
     def test_single_node_cluster_below_floor_advances_floor_stuck_counter(self) -> None:
         """A stage stuck below floor with no expansion headroom advances ``_floor_stuck_counters``.
@@ -582,9 +584,9 @@ class TestGroupCEdges:
         # a regression where the counter only fired on the first cycle (e.g., a future
         # change that resets the counter on a non-empty intent dict, or a Phase B path
         # that succeeds spuriously).
-        assert scheduler._floor_stuck_counters.get("hot", 0) == 3, (
+        assert scheduler.ledgers.floor_stuck_counters.get("hot") == 3, (
             f"expected _floor_stuck_counters['hot'] == 3 after 3 consecutive sub-floor cycles "
-            f"with no headroom; got {scheduler._floor_stuck_counters.get('hot', 0)}"
+            f"with no headroom; got {scheduler.ledgers.floor_stuck_counters.get('hot')}"
         )
 
     @pytest.mark.parametrize("num_cycles", [2, 5, 10])
@@ -614,18 +616,19 @@ class TestGroupCEdges:
 
         # After ``num_cycles`` cycles only the latest pair survives in the map.
         live = {f"hot-node-0-w{(num_cycles - 1) * 10}", f"hot-node-0-w{(num_cycles - 1) * 10 + 1}"}
-        assert set(scheduler._worker_ready_first_seen_at) == live
+        assert set(scheduler.ledgers.warmup.tracked_ids()) == live
 
 
 class TestDonorFlowUnderChurn:
     """Donor selection paths degrade gracefully when the donor stage loses workers.
 
-    Phase B floor donor (``select_youngest_eligible_donor``) and Phase C
-    saturation-mode cross-stage donor (``find_saturation_donor``) both
-    consume per-stage live worker sets sourced from the planner's
-    cycle-start snapshot. When a donor stage simultaneously suffers
-    worker loss (peer node disappears from the actor pool), the donor
-    selection must:
+    Phase B floor enforcement (driven by ``FloorPolicy`` through
+    ``DonorCoordinator.acquire``) and Phase C saturation-mode
+    cross-stage donor (driven by ``SaturationPolicy`` through the
+    same coordinator) both consume per-stage live worker sets
+    sourced from the planner's cycle-start snapshot. When a donor
+    stage simultaneously suffers worker loss (peer node disappears
+    from the actor pool), the donor selection must:
 
       1. Operate exclusively on surviving workers (lost ids never
          reach the pool because they are absent from
@@ -633,7 +636,7 @@ class TestDonorFlowUnderChurn:
       2. Honor the donor stage's floor against the post-loss live
          count, not the pre-loss count.
       3. Not leak per-worker state across cycles in a way that
-         corrupts the anti-flap state (``_last_donation_cycle``).
+         corrupts the anti-flap state (``last_donation_cycle``).
 
     These tests cover the donor-flow paths under churn explicitly.
     The scheduler-level Phase D / floor / EWMA paths under churn are
@@ -690,7 +693,7 @@ class TestDonorFlowUnderChurn:
         receiver is below floor and the cluster is full from the
         receiver's perspective, so Phase B falls through to the donor
         helper. The donor's ``worker_ids_by_stage`` reflects only
-        the survivors -- the lost id is absent. The helper is therefore
+        the survivors - the lost id is absent. The helper is therefore
         forced to pick from survivors, by construction.
 
         ::
@@ -769,8 +772,8 @@ class TestDonorFlowUnderChurn:
         )
         assert deleted_ids, "expected at least one survivor donation to satisfy receiver floor"
         # Lost id is absent from every per-worker map post-cycle.
-        assert "donor-node-0-w2" not in scheduler._worker_ages
-        assert "donor-node-0-w2" not in scheduler._worker_ready_first_seen_at
+        assert "donor-node-0-w2" not in scheduler.ledgers.worker_ages
+        assert not scheduler.ledgers.warmup.is_tracked("donor-node-0-w2")
 
     def test_floor_donor_unavailable_when_donor_stage_falls_to_floor(self) -> None:
         """Donor stage that loses workers down to its floor cannot donate; receiver floor stays unmet.
@@ -787,11 +790,11 @@ class TestDonorFlowUnderChurn:
         Phase B for receiver (target=4):
           * try_add succeeds once (1 free CPU consumed); receiver = 2.
           * try_add fails (cluster full again).
-          * donor fallback queries ``select_youngest_eligible_donor``;
-            donor stage at floor returns ``None`` (no slack to donate).
+          * donor fallback queries ``DonorCoordinator.acquire(policy=FloorPolicy(), ...)``;
+            donor stage at floor returns ``NO_CANDIDATES`` (no slack to donate).
           * receiver ends at 2, still below floor=4.
 
-        Pin: ``_floor_stuck_counters['receiver']`` is **absent** -- the
+        Pin: ``_floor_stuck_counters['receiver']`` is **absent** - the
         partial direct-add counts as progress, which Phase B's
         ``made_progress`` branch uses to clear the counter for this
         cycle (the next cycle without progress is the one that would
@@ -863,10 +866,10 @@ class TestDonorFlowUnderChurn:
         # is RESET (cleared from the map) on this cycle by Phase B's ``made_progress``
         # branch. The next cycle without further progress is the one that increments
         # the counter. Pin the actual contract: counter is absent (cleared) this cycle.
-        assert "receiver" not in scheduler._floor_stuck_counters
+        assert "receiver" not in scheduler.ledgers.floor_stuck_counters.view()
         # Lost donor id is absent from per-worker maps.
-        assert "donor-node-0-w2" not in scheduler._worker_ages
-        assert "donor-node-0-w2" not in scheduler._worker_ready_first_seen_at
+        assert "donor-node-0-w2" not in scheduler.ledgers.worker_ages
+        assert not scheduler.ledgers.warmup.is_tracked("donor-node-0-w2")
 
     def test_last_donation_cycle_persists_after_donor_stage_loses_all_workers(self) -> None:
         """``_last_donation_cycle`` is keyed by stage name, not by worker id, so loss preserves the entry.
@@ -881,7 +884,7 @@ class TestDonorFlowUnderChurn:
         anti-flap map.
 
         The map is populated only by Phase C
-        (``_record_donation_success``); Phase B floor donor does
+        (``record_donation_success``); Phase B floor donor does
         not stamp this map. To pin the churn contract regardless of
         donation path, the test seeds the map directly with a
         sentinel cycle value, then drives a cycle that loses every
@@ -900,12 +903,12 @@ class TestDonorFlowUnderChurn:
 
         # Seed the anti-flap map directly with a sentinel value pinned to the current
         # cycle counter. The contract under test is: the seeded entry MUST survive a
-        # cycle in which every donor worker disappears -- per-worker churn must not
+        # cycle in which every donor worker disappears - per-worker churn must not
         # mutate the stage-keyed map. Bypassing the donation-path requirement keeps
         # the test focused on the churn contract instead of accidentally testing
         # whether Phase B populates the map.
-        seeded_cycle = scheduler._cycle_counter
-        scheduler._last_donation_cycle["donor"] = seeded_cycle
+        seeded_cycle = scheduler.ledgers.cycle_counter
+        scheduler.ledgers.last_donation_cycle["donor"] = seeded_cycle
 
         # Cycle 2: donor loses ALL workers. Cluster goes to receiver-only (3 workers, 1 free).
         ps_cycle_2 = data_structures.ProblemState(
@@ -918,17 +921,18 @@ class TestDonorFlowUnderChurn:
 
         # The donor's per-worker state was pruned (no live ids in the donor stage).
         for i in range(3):
-            assert f"donor-node-0-w{i}" not in scheduler._worker_ages
-            assert f"donor-node-0-w{i}" not in scheduler._worker_ready_first_seen_at
+            assert f"donor-node-0-w{i}" not in scheduler.ledgers.worker_ages
+            assert not scheduler.ledgers.warmup.is_tracked(f"donor-node-0-w{i}")
         # The seeded entry survives the full-stage loss with its original cycle value.
         # No autoscale-side hook deletes stage-keyed map entries when a stage loses all
         # workers; entries persist for as long as the stage exists in the problem.
-        assert "donor" in scheduler._last_donation_cycle, (
-            f"loss must not delete the stage-keyed entry; _last_donation_cycle={dict(scheduler._last_donation_cycle)}"
+        assert "donor" in scheduler.ledgers.last_donation_cycle, (
+            "loss must not delete the stage-keyed entry; "
+            f"_last_donation_cycle={dict(scheduler.ledgers.last_donation_cycle)}"
         )
-        assert scheduler._last_donation_cycle["donor"] == seeded_cycle, (
+        assert scheduler.ledgers.last_donation_cycle["donor"] == seeded_cycle, (
             f"loss must not overwrite the stage-keyed entry; "
-            f"seeded={seeded_cycle}, observed={scheduler._last_donation_cycle['donor']}"
+            f"seeded={seeded_cycle}, observed={scheduler.ledgers.last_donation_cycle['donor']}"
         )
 
     def test_donor_stage_with_no_survivors_is_skipped_by_floor_donor(self) -> None:
@@ -979,5 +983,5 @@ class TestDonorFlowUnderChurn:
         assert receiver_post == 2
         # Lost donor ids are absent from per-worker maps.
         for i in range(3):
-            assert f"donor-node-0-w{i}" not in scheduler._worker_ages
-            assert f"donor-node-0-w{i}" not in scheduler._worker_ready_first_seen_at
+            assert f"donor-node-0-w{i}" not in scheduler.ledgers.worker_ages
+            assert not scheduler.ledgers.warmup.is_tracked(f"donor-node-0-w{i}")

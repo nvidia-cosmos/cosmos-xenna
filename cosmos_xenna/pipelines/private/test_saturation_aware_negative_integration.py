@@ -28,8 +28,8 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -180,7 +180,7 @@ class TestProblemStateShapeMismatchAfterSuccessfulCycle:
             ]
         )
         scheduler.autoscale(time=0.0, problem_state=valid_state)
-        snapshot_stage_states_before = dict(scheduler._stage_states)
+        snapshot_stage_states_before = dict(scheduler.ledgers.stage_states)
 
         bad_state = data_structures.ProblemState([_stage_state(name="A", num_workers=1, num_used_slots=4)])
 
@@ -191,9 +191,9 @@ class TestProblemStateShapeMismatchAfterSuccessfulCycle:
         assert "1 stages" in message and "2" in message, (
             f"error must name the shape mismatch (got=1 vs expected=2); message={message!r}"
         )
-        assert set(scheduler._stage_states) == set(snapshot_stage_states_before), (
+        assert set(scheduler.ledgers.stage_states) == set(snapshot_stage_states_before), (
             "stage_states set must not shrink to the corrupted snapshot's shape; "
-            f"before={set(snapshot_stage_states_before)}, after={set(scheduler._stage_states)}"
+            f"before={set(snapshot_stage_states_before)}, after={set(scheduler.ledgers.stage_states)}"
         )
 
 
@@ -230,9 +230,9 @@ class TestStageNameWithCurlyBracesInMulticycleError:
         assert "1 stages" in message and "2" in message, (
             f"error must report the shape mismatch numerically; got message={message!r}"
         )
-        assert hostile_name in scheduler._stage_states, (
+        assert hostile_name in scheduler.ledgers.stage_states, (
             "hostile-name stage must persist in scheduler state after the failed cycle; "
-            f"_stage_states keys={set(scheduler._stage_states)}"
+            f"_stage_states keys={set(scheduler.ledgers.stage_states)}"
         )
 
 
@@ -257,21 +257,24 @@ class TestAllocationFailureSkipCyclePreservesStateAndRecovers:
         )
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        worker_ages_after_cycle_1 = dict(scheduler._worker_ages)
+        worker_ages_after_cycle_1 = dict(scheduler.ledgers.worker_ages)
         assert "stage-w0" in worker_ages_after_cycle_1, (
             f"expected cycle 1 to register 'stage-w0' in _worker_ages; got {set(worker_ages_after_cycle_1)}"
         )
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=resources.AllocationError("synthetic placement failure"),
             ):
                 scheduler.autoscale(time=10.0, problem_state=ps)
 
-        assert worker_ages_after_cycle_1.keys() <= scheduler._worker_ages.keys(), (
+        assert worker_ages_after_cycle_1.keys() <= scheduler.ledgers.worker_ages.keys(), (
             "absorbed AllocationError must not evict cycle-1 worker ids from _worker_ages; "
-            f"before={set(worker_ages_after_cycle_1)}, after={set(scheduler._worker_ages)}"
+            f"before={set(worker_ages_after_cycle_1)}, after={set(scheduler.ledgers.worker_ages)}"
         )
 
         recovery_adds: list[int] = []
@@ -304,9 +307,12 @@ class TestAllocationFailurePropagatesWhenKillSwitchDisabled:
         )
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        ages_before_failure = dict(scheduler._worker_ages)
+        ages_before_failure = dict(scheduler.ledgers.worker_ages)
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=resources.AllocationError("synthetic placement failure"),
@@ -314,9 +320,9 @@ class TestAllocationFailurePropagatesWhenKillSwitchDisabled:
                 with pytest.raises(resources.AllocationError, match="synthetic placement failure"):
                     scheduler.autoscale(time=10.0, problem_state=ps)
 
-        assert ages_before_failure.keys() <= scheduler._worker_ages.keys(), (
+        assert ages_before_failure.keys() <= scheduler.ledgers.worker_ages.keys(), (
             "propagated AllocationError must not silently evict pre-failure ids from _worker_ages; "
-            f"before={set(ages_before_failure)}, after={set(scheduler._worker_ages)}"
+            f"before={set(ages_before_failure)}, after={set(scheduler.ledgers.worker_ages)}"
         )
 
         recovery_adds: list[int] = []
@@ -359,8 +365,8 @@ class TestCorruptedMidCycleMetricStateBlocksNextCycleAndRecovers:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime_a = scheduler._stage_states["A"]
-        runtime_a.pressure_ewma = math.nan
+        runtime_a = scheduler.ledgers.stage_states["A"]
+        runtime_a.pressure.ewma = math.nan
 
         with pytest.raises(ValueError) as exc_info:
             scheduler.autoscale(time=10.0, problem_state=ps)
@@ -376,7 +382,7 @@ class TestCorruptedMidCycleMetricStateBlocksNextCycleAndRecovers:
         assert len(recovery_solution.stages) == 2, (
             f"fresh scheduler must emit a 2-stage solution; got {len(recovery_solution.stages)}"
         )
-        fresh_ewma = fresh_scheduler._stage_states["A"].pressure_ewma
+        fresh_ewma = fresh_scheduler.ledgers.stage_states["A"].pressure.ewma
         assert fresh_ewma is None or math.isfinite(fresh_ewma), (
             f"fresh scheduler's pressure_ewma must stay finite over the same fixture; got {fresh_ewma!r}"
         )

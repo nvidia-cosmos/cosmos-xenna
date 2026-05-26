@@ -396,6 +396,23 @@ class SchedulerKind(enum.StrEnum):
     FRAGMENTATION_BASED = "fragmentation_based"
     SATURATION_AWARE = "saturation_aware"
 
+    @property
+    def supports_setup_aware_queue(self) -> bool:
+        """Whether this scheduler kind reads the per-stage ``setup_aware_max_queued`` flag.
+
+        The setup-aware backpressure cap (in
+        ``streaming_backpressure.compute_max_queued``) is gated by a
+        per-stage tunable that only the saturation-aware scheduler
+        consumes; the Rust-backed fragmentation-based path has no
+        equivalent config field and ignores the flag. Exposing the
+        capability on the enum keeps the per-stage backpressure
+        resolver from naming a specific ``SchedulerKind`` value and
+        leaves the abstraction boundary at the scheduler-kind layer
+        instead of at the backpressure helper. Future scheduler kinds
+        that wish to opt in just return ``True`` here.
+        """
+        return self is SchedulerKind.SATURATION_AWARE
+
 
 @attrs.define
 class SaturationAwareStageConfig:
@@ -414,7 +431,28 @@ class SaturationAwareStageConfig:
 
     Detailed tuning guidance per workload class lives in
     ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
+
+    Configuration tiers:
+        Per-field tier classification (primary / expert) lives in the
+        operator quick-reference at
+        ``docs/scheduler/saturation-aware/tuning.md``. The "Primary
+        knobs" section there groups every knob most operators ever
+        touch; the "Advanced tuning fields" appendix groups the rest
+        by feature. Fields are kept on this class so tests,
+        programmatic overrides, and future operator-facing surfacing
+        remain possible without a config migration. Defaults match
+        the recommended production behaviour; reach for any field
+        only when a documented symptom matches a row in
+        ``tuning.md``.
+
     """
+
+    # Per-field tier classification (primary / expert) lives in
+    # ``docs/scheduler/saturation-aware/tuning.md`` (the operator
+    # quick-reference). Inline per-field ``# tier:`` markers were
+    # intentionally NOT added: tuning.md is the single operator-facing
+    # source of truth, so an inline marker here would create a second
+    # source of truth that can drift from the operator doc.
 
     # Minimum cycles with at least one ready actor before the classifier is
     # trusted for that stage. Acts as a count-based data-sufficiency gate.
@@ -426,7 +464,7 @@ class SaturationAwareStageConfig:
     # canonical balanced QED value. Power users tune this single primary knob;
     # the explicit threshold overrides below stay available for stage-level
     # pinning. Range: [0.10, 0.60]. Tuning guidance lives in
-    # ``cosmos-xenna/docs/scheduler/saturation-aware/08-auto-derived-thresholds.md``.
+    # ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
     saturation_aggressiveness: float = attrs.field(
         default=0.30,
         validator=attrs.validators.and_(attrs.validators.ge(0.10), attrs.validators.le(0.60)),
@@ -785,7 +823,7 @@ class SaturationAwareStageConfig:
             raise ValueError(msg)
         # Local import keeps ``pressure.py``'s gauge registration SA-only;
         # a top-level import would trigger it from every non-SA pipeline.
-        from cosmos_xenna.pipelines.private.scheduling_py.pressure import BACKLOG_CAP
+        from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import BACKLOG_CAP
 
         if self.pressure_critical_threshold > BACKLOG_CAP:
             msg = (
@@ -805,7 +843,25 @@ class SaturationAwareConfig:
     ``SaturationAwareStageConfig``; see that class for resolution order.
     Detailed tuning guidance per workload class lives in
     ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
+
+    Configuration tiers:
+        Per-field tier classification (primary / expert) lives in the
+        operator quick-reference at
+        ``docs/scheduler/saturation-aware/tuning.md``. The "Primary
+        knobs" section there groups every knob most operators ever
+        touch; the "Advanced tuning fields" appendix groups the rest
+        by feature. Defaults match the recommended production
+        behaviour; reach for any field only when a documented symptom
+        matches a row in ``tuning.md``.
+
     """
+
+    # Per-field tier classification (primary / expert) lives in
+    # ``docs/scheduler/saturation-aware/tuning.md`` (the operator
+    # quick-reference). Inline per-field ``# tier:`` markers were
+    # intentionally NOT added: tuning.md is the single operator-facing
+    # source of truth, so an inline marker here would create a second
+    # source of truth that can drift from the operator doc.
 
     # Cycle period for the autoscaler control loop, in seconds. Effective
     # response time is ``interval_s * streak_min_cycles``.
@@ -1223,7 +1279,7 @@ class StreamingSpecificSpec:
     # ``SaturationAwareConfig``. The chained factories on
     # ``SaturationAwareConfig.stage_defaults`` and
     # ``SaturationAwareStageConfig.__attrs_post_init__`` import
-    # ``scheduling_py.pressure``, which registers Ray ``Gauge`` series
+    # ``scheduling_py.phases.intent.pressure``, which registers Ray ``Gauge`` series
     # at module load; constructing the SA config eagerly would defeat
     # the lazy-registration guarantee for FRAGMENTATION_BASED runs.
     # Callers running on the saturation-aware path reach a non-None
@@ -1234,7 +1290,7 @@ class StreamingSpecificSpec:
         """Return the saturation-aware config, materializing a default once when ``None``.
 
         The ``saturation_aware`` field defaults to ``None`` to keep the
-        fragmentation-based path free of ``scheduling_py.pressure``
+        fragmentation-based path free of ``scheduling_py.phases.intent.pressure``
         Ray ``Gauge`` registrations triggered transitively by the
         ``SaturationAwareConfig`` factory chain. This helper is the
         single point where the SA-aware code paths force materialization;

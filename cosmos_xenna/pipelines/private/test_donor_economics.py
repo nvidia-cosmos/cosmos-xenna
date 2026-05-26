@@ -5,13 +5,14 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Donor-economics helpers and the throughput-first commit gate.
 
@@ -22,37 +23,49 @@ Five concerns ship from this module:
 *   ``_receiver_value`` - marginal value of adding N workers to the
     receiver; combines pressure EWMA with a bottleneck-severity term
     and an intent term.
-*   ``_signal_trust`` - per-stage Sharpe-style trust metric used by
+*   ``signal_trust`` - per-stage Sharpe-style trust metric used by
     the layer-4 pre-filter.
 *   ``_compute_post_plan_d_k`` - post-plan ``D_k`` simulator that
     holds ``S_k`` fixed and recomputes effective capacity per affected
     stage.
-*   ``_evaluate_economic_gate`` - the throughput-first commit gate
-    composer that returns a ``_GateResult`` carrying every metric the
+*   ``EconomicGate.evaluate`` - the throughput-first commit gate
+    composer that returns a ``GateResult`` carrying every metric the
     decision log emits.
 
 Each test pins one contract; the gate's reject-reason values are
-asserted via ``RejectReason`` to keep log strings stable.
+asserted via ``RejectReason`` so the structured ``reject_reason``
+field bound by ``logger.bind(...).debug(...)`` stays stable across
+emit sites.
 """
 
 import math
+from collections.abc import Mapping
 
 import attrs
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorPlan,
-    DonorWorker,
-    RejectReason,
+from cosmos_xenna.pipelines.private.scheduling_py.donor.economic_gate import (
+    EconomicGate,
     _compute_post_plan_d_k,
     _donor_cost,
-    _evaluate_economic_gate,
-    _format_donor_decision_log,
     _receiver_value,
-    _signal_trust,
+    signal_trust,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
-from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import (
+    DonorPlan,
+    DonorWorker,
+    GateResult,
+    RejectReason,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
+    GrowthMode,
+    GrowthState,
+    PressureState,
+    StageRuntimeState,
+    StageState,
+)
+from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
 
 
 def _state(
@@ -63,23 +76,54 @@ def _state(
     slots_empty_ewma: float | None = 0.5,
     pressure_ewma: float | None = 0.0,
     noise_ewma: float | None = None,
-) -> _StageRuntimeState:
+) -> StageRuntimeState:
     """Compact factory for runtime states used in the economics tests."""
-    return _StageRuntimeState(
+    return StageRuntimeState(
         stage_name=name,
-        classifier_state=classifier,
-        classifier_streak=streak,
-        growth_mode=GrowthMode.TRACKING,
-        growth_streak=10,
-        slots_empty_ratio_ewma=slots_empty_ewma,
-        pressure_ewma=pressure_ewma,
-        classifier_signal_noise_ewma=noise_ewma,
+        classifier=ClassifierState(
+            state=classifier, streak=streak, slots_empty_ratio_ewma=slots_empty_ewma, signal_noise_ewma=noise_ewma
+        ),
+        growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
+        pressure=PressureState(ewma=pressure_ewma),
     )
 
 
 def _config(**overrides: object) -> SaturationAwareConfig:
     """``SaturationAwareConfig`` with overridable defaults for gate tests."""
     return SaturationAwareConfig(**overrides)  # type: ignore[arg-type]
+
+
+def _evaluate_economic_gate(
+    *,
+    plan: DonorPlan,
+    stage_names: list[str],
+    stage_states: dict[str, StageRuntimeState],
+    receiver_intent: int,
+    d_k_now: Mapping[str, float],
+    effective_capacities: Mapping[str, int],
+    s_k_ewma: Mapping[str, float],
+    slots_per_worker_by_stage: Mapping[str, int],
+    config: SaturationAwareConfig,
+) -> GateResult:
+    """Construct an ``EconomicGate`` and dispatch ``evaluate``.
+
+    Tests call this helper once per assertion so each test exercises
+    the public class API (``EconomicGate(config=...).evaluate(...)``)
+    through a single call site; the production module exports
+    ``EconomicGate`` only.
+
+    """
+    gate = EconomicGate(config=config)
+    return gate.evaluate(
+        plan=plan,
+        stage_names=stage_names,
+        stage_states=stage_states,
+        receiver_intent=receiver_intent,
+        d_k_now=d_k_now,
+        effective_capacities=effective_capacities,
+        s_k_ewma=s_k_ewma,
+        slots_per_worker_by_stage=slots_per_worker_by_stage,
+    )
 
 
 class TestDonorCost:
@@ -166,21 +210,21 @@ class TestSignalTrust:
     def test_clean_signal_trust_equals_clamped_streak(self) -> None:
         """``classifier_signal_noise_ewma=None`` -> denominator = 1.0 -> trust = streak."""
         stage = _state("A", streak=30, noise_ewma=None)
-        trust = _signal_trust(stage, trust_streak_cap=60)
+        trust = signal_trust(stage, trust_streak_cap=60)
 
         assert trust == 30.0
 
     def test_streak_clamped_at_trust_streak_cap(self) -> None:
         """``min(streak, cap)`` mirrors the donor-cost streak cap independently."""
         stage = _state("A", streak=10_000, noise_ewma=None)
-        trust = _signal_trust(stage, trust_streak_cap=60)
+        trust = signal_trust(stage, trust_streak_cap=60)
 
         assert trust == 60.0
 
     def test_noise_attenuates_trust(self) -> None:
         """Larger noise EWMA reduces trust proportionally."""
         stage = _state("A", streak=30, noise_ewma=4.0)
-        trust = _signal_trust(stage, trust_streak_cap=60)
+        trust = signal_trust(stage, trust_streak_cap=60)
 
         # min(30, 60) / (1 + 4) = 6.0.
         assert math.isclose(trust, 6.0, rel_tol=1e-9)
@@ -193,9 +237,9 @@ class TestComputePostPlanDk:
         """Capacity bookkeeping respects channel units.
 
         A donation cycle removes N donors and adds exactly ONE receiver
-        worker (regardless of plan size) -- ``_run_phase_c_grow`` calls
-        ``try_add_worker`` once per ``_attempt_cross_stage_donation``.
-        With ``slots_per_worker=1`` for both stages, removing 2 donor
+        worker (regardless of plan size) -- ``phases.phase_c.run`` calls
+        ``try_add_worker`` once per ``DonorCoordinator.acquire``. With
+        ``slots_per_worker=1`` for both stages, removing 2 donor
         workers drops donor capacity by 2 channels and gains the
         receiver 1 channel.
         """
@@ -562,337 +606,3 @@ class TestGateResultStability:
 
         with pytest.raises(attrs.exceptions.FrozenInstanceError):
             result.accepted = False  # type: ignore[misc]
-
-
-class TestDecisionLogSchema:
-    """The structured decision-log line carries every advertised field in the same order."""
-
-    def test_commit_line_starts_with_commit_marker(self) -> None:
-        """INFO commit log starts with ``[scheduler] donor decision (commit):``."""
-        cfg = _config()
-        plan = DonorPlan(
-            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
-            receiver_stage_index=1,
-        )
-        states = {
-            "A": _state("A", slots_empty_ewma=0.5, streak=60),
-            "B": _state("B", classifier=StageState.SATURATED, pressure_ewma=2.0, streak=60),
-        }
-        gate = _evaluate_economic_gate(
-            plan=plan,
-            stage_names=["A", "B"],
-            stage_states=states,
-            receiver_intent=1,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            config=cfg,
-            slots_per_worker_by_stage={},
-        )
-
-        line = _format_donor_decision_log(
-            receiver_name="B",
-            receiver_state=states["B"],
-            receiver_d_k=math.nan,
-            receiver_intent=1,
-            capacity_before=1,
-            capacity_after=2,
-            plan=plan,
-            stage_names=["A", "B"],
-            gate_result=gate,
-            spread_threshold=cfg.cross_stage_donor_spread_threshold,
-            reject_reason=None,
-        )
-
-        assert line.startswith("[scheduler] donor decision (commit):")
-
-    def test_reject_line_starts_with_reject_marker(self) -> None:
-        """DEBUG reject log starts with ``[scheduler] donor decision (reject):``."""
-        line = _format_donor_decision_log(
-            receiver_name="B",
-            receiver_state=None,
-            receiver_d_k=math.nan,
-            receiver_intent=0,
-            capacity_before=0,
-            capacity_after=0,
-            plan=None,
-            stage_names=["A", "B"],
-            gate_result=None,
-            spread_threshold=0.5,
-            reject_reason=RejectReason.NO_CANDIDATES.value,
-        )
-
-        assert line.startswith("[scheduler] donor decision (reject):")
-
-    def test_commit_line_carries_every_documented_field(self) -> None:
-        """The commit log carries every field the operator schema specifies."""
-        cfg = _config()
-        plan = DonorPlan(
-            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
-            receiver_stage_index=1,
-        )
-        states = {
-            "A": _state("A", slots_empty_ewma=0.5, streak=60),
-            "B": _state("B", classifier=StageState.SATURATED, pressure_ewma=2.0, streak=60),
-        }
-        gate = _evaluate_economic_gate(
-            plan=plan,
-            stage_names=["A", "B"],
-            stage_states=states,
-            receiver_intent=1,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            config=cfg,
-            slots_per_worker_by_stage={},
-        )
-
-        line = _format_donor_decision_log(
-            receiver_name="B",
-            receiver_state=states["B"],
-            receiver_d_k=4.0,
-            receiver_intent=1,
-            capacity_before=1,
-            capacity_after=2,
-            plan=plan,
-            stage_names=["A", "B"],
-            gate_result=gate,
-            spread_threshold=cfg.cross_stage_donor_spread_threshold,
-            reject_reason=None,
-        )
-
-        # Each field name MUST appear exactly as the operator schema documents.
-        for field in (
-            "receiver=",
-            "classifier=",
-            "pressure_ewma=",
-            "slots_empty=",
-            "D_k=",
-            "capacity_before=",
-            "capacity_after=",
-            "intent=",
-            "receiver_value=",
-            "donor_plan=",
-            "donor_cost=",
-            "spread=",
-            "spread_threshold=",
-            "signal_trust=",
-            "throughput_before=",
-            "throughput_after=",
-            "max_d_before=",
-            "max_d_after=",
-            "balance_score_before=",
-            "balance_score_after=",
-        ):
-            assert field in line, f"missing field {field!r} in decision log: {line}"
-
-    def test_reject_line_includes_reject_reason_and_placement_reject_reason(self) -> None:
-        """DEBUG reject log carries both ``reject_reason`` and ``placement_reject_reason``."""
-        line = _format_donor_decision_log(
-            receiver_name="B",
-            receiver_state=None,
-            receiver_d_k=math.nan,
-            receiver_intent=0,
-            capacity_before=0,
-            capacity_after=0,
-            plan=None,
-            stage_names=["A", "B"],
-            gate_result=None,
-            spread_threshold=0.5,
-            reject_reason=RejectReason.RESOURCE_FIT.value,
-            placement_reject_reason="no_placement",
-        )
-
-        assert "reject_reason='resource_fit'" in line
-        assert "placement_reject_reason='no_placement'" in line
-
-    def test_early_return_reject_line_uses_nan_for_unavailable_metrics(self) -> None:
-        """Early-return paths (no plan / gate) render ``nan`` for missing floats."""
-        line = _format_donor_decision_log(
-            receiver_name="B",
-            receiver_state=None,
-            receiver_d_k=math.nan,
-            receiver_intent=0,
-            capacity_before=0,
-            capacity_after=0,
-            plan=None,
-            stage_names=["A", "B"],
-            gate_result=None,
-            spread_threshold=0.5,
-            reject_reason=RejectReason.MASTER_TOGGLE_OFF.value,
-        )
-
-        # NaN values carry the textual marker ``nan`` for log consumers
-        # that key off it; donor_plan / signal_trust render as empty lists.
-        assert "spread=nan" in line
-        assert "throughput_before=nan" in line
-        assert "donor_plan=[]" in line
-        assert "signal_trust=[]" in line
-
-
-class TestRejectionPathEmitsDebug:
-    """Each layered rejection emits exactly one DEBUG line via ``_emit_reject``."""
-
-    def test_master_toggle_off_emits_one_debug_line(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Disabling ``enable_cross_stage_donor`` emits one ``master_toggle_off`` DEBUG line."""
-        from unittest.mock import patch
-
-        from cosmos_xenna.pipelines.private.scheduling_py.donor import find_saturation_donor
-
-        cfg = _config(enable_cross_stage_donor=False)
-        states = {
-            "A": _state("A", streak=60),
-            "B": _state("B", classifier=StageState.SATURATED),
-        }
-        emitted: list[str] = []
-
-        with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.donor.logger.debug",
-            lambda msg: emitted.append(msg),
-        ):
-            decision = find_saturation_donor(
-                receiver_stage_index=1,
-                receiver_stage_name="B",
-                stage_names=["A", "B"],
-                stage_floors={0: 1, 1: 1},
-                worker_ids_by_stage=[["a-w0"], ["b-w0"]],
-                worker_ages={"a-w0": 0, "b-w0": 0},
-                worker_nodes={},
-                stage_states=states,
-                config=cfg,
-                stage_configs={},
-                cycle=0,
-                last_donation_cycle={},
-                ctx=None,  # type: ignore[arg-type]
-                receiver_intent=1,
-                d_k_now={},
-                effective_capacities={},
-                s_k_ewma={},
-                slots_per_worker_by_stage={},
-            )
-
-        assert decision is None
-        assert len(emitted) == 1
-        assert "reject_reason='master_toggle_off'" in emitted[0]
-
-    def test_resource_fit_failure_emits_one_debug_line(self) -> None:
-        """An always-infeasible probe drives ``find_saturation_donor`` to the resource_fit DEBUG path."""
-        from unittest.mock import patch
-
-        import attrs
-
-        from cosmos_xenna.pipelines.private.scheduling_py.donor import find_saturation_donor
-
-        @attrs.frozen
-        class _InfeasibleProbe:
-            feasible: bool = False
-            reject_reason: str = "no_placement"
-
-        @attrs.define
-        class _AlwaysInfeasibleCtx:
-            def probe_add_after_removals(
-                self,
-                removals: list[tuple[int, str]],
-                add_stage_index: int,
-            ) -> _InfeasibleProbe:
-                del removals, add_stage_index
-                return _InfeasibleProbe()
-
-        cfg = _config()
-        states = {
-            "A": _state("A", streak=60),
-            "B": _state("B", classifier=StageState.SATURATED),
-        }
-        stage_configs = {name: SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3) for name in ("A", "B")}
-        emitted: list[str] = []
-
-        with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.donor.logger.debug",
-            lambda msg: emitted.append(msg),
-        ):
-            decision = find_saturation_donor(
-                receiver_stage_index=1,
-                receiver_stage_name="B",
-                stage_names=["A", "B"],
-                stage_floors={0: 1, 1: 1},
-                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-                worker_ages={"a-w0": 5, "a-w1": 3, "b-w0": 2},
-                worker_nodes={},
-                stage_states=states,
-                config=cfg,
-                stage_configs=stage_configs,
-                cycle=100,
-                last_donation_cycle={},
-                ctx=_AlwaysInfeasibleCtx(),  # type: ignore[arg-type]
-                receiver_intent=1,
-                d_k_now={},
-                effective_capacities={},
-                s_k_ewma={},
-                slots_per_worker_by_stage={},
-            )
-
-        assert decision is None
-        assert len(emitted) == 1
-        assert "reject_reason='resource_fit'" in emitted[0]
-
-    def test_economic_gate_rejection_emits_debug_line_through_find_saturation_donor(self) -> None:
-        """A gate rejection (not a layered filter) reaches the find_saturation_donor wrapper's DEBUG path."""
-        from unittest.mock import patch
-
-        import attrs
-
-        from cosmos_xenna.pipelines.private.scheduling_py.donor import find_saturation_donor
-
-        @attrs.frozen
-        class _AlwaysFeasibleProbe:
-            feasible: bool = True
-            reject_reason: str = ""
-
-        @attrs.define
-        class _AlwaysFeasibleCtx:
-            def probe_add_after_removals(
-                self,
-                removals: list[tuple[int, str]],
-                add_stage_index: int,
-            ) -> _AlwaysFeasibleProbe:
-                del removals, add_stage_index
-                return _AlwaysFeasibleProbe()
-
-        # Spread threshold high enough that the chosen plan fails the
-        # spread gate (donor_cost ~0, receiver_value ~0 -> spread=0).
-        cfg = _config(cross_stage_donor_spread_threshold=10.0)
-        states = {
-            "A": _state("A", slots_empty_ewma=0.0, streak=60),
-            "B": _state("B", pressure_ewma=0.0, streak=60),
-        }
-        stage_configs = {name: SaturationAwareStageConfig(over_provisioned_streak_min_cycles=3) for name in ("A", "B")}
-        emitted: list[str] = []
-
-        with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.donor.logger.debug",
-            lambda msg: emitted.append(msg),
-        ):
-            decision = find_saturation_donor(
-                receiver_stage_index=1,
-                receiver_stage_name="B",
-                stage_names=["A", "B"],
-                stage_floors={0: 1, 1: 1},
-                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-                worker_ages={"a-w0": 5, "a-w1": 3, "b-w0": 2},
-                worker_nodes={},
-                stage_states=states,
-                config=cfg,
-                stage_configs=stage_configs,
-                cycle=100,
-                last_donation_cycle={},
-                ctx=_AlwaysFeasibleCtx(),  # type: ignore[arg-type]
-                receiver_intent=0,
-                d_k_now={},
-                effective_capacities={},
-                s_k_ewma={},
-                slots_per_worker_by_stage={},
-            )
-
-        assert decision is None
-        assert len(emitted) == 1
-        assert "reject_reason='spread_below_threshold'" in emitted[0]

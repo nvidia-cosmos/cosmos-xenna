@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"""Tests for ``SaturationAwareScheduler._run_phase_c_grow`` DAG-priority + stuck-plan counter.
+"""Tests for the saturation-aware Phase C entry point (``phases.phase_c.run``) DAG-priority + stuck-plan counter.
 
 The scheduler extends single-target growth into multi-target
 DAG-priority growth and adds the per-stage stuck-plan counter that
@@ -33,10 +33,11 @@ feeds the later watchdog. The contract under test:
       this file pins behaviour that depends on the ordering being
       downstream-first when the legacy DAG toggle is enabled.
 
-Tests inject the intent dict via
-``patch.object(scheduler, "_compute_intent_deltas", ...)`` so each
-adversarial case exercises placement without rigging classifier
-signals.
+Tests inject the intent dict by patching
+``IntentPhase._compute_intent_deltas`` on
+``cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase``
+so each adversarial case exercises placement without rigging
+classifier signals.
 """
 
 import logging
@@ -47,7 +48,7 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -149,12 +150,15 @@ def _autoscale_with_intents(
     state: data_structures.ProblemState,
     intents: dict[str, int],
 ) -> data_structures.Solution:
-    """Run autoscale with ``intents`` injected as ``_compute_intent_deltas`` output."""
+    """Run autoscale with ``intents`` injected as the patched ``intent_phase.compute`` output."""
 
-    def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
+    def _inject(_services: object, _cycle: object, **_kwargs: object) -> dict[str, int]:
         return dict(intents)
 
-    with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):
+    with patch(
+        "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+        side_effect=_inject,
+    ):
         return scheduler.autoscale(time=0.0, problem_state=state)
 
 
@@ -195,8 +199,8 @@ class TestDagPriorityCanonical:
 
         _autoscale_with_intents(scheduler, self._three_stage_state(), {"s0": 1, "s2": 1})
 
-        assert scheduler._stuck_plan_counters["s0"] == 1
-        assert scheduler._stuck_plan_counters["s2"] == 0
+        assert scheduler.ledgers.stuck_plan.get_counter("s0") == 1
+        assert scheduler.ledgers.stuck_plan.get_counter("s2") == 0
 
     def test_problem_order_iteration_when_dag_priority_flag_disabled(self) -> None:
         """With ``enable_dag_priority_growth=False``, stage[0] (problem-order first) wins."""
@@ -208,8 +212,8 @@ class TestDagPriorityCanonical:
 
         _autoscale_with_intents(scheduler, self._three_stage_state(), {"s0": 1, "s2": 1})
 
-        assert scheduler._stuck_plan_counters["s0"] == 0, "shallowest wins under problem-order"
-        assert scheduler._stuck_plan_counters["s2"] == 1, "deepest is starved under problem-order"
+        assert scheduler.ledgers.stuck_plan.get_counter("s0") == 0, "shallowest wins under problem-order"
+        assert scheduler.ledgers.stuck_plan.get_counter("s2") == 1, "deepest is starved under problem-order"
 
 
 class TestIndependentMultiTargetGrowth:
@@ -232,9 +236,9 @@ class TestIndependentMultiTargetGrowth:
 
         _autoscale_with_intents(scheduler, state, {"s0": 1, "s1": 1, "s2": 1})
 
-        assert scheduler._stuck_plan_counters["s2"] == 0, "deepest grew, counter reset"
-        assert scheduler._stuck_plan_counters["s1"] == 1, "stage[1] was attempted (and failed)"
-        assert scheduler._stuck_plan_counters["s0"] == 1, "stage[0] was attempted (and failed)"
+        assert scheduler.ledgers.stuck_plan.get_counter("s2") == 0, "deepest grew, counter reset"
+        assert scheduler.ledgers.stuck_plan.get_counter("s1") == 1, "stage[1] was attempted (and failed)"
+        assert scheduler.ledgers.stuck_plan.get_counter("s0") == 1, "stage[0] was attempted (and failed)"
 
 
 class TestStuckPlanAccumulation:
@@ -251,7 +255,7 @@ class TestStuckPlanAccumulation:
         observed: list[int] = []
         for _ in range(3):
             _autoscale_with_intents(scheduler, state, {"A": 5})
-            observed.append(scheduler._stuck_plan_counters["A"])
+            observed.append(scheduler.ledgers.stuck_plan.get_counter("A"))
 
         assert observed == [1, 2, 3]
 
@@ -266,12 +270,12 @@ class TestStuckPlanReset:
             cluster=_cluster(total_cpus_per_node=8),
         )
         # Manually seed a prior-stuck state without rigging the cluster.
-        scheduler._stuck_plan_counters["A"] = 7
+        scheduler.ledgers.stuck_plan.set("A", 7)
         state = _problem_state([("A", 1, 1, False)])
 
         _autoscale_with_intents(scheduler, state, {"A": 2})
 
-        assert scheduler._stuck_plan_counters["A"] == 0
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 0
 
     def test_intent_zero_resets_counter_after_prior_stuck(self) -> None:
         """A stage that recovers to ``intent <= 0`` clears its stuck history."""
@@ -282,11 +286,11 @@ class TestStuckPlanReset:
         state = _problem_state([("A", 1, 1, False)])
 
         _autoscale_with_intents(scheduler, state, {"A": 5})
-        assert scheduler._stuck_plan_counters["A"] == 1
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 1
 
         _autoscale_with_intents(scheduler, state, {"A": 0})
 
-        assert scheduler._stuck_plan_counters["A"] == 0
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 0
 
     def test_negative_intent_resets_counter(self) -> None:
         """``intent < 0`` (Phase D territory) also resets the counter."""
@@ -299,7 +303,7 @@ class TestStuckPlanReset:
         _autoscale_with_intents(scheduler, state, {"A": 5})
         _autoscale_with_intents(scheduler, state, {"A": -2})
 
-        assert scheduler._stuck_plan_counters["A"] == 0
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 0
 
     def test_setup_resets_counters(self) -> None:
         """A fresh ``setup()`` clears the stuck-plan dict completely."""
@@ -308,11 +312,11 @@ class TestStuckPlanReset:
             cluster=_cluster(total_cpus_per_node=1),
         )
         _autoscale_with_intents(scheduler, _problem_state([("A", 1, 1, False)]), {"A": 5})
-        assert scheduler._stuck_plan_counters != {}
+        assert dict(scheduler.ledgers.stuck_plan.view()) != {}
 
         scheduler.setup(_problem([("B", None)]))
 
-        assert scheduler._stuck_plan_counters == {}
+        assert dict(scheduler.ledgers.stuck_plan.view()) == {}
 
 
 class TestStuckPlanFinishedStage:
@@ -325,11 +329,11 @@ class TestStuckPlanFinishedStage:
             cluster=_cluster(total_cpus_per_node=1),
         )
         _autoscale_with_intents(scheduler, _problem_state([("A", 1, 1, False)]), {"A": 5})
-        assert scheduler._stuck_plan_counters["A"] == 1
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 1
 
         _autoscale_with_intents(scheduler, _problem_state([("A", 1, 1, True)]), {"A": 5})
 
-        assert scheduler._stuck_plan_counters["A"] == 1, (
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 1, (
             "current contract: finished short-circuit precedes the counter update; "
             "previously-stuck stages retain their counter value across the transition"
         )
@@ -389,8 +393,8 @@ class TestDagPriorityScale:
 
         assert len(solution.stages[99].new_workers) == 1
         assert sum(len(s.new_workers) for s in solution.stages[:99]) == 0
-        assert scheduler._stuck_plan_counters[stage_names[99]] == 0
-        assert all(scheduler._stuck_plan_counters[n] == 1 for n in stage_names[:99])
+        assert scheduler.ledgers.stuck_plan.get_counter(stage_names[99]) == 0
+        assert all(scheduler.ledgers.stuck_plan.get_counter(n) == 1 for n in stage_names[:99])
 
 
 class TestBottleneckPriorityGrowth:
@@ -415,7 +419,7 @@ class TestBottleneckPriorityGrowth:
             enable_bottleneck_priority_growth=True,
         )
         # Pre-populate the intrinsic S_k EWMA so identify_bottleneck returns engaged with s1 as argmax.
-        scheduler._s_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+        scheduler.ledgers.s_k_ewma.set_many({"s0": 0.5, "s1": 4.0, "s2": 0.5})
 
         solution = _autoscale_with_intents(
             scheduler,
@@ -434,7 +438,7 @@ class TestBottleneckPriorityGrowth:
             cluster=_cluster(total_cpus_per_node=4),
             enable_bottleneck_priority_growth=False,
         )
-        scheduler._s_k_ewma = {"s0": 0.5, "s1": 4.0, "s2": 0.5}
+        scheduler.ledgers.s_k_ewma.set_many({"s0": 0.5, "s1": 4.0, "s2": 0.5})
 
         solution = _autoscale_with_intents(
             scheduler,
@@ -453,7 +457,7 @@ class TestBottleneckPriorityGrowth:
             enable_bottleneck_priority_growth=True,
         )
         # Balanced intrinsic S_k -> uniform D_k -> ratio=1.0 < 2.0 -> not engaged.
-        scheduler._s_k_ewma = {"s0": 1.0, "s1": 1.0, "s2": 1.0}
+        scheduler.ledgers.s_k_ewma.set_many({"s0": 1.0, "s1": 1.0, "s2": 1.0})
 
         solution = _autoscale_with_intents(
             scheduler,

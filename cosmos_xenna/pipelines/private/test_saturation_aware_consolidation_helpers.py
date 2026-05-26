@@ -17,8 +17,8 @@
 """Direct unit tests for the Phase D consolidation helpers.
 
 Pins the contracts of
-:meth:`SaturationAwareScheduler._compute_host_gpu_used_fractions` and
-:meth:`SaturationAwareScheduler._extract_worker_host_gpu_used_fractions`
+:func:`aggregate_host_gpu_used_fractions` and
+:func:`project_stage_worker_fractions`
 in isolation from Phase D's orchestrator wiring. Failures here pinpoint
 helper-level bugs without forcing a full autoscale cycle, which is the
 natural failure-attribution boundary when consolidation regressions
@@ -49,7 +49,10 @@ import math
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.gpu_fraction_map import (
+    aggregate_host_gpu_used_fractions,
+    project_stage_worker_fractions,
+)
 
 _F32_TOL = 1e-5
 
@@ -110,7 +113,7 @@ class TestComputeHostGpuUsedFractions:
         """No stages means no GPUs to aggregate; the map is empty."""
         state = _make_problem_state([])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result == {}
 
@@ -118,7 +121,7 @@ class TestComputeHostGpuUsedFractions:
         """A stage with no workers contributes no allocations."""
         state = _make_problem_state([("A", [], False)])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result == {}
 
@@ -126,7 +129,7 @@ class TestComputeHostGpuUsedFractions:
         """Workers with empty ``gpus`` lists do not appear in the map."""
         state = _make_problem_state([("A", [("A-w0", []), ("A-w1", [])], False)])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result == {}
 
@@ -134,7 +137,7 @@ class TestComputeHostGpuUsedFractions:
         """A single worker on a single GPU yields one map entry."""
         state = _make_problem_state([("A", [("A-w0", [("node-0", 2, 0.35)])], False)])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 2)}
         assert result[("node-0", 2)] == pytest.approx(0.35, abs=_F32_TOL)
@@ -148,7 +151,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result == {("node-0", 0): pytest.approx(0.80, abs=_F32_TOL)}
 
@@ -161,7 +164,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result == {("node-0", 0): pytest.approx(0.60, abs=_F32_TOL)}
 
@@ -181,7 +184,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0), ("node-0", 1), ("node-1", 0)}
         assert result[("node-0", 0)] == pytest.approx(0.10, abs=_F32_TOL)
@@ -196,7 +199,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0), ("node-0", 1)}
         assert result[("node-0", 0)] == pytest.approx(0.50, abs=_F32_TOL)
@@ -210,7 +213,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0), ("node-1", 0)}
         assert result[("node-0", 0)] == pytest.approx(1.0, abs=_F32_TOL)
@@ -229,7 +232,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert result[("node-0", 0)] == pytest.approx(1.50, abs=_F32_TOL)
 
@@ -237,7 +240,7 @@ class TestComputeHostGpuUsedFractions:
         """Allocations with ``used_fraction=0`` still appear in the map (key exists)."""
         state = _make_problem_state([("A", [("A-w0", [("node-0", 0, 0.0)])], False)])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0)}
         assert result[("node-0", 0)] == 0.0
@@ -251,8 +254,8 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        first = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
-        second = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        first = aggregate_host_gpu_used_fractions(state)
+        second = aggregate_host_gpu_used_fractions(state)
 
         assert first == second
 
@@ -265,7 +268,7 @@ class TestComputeHostGpuUsedFractions:
             ],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0)}
         assert result[("node-0", 0)] == pytest.approx(0.40, abs=_F32_TOL)
@@ -278,7 +281,7 @@ class TestComputeHostGpuUsedFractions:
             [(f"S{i}", [worker_rows[i]], False) for i in range(100)],
         )
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", 0)}
         # f32 quantization on each of 100 0.01 contributions accumulates to a wider
@@ -296,7 +299,7 @@ class TestComputeHostGpuUsedFractions:
             worker_rows.append((f"w{index:04d}", [("node-0", offset, 0.001)]))
         state = _make_problem_state([("S", worker_rows, False)])
 
-        result = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+        result = aggregate_host_gpu_used_fractions(state)
 
         assert set(result.keys()) == {("node-0", offset) for offset in range(8)}
         for offset, count in enumerate(per_gpu_count):
@@ -311,7 +314,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         """A stage with no workers projects to an empty map."""
         state = _make_problem_state([("A", [], False)])
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions={},
         )
@@ -322,7 +325,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         """A worker with no GPU allocations defaults to fraction 0.0."""
         state = _make_problem_state([("A", [("A-w0", [])], False)])
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions={},
         )
@@ -335,7 +338,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         # Cluster-wide aggregate includes a phantom 0.40 from another (unmodeled) stage.
         host_gpu_used_fractions = {("node-0", 0): 0.70}
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -347,7 +350,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         """A worker whose GPU is absent from the cluster map maps to 0.0."""
         state = _make_problem_state([("A", [("A-w0", [("node-0", 9, 0.10)])], False)])
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions={("node-0", 0): 0.99},
         )
@@ -364,7 +367,7 @@ class TestExtractWorkerHostGpuUsedFractions:
             ("node-0", 1): 0.10,
         }
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -382,7 +385,7 @@ class TestExtractWorkerHostGpuUsedFractions:
             ("node-1", 0): 0.30,
         }
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -410,7 +413,7 @@ class TestExtractWorkerHostGpuUsedFractions:
             ("node-0", 1): 0.95,
         }
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -424,7 +427,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         """A GPU with aggregate 0.0 projects to a worker fraction of 0.0."""
         state = _make_problem_state([("A", [("A-w0", [("node-0", 0, 0.0)])], False)])
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions={("node-0", 0): 0.0},
         )
@@ -448,7 +451,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         # Cluster-wide map sees both: 0.25 + 0.25 = 0.50.
         host_gpu_used_fractions = {("node-0", 0): 0.50}
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -464,7 +467,7 @@ class TestExtractWorkerHostGpuUsedFractions:
         state = _make_problem_state([("A", [("A-w0", [("node-0", 0, 0.50)])], False)])
         host_gpu_used_fractions = {("node-0", 0): 1.50}
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -481,7 +484,7 @@ class TestExtractWorkerHostGpuUsedFractions:
             ("node-0", 1): 0.0,
         }
 
-        result = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+        result = project_stage_worker_fractions(
             runtime_stage=state.rust.stages[0],
             host_gpu_used_fractions=host_gpu_used_fractions,
         )
@@ -494,26 +497,37 @@ class TestExtractWorkerHostGpuUsedFractions:
 class TestDefensiveNumericInputs:
     """Pin where adversarial numeric inputs are rejected vs. propagated.
 
-    The Rust ``GpuAllocation`` constructor enforces a numeric domain
-    (finite, non-NaN). Inputs that violate that domain panic at the
-    Rust boundary before they can reach the Python aggregator, so the
-    Python helpers never observe pathological fractions in production.
-    These tests pin that boundary so a future change that loosens
-    Rust-side validation forces an explicit choice about how the
-    Python helpers should respond.
+    The Rust ``GpuAllocation`` constructor PARTIALLY enforces a
+    numeric domain. NaN and ``+inf`` panic at the Rust boundary, so
+    the Python aggregator never observes them. Negative values, by
+    contrast, silently wrap in the unsigned fixed-point storage
+    (``FixedU32<U16>``); production allocations are non-negative so
+    this wrap is never exercised, but pinning it here makes the
+    asymmetry explicit and forces an explicit choice if the Rust
+    validation later tightens (panic on negatives) or loosens
+    (NaN/inf no longer panic).
     """
 
-    def test_negative_fraction_is_rejected_at_rust_boundary(self) -> None:
-        """Negative ``used_fraction`` panics in the Rust ``GpuAllocation`` constructor.
+    def test_negative_fraction_silently_wraps_in_unsigned_fixed_point(self) -> None:
+        """Negative ``used_fraction`` silently wraps to a near-max value.
 
-        The Rust storage uses a quantized fixed-point representation
-        (``FixedUtil``) whose ``from_num`` rejects negatives via
-        overflow, matching the NaN/inf rejection pattern. Production
-        allocations are always non-negative; a negative input
-        signals accounting drift upstream of the planner.
+        The Rust storage is ``FixedU32<U16>``, an unsigned 32-bit
+        fixed-point with 16 fractional bits. In release mode the
+        ``fixed`` crate's ``from_num`` of a negative ``f32`` does
+        NOT panic; it reinterprets the scaled bit pattern as
+        ``u32``, which wraps to roughly ``2^16 + x`` for small
+        negative ``x``. Production allocations are non-negative so
+        this corner is never exercised, but the wrap means the
+        Python aggregator DOES observe a pathological value if a
+        negative input reaches the constructor. A future Rust patch
+        that adds explicit non-negative validation would flip this
+        assertion, making the cleanup intent surface in the diff.
         """
-        with pytest.raises(BaseException, match="overflows"):
-            _make_problem_state([("A", [("A-w0", [("node-0", 0, -0.1)])], False)])
+        state = _make_problem_state(
+            [("A", [("A-w0", [("node-0", 0, -0.1)])], False)],
+        )
+        result = aggregate_host_gpu_used_fractions(state)
+        assert result == {("node-0", 0): pytest.approx(65535.9, abs=0.1)}
 
     def test_inf_fraction_is_rejected_at_rust_boundary(self) -> None:
         """``+inf`` ``used_fraction`` panics in the Rust ``GpuAllocation`` constructor."""

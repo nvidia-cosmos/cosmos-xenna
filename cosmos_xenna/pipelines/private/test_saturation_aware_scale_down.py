@@ -20,7 +20,7 @@ import math
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.scale_down import select_workers_to_remove_oldest_first
 
 
 class TestSelectWorkersToRemoveOldestFirst:
@@ -386,3 +386,33 @@ class TestConsolidationTiebreakEdgeCases:
                 worker_host_gpu_used_fractions={"bad": bad_fraction},
                 delete_count=1,
             )
+
+    def test_invalid_gpu_fraction_on_excluded_worker_is_ignored(self) -> None:
+        """A NaN fraction on an excluded worker must not fail the unrelated scale-down.
+
+        The validation is scoped to the candidate pool (``worker_ids``
+        minus ``excluded_worker_ids``); fractions attached to excluded
+        ids are not consumed by the sort and so cannot raise.
+        """
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["good", "warmup"],
+            worker_ages={"good": 5, "warmup": 0},
+            worker_used_slots={"good": 0, "warmup": 0},
+            worker_host_gpu_used_fractions={"good": 0.3, "warmup": math.nan},
+            excluded_worker_ids=frozenset({"warmup"}),
+            delete_count=1,
+        )
+
+        assert selected == ["good"]
+
+    def test_invalid_gpu_fraction_on_non_candidate_worker_is_ignored(self) -> None:
+        """A bad fraction for an id not in ``worker_ids`` must not raise."""
+        selected = select_workers_to_remove_oldest_first(
+            worker_ids=["a"],
+            worker_ages={"a": 1},
+            worker_used_slots={"a": 0},
+            worker_host_gpu_used_fractions={"a": 0.2, "stale": math.nan},
+            delete_count=1,
+        )
+
+        assert selected == ["a"]

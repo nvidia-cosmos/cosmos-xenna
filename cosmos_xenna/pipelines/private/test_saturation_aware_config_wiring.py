@@ -54,20 +54,25 @@ import pytest
 from loguru import logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+from cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle import PostCycleReporter
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck import bottleneck_phase
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.identity import (
     BottleneckEngagementState,
     BottleneckIdentity,
     identify_bottleneck,
     maybe_log_bottleneck_engagement,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
-    record_executed_delta,
-    run_per_stage_pipeline,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.classifier import classify
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import compute_pressure
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import StageDecisionPipeline
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.allocation_failure_gate import AllocationFailureGate
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    GrowthMode,
+    StageRuntimeState,
+    StageState,
+    update_ewma,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.pressure import compute_pressure
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState, update_ewma
 from cosmos_xenna.pipelines.private.specs import (
     PipelineConfig,
     PipelineSpec,
@@ -149,12 +154,12 @@ def _resolved_state(
     *,
     stage_name: str = "S",
     config: SaturationAwareStageConfig,
-) -> _StageRuntimeState:
+) -> StageRuntimeState:
     """Build a runtime state with thresholds already resolved."""
-    from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
+    from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 
-    state = _StageRuntimeState(stage_name=stage_name)
-    state.resolved_thresholds = _resolve_auto_thresholds(stage_cfg=config, slots_per_actor=8)
+    state = StageRuntimeState(stage_name=stage_name)
+    state.classifier.resolved_thresholds = _resolve_auto_thresholds(stage_cfg=config, slots_per_actor=8)
     return state
 
 
@@ -275,7 +280,7 @@ class TestRawStringSchedulerKindNormalization:
 
     def test_raw_string_scheduler_dispatches_saturation_aware_algorithm(self) -> None:
         """``_make_scheduler_algorithm`` instantiates the saturation-aware scheduler for a string input."""
-        from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+        from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
         from cosmos_xenna.pipelines.private.streaming import _make_scheduler_algorithm
 
         mode_specific = StreamingSpecificSpec(scheduler="saturation_aware")  # type: ignore[arg-type]
@@ -307,7 +312,7 @@ class TestSaturationAwareIntervalUsedAcrossWiring:
     def test_interval_s_is_observed_on_constructed_scheduler(self) -> None:
         """The scheduler stores ``interval_s`` from its ``SaturationAwareConfig`` on construction."""
         sat_cfg = SaturationAwareConfig(interval_s=3.25)
-        from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+        from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 
         scheduler = SaturationAwareScheduler(sat_cfg)
 
@@ -341,15 +346,15 @@ class TestMinDataPointsTrustGate:
         ps = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._stage_states["S"].valid_signal_samples == 1
-        assert scheduler._last_intent_deltas.get("S", 0) > 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 1
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) > 0
 
     def test_min_data_points_three_suppresses_until_third_valid_sample(self) -> None:
         """With ``min_data_points=3`` the first two valid samples produce zero intent; the third fires."""
         # Disable regime-aware aggressiveness so the third cycle does
         # not coincide with the default ``regime_transition_streak_cycles=3``
         # transition, which (by design) resets the trust-gate counter
-        # via ``_update_regime_aware_aggressiveness`` and would otherwise
+        # via ``RegimeController.update`` and would otherwise
         # require this test to run extra cycles for the gate to rebuild.
         # The test's contract is the ``min_data_points`` trust gate,
         # not the regime detector, so we silence regime detection.
@@ -367,13 +372,13 @@ class TestMinDataPointsTrustGate:
         ps = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
 
         scheduler.autoscale(time=1.0, problem_state=ps)
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
 
         scheduler.autoscale(time=2.0, problem_state=ps)
-        assert scheduler._last_intent_deltas.get("S", 0) > 0
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) > 0
 
     def test_warmup_filtered_all_zero_samples_reset_counter(self) -> None:
         """Cycles whose warmup filter drops every contribution RESET the counter to zero.
@@ -395,12 +400,12 @@ class TestMinDataPointsTrustGate:
         )
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
-        scheduler._stage_states["S"].valid_signal_samples = 5
+        scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples = 5
         ps = _problem_state_with_signals([("S", 1, 8, 8, 0)])
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._stage_states["S"].valid_signal_samples == 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 0
 
 
 class TestTrustGateFreshnessAfterMinDataPointsReached:
@@ -442,8 +447,8 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         # a positive intent.
         ps_fresh = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
         scheduler.autoscale(time=0.0, problem_state=ps_fresh)
-        assert scheduler._stage_states["S"].valid_signal_samples == 1
-        assert scheduler._last_intent_deltas.get("S", 0) > 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 1
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) > 0
 
         # Cycle 1: same signal expressed via a 0-worker snapshot. The
         # aggregation returns ``(0, 0)`` slots so the current cycle is
@@ -453,8 +458,8 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         ps_stale = _problem_state_with_signals([("S", 0, 8, 0, 0)], input_queue_depth=100)
         scheduler.autoscale(time=1.0, problem_state=ps_stale)
 
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
-        assert scheduler._stage_states["S"].valid_signal_samples == 0
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 0
 
     def test_post_gap_recovery_requires_rebuilding_consecutive_trust(self) -> None:
         """Post-gap recovery: ``min_data_points`` consecutive fresh cycles must re-accrue before the gate reopens.
@@ -484,34 +489,34 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         # Cycle 0: first fresh sample - counter advances but gate
         # stays closed (need 2 consecutive).
         scheduler.autoscale(time=0.0, problem_state=ps_fresh)
-        assert scheduler._stage_states["S"].valid_signal_samples == 1
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 1
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
 
         # Cycle 1: second consecutive fresh sample opens the gate.
         scheduler.autoscale(time=1.0, problem_state=ps_fresh)
-        assert scheduler._stage_states["S"].valid_signal_samples == 2
-        assert scheduler._last_intent_deltas.get("S", 0) > 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 2
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) > 0
 
         # Cycle 2: stale cycle invalidates trust - counter resets and
         # delta is clamped to 0.
         scheduler.autoscale(time=2.0, problem_state=ps_stale)
-        assert scheduler._stage_states["S"].valid_signal_samples == 0
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 0
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
 
         # Cycle 3: a single post-gap fresh sample is not enough - the
         # gate stays closed (counter back to 1, still < min_data_points).
         scheduler.autoscale(time=3.0, problem_state=ps_fresh)
-        assert scheduler._stage_states["S"].valid_signal_samples == 1
-        assert scheduler._last_intent_deltas.get("S", 0) == 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 1
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) == 0
 
         # Cycle 4: second consecutive post-gap fresh sample reopens
         # the gate - trust has fully rebuilt from scratch.
         scheduler.autoscale(time=4.0, problem_state=ps_fresh)
-        assert scheduler._stage_states["S"].valid_signal_samples == 2
-        assert scheduler._last_intent_deltas.get("S", 0) > 0
+        assert scheduler.ledgers.stage_states["S"].classifier.valid_signal_samples == 2
+        assert scheduler.last_cycle.intent.deltas.get("S", 0) > 0
 
     def test_stale_cycle_does_not_refresh_pressure_ewma(self) -> None:
-        """Carry-forward cycles leave ``stage_state.pressure_ewma`` untouched."""
+        """Carry-forward cycles leave ``stage_state.pressure.ewma`` untouched."""
         sat_cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(
                 min_data_points=1,
@@ -525,7 +530,7 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
 
         ps_fresh = _problem_state_with_signals([("S", 1, 8, 8, 0)], input_queue_depth=100)
         scheduler.autoscale(time=0.0, problem_state=ps_fresh)
-        first_pressure = scheduler._stage_states["S"].pressure_ewma
+        first_pressure = scheduler.ledgers.stage_states["S"].pressure.ewma
         assert first_pressure is not None and first_pressure > 0.0
 
         # Stale cycle: zero current samples must not blend a fresh queue
@@ -533,7 +538,7 @@ class TestTrustGateFreshnessAfterMinDataPointsReached:
         ps_stale = _problem_state_with_signals([("S", 0, 8, 0, 0)], input_queue_depth=999)
         scheduler.autoscale(time=1.0, problem_state=ps_stale)
 
-        assert scheduler._stage_states["S"].pressure_ewma == first_pressure
+        assert scheduler.ledgers.stage_states["S"].pressure.ewma == first_pressure
 
 
 class TestPressureClassifierFields:
@@ -561,7 +566,6 @@ class TestPressureClassifierFields:
 
         verdict = classify(
             slots_empty_ratio_ewma=0.10,
-            input_queue_depth=100,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
             activation_threshold=0.05,
@@ -586,7 +590,6 @@ class TestPressureClassifierFields:
         # (2.5), so CRITICAL falls through to SATURATED.
         verdict = classify(
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=100,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
             activation_threshold=0.05,
@@ -613,7 +616,6 @@ class TestPressureClassifierFields:
         # NOT fire and OVER_PROVISIONED is preserved.
         verdict = classify(
             slots_empty_ratio_ewma=0.70,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
             activation_threshold=0.05,
@@ -705,15 +707,15 @@ class TestBottleneckDecisionFields:
         scheduler.setup(_problem(["A", "B"]))
 
         # Seed cycle: latch each stage at a distinct intrinsic S_k value.
-        scheduler._update_s_k_ewma({"A": 2.0, "B": 1.0})
-        assert scheduler._s_k_ewma["A"] == pytest.approx(2.0)
-        assert scheduler._s_k_ewma["B"] == pytest.approx(1.0)
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 2.0, "B": 1.0})
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(2.0)
+        assert scheduler.ledgers.s_k_ewma.get("B") == pytest.approx(1.0)
 
         # Second cycle with alpha=1.0 replaces (no blending with prior).
-        scheduler._update_s_k_ewma({"A": 5.0, "B": 0.5})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 5.0, "B": 0.5})
 
-        assert scheduler._s_k_ewma["A"] == pytest.approx(5.0)
-        assert scheduler._s_k_ewma["B"] == pytest.approx(0.5)
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(5.0)
+        assert scheduler.ledgers.s_k_ewma.get("B") == pytest.approx(0.5)
 
     def test_classifier_signal_noise_smoothing_level_one_latches_to_latest_delta(self) -> None:
         """``classifier_signal_noise_smoothing_level=1.0`` makes the noise EWMA latch onto the latest delta.
@@ -740,12 +742,12 @@ class TestBottleneckDecisionFields:
         # Cycle 1: ratio = 6 / 8 = 0.75. Cold-start -> no delta -> noise stays None.
         ps1 = _problem_state_with_signals([("S", 1, 8, 2, 6)], input_queue_depth=10)
         scheduler.autoscale(time=0.0, problem_state=ps1)
-        assert scheduler._stage_states["S"].classifier_signal_noise_ewma is None
+        assert scheduler.ledgers.stage_states["S"].classifier.signal_noise_ewma is None
 
         # Cycle 2: ratio = 2 / 8 = 0.25. Delta = |0.25 - 0.75| = 0.50. Latched.
         ps2 = _problem_state_with_signals([("S", 1, 8, 6, 2)], input_queue_depth=10)
         scheduler.autoscale(time=1.0, problem_state=ps2)
-        assert scheduler._stage_states["S"].classifier_signal_noise_ewma == pytest.approx(0.50)
+        assert scheduler.ledgers.stage_states["S"].classifier.signal_noise_ewma == pytest.approx(0.50)
 
     def test_balance_regression_tolerance_fires_warn_above_threshold(
         self,
@@ -755,13 +757,20 @@ class TestBottleneckDecisionFields:
         sat_cfg = SaturationAwareConfig(cross_stage_donor_balance_regression_tolerance=0.05)
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
-        scheduler._balance_score_start = 0.90
+        reporter = PostCycleReporter(
+            pipeline=scheduler.pipeline,
+            ledgers=scheduler.ledgers,
+            pipeline_name=scheduler.pipeline_name,
+            manual_allocation=AllocationFailureGate(),
+            floor_allocation=AllocationFailureGate(),
+            grow_allocation=AllocationFailureGate(),
+        )
 
         log_lines: list[str] = []
         sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
         try:
             # 0.50 < 0.90 - 0.05 -> WARN.
-            scheduler._maybe_warn_balance_regression(0.50)
+            reporter._maybe_warn_balance_regression(balance_score_start=0.90, balance_score_end=0.50)
         finally:
             logger.remove(sink_id)
 
@@ -776,13 +785,20 @@ class TestBottleneckDecisionFields:
         sat_cfg = SaturationAwareConfig(cross_stage_donor_balance_regression_tolerance=0.05)
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
-        scheduler._balance_score_start = 0.90
+        reporter = PostCycleReporter(
+            pipeline=scheduler.pipeline,
+            ledgers=scheduler.ledgers,
+            pipeline_name=scheduler.pipeline_name,
+            manual_allocation=AllocationFailureGate(),
+            floor_allocation=AllocationFailureGate(),
+            grow_allocation=AllocationFailureGate(),
+        )
 
         log_lines: list[str] = []
         sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
         try:
             # 0.88 >= 0.90 - 0.05 = 0.85 -> no WARN.
-            scheduler._maybe_warn_balance_regression(0.88)
+            reporter._maybe_warn_balance_regression(balance_score_start=0.90, balance_score_end=0.88)
         finally:
             logger.remove(sink_id)
 
@@ -793,13 +809,20 @@ class TestBottleneckDecisionFields:
         sat_cfg = SaturationAwareConfig()
         scheduler = SaturationAwareScheduler(sat_cfg)
         scheduler.setup(_problem(["S"]))
-        # Cold-start: fewer than 2 stages with finite D_k -> NaN.
-        scheduler._balance_score_start = math.nan
+        reporter = PostCycleReporter(
+            pipeline=scheduler.pipeline,
+            ledgers=scheduler.ledgers,
+            pipeline_name=scheduler.pipeline_name,
+            manual_allocation=AllocationFailureGate(),
+            floor_allocation=AllocationFailureGate(),
+            grow_allocation=AllocationFailureGate(),
+        )
 
         log_lines: list[str] = []
         sink_id = logger.add(lambda msg: log_lines.append(msg.record["message"]), level="WARNING")
         try:
-            scheduler._maybe_warn_balance_regression(0.10)
+            # Cold-start: fewer than 2 stages with finite D_k -> NaN.
+            reporter._maybe_warn_balance_regression(balance_score_start=math.nan, balance_score_end=0.10)
         finally:
             logger.remove(sink_id)
 
@@ -873,15 +896,15 @@ class TestGrowthModeStateMachineKillSwitch:
             worker_warmup_measurement_grace_s=0.0,
         )
         state = _resolved_state(config=stage_cfg)
-        state.growth_mode = GrowthMode.HOLD
-        state.classifier_state = StageState.SATURATED
-        state.classifier_streak = 5
+        state.growth.mode = GrowthMode.HOLD
+        state.classifier.state = StageState.SATURATED
+        state.classifier.streak = 5
         # Capacity target exceeds current_workers so the sizer-driven delta is positive.
-        state.capacity_target_workers = 10
+        state.growth.capacity_target_workers = 10
 
         # Slot signal in the SATURATED zone (ratio between activation_threshold
         # and saturation_threshold), high pressure prevents demotion to NORMAL.
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=19,
             num_empty_slots=1,
@@ -896,13 +919,13 @@ class TestGrowthModeStateMachineKillSwitch:
         """``record_executed_delta`` is a no-op when the kill switch is off."""
         stage_cfg = SaturationAwareStageConfig(enable_growth_mode_state_machine=False)
         state = _resolved_state(config=stage_cfg)
-        initial_mode = state.growth_mode
-        initial_streak = state.growth_streak
+        initial_mode = state.growth.mode
+        initial_streak = state.growth.streak
 
-        record_executed_delta(stage_state=state, delta_executed=-5, config=stage_cfg)
+        StageDecisionPipeline().record_executed_delta(stage_state=state, delta_executed=-5, config=stage_cfg)
 
-        assert state.growth_mode is initial_mode
-        assert state.growth_streak == initial_streak
+        assert state.growth.mode is initial_mode
+        assert state.growth.streak == initial_streak
 
 
 class TestStageOverridePrecedenceForMinDataPoints:
@@ -929,8 +952,10 @@ class TestStageOverridePrecedenceForMinDataPoints:
         scheduler.autoscale(time=0.0, problem_state=ps)
 
         # 'loud' has min_data_points=1, fires immediately. 'quiet' has =5 so trust gate clamps to 0.
-        assert scheduler._last_intent_deltas.get("loud", 0) > 0
-        assert scheduler._last_intent_deltas.get("quiet", 0) == 0
+        last_cycle = scheduler.last_cycle
+        assert last_cycle is not None
+        assert last_cycle.intent.deltas.get("loud", 0) > 0
+        assert last_cycle.intent.deltas.get("quiet", 0) == 0
 
 
 class TestConfigWiringMetaCoverage:

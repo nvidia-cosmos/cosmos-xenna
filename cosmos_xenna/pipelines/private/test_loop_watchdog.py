@@ -23,8 +23,8 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
-from cosmos_xenna.pipelines.private.scheduling_py import loop_watchdog as loop_watchdog_module
-from cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog import loop_watchdog
+from cosmos_xenna.pipelines.private.scheduling_py.lifecycle import loop_watchdog as loop_watchdog_module
+from cosmos_xenna.pipelines.private.scheduling_py.lifecycle.loop_watchdog import loop_watchdog
 
 
 class _FakeHistogram:

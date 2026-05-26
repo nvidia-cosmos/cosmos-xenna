@@ -30,8 +30,8 @@ Pinned thresholds for the test suite:
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.classifier import classify
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
@@ -76,7 +76,6 @@ class TestSaturatedCriticalZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.SATURATED_CRITICAL
@@ -89,7 +88,6 @@ class TestSaturatedCriticalZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.activation_threshold - 1e-6,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.SATURATED_CRITICAL
@@ -102,7 +100,6 @@ class TestSaturatedCriticalZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
         )
         assert result is StageState.SATURATED_CRITICAL
@@ -115,7 +112,6 @@ class TestSaturatedCriticalZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             prev_state=StageState.SATURATED,
         )
         assert result is StageState.SATURATED_CRITICAL
@@ -129,7 +125,6 @@ class TestSaturatedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.activation_threshold,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.SATURATED
@@ -142,7 +137,6 @@ class TestSaturatedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.saturation_threshold - 1e-6,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.SATURATED
@@ -155,7 +149,6 @@ class TestSaturatedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.saturation_threshold,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.NORMAL
@@ -171,7 +164,6 @@ class TestSaturatedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
-            input_queue_depth=10,
             prev_state=StageState.SATURATED,
         )
         assert result is StageState.SATURATED
@@ -183,7 +175,6 @@ class TestSaturatedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_above_deadband,
-            input_queue_depth=10,
             prev_state=StageState.SATURATED,
         )
         assert result is StageState.NORMAL
@@ -197,7 +188,6 @@ class TestSaturatedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
-            input_queue_depth=10,
             prev_state=StageState.SATURATED_CRITICAL,
         )
         assert result is StageState.SATURATED
@@ -211,7 +201,6 @@ class TestSaturatedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_above_deadband,
-            input_queue_depth=0,
             prev_state=StageState.SATURATED,
         )
         assert result is StageState.NORMAL
@@ -226,7 +215,6 @@ class TestNormalZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=midband,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.NORMAL
@@ -249,7 +237,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -269,7 +256,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -282,7 +268,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=1.0,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -295,7 +280,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=1.0,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -308,7 +292,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -321,7 +304,6 @@ class TestOverProvisionedZone:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -340,7 +322,6 @@ class TestOverProvisionedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
-            input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -351,7 +332,6 @@ class TestOverProvisionedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_below_deadband,
-            input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
         )
         assert result is StageState.NORMAL
@@ -365,7 +345,6 @@ class TestOverProvisionedHysteresis:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=ratio_inside_deadband,
-            input_queue_depth=0,
             prev_state=StageState.OVER_PROVISIONED,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -382,7 +361,6 @@ class TestEmptyQueueWithBusySlots:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.SATURATED_CRITICAL
@@ -396,7 +374,6 @@ class TestEmptyQueueWithBusySlots:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=midband,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
         )
         assert result is StageState.NORMAL
@@ -423,7 +400,6 @@ class TestCrossZoneTransitions:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.80,
-            input_queue_depth=10,
             prev_state=StageState.SATURATED,
         )
         assert result is StageState.OVER_PROVISIONED
@@ -441,7 +417,6 @@ class TestCrossZoneTransitions:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
             prev_state=StageState.OVER_PROVISIONED,
         )
         assert result is StageState.SATURATED
@@ -463,7 +438,6 @@ class TestPressureNormalThresholdStrictness:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
             pressure_ewma=cfg.pressure_normal_threshold,
         )
@@ -477,7 +451,6 @@ class TestPressureNormalThresholdStrictness:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
             pressure_ewma=cfg.pressure_normal_threshold + 0.01,
         )
@@ -495,7 +468,6 @@ class TestPressureColdStartFallback:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
-            input_queue_depth=0,
             prev_state=StageState.NORMAL,
             pressure_ewma=None,
         )
@@ -509,7 +481,6 @@ class TestPressureColdStartFallback:
         result = _classify(
             cfg,
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             prev_state=StageState.NORMAL,
             pressure_ewma=None,
         )

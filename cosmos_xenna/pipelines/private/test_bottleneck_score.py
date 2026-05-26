@@ -17,7 +17,7 @@
 """Tests for the Forced-Flow-Law bottleneck-score emitter.
 
 Pin the contract of
-:func:`cosmos_xenna.pipelines.private.scheduling_py.bottleneck.emit_bottleneck_score`
+:func:`cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics.emit_bottleneck_score`
 plus the one end-to-end wiring point in
 :class:`SaturationAwareScheduler`:
 
@@ -52,14 +52,24 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py import bottleneck
-from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
-    BottleneckIdentity,
-    compute_d_k,
-    emit_bottleneck_score,
-    identify_bottleneck,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck import metrics, scoring
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity import (
+    HeterogeneityWarnState,
+    compute_heterogeneity_ratio,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.identity import (
+    BottleneckEngagementState,
+    BottleneckIdentity,
+    identify_bottleneck,
+    maybe_log_bottleneck_engagement,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics import emit_bottleneck_score
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.scoring import (
+    compute_balance_score,
+    compute_d_k,
+    emit_balance_score,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -108,11 +118,11 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
 def gauge_observations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, dict[str, str]]]:
     """Capture every ``set()`` call on the module-level bottleneck gauge.
 
-    Replaces ``bottleneck._BOTTLENECK_GAUGE.set`` with a free
-    function (not a bound method) so the helper can be exercised
-    without a live Ray metrics agent. Each call appends a
-    ``(value, tags)`` tuple to the returned list; tests inspect the
-    list to verify per-stage observations.
+    Replaces ``bottleneck.metrics._BOTTLENECK_GAUGE.set`` with a
+    free function (not a bound method) so the helper can be
+    exercised without a live Ray metrics agent. Each call appends
+    a ``(value, tags)`` tuple to the returned list; tests inspect
+    the list to verify per-stage observations.
     """
     captured: list[tuple[float, dict[str, str]]] = []
 
@@ -121,7 +131,7 @@ def gauge_observations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, dic
             return
         captured.append((float(value), dict(tags or {})))
 
-    monkeypatch.setattr(bottleneck._BOTTLENECK_GAUGE, "set", fake_set)
+    monkeypatch.setattr(metrics._BOTTLENECK_GAUGE, "set", fake_set)
     return captured
 
 
@@ -380,7 +390,9 @@ class TestEmitBottleneckScore:
         duplicates it) breaks the test.
         """
         scheduler, ps = _build_one_stage_scheduler()
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.emit_bottleneck_score"
+        ) as mock_emit:
             scheduler.autoscale(time=0.0, problem_state=ps)
             assert mock_emit.call_count == 1, (
                 f"expected exactly one helper invocation per cycle, got {mock_emit.call_count}"
@@ -400,7 +412,9 @@ class TestAutoscaleServiceTimeWiring:
         cold-start branch downstream.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.emit_bottleneck_score"
+        ) as mock_emit:
             scheduler.autoscale(time=0.0, problem_state=ps)
             assert mock_emit.call_count == 1
             kwargs = mock_emit.call_args.kwargs
@@ -442,7 +456,9 @@ class TestAutoscaleServiceTimeWiring:
         )
         scheduler.update_with_measurements(time=1.5, measurements=ms2)
 
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.emit_bottleneck_score"
+        ) as mock_emit:
             scheduler.autoscale(time=2.0, problem_state=ps)
             kwargs = mock_emit.call_args.kwargs
             # Single stage with c_k=1; first finite sample replaces the
@@ -459,9 +475,11 @@ class TestAutoscaleServiceTimeWiring:
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
         with (
-            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit,
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.compute_heterogeneity_ratio"
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.emit_bottleneck_score"
+            ) as mock_emit,
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.compute_heterogeneity_ratio"
             ) as mock_hetero,
         ):
             scheduler.autoscale(time=0.0, problem_state=ps)
@@ -483,7 +501,9 @@ class TestAutoscaleServiceTimeWiring:
         produced once per cycle.
         """
         scheduler, ps = _build_one_stage_scheduler(stage_name="hot")
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.emit_bottleneck_score") as mock_emit:
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.emit_bottleneck_score"
+        ) as mock_emit:
             scheduler.autoscale(time=0.0, problem_state=ps)
             kwargs = mock_emit.call_args.kwargs
             assert "bottleneck_identity" in kwargs
@@ -542,7 +562,7 @@ class TestIdentifyBottleneck:
 
     def test_balanced_three_stages_returns_disengaged(self) -> None:
         """A homogeneous pipeline must NOT engage the bottleneck gate."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"a": 1.0, "b": 1.0, "c": 1.0},
             heterogeneity_threshold=2.0,
         )
@@ -553,7 +573,7 @@ class TestIdentifyBottleneck:
 
     def test_heterogeneous_three_stages_engages_with_argmax(self) -> None:
         """A clearly heterogeneous pipeline engages and names argmax_k D_k."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"download": 0.05, "caption": 2.0, "embed": 0.10},
             heterogeneity_threshold=2.0,
         )
@@ -564,7 +584,7 @@ class TestIdentifyBottleneck:
 
     def test_all_nan_returns_disengaged_with_nan_fields(self) -> None:
         """Cold-start cluster (all NaN) keeps the gate disengaged."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"a": math.nan, "b": math.nan, "c": math.nan},
             heterogeneity_threshold=2.0,
         )
@@ -576,7 +596,7 @@ class TestIdentifyBottleneck:
 
     def test_single_finite_stage_returns_disengaged(self) -> None:
         """A pipeline with only one finite D_k cannot engage the gate."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"hot": 1.5, "cold1": math.nan, "cold2": math.nan},
             heterogeneity_threshold=2.0,
         )
@@ -587,7 +607,7 @@ class TestIdentifyBottleneck:
 
     def test_two_stage_uses_max_over_min_for_ratio(self) -> None:
         """For n=2 the ratio is max/min, not max/median (capped at 2.0)."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"fast": 0.5, "slow": 4.0},
             heterogeneity_threshold=2.0,
         )
@@ -598,7 +618,7 @@ class TestIdentifyBottleneck:
 
     def test_near_tie_uses_lex_smallest_for_stability(self) -> None:
         """Within near_tie_tolerance of max, the lex-smallest name wins."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"alpha": 3.95, "beta": 4.0, "gamma": 0.5, "delta": 0.5, "epsilon": 0.5},
             heterogeneity_threshold=2.0,
             near_tie_tolerance=0.05,
@@ -609,7 +629,7 @@ class TestIdentifyBottleneck:
 
     def test_strict_argmax_when_tolerance_zero(self) -> None:
         """Tolerance 0.0 means strict max; ties only count when D_k is exactly equal."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"alpha": 3.95, "beta": 4.0, "gamma": 0.5, "delta": 0.5, "epsilon": 0.5},
             heterogeneity_threshold=2.0,
             near_tie_tolerance=0.0,
@@ -620,7 +640,7 @@ class TestIdentifyBottleneck:
 
     def test_zero_or_negative_d_k_treated_as_cold_start(self) -> None:
         """Non-positive D_k inputs are excluded from finite_scores."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"hot": 2.0, "broken": 0.0, "negative": -0.5},
             heterogeneity_threshold=2.0,
         )
@@ -631,7 +651,7 @@ class TestIdentifyBottleneck:
 
     def test_ratio_just_below_threshold_is_disengaged(self) -> None:
         """``ratio < threshold`` keeps the gate off."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"a": 1.0, "b": 1.0, "c": 1.99},
             heterogeneity_threshold=2.0,
         )
@@ -640,7 +660,7 @@ class TestIdentifyBottleneck:
 
     def test_ratio_at_threshold_is_engaged(self) -> None:
         """``ratio >= threshold`` engages the gate at the boundary."""
-        identity = bottleneck.identify_bottleneck(
+        identity = identify_bottleneck(
             {"a": 1.0, "b": 1.0, "c": 2.0},
             heterogeneity_threshold=2.0,
         )
@@ -651,7 +671,7 @@ class TestIdentifyBottleneck:
     def test_near_tie_tolerance_negative_is_rejected(self) -> None:
         """A negative tolerance would raise the tie floor above ``max_d`` and empty the tied list."""
         with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=1.5,
                 near_tie_tolerance=-0.01,
@@ -660,7 +680,7 @@ class TestIdentifyBottleneck:
     def test_near_tie_tolerance_one_is_rejected(self) -> None:
         """A tolerance of 1.0 collapses the band so every positive score is tied."""
         with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=1.5,
                 near_tie_tolerance=1.0,
@@ -669,7 +689,7 @@ class TestIdentifyBottleneck:
     def test_near_tie_tolerance_above_one_is_rejected(self) -> None:
         """A tolerance above 1.0 produces a sub-zero floor and the same degenerate verdict."""
         with pytest.raises(ValueError, match=r"near_tie_tolerance must be in \[0.0, 1.0\)"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=1.5,
                 near_tie_tolerance=1.01,
@@ -678,7 +698,7 @@ class TestIdentifyBottleneck:
     def test_heterogeneity_threshold_at_one_is_rejected(self) -> None:
         """A homogeneous cluster has ratio ``1.0``; the floor must be strictly greater."""
         with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=1.0,
             )
@@ -686,7 +706,7 @@ class TestIdentifyBottleneck:
     def test_heterogeneity_threshold_below_one_is_rejected(self) -> None:
         """A floor below ``1.0`` would engage on near-uniform pipelines."""
         with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=0.5,
             )
@@ -694,7 +714,7 @@ class TestIdentifyBottleneck:
     def test_heterogeneity_threshold_nan_is_rejected(self) -> None:
         """``NaN`` would silently engage every cycle (``ratio < NaN`` is always ``False``)."""
         with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=math.nan,
             )
@@ -708,7 +728,7 @@ class TestIdentifyBottleneck:
         error.
         """
         with pytest.raises(ValueError, match=r"heterogeneity_threshold must be finite and > 1.0"):
-            bottleneck.identify_bottleneck(
+            identify_bottleneck(
                 {"a": 1.0, "b": 2.0},
                 heterogeneity_threshold=math.inf,
             )
@@ -722,8 +742,8 @@ class TestMaybeLogBottleneckEngagement:
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The very first persistent state seeds last_announced without logging."""
-        state = bottleneck.BottleneckEngagementState()
-        identity = bottleneck.BottleneckIdentity(
+        state = BottleneckEngagementState()
+        identity = BottleneckIdentity(
             engaged=True,
             stage_name="caption",
             max_d_k=2.0,
@@ -732,7 +752,7 @@ class TestMaybeLogBottleneckEngagement:
         )
 
         for _ in range(2):
-            bottleneck.maybe_log_bottleneck_engagement(
+            maybe_log_bottleneck_engagement(
                 identity=identity,
                 state=state,
                 persistence_cycles=2,
@@ -748,8 +768,8 @@ class TestMaybeLogBottleneckEngagement:
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
         """After seeding engaged, two consecutive disengaged cycles fire one INFO log."""
-        state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
-        disengaged = bottleneck.BottleneckIdentity(
+        state = BottleneckEngagementState(last_announced=True, candidate_streak=0)
+        disengaged = BottleneckIdentity(
             engaged=False,
             stage_name=None,
             max_d_k=math.nan,
@@ -758,7 +778,7 @@ class TestMaybeLogBottleneckEngagement:
         )
 
         for _ in range(2):
-            bottleneck.maybe_log_bottleneck_engagement(
+            maybe_log_bottleneck_engagement(
                 identity=disengaged,
                 state=state,
                 persistence_cycles=2,
@@ -774,15 +794,15 @@ class TestMaybeLogBottleneckEngagement:
         loguru_caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A single off-state cycle inside an engaged streak does not fire the log."""
-        state = bottleneck.BottleneckEngagementState(last_announced=True, candidate_streak=0)
-        engaged = bottleneck.BottleneckIdentity(
+        state = BottleneckEngagementState(last_announced=True, candidate_streak=0)
+        engaged = BottleneckIdentity(
             engaged=True,
             stage_name="caption",
             max_d_k=2.0,
             median_d_k=0.5,
             heterogeneity_ratio=4.0,
         )
-        disengaged = bottleneck.BottleneckIdentity(
+        disengaged = BottleneckIdentity(
             engaged=False,
             stage_name=None,
             max_d_k=math.nan,
@@ -790,12 +810,8 @@ class TestMaybeLogBottleneckEngagement:
             heterogeneity_ratio=math.nan,
         )
 
-        bottleneck.maybe_log_bottleneck_engagement(
-            identity=disengaged, state=state, persistence_cycles=2, pipeline_name="p1"
-        )
-        bottleneck.maybe_log_bottleneck_engagement(
-            identity=engaged, state=state, persistence_cycles=2, pipeline_name="p1"
-        )
+        maybe_log_bottleneck_engagement(identity=disengaged, state=state, persistence_cycles=2, pipeline_name="p1")
+        maybe_log_bottleneck_engagement(identity=engaged, state=state, persistence_cycles=2, pipeline_name="p1")
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert info_logs == []
@@ -820,15 +836,15 @@ class TestMaybeLogBottleneckEngagement:
         value flip so a noisy mixed sequence is correctly debounced
         during the cold-start seeding phase.
         """
-        state = bottleneck.BottleneckEngagementState()
-        engaged = bottleneck.BottleneckIdentity(
+        state = BottleneckEngagementState()
+        engaged = BottleneckIdentity(
             engaged=True,
             stage_name="caption",
             max_d_k=2.0,
             median_d_k=0.5,
             heterogeneity_ratio=4.0,
         )
-        disengaged = bottleneck.BottleneckIdentity(
+        disengaged = BottleneckIdentity(
             engaged=False,
             stage_name=None,
             max_d_k=math.nan,
@@ -837,7 +853,7 @@ class TestMaybeLogBottleneckEngagement:
         )
 
         for identity in (engaged, disengaged, engaged):
-            bottleneck.maybe_log_bottleneck_engagement(
+            maybe_log_bottleneck_engagement(
                 identity=identity,
                 state=state,
                 persistence_cycles=3,
@@ -869,15 +885,15 @@ class TestMaybeLogBottleneckEngagement:
         Pairs with ``test_cold_start_mixed_sequence_does_not_seed_last_announced``
         to bracket the gate's behaviour at both extremes.
         """
-        state = bottleneck.BottleneckEngagementState()
-        engaged = bottleneck.BottleneckIdentity(
+        state = BottleneckEngagementState()
+        engaged = BottleneckIdentity(
             engaged=True,
             stage_name="caption",
             max_d_k=2.0,
             median_d_k=0.5,
             heterogeneity_ratio=4.0,
         )
-        disengaged = bottleneck.BottleneckIdentity(
+        disengaged = BottleneckIdentity(
             engaged=False,
             stage_name=None,
             max_d_k=math.nan,
@@ -887,17 +903,11 @@ class TestMaybeLogBottleneckEngagement:
 
         # Noisy preamble: streak rebuilds on the False that follows
         # the True, then again on the True that follows the False.
-        bottleneck.maybe_log_bottleneck_engagement(
-            identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1"
-        )
-        bottleneck.maybe_log_bottleneck_engagement(
-            identity=disengaged, state=state, persistence_cycles=3, pipeline_name="p1"
-        )
+        maybe_log_bottleneck_engagement(identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1")
+        maybe_log_bottleneck_engagement(identity=disengaged, state=state, persistence_cycles=3, pipeline_name="p1")
         # Three consecutive engaged cycles must seed last_announced.
         for _ in range(3):
-            bottleneck.maybe_log_bottleneck_engagement(
-                identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1"
-            )
+            maybe_log_bottleneck_engagement(identity=engaged, state=state, persistence_cycles=3, pipeline_name="p1")
 
         info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
         assert info_logs == []
@@ -1053,8 +1063,8 @@ class TestHeterogeneityRatioActorNormalized:
         1.0 (false homogeneity) and the gauge would mislead operators.
         """
         d_k_by_stage = {"A": compute_d_k(10.0, 2), "B": compute_d_k(10.0, 10)}
-        state = bottleneck.HeterogeneityWarnState()
-        bottleneck.compute_heterogeneity_ratio(
+        state = HeterogeneityWarnState()
+        compute_heterogeneity_ratio(
             d_k_by_stage=d_k_by_stage,
             pipeline_name="test_pipeline",
             state=state,
@@ -1086,19 +1096,19 @@ class TestComputeBalanceScore:
         """Identical ``D_k`` across stages -> ratio=1 -> balance=1.0."""
         d_k_by_stage = {"A": 1.0, "B": 1.0}
 
-        assert bottleneck.compute_balance_score(d_k_by_stage) == 1.0
+        assert compute_balance_score(d_k_by_stage) == 1.0
 
     def test_severe_bottleneck_drops_score_well_below_one(self) -> None:
         """``max/min = 10`` -> balance = 0.1."""
         d_k_by_stage = {"A": 1.0, "B": 10.0}
 
-        assert math.isclose(bottleneck.compute_balance_score(d_k_by_stage), 0.1, rel_tol=1e-9)
+        assert math.isclose(compute_balance_score(d_k_by_stage), 0.1, rel_tol=1e-9)
 
     def test_cold_start_returns_nan(self) -> None:
         """Fewer than two finite-positive stages -> NaN, not 0 / 1."""
         d_k_by_stage = {"A": math.nan, "B": 0.0}
 
-        assert math.isnan(bottleneck.compute_balance_score(d_k_by_stage))
+        assert math.isnan(compute_balance_score(d_k_by_stage))
 
 
 class TestEmitBalanceScore:
@@ -1114,9 +1124,9 @@ class TestEmitBalanceScore:
         def fake_set(value: float, *, tags: dict[str, str] | None = None) -> None:
             captured.append((value, tags or {}))
 
-        monkeypatch.setattr(bottleneck._BALANCE_SCORE_GAUGE, "set", fake_set)
+        monkeypatch.setattr(scoring._BALANCE_SCORE_GAUGE, "set", fake_set)
 
-        observed = bottleneck.emit_balance_score({"A": 1.0, "B": 4.0}, pipeline_name="test_pipeline")
+        observed = emit_balance_score({"A": 1.0, "B": 4.0}, pipeline_name="test_pipeline")
 
         # 1 / max(1, 4/1) = 0.25.
         assert math.isclose(observed, 0.25, rel_tol=1e-9)
@@ -1132,9 +1142,9 @@ class TestEmitBalanceScore:
         def fake_set(value: float, *, tags: dict[str, str] | None = None) -> None:
             captured.append((value, tags or {}))
 
-        monkeypatch.setattr(bottleneck._BALANCE_SCORE_GAUGE, "set", fake_set)
+        monkeypatch.setattr(scoring._BALANCE_SCORE_GAUGE, "set", fake_set)
 
-        observed = bottleneck.emit_balance_score({"A": math.nan, "B": math.nan}, pipeline_name="test_pipeline")
+        observed = emit_balance_score({"A": math.nan, "B": math.nan}, pipeline_name="test_pipeline")
 
         assert math.isnan(observed)
         assert len(captured) == 1

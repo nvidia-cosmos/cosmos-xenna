@@ -14,11 +14,11 @@
 # limitations under the License.
 
 
-"""Tests for ``SaturationAwareScheduler._compute_intent_deltas``.
+"""Tests for ``intent_phase.compute``.
 
 The orchestrator's ``autoscale()`` runs the per-stage decision
 pipeline after Phase B floor enforcement and stores the resulting
-signed worker-count intents on ``self._last_intent_deltas``. Phase
+signed worker-count intents on ``cycle.intent.deltas``. Phase
 C (grow) consumes the intents in the same cycle, so positive intent
 flows into the emitted ``Solution`` as worker adds.
 
@@ -37,9 +37,9 @@ This module pins:
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -139,7 +139,7 @@ def _problem_state_with_signals(
 
 
 class TestIntentDictShape:
-    """Pin the shape of ``_last_intent_deltas`` produced by every cycle."""
+    """Pin the shape of ``cycle.intent.deltas`` produced by every cycle."""
 
     def test_zero_stage_pipeline_yields_empty_intent_dict(self) -> None:
         """An empty problem produces an empty intent dict, no error."""
@@ -149,7 +149,7 @@ class TestIntentDictShape:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas == {}
+        assert scheduler.last_cycle.intent.deltas == {}
 
     def test_all_finished_pipeline_yields_empty_intent_dict(self) -> None:
         """Finished stages do not produce intent entries."""
@@ -164,7 +164,7 @@ class TestIntentDictShape:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas == {}
+        assert scheduler.last_cycle.intent.deltas == {}
 
     def test_mixed_finished_active_pipeline_keys_only_active_stages(self) -> None:
         """Finished stages absent; active stages each get one entry."""
@@ -180,7 +180,7 @@ class TestIntentDictShape:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert sorted(scheduler._last_intent_deltas) == ["downstream", "upstream"]
+        assert sorted(scheduler.last_cycle.intent.deltas) == ["downstream", "upstream"]
 
 
 class TestShapeMismatchSurfacesAsInvariantError:
@@ -207,7 +207,7 @@ class TestColdStartDoesNotCrash:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas == {"A": 0}
+        assert scheduler.last_cycle.intent.deltas == {"A": 0}
 
 
 class TestSolutionShapeReflectsIntentAfterPhaseC:
@@ -240,7 +240,7 @@ class TestSolutionShapeReflectsIntentAfterPhaseC:
 
         solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
-        intent = scheduler._last_intent_deltas["hot"]
+        intent = scheduler.last_cycle.intent.deltas["hot"]
         assert intent > 0, "expected SATURATED_CRITICAL to produce positive intent"
         assert len(solution.stages[0].new_workers) == intent
         assert solution.stages[0].deleted_workers == []
@@ -252,7 +252,7 @@ class TestMultiCycleClassifierConvergence:
     def test_steady_busy_signal_settles_into_saturated_zone(self) -> None:
         """A steady-busy signal classifies the stage in the saturated zone after enough cycles.
 
-        Pins that ``_compute_intent_deltas`` actually runs the
+        Pins that ``intent_phase.compute`` actually runs the
         classifier each cycle and the EWMA tracks the live ratio
         across multiple ``autoscale()`` calls.
         """
@@ -263,11 +263,11 @@ class TestMultiCycleClassifierConvergence:
         for _ in range(5):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["busy"]
-        assert runtime.classifier_state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
-        assert runtime.classifier_streak >= 1
-        assert runtime.slots_empty_ratio_ewma is not None
-        assert 0.0 <= runtime.slots_empty_ratio_ewma <= 1.0
+        runtime = scheduler.ledgers.stage_states["busy"]
+        assert runtime.classifier.state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
+        assert runtime.classifier.streak >= 1
+        assert runtime.classifier.slots_empty_ratio_ewma is not None
+        assert 0.0 <= runtime.classifier.slots_empty_ratio_ewma <= 1.0
 
     def test_steady_idle_signal_settles_into_over_provisioned(self) -> None:
         """A steady-idle signal classifies the stage as OVER_PROVISIONED after enough cycles."""
@@ -278,25 +278,29 @@ class TestMultiCycleClassifierConvergence:
         for _ in range(5):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["idle"]
-        assert runtime.classifier_state is StageState.OVER_PROVISIONED
+        runtime = scheduler.ledgers.stage_states["idle"]
+        assert runtime.classifier.state is StageState.OVER_PROVISIONED
 
 
 class TestIntentDictResetsAcrossCycles:
     """The intent dict is reassigned -- never appended -- on every cycle."""
 
     def test_setup_resets_intent_dict_to_empty(self) -> None:
-        """A fresh ``setup()`` clears any prior cycle's intent dict."""
+        """A fresh ``setup()`` resets the cycle so no stale intents survive."""
         cfg = _no_warmup_grace_config(min_workers=1)
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem_with_stages(["A"]))
         ps_first = _problem_state_with_signals([("A", 1, 1, 1, 0, 0, False)])
         scheduler.autoscale(time=0.0, problem_state=ps_first)
-        assert scheduler._last_intent_deltas != {}
+        assert scheduler.last_cycle.intent.deltas != {}
 
         scheduler.setup(_problem_with_stages(["B"]))
 
-        assert scheduler._last_intent_deltas == {}
+        # ``setup()`` clears the most-recent-cycle observability
+        # hook; ``_last_cycle is None`` and the scheduler's own
+        # cycle counter resets to zero.
+        assert scheduler.last_cycle is None
+        assert scheduler.ledgers.cycle_counter == 0
 
     def test_each_cycle_reassigns_the_intent_dict(self) -> None:
         """Successive cycles produce distinct dict instances rather than mutating one in place."""
@@ -304,10 +308,10 @@ class TestIntentDictResetsAcrossCycles:
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_signals([("A", 1, 1, 1, 0, 0, False)])
         scheduler.autoscale(time=0.0, problem_state=ps)
-        first_dict = scheduler._last_intent_deltas
+        first_dict = scheduler.last_cycle.intent.deltas
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        second_dict = scheduler._last_intent_deltas
+        second_dict = scheduler.last_cycle.intent.deltas
 
         assert first_dict is not second_dict
 
@@ -325,5 +329,5 @@ class TestScaleHandlesLargePipeline:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert len(scheduler._last_intent_deltas) == 100
-        assert set(scheduler._last_intent_deltas) == set(stage_names)
+        assert len(scheduler.last_cycle.intent.deltas) == 100
+        assert set(scheduler.last_cycle.intent.deltas) == set(stage_names)

@@ -22,8 +22,8 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
-from cosmos_xenna.pipelines.private.scheduling_py import stuck_plan
-from cosmos_xenna.pipelines.private.scheduling_py.stuck_plan import StuckPlanDetector
+from cosmos_xenna.pipelines.private.scheduling_py.state import stuck_plan_detector as stuck_plan
+from cosmos_xenna.pipelines.private.scheduling_py.state.stuck_plan_detector import StuckPlanDetector
 
 
 class _FakeGauge:

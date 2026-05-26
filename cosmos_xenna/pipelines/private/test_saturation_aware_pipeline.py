@@ -34,39 +34,40 @@ the ``_advance_cycle`` helper, which models the scheduler executing
 exactly the recommendation.
 """
 
-import attrs
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
-    record_executed_delta,
-    run_per_stage_pipeline,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import StageDecisionPipeline
+from cosmos_xenna.pipelines.private.scheduling_py.state.recommendation_history import RecommendationHistory
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
+    GrowthMode,
+    StageRuntimeState,
+    StageState,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.stabilization import _RecommendationHistory
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
 def _advance_cycle(
-    stage_state: _StageRuntimeState,
+    stage_state: StageRuntimeState,
     *,
     num_used_slots: int,
     num_empty_slots: int,
     input_queue_depth: int,
     current_workers: int,
     config: SaturationAwareStageConfig,
-    recommendation_history: _RecommendationHistory | None = None,
+    recommendation_history: RecommendationHistory | None = None,
 ) -> int:
     """Test helper: run the recommendation, then record the executed delta.
 
     Mirrors the scheduler's call pattern (``run_per_stage_pipeline``
-    in ``_compute_intent_deltas`` plus ``record_executed_delta`` in
+    in ``intent_phase.compute`` plus ``record_executed_delta`` in
     ``_record_post_commit_executed_deltas``) for tests that assert on
     the growth-mode state machine. Tests that only inspect the
     returned delta or other recommendation-side state continue to
     call ``run_per_stage_pipeline`` directly.
     """
-    delta = run_per_stage_pipeline(
+    delta = StageDecisionPipeline().compute_recommendation(
         stage_state=stage_state,
         num_used_slots=num_used_slots,
         num_empty_slots=num_empty_slots,
@@ -75,7 +76,7 @@ def _advance_cycle(
         config=config,
         recommendation_history=recommendation_history,
     )
-    record_executed_delta(stage_state=stage_state, delta_executed=delta, config=config)
+    StageDecisionPipeline().record_executed_delta(stage_state=stage_state, delta_executed=delta, config=config)
     return delta
 
 
@@ -85,7 +86,7 @@ def cfg() -> SaturationAwareStageConfig:
     return SaturationAwareStageConfig(saturation_threshold=0.15, activation_threshold=0.05)
 
 
-def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> _StageRuntimeState:
+def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> StageRuntimeState:
     """Build a runtime state with classifier thresholds pre-resolved.
 
     Production resolves thresholds on the first ``autoscale()`` cycle;
@@ -96,7 +97,7 @@ def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> _S
     ``slots_per_actor``.
     """
     resolved = _resolve_auto_thresholds(cfg, slots_per_actor=8)
-    return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
+    return StageRuntimeState(stage_name=name, classifier=ClassifierState(resolved_thresholds=resolved))
 
 
 class TestThresholdLifecycleGuard:
@@ -104,10 +105,10 @@ class TestThresholdLifecycleGuard:
 
     def test_unresolved_thresholds_raise_contextual_runtime_error(self, cfg: SaturationAwareStageConfig) -> None:
         """Direct callers must populate ``resolved_thresholds`` before running the pipeline."""
-        state = _StageRuntimeState(stage_name="TestStage")
+        state = StageRuntimeState(stage_name="TestStage")
 
         with pytest.raises(RuntimeError, match="TestStage.*has no resolved_thresholds"):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=3,
                 num_empty_slots=2,
@@ -133,13 +134,13 @@ class TestNoActionPath:
             config=cfg,
         )
         assert delta == 0
-        assert state.classifier_state is StageState.NORMAL
-        assert state.classifier_streak == 1
-        assert state.slots_empty_ratio_ewma == pytest.approx(0.4)
-        assert state.last_valid_slots_empty_ratio_ewma == pytest.approx(0.4)
-        assert state.growth_mode is GrowthMode.ACQUIRING
-        assert state.growth_streak == 1
-        assert state.prev_workers == 4
+        assert state.classifier.state is StageState.NORMAL
+        assert state.classifier.streak == 1
+        assert state.classifier.slots_empty_ratio_ewma == pytest.approx(0.4)
+        assert state.classifier.last_valid_slots_empty_ratio_ewma == pytest.approx(0.4)
+        assert state.growth.mode is GrowthMode.ACQUIRING
+        assert state.growth.streak == 1
+        assert state.growth.prev_workers == 4
 
 
 class TestCriticalScaleUpPath:
@@ -161,9 +162,9 @@ class TestCriticalScaleUpPath:
             config=cfg,
         )
         assert delta == 1
-        assert state.classifier_state is StageState.SATURATED_CRITICAL
+        assert state.classifier.state is StageState.SATURATED_CRITICAL
         # Growth fires; growth_mode stays in ACQUIRING (no shrink event).
-        assert state.growth_mode is GrowthMode.ACQUIRING
+        assert state.growth.mode is GrowthMode.ACQUIRING
 
 
 class TestSaturatedScaleUpPath:
@@ -172,7 +173,7 @@ class TestSaturatedScaleUpPath:
     def test_first_cycle_saturated_does_not_fire(self, cfg: SaturationAwareStageConfig) -> None:
         """SATURATED at streak=1 < min=2 -> fire-gate fails -> delta=0."""
         state = _fresh_state(cfg)
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=10,
             num_empty_slots=1,
@@ -181,8 +182,8 @@ class TestSaturatedScaleUpPath:
             config=cfg,
         )
         assert delta == 0
-        assert state.classifier_state is StageState.SATURATED
-        assert state.classifier_streak == 1
+        assert state.classifier.state is StageState.SATURATED
+        assert state.classifier.streak == 1
 
     def test_second_cycle_saturated_fires_growth(self, cfg: SaturationAwareStageConfig) -> None:
         """Two consecutive SATURATED cycles -> streak=2 -> fire.
@@ -191,7 +192,7 @@ class TestSaturatedScaleUpPath:
         ``None``): the discrete fallback emits +1.
         """
         state = _fresh_state(cfg)
-        run_per_stage_pipeline(  # cycle 1: streak goes to 1
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=10,
             num_empty_slots=1,
@@ -199,7 +200,7 @@ class TestSaturatedScaleUpPath:
             current_workers=4,
             config=cfg,
         )
-        delta = run_per_stage_pipeline(  # cycle 2: streak goes to 2 -> fire
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=10,
             num_empty_slots=1,
@@ -208,8 +209,8 @@ class TestSaturatedScaleUpPath:
             config=cfg,
         )
         assert delta == 1
-        assert state.classifier_state is StageState.SATURATED
-        assert state.classifier_streak == 2
+        assert state.classifier.state is StageState.SATURATED
+        assert state.classifier.streak == 2
 
 
 class TestOverProvisionedShrinkPath:
@@ -238,12 +239,12 @@ class TestOverProvisionedShrinkPath:
             current_workers=10,
             config=cfg,
         )
-        assert state.classifier_streak == 30
+        assert state.classifier.streak == 30
         # Cold-start fallback (no D_k yet) shrinks by exactly one worker.
         assert delta == -1
         # ACQUIRING + first shrink -> TRACKING.
-        assert state.growth_mode is GrowthMode.TRACKING
-        assert state.growth_streak == 1
+        assert state.growth.mode is GrowthMode.TRACKING
+        assert state.growth.streak == 1
 
 
 class TestEmptyQueueWithIdleSlotsClassifiesAsOverProvisioned:
@@ -260,7 +261,7 @@ class TestEmptyQueueWithIdleSlotsClassifiesAsOverProvisioned:
     ) -> None:
         """Free slots + empty queue -> OVER_PROVISIONED; first cycle delta is zero."""
         state = _fresh_state(cfg)
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=1,
             num_empty_slots=9,
@@ -269,7 +270,7 @@ class TestEmptyQueueWithIdleSlotsClassifiesAsOverProvisioned:
             config=cfg,
         )
         assert delta == 0
-        assert state.classifier_state is StageState.OVER_PROVISIONED
+        assert state.classifier.state is StageState.OVER_PROVISIONED
 
 
 class TestZeroActorsColdStart:
@@ -288,15 +289,15 @@ class TestZeroActorsColdStart:
         )
         assert delta == 0
         # Classifier untouched; EWMA still uninitialised.
-        assert state.classifier_state is StageState.NORMAL
-        assert state.classifier_streak == 0
-        assert state.slots_empty_ratio_ewma is None
-        assert state.last_valid_slots_empty_ratio_ewma is None
+        assert state.classifier.state is StageState.NORMAL
+        assert state.classifier.streak == 0
+        assert state.classifier.slots_empty_ratio_ewma is None
+        assert state.classifier.last_valid_slots_empty_ratio_ewma is None
         # Growth-mode timer ticks regardless (the scheduler always calls
         # ``record_executed_delta`` for every stage that participated in
         # the cycle, including cold-start no-action stages).
-        assert state.growth_mode is GrowthMode.ACQUIRING
-        assert state.growth_streak == 1
+        assert state.growth.mode is GrowthMode.ACQUIRING
+        assert state.growth.streak == 1
 
 
 class TestZeroActorsCarryForward:
@@ -308,7 +309,7 @@ class TestZeroActorsCarryForward:
     ) -> None:
         """Saturated, then zero actors transient -> classifier still sees SATURATED via carry-forward."""
         state = _fresh_state(cfg)
-        run_per_stage_pipeline(  # cycle 1: SATURATED, EWMA caches a low value.
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=10,
             num_empty_slots=1,
@@ -316,12 +317,12 @@ class TestZeroActorsCarryForward:
             current_workers=4,
             config=cfg,
         )
-        cached_ewma = state.slots_empty_ratio_ewma
+        cached_ewma = state.classifier.slots_empty_ratio_ewma
         assert cached_ewma is not None
         assert cfg.saturation_threshold is not None
         assert cached_ewma < cfg.saturation_threshold
 
-        run_per_stage_pipeline(  # cycle 2: zero actors momentarily.
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,
@@ -330,9 +331,9 @@ class TestZeroActorsCarryForward:
             config=cfg,
         )
         # EWMA itself is unchanged -- carry-forward, no new sample blended in.
-        assert state.slots_empty_ratio_ewma == cached_ewma
+        assert state.classifier.slots_empty_ratio_ewma == cached_ewma
         # Classifier must have re-classified using the cached value.
-        assert state.classifier_state is StageState.SATURATED
+        assert state.classifier.state is StageState.SATURATED
 
     def test_zero_actor_carry_forward_returns_zero_delta_without_relying_on_trust_gate(
         self,
@@ -356,7 +357,7 @@ class TestZeroActorsCarryForward:
         # ``should_fire_action(SATURATED, streak, ...)`` would return
         # True on the very next cycle.
         for _ in range(cfg.saturated_streak_min_cycles + 1):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=10,
                 num_empty_slots=1,
@@ -364,10 +365,10 @@ class TestZeroActorsCarryForward:
                 current_workers=4,
                 config=cfg,
             )
-        assert state.classifier_state is StageState.SATURATED
-        assert state.classifier_streak >= cfg.saturated_streak_min_cycles
+        assert state.classifier.state is StageState.SATURATED
+        assert state.classifier.streak >= cfg.saturated_streak_min_cycles
 
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,
@@ -379,7 +380,7 @@ class TestZeroActorsCarryForward:
         # The classifier state machine must still reflect carry-forward
         # tracking (the prior test pins the same invariant for a single
         # transient cycle; this test verifies it survives the clamp).
-        assert state.classifier_state is StageState.SATURATED
+        assert state.classifier.state is StageState.SATURATED
 
 
 class TestEwmaSmoothing:
@@ -390,7 +391,7 @@ class TestEwmaSmoothing:
         state = _fresh_state(cfg)
         target = 0.50
         for _ in range(20):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=1,
                 num_empty_slots=1,
@@ -398,7 +399,7 @@ class TestEwmaSmoothing:
                 current_workers=4,
                 config=cfg,
             )
-        assert state.slots_empty_ratio_ewma == pytest.approx(target, rel=1e-2)
+        assert state.classifier.slots_empty_ratio_ewma == pytest.approx(target, rel=1e-2)
 
 
 class TestFullLifecycleTrace:
@@ -433,7 +434,7 @@ class TestFullLifecycleTrace:
                 config=cfg,
             )
             assert delta == 0
-            assert state.classifier_state is StageState.OVER_PROVISIONED
+            assert state.classifier.state is StageState.OVER_PROVISIONED
 
         # 30th cycle: streak hits threshold, shrink fires, mode flips.
         delta = _advance_cycle(
@@ -444,11 +445,11 @@ class TestFullLifecycleTrace:
             current_workers=10,
             config=cfg,
         )
-        assert state.classifier_streak == 30
+        assert state.classifier.streak == 30
         assert delta == -1
         # ACQUIRING + first shrink -> TRACKING (ceiling discovered).
-        assert state.growth_mode is GrowthMode.TRACKING
-        assert state.growth_streak == 1
+        assert state.growth.mode is GrowthMode.TRACKING
+        assert state.growth.streak == 1
 
 
 class TestColdStartZeroActorsDoesNotResetGrowthMode:
@@ -459,13 +460,11 @@ class TestColdStartZeroActorsDoesNotResetGrowthMode:
         cfg: SaturationAwareStageConfig,
     ) -> None:
         """A stage parked in HOLD with zero actors must still exit to TRACKING after the window expires."""
-        # Construct a state already in HOLD via attrs.evolve to skip the lifecycle.
-        state = attrs.evolve(
-            _fresh_state(cfg),
-            growth_mode=GrowthMode.HOLD,
-            growth_streak=cfg.stabilization_window_cycles_down,
-            last_valid_slots_empty_ratio_ewma=None,
-        )
+        # Construct a state already in HOLD via direct sub-state mutation to skip the lifecycle.
+        state = _fresh_state(cfg)
+        state.growth.mode = GrowthMode.HOLD
+        state.growth.streak = cfg.stabilization_window_cycles_down
+        state.classifier.last_valid_slots_empty_ratio_ewma = None
         # Zero actors + no prior EWMA: cold-start short-circuit, but the
         # growth-mode timer must still tick. The scheduler models this by
         # calling ``record_executed_delta(0)`` for every stage that
@@ -479,5 +478,5 @@ class TestColdStartZeroActorsDoesNotResetGrowthMode:
             config=cfg,
         )
         assert delta == 0
-        assert state.growth_mode is GrowthMode.TRACKING
-        assert state.growth_streak == 1
+        assert state.growth.mode is GrowthMode.TRACKING
+        assert state.growth.streak == 1

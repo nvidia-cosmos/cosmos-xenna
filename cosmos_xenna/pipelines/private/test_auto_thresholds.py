@@ -19,7 +19,7 @@ Pin the operator contract: ``saturation_aggressiveness`` (the
 ``K`` in ``K/sqrt(c)``) is the single primary knob; the per-threshold
 overrides on ``SaturationAwareStageConfig`` opt out of auto-derivation;
 the resolved values flow through scheduler ``setup()`` onto
-``_StageRuntimeState.resolved_thresholds`` for the lifetime of the run.
+``StageRuntimeState.classifier.resolved_thresholds`` for the lifetime of the run.
 
 Each test verifies one slice of the resolution contract so a future
 formula tweak surfaces as a precise test failure instead of a vague
@@ -31,7 +31,7 @@ import math
 import pytest
 from attrs.exceptions import FrozenInstanceError
 
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import (
     ResolvedThresholds,
     _resolve_auto_thresholds,
 )

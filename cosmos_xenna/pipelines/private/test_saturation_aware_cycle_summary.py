@@ -24,7 +24,7 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -104,14 +104,24 @@ class TestCycleSummary:
         """Every autoscale cycle emits exactly one summary line at DEBUG."""
         scheduler = _scheduler()
         ps = _problem_state()
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 0},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         summary_records = [r for r in loguru_caplog.records if "cycle 1 summary" in r.message]
         assert len(summary_records) == 1
         assert summary_records[0].levelno == logging.DEBUG
         msg = summary_records[0].message
-        for needle in ("regime=", "heterogeneity_streak=", "heterogeneity_fired=", "phase_c_allocation_failure="):
+        for needle in (
+            "regime=",
+            "heterogeneity_streak=",
+            "heterogeneity_fired=",
+            "manual_allocation_aborted_cycle=",
+            "floor_allocation_aborted_cycle=",
+            "grow_allocation_aborted_cycle=",
+        ):
             assert needle in msg
 
     def test_cycle_summary_is_below_info_level(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
@@ -119,7 +129,10 @@ class TestCycleSummary:
         scheduler = _scheduler()
         ps = _problem_state()
         loguru_caplog.set_level(logging.INFO, logger="loguru")
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 0},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         info_or_higher = [r for r in loguru_caplog.records if r.levelno >= logging.INFO and "summary" in r.message]

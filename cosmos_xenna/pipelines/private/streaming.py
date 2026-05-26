@@ -37,7 +37,7 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.streaming_backpressure import (
+from cosmos_xenna.pipelines.private.scheduling_py.cluster.streaming_backpressure import (
     compute_max_queued,
     resolve_setup_aware_max_queued_enabled,
 )
@@ -503,7 +503,7 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
             )
         case specs.SchedulerKind.SATURATION_AWARE:
             # Deferred import keeps the fragmentation-based path free of metric series it never observes.
-            from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+            from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 
             job_info = pipeline_spec.job_info
             pipeline_name = job_info.pipeline_type if job_info is not None else ""

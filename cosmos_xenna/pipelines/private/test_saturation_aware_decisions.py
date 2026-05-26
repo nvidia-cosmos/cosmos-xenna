@@ -29,12 +29,12 @@ Default per-stage thresholds at the time of writing:
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.decisions import (
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.decisions import (
     compute_delta,
     should_fire_action,
     update_streak,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import GrowthMode, StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
@@ -58,7 +58,7 @@ class TestUpdateStreak:
         assert result == 1
 
     def test_first_cycle_in_initial_state_returns_one(self) -> None:
-        """Initial _StageRuntimeState has streak=0; first cycle in same state -> 1."""
+        """Initial StageRuntimeState has streak=0; first cycle in same state -> 1."""
         result = update_streak(StageState.NORMAL, prev_streak=0, new_state=StageState.NORMAL)
         assert result == 1
 

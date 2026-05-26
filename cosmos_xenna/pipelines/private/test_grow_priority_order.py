@@ -37,7 +37,7 @@ import math
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.dag_priority import compute_grow_priority_order
+from cosmos_xenna.pipelines.private.scheduling_py.phases.grow.dag_priority import compute_grow_priority_order
 
 
 def _problem(stage_names: list[str]) -> data_structures.Problem:

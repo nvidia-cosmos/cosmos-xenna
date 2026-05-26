@@ -36,13 +36,13 @@ priming, and the dispatcher's catch-up time.
 
 These tests pin:
 
-  * The helper (``_aggregate_slot_signals_excluding_warmup``) sums
-    only mature workers' contributions; the all-warmup case yields
+  * The helper (``WarmupTracker.filter_slot_signals``) sums only
+    mature workers' contributions; the all-warmup case yields
     ``(0, 0)`` so the upstream classifier holds.
   * Grace=0 disables the filter (legacy behaviour for tests and
     operator opt-out).
   * ``input_queue_depth`` is unfiltered (per-stage signal).
-  * Workers age across cycles via ``_refresh_worker_ready_first_seen``;
+  * Workers age across cycles via ``WarmupTracker.refresh``;
     departed workers drop from the map.
   * SPMD worker groups share a single first-seen timestamp.
   * Boundary: a worker exactly at grace seconds is admitted on the
@@ -54,7 +54,7 @@ These tests pin:
 
 The fixture pattern mirrors ``test_setup_quiescence.py``: each test
 isolates one behaviour, builds a dedicated scheduler, and inspects
-``_last_intent_deltas`` and / or ``_stage_states`` to verify the
+``cycle.intent.deltas`` and / or ``_stage_states`` to verify the
 contract. Fixtures use ``pytest`` parametrization where the same
 contract must hold across multiple input shapes.
 """
@@ -62,8 +62,8 @@ contract must hold across multiple input shapes.
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -206,11 +206,11 @@ def _scheduler_with_warmup_grace(
     Donor warmup grace has its own dedicated test module
     (``test_donor_warmup_grace.py``); these tests verify the
     measurement filter alone via direct calls to
-    ``_aggregate_slot_signals_excluding_warmup``.
+    ``WarmupTracker.filter_slot_signals``.
 
     Streak / window defaults make the up path fire on a single
     cycle so a positive intent shows up in
-    ``_last_intent_deltas`` immediately once the EWMA crosses the
+    ``cycle.intent.deltas`` immediately once the EWMA crosses the
     activation threshold.
     """
     cfg = SaturationAwareConfig(
@@ -241,7 +241,7 @@ class TestRefreshWorkerReadyFirstSeen:
         scheduler.autoscale(time=100.0, problem_state=ps)
 
         for i in range(3):
-            assert scheduler._worker_ready_first_seen_at[f"hot-w{i}"] == 100.0
+            assert scheduler.ledgers.warmup.first_seen_for(f"hot-w{i}") == 100.0
 
     def test_subsequent_cycle_carries_forward_existing_timestamp(self) -> None:
         """An already-observed worker keeps its first-seen value across cycles."""
@@ -251,8 +251,8 @@ class TestRefreshWorkerReadyFirstSeen:
         scheduler.autoscale(time=100.0, problem_state=ps)
         scheduler.autoscale(time=130.0, problem_state=ps)
 
-        assert scheduler._worker_ready_first_seen_at["hot-w0"] == 100.0
-        assert scheduler._worker_ready_first_seen_at["hot-w1"] == 100.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-w0") == 100.0
+        assert scheduler.ledgers.warmup.first_seen_for("hot-w1") == 100.0
 
     def test_worker_disappears_drops_from_map(self) -> None:
         """A worker absent from this cycle's snapshot is evicted from the map."""
@@ -261,13 +261,13 @@ class TestRefreshWorkerReadyFirstSeen:
         ps_two = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=2)])
 
         scheduler.autoscale(time=100.0, problem_state=ps_three)
-        assert "hot-w2" in scheduler._worker_ready_first_seen_at
+        assert scheduler.ledgers.warmup.is_tracked("hot-w2")
 
         scheduler.autoscale(time=110.0, problem_state=ps_two)
 
-        assert "hot-w2" not in scheduler._worker_ready_first_seen_at
-        assert "hot-w0" in scheduler._worker_ready_first_seen_at
-        assert "hot-w1" in scheduler._worker_ready_first_seen_at
+        assert not scheduler.ledgers.warmup.is_tracked("hot-w2")
+        assert scheduler.ledgers.warmup.is_tracked("hot-w0")
+        assert scheduler.ledgers.warmup.is_tracked("hot-w1")
 
     def test_all_workers_disappear_clears_map(self) -> None:
         """A drained stage produces an empty first-seen map."""
@@ -278,18 +278,18 @@ class TestRefreshWorkerReadyFirstSeen:
         scheduler.autoscale(time=0.0, problem_state=ps_full)
         scheduler.autoscale(time=10.0, problem_state=ps_drained)
 
-        assert scheduler._worker_ready_first_seen_at == {}
+        assert scheduler.ledgers.warmup.tracked_count() == 0
 
     def test_setup_resets_first_seen_map(self) -> None:
         """A fresh ``setup()`` clears any prior cycle's first-seen records."""
         scheduler = _scheduler_with_warmup_grace("hot")
         ps = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=2)])
         scheduler.autoscale(time=0.0, problem_state=ps)
-        assert scheduler._worker_ready_first_seen_at != {}
+        assert scheduler.ledgers.warmup.tracked_count() != 0
 
         scheduler.setup(_problem(["hot"]))
 
-        assert scheduler._worker_ready_first_seen_at == {}
+        assert scheduler.ledgers.warmup.tracked_count() == 0
 
 
 class TestWarmupGraceSuppressesScaleUp:
@@ -302,9 +302,9 @@ class TestWarmupGraceSuppressesScaleUp:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state is StageState.NORMAL
-        assert scheduler._last_intent_deltas["hot"] == 0
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state is StageState.NORMAL
+        assert scheduler.last_cycle.intent.deltas["hot"] == 0
 
     def test_intent_remains_zero_during_full_warmup_window(self) -> None:
         """For every advance up to but not including ``grace_s``, intent stays zero."""
@@ -313,7 +313,7 @@ class TestWarmupGraceSuppressesScaleUp:
 
         for elapsed in (0.0, 10.0, 20.0, 30.0, 40.0, 50.0):
             scheduler.autoscale(time=elapsed, problem_state=ps)
-            assert scheduler._last_intent_deltas["hot"] == 0, f"unexpected intent at t={elapsed}"
+            assert scheduler.last_cycle.intent.deltas["hot"] == 0, f"unexpected intent at t={elapsed}"
 
     def test_grace_release_fires_phase_c_on_subsequent_cycle(self) -> None:
         """After ``grace_s`` elapses the EWMA absorbs the saturated signal and intent goes positive."""
@@ -326,9 +326,9 @@ class TestWarmupGraceSuppressesScaleUp:
         # The grace boundary admits workers at first_seen_age >= grace_s. Once
         # admitted the EWMA absorbs the saturated ratio and the intent fires
         # because saturated_streak_min_cycles=1 in the helper config.
-        assert scheduler._last_intent_deltas["hot"] > 0
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
 
 
 class TestWarmupGraceOptOut:
@@ -341,9 +341,9 @@ class TestWarmupGraceOptOut:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas["hot"] > 0
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
 
 
 class TestQueueDepthIsUnfiltered:
@@ -415,11 +415,11 @@ class TestMixedAgeWorkers:
                 )
             ]
         )
-        scheduler._refresh_worker_ready_first_seen(ps_four, now=60.0)
+        scheduler.ledgers.warmup.refresh(ps_four, now=60.0)
 
-        used, empty = scheduler._aggregate_slot_signals_excluding_warmup(
+        used, empty = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps_four.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=60.0,
         )
 
@@ -440,9 +440,9 @@ class TestWarmupGraceBoundary:
         scheduler.autoscale(time=30.0, problem_state=ps)
 
         runtime_stage = ps.rust.stages[0]
-        used, empty = scheduler._aggregate_slot_signals_excluding_warmup(
+        used, empty = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=runtime_stage,
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=30.0,
         )
 
@@ -455,9 +455,9 @@ class TestWarmupGraceBoundary:
         ps = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=4)])
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        used, empty = scheduler._aggregate_slot_signals_excluding_warmup(
+        used, empty = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=29.999_999,
         )
 
@@ -477,8 +477,8 @@ class TestNonMonotonicTimeIsBenign:
 
         # With now < first_seen, (now - first_seen) is negative, treated as
         # warmup. No crash; filter returns (0, 0); classifier holds.
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state is StageState.NORMAL
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state is StageState.NORMAL
 
     def test_recovery_from_backward_jump_admits_workers_when_age_passes(self) -> None:
         """Once wall-clock moves forward past the recorded first_seen + grace, workers admit again."""
@@ -490,7 +490,7 @@ class TestNonMonotonicTimeIsBenign:
         scheduler.autoscale(time=140.0, problem_state=ps)  # forward, age = 40 s -> mature
 
         # The forward cycle admits the workers and the saturated signal fires.
-        assert scheduler._last_intent_deltas["hot"] > 0
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
 
 
 class TestSpmdGroupSharesTimestamp:
@@ -526,16 +526,16 @@ class TestSpmdGroupSharesTimestamp:
             ]
         )
 
-        scheduler._refresh_worker_ready_first_seen(ps, now=0.0)
+        scheduler.ledgers.warmup.refresh(ps, now=0.0)
 
         # The whole group is one entry in the first-seen map.
-        assert len(scheduler._worker_ready_first_seen_at) == 1
-        assert "hot-w0" in scheduler._worker_ready_first_seen_at
+        assert scheduler.ledgers.warmup.tracked_count() == 1
+        assert scheduler.ledgers.warmup.is_tracked("hot-w0")
 
         # During warmup the group contributes (0, 0).
-        used_warmup, empty_warmup = scheduler._aggregate_slot_signals_excluding_warmup(
+        used_warmup, empty_warmup = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=30.0,
         )
         assert (used_warmup, empty_warmup) == (0, 0)
@@ -546,9 +546,9 @@ class TestSpmdGroupSharesTimestamp:
         # num_used_slots=15 (sum across the 2 actors) -> empty = 16 - 15 = 1.
         # Earlier (buggy) code computed slots_per_worker - num_used_slots = 8 - 15 -> max(0, ...) = 0,
         # under-counting by (K-1)*slots_per_worker = 8 empties and biasing the classifier toward SATURATED.
-        used_mature, empty_mature = scheduler._aggregate_slot_signals_excluding_warmup(
+        used_mature, empty_mature = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=60.0,
         )
         assert used_mature == 15
@@ -574,9 +574,9 @@ class TestZeroWorkerStage:
             ]
         )
 
-        used, empty = scheduler._aggregate_slot_signals_excluding_warmup(
+        used, empty = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=0.0,
         )
 
@@ -600,14 +600,14 @@ class TestLargeStagePerformance:
         scheduler = _scheduler_with_warmup_grace("hot", grace_s=60.0)
         ps = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=100)])
 
-        scheduler._refresh_worker_ready_first_seen(ps, now=0.0)
-        used, empty = scheduler._aggregate_slot_signals_excluding_warmup(
+        scheduler.ledgers.warmup.refresh(ps, now=0.0)
+        used, empty = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=0.0,
         )
 
-        assert len(scheduler._worker_ready_first_seen_at) == 100
+        assert scheduler.ledgers.warmup.tracked_count() == 100
         assert (used, empty) == (0, 0)
 
 
@@ -621,14 +621,14 @@ class TestParametricGraceBoundary:
         ps = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=4)])
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        used_before, empty_before = scheduler._aggregate_slot_signals_excluding_warmup(
+        used_before, empty_before = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=grace_s - 1e-9,
         )
-        used_after, empty_after = scheduler._aggregate_slot_signals_excluding_warmup(
+        used_after, empty_after = scheduler.ledgers.warmup.filter_slot_signals(
             runtime_stage=ps.rust.stages[0],
-            stage_cfg=scheduler._stage_cfg("hot"),
+            stage_cfg=scheduler.pipeline.stage_config("hot"),
             now=grace_s,
         )
 

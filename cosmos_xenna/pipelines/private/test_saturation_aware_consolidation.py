@@ -56,7 +56,11 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.gpu_fraction_map import (
+    aggregate_host_gpu_used_fractions,
+    project_stage_worker_fractions,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 SchedulerFactory = Callable[..., tuple[SaturationAwareScheduler, data_structures.Problem]]
@@ -271,7 +275,7 @@ def make_gpu_state() -> GpuStateFactory:
 def autoscale_with_intents() -> AutoscaleFactory:
     """Run a single ``autoscale`` cycle with the given signed intent deltas.
 
-    Patches ``SaturationAwareScheduler._compute_intent_deltas`` for
+    Patches ``intent_phase.compute`` for
     the duration of the call so the per-stage classifier
     machinery is bypassed and the test controls Phase D's
     deletion driver directly. The patch is scoped to one
@@ -284,7 +288,10 @@ def autoscale_with_intents() -> AutoscaleFactory:
         state: data_structures.ProblemState,
         intents: dict[str, int],
     ) -> data_structures.Solution:
-        with patch.object(scheduler, "_compute_intent_deltas", return_value=dict(intents)):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value=dict(intents),
+        ):
             return scheduler.autoscale(time=0.0, problem_state=state)
 
     return _factory
@@ -586,10 +593,10 @@ class TestProductionIncidentReplay:
         deleted_total: set[str] = set()
         for _cycle in range(3):
             state = _next_cycle_state(make_gpu_state, specs, deleted_total)
-            host_gpu_used_fractions = SaturationAwareScheduler._compute_host_gpu_used_fractions(state)
+            host_gpu_used_fractions = aggregate_host_gpu_used_fractions(state)
             stage_a = state.rust.stages[0]
             assert stage_a.stage_name == "A"
-            per_worker_a = SaturationAwareScheduler._extract_worker_host_gpu_used_fractions(
+            per_worker_a = project_stage_worker_fractions(
                 runtime_stage=stage_a,
                 host_gpu_used_fractions=host_gpu_used_fractions,
             )

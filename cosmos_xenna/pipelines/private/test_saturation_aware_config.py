@@ -48,6 +48,14 @@ class TestSchedulerKind:
         assert SchedulerKind.FRAGMENTATION_BASED.value == "fragmentation_based"
         assert SchedulerKind.SATURATION_AWARE.value == "saturation_aware"
 
+    def test_saturation_aware_supports_setup_aware_queue(self) -> None:
+        """SA opts in to the setup-aware backpressure cap so the resolver gates on the capability flag."""
+        assert SchedulerKind.SATURATION_AWARE.supports_setup_aware_queue is True
+
+    def test_fragmentation_based_does_not_support_setup_aware_queue(self) -> None:
+        """FRAGMENTATION_BASED has no SA stage config, so the capability flag returns False."""
+        assert SchedulerKind.FRAGMENTATION_BASED.supports_setup_aware_queue is False
+
 
 class TestSaturationAwareStageConfigFieldValidators:
     """Single-field validators reject invalid values at __init__ time.

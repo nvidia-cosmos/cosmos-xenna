@@ -26,8 +26,8 @@ Default at the time of writing:
 import attrs
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.growth_mode import compute_growth_mode_transition
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.growth_mode import compute_growth_mode_transition
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import GrowthMode
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
@@ -41,7 +41,7 @@ class TestAcquiringTransitions:
     """ACQUIRING is the initial mode; only first executed shrink moves it forward."""
 
     def test_first_shrink_transitions_to_tracking(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING + delta<0 -> (TRACKING, 1) -- ceiling discovered."""
+        """ACQUIRING + delta<0 -> (TRACKING, 1) - ceiling discovered."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.ACQUIRING,
             prev_streak=5,
@@ -51,7 +51,7 @@ class TestAcquiringTransitions:
         assert result == (GrowthMode.TRACKING, 1)
 
     def test_no_action_holds_acquiring_and_increments_streak(self, cfg: SaturationAwareStageConfig) -> None:
-        """ACQUIRING + delta=0 -> (ACQUIRING, prev_streak + 1) -- still in slow-start."""
+        """ACQUIRING + delta=0 -> (ACQUIRING, prev_streak + 1) - still in slow-start."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.ACQUIRING,
             prev_streak=5,
@@ -75,7 +75,7 @@ class TestTrackingTransitions:
     """TRACKING is the steady-state after ceiling discovery; shrink moves it to HOLD."""
 
     def test_shrink_transitions_to_hold(self, cfg: SaturationAwareStageConfig) -> None:
-        """TRACKING + delta<0 -> (HOLD, 1) -- post-shrink stabilization begins."""
+        """TRACKING + delta<0 -> (HOLD, 1) - post-shrink stabilization begins."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.TRACKING,
             prev_streak=10,
@@ -95,7 +95,7 @@ class TestTrackingTransitions:
         assert result == (GrowthMode.TRACKING, 11)
 
     def test_grow_holds_tracking_and_increments_streak(self, cfg: SaturationAwareStageConfig) -> None:
-        """TRACKING + delta>0 -> (TRACKING, prev_streak + 1) -- mode unchanged on grow."""
+        """TRACKING + delta>0 -> (TRACKING, prev_streak + 1) - mode unchanged on grow."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.TRACKING,
             prev_streak=10,
@@ -109,7 +109,7 @@ class TestHoldTransitions:
     """HOLD is the post-shrink stabilization mode; exits on timer expiry or restarts on re-shrink."""
 
     def test_re_shrink_restarts_hold_timer(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD + delta<0 -> (HOLD, 1) -- timer restarts so the stabilization window covers the new shrink."""
+        """HOLD + delta<0 -> (HOLD, 1) - timer restarts so the stabilization window covers the new shrink."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.HOLD,
             prev_streak=20,
@@ -129,7 +129,7 @@ class TestHoldTransitions:
         assert result == (GrowthMode.HOLD, 11)
 
     def test_no_action_at_window_minus_one_holds(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD + delta=0 + streak == window-1 -> (HOLD, window) -- one cycle before timer fires."""
+        """HOLD + delta=0 + streak == window-1 -> (HOLD, window) - one cycle before timer fires."""
         boundary = cfg.stabilization_window_cycles_down - 1
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.HOLD,
@@ -140,7 +140,7 @@ class TestHoldTransitions:
         assert result == (GrowthMode.HOLD, cfg.stabilization_window_cycles_down)
 
     def test_no_action_at_window_transitions_to_tracking(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD + delta=0 + streak == window -> (TRACKING, 1) -- timer expires."""
+        """HOLD + delta=0 + streak == window -> (TRACKING, 1) - timer expires."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.HOLD,
             prev_streak=cfg.stabilization_window_cycles_down,
@@ -150,7 +150,7 @@ class TestHoldTransitions:
         assert result == (GrowthMode.TRACKING, 1)
 
     def test_burst_growth_in_hold_does_not_transition(self, cfg: SaturationAwareStageConfig) -> None:
-        """HOLD + delta>0 (burst-only) -> (HOLD, prev_streak + 1) -- burst growth keeps timer counting."""
+        """HOLD + delta>0 (burst-only) -> (HOLD, prev_streak + 1) - burst growth keeps timer counting."""
         result = compute_growth_mode_transition(
             prev_mode=GrowthMode.HOLD,
             prev_streak=10,
@@ -163,7 +163,7 @@ class TestHoldTransitions:
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """HOLD + prev_streak == window + delta<0 -> (HOLD, 1) -- shrink path wins, timer restarts.
+        """HOLD + prev_streak == window + delta<0 -> (HOLD, 1) - shrink path wins, timer restarts.
 
         Both branches of the function would fire on this input. The
         ``delta_executed < 0`` check comes first in the function body
@@ -184,7 +184,7 @@ class TestHoldTransitions:
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """HOLD + delta=0 + streak >> window -> (TRACKING, 1) -- ``>=`` not ``==``.
+        """HOLD + delta=0 + streak >> window -> (TRACKING, 1) - ``>=`` not ``==``.
 
         Defensive pin against a future refactor that accidentally
         narrows the timer-expiry condition to exact equality. If a
@@ -203,7 +203,7 @@ class TestHoldTransitions:
 
 
 class TestSmallestValidWindow:
-    """Window = 1 is the smallest valid value -- HOLD exits on the very next no-action cycle."""
+    """Window = 1 is the smallest valid value - HOLD exits on the very next no-action cycle."""
 
     def test_window_of_one_exits_immediately_after_entry_cycle(
         self,
@@ -266,7 +266,7 @@ class TestFullLifecycleTrace:
         assert mode is GrowthMode.ACQUIRING
         assert streak == 9  # grows do not transition; streak keeps incrementing
 
-        # ---- Phase 3: First shrink -- ceiling discovered.
+        # ---- Phase 3: First shrink - ceiling discovered.
         mode, streak = compute_growth_mode_transition(prev_mode=mode, prev_streak=streak, delta_executed=-1, config=cfg)
         assert mode is GrowthMode.TRACKING
         assert streak == 1
@@ -279,7 +279,7 @@ class TestFullLifecycleTrace:
         assert mode is GrowthMode.TRACKING
         assert streak == 5
 
-        # ---- Phase 5: Second shrink -- enter HOLD.
+        # ---- Phase 5: Second shrink - enter HOLD.
         mode, streak = compute_growth_mode_transition(prev_mode=mode, prev_streak=streak, delta_executed=-1, config=cfg)
         assert mode is GrowthMode.HOLD
         assert streak == 1
@@ -292,7 +292,7 @@ class TestFullLifecycleTrace:
         assert mode is GrowthMode.HOLD
         assert streak == cfg.stabilization_window_cycles_down
 
-        # ---- Phase 7: One more quiet cycle -- timer fires, exit to TRACKING.
+        # ---- Phase 7: One more quiet cycle - timer fires, exit to TRACKING.
         mode, streak = compute_growth_mode_transition(prev_mode=mode, prev_streak=streak, delta_executed=0, config=cfg)
         assert mode is GrowthMode.TRACKING
         assert streak == 1
@@ -380,7 +380,7 @@ class TestInputValidation:
             compute_growth_mode_transition(prev_mode=GrowthMode.ACQUIRING, prev_streak=-1, delta_executed=0, config=cfg)
 
     def test_zero_prev_streak_is_accepted_as_cold_start(self, cfg: SaturationAwareStageConfig) -> None:
-        """Cold-start: ``_StageRuntimeState.growth_streak`` defaults to 0 before the first cycle.
+        """Cold-start: ``StageRuntimeState.growth.streak`` defaults to 0 before the first cycle.
 
         The first autoscale call must not raise on this initial value;
         the fall-through path increments to 1 cleanly.

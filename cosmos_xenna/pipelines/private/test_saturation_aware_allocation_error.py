@@ -26,10 +26,10 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py import allocation_failures
-from cosmos_xenna.pipelines.private.scheduling_py.donor import DonorPlan, DonorWorker
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.cluster import allocation_failures
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -212,7 +212,10 @@ class TestAllocationErrorDefense:
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             err = resources.AllocationError("synthetic placement failure")
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker", side_effect=err
@@ -249,7 +252,10 @@ class TestAllocationErrorDefense:
         ps = _problem_state_with_one_worker()
 
         err = RuntimeError("synthetic non-allocation raise")
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker", side_effect=err
             ):
@@ -267,7 +273,10 @@ class TestAllocationErrorDefense:
         ps = _problem_state_with_one_worker()
 
         err = resources.AllocationError("synthetic placement failure")
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker", side_effect=err
             ):
@@ -284,7 +293,10 @@ class TestAllocationErrorDefense:
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 return_value=None,
@@ -292,7 +304,7 @@ class TestAllocationErrorDefense:
                 scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert fake_counter.calls == [], "No-fit must not bump the failure counter"
-        assert scheduler._stuck_plan_counters["stage"] == 1, "No-fit must increment the stuck counter"
+        assert scheduler.ledgers.stuck_plan.get_counter("stage") == 1, "No-fit must increment the stuck counter"
 
 
 class TestDonorRetryInvariant:
@@ -335,19 +347,38 @@ class TestDonorRetryInvariant:
             removals=(DonorWorker(stage_index=0, worker_id="stage-w0", age=0),),
             receiver_stage_index=0,
         )
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 1}):
+        # The post-commit retry divergence path is now reached via
+        # DonorCoordinator.acquire, which returns a successful
+        # DonorAcquireResult (plan set, no reject reason). Patching
+        # the coordinator's instance method also bypasses
+        # SaturationPolicy.on_commit so the test does not need a
+        # separate record-call assertion - the divergence raises
+        # before any cooldown ledger update would run.
+        from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+        from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorAcquireResult
+
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"stage": 1},
+        ):
             with patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=lambda *_a, **_k: next(try_add_returns),
             ):
-                with patch.object(scheduler, "_attempt_cross_stage_donation", return_value=donor_plan):
-                    with patch.object(scheduler, "_record_donation_success") as record_mock:
-                        with pytest.raises(SchedulerInvariantError, match="planner state diverged"):
-                            scheduler.autoscale(time=0.0, problem_state=ps)
+                with patch.object(
+                    DonorCoordinator,
+                    "acquire",
+                    return_value=DonorAcquireResult(
+                        plan=donor_plan,
+                        attempted_plan=donor_plan,
+                        reject_reason=None,
+                        placement_reject_reason="",
+                        gate_result=None,
+                    ),
+                ):
+                    with pytest.raises(SchedulerInvariantError, match="planner snapshot diverged"):
+                        scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert record_mock.call_count == 0, (
-            "_record_donation_success must not be called when the post-commit retry diverges"
-        )
         assert fake_counter.calls == [], (
             "SchedulerInvariantError must not increment the absorbed-allocation-failure counter"
         )
@@ -441,9 +472,9 @@ def rust_cluster_with_two_gpus() -> Any:
     Mirrors the Python-side ``ClusterResources`` fixture used by
     ``test_emit_allocation_failure_logs_gpu_fragmentation_rows`` but
     exposes the underlying rust object via ``.to_rust()``. Production
-    code in ``SaturationAwareScheduler._absorb_allocation_failure``
-    passes ``self._problem.rust.cluster_resources`` (the rust binding)
-    -- not the Python wrapper -- so tests in
+    code in :meth:`AllocationFailureGate.absorb` passes
+    ``self._problem.rust.cluster_resources`` (the rust binding)
+    - not the Python wrapper - so tests in
     :class:`TestAllocationFailureSnapshotAcrossRustBinding` consume
     this fixture to exercise the actual production-side type.
     """
@@ -535,7 +566,7 @@ class TestAllocationFailureSnapshotAcrossRustBinding:
         assert "'free_fraction': 0.75" in message
         # The formatter-safety fallback must NOT have triggered. Pinning
         # the absence of its placeholder text yields a sharper failure
-        # signal -- "snapshot helper raised" -- than the indirect signal
+        # signal - "snapshot helper raised" - than the indirect signal
         # from the per-row substring assertions above.
         assert "<unavailable: formatting error>" not in message
         assert "snapshot formatter raised" not in message

@@ -46,7 +46,7 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -217,7 +217,7 @@ def autoscale_with_intents() -> AutoscaleFactory:
     """Run autoscale with the given intent deltas patched into the scheduler.
 
     The factory is stateless: each invocation patches
-    ``_compute_intent_deltas`` for exactly one ``autoscale`` call and
+    ``intent_phase.compute`` for exactly one ``autoscale`` call and
     cleans up on exit. Tests that need multiple cycles call the
     factory once per cycle.
     """
@@ -227,7 +227,10 @@ def autoscale_with_intents() -> AutoscaleFactory:
         state: data_structures.ProblemState,
         intents: dict[str, int],
     ) -> data_structures.Solution:
-        with patch.object(scheduler, "_compute_intent_deltas", return_value=dict(intents)):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value=dict(intents),
+        ):
             return scheduler.autoscale(time=0.0, problem_state=state)
 
     return _factory
@@ -246,7 +249,7 @@ class TestComputeStageCeilings:
         """The default configuration leaves every stage uncapped."""
         scheduler, _ = make_scheduler([("A", None), ("B", None)])
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=1)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=1)
 
         assert ceilings == {0: None, 1: None}
 
@@ -254,7 +257,7 @@ class TestComputeStageCeilings:
         """``max_workers`` alone sets the ceiling at that integer."""
         scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers=4))
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=1)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=1)
 
         assert ceilings == {0: 4}
 
@@ -262,7 +265,7 @@ class TestComputeStageCeilings:
         """``max_workers_per_node`` is multiplied by the cluster node count."""
         scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers_per_node=2), num_nodes=4)
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=4)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=4)
 
         assert ceilings == {0: 8}
 
@@ -274,7 +277,7 @@ class TestComputeStageCeilings:
             num_nodes=4,
         )
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=4)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=4)
         # max_workers=10, max_workers_per_node*num_nodes=1*4=4. min(10, 4) = 4.
         assert ceilings == {0: 4}
 
@@ -299,7 +302,7 @@ class TestComputeStageCeilings:
             stage_spec_overrides={"A": _test_stage_config(max_workers=2)},
         )
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=1)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=1)
 
         assert ceilings == {0: 2}
 
@@ -336,16 +339,16 @@ class TestComputeStageCeilings:
             num_nodes=4,
         )
 
-        ceilings = scheduler._compute_stage_ceilings(num_nodes=4)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=4)
         # max_workers=2, max_workers_per_node*num_nodes=4*4=16. min(2, 16) = 2.
         assert ceilings == {0: 2}
 
     def test_called_before_setup_raises_runtime_error(self) -> None:
-        """The helper refuses to run before ``setup()`` populates ``_problem``."""
+        """The helper refuses to run before ``setup()`` populates the pipeline."""
         scheduler = SaturationAwareScheduler(_make_config(max_workers=4))
 
-        with pytest.raises(RuntimeError, match="_compute_stage_ceilings called before setup"):
-            scheduler._compute_stage_ceilings(num_nodes=1)
+        with pytest.raises(RuntimeError, match="runner read before setup"):
+            _ = scheduler.runner
 
 
 class TestStageSpecOverrideConstructorContract:
@@ -497,7 +500,7 @@ class TestPhaseCCapClamp:
         """Hard cap clamping a positive intent to zero headroom clears the stuck counter.
 
         Pins the per-stage loop reset branch in
-        ``_run_phase_c_grow``: when ``_compute_intent_deltas`` produces
+        ``phases.phase_c.run``: when ``intent_phase.compute`` produces
         a positive intent but the hard worker cap leaves zero headroom
         (``current >= ceiling``), the clamp routes through the inner
         ``if intent <= 0`` reset path and the per-stage stuck counter
@@ -509,11 +512,11 @@ class TestPhaseCCapClamp:
         # Seed at cap (4 workers) so the headroom is zero and the cap clamp fires.
         state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
         # Seed a prior-stuck history without rigging the cluster.
-        scheduler._stuck_plan_counters["A"] = 7
+        scheduler.ledgers.stuck_plan.set("A", 7)
 
         autoscale_with_intents(scheduler, state, {"A": 5})
 
-        assert scheduler._stuck_plan_counters["A"] == 0, (
+        assert scheduler.ledgers.stuck_plan.get_counter("A") == 0, (
             "the hard-cap zero-headroom branch must reset the stuck counter so the watchdog "
             "does not promote cap-bound stages to 'stuck plan' INFO lines."
         )

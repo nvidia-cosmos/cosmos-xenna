@@ -32,16 +32,15 @@ fragmentation-based scheduler and the saturation-aware scheduler:
 
 Single-cycle structural parity only; multi-cycle numerical convergence
 is covered by the saturation-aware focused tests, not this parity
-harness. Rationale for the structural-vs-numerical scoping decision
-lives in
-``cosmos-xenna/docs/scheduler/saturation-aware/04-per-cycle-pipeline.md``.
+harness. See ``cosmos-xenna/docs/scheduler/saturation-aware/`` for the
+algorithm.
 """
 
 import uuid
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -592,7 +591,7 @@ class TestSchedulerStructuralParity:
 
         Pins the parity surface for the Phase A delete path: legacy Phase 1
         ``remove_best_worker_fn`` and saturation-aware
-        ``_run_phase_a_delete`` both bring the stage down to the operator's
+        ``phases.manual.executors.ManualDeleteExecutor`` both bring the stage down to the operator's
         requested count.
         """
         cluster = _cluster(total_cpus_per_node=8)

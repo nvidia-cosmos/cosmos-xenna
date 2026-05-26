@@ -30,12 +30,32 @@ Pin the contract:
 """
 
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorAcquireResult, DonorPlan, DonorWorker
+from cosmos_xenna.pipelines.private.scheduling_py.phases.floor.floor_phase import FloorPhase
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import AutoscaleCycle
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _make_cycle(
+    ctx: data_structures.AutoscalePlanContext,
+    problem_state: data_structures.ProblemState,
+) -> AutoscaleCycle:
+    """Build a minimal ``AutoscaleCycle`` for direct phase-method tests."""
+    return AutoscaleCycle(
+        ctx=ctx,
+        problem_state=problem_state,
+        time=0.0,
+        cycle_counter=0,
+        pipeline_name="",
+    )
 
 
 def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 16) -> resources.ClusterResources:
@@ -110,7 +130,17 @@ def _problem_state(
 
 
 class _RaisingAddContext:
-    """Fake planner that surfaces a hard floor-enforcement failure."""
+    """Fake planner that surfaces a hard floor-enforcement failure.
+
+    Exposes the minimal surface ``FloorPhase.run`` reaches BEFORE
+    the donor path: ``worker_ids_by_stage`` (read to compute
+    ``current``), ``try_add_worker`` (the call site under test),
+    and ``cluster_snapshot`` (consumed by the shared
+    :mod:`allocation_failures` defense layer when it absorbs an
+    :class:`resources.AllocationError`). The snapshot is fixed
+    cluster geometry; the absorb-path tests only assert on the
+    flag and call-count contract, not on the snapshot content.
+    """
 
     def __init__(self, exc: Exception | None = None) -> None:
         self.calls: list[int] = []
@@ -124,6 +154,28 @@ class _RaisingAddContext:
         """Raise the same exception types the planner can raise."""
         self.calls.append(stage_index)
         raise self._exc
+
+    def cluster_snapshot(self) -> resources.ClusterResources:
+        """Return a stable cluster snapshot for the absorb path's diagnostic log."""
+        return _cluster()
+
+
+class _MalformedAcquireResult:
+    """Test double simulating a coordinator that violates the DonorAcquireResult invariant.
+
+    The real :class:`DonorAcquireResult.committed` is a ``@property``
+    defined as ``self.plan is not None`` (donor/types.py:204), so
+    an attrs-constructed instance can never report ``committed=True``
+    paired with ``plan=None``. This double duck-types the three
+    attributes the FloorPhase reads after a successful commit
+    (``committed`` / ``probe_failed_at_commit`` / ``plan``) so the
+    phase's defensive coordinator-invariant raise is reachable
+    from a test without exercising a real coordinator defect.
+    """
+
+    committed = True
+    plan = None
+    probe_failed_at_commit = False
 
 
 class TestPhaseBFloor:
@@ -322,13 +374,17 @@ class TestPhaseBFloor:
         assert len(solution.stages[1].new_workers) == 1
 
     def test_floor_called_before_setup_raises_runtime_error(self) -> None:
-        """Calling the floor phase before ``setup`` fails with a clear scheduler error."""
+        """Reading ``scheduler.runner`` before ``setup`` fails with a clear scheduler error.
+
+        ``FloorPhase().run(cycle, services)`` requires a ``FloorServices``
+        value object which is constructed inside ``scheduler.setup()`` and
+        owned by the runner. The "called before setup" contract therefore
+        manifests as a guard on ``scheduler.runner`` rather than as a
+        message-shaped exception inside the phase body.
+        """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
-        with pytest.raises(RuntimeError, match="_run_phase_b_floor called before setup"):
-            scheduler._run_phase_b_floor(
-                cast(data_structures.AutoscalePlanContext, object()),
-                _problem_state([("A", 0, 1, False)]),
-            )
+        with pytest.raises(RuntimeError, match="runner read before setup"):
+            _ = scheduler.runner
 
     def test_planner_runtime_error_propagates(self) -> None:
         """Hard planner failures are not rewritten as floor-capacity exhaustion."""
@@ -337,9 +393,12 @@ class TestPhaseBFloor:
         ctx = _RaisingAddContext()
 
         with pytest.raises(RuntimeError, match="planner context is drained"):
-            scheduler._run_phase_b_floor(
-                cast(data_structures.AutoscalePlanContext, ctx),
-                _problem_state([("A", 0, 1, False)]),
+            FloorPhase().run(
+                _make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                scheduler.runner.floor_services,
             )
 
         assert ctx.calls == [0]
@@ -351,9 +410,12 @@ class TestPhaseBFloor:
         ctx = _RaisingAddContext(IndexError("stage_index 0 out of range"))
 
         with pytest.raises(IndexError, match="stage_index 0 out of range"):
-            scheduler._run_phase_b_floor(
-                cast(data_structures.AutoscalePlanContext, ctx),
-                _problem_state([("A", 0, 1, False)]),
+            FloorPhase().run(
+                _make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                scheduler.runner.floor_services,
             )
 
         assert ctx.calls == [0]
@@ -402,3 +464,208 @@ class TestPhaseBFloor:
         )
         assert len(solution.stages[0].new_workers) == 2
         assert len(solution.stages[1].new_workers) == 3
+
+
+class TestPhaseBFloorAllocationErrorDefense:
+    """Pin the Phase B side of the shared allocation-failure defense layer.
+
+    The wrapper in
+    :func:`cosmos_xenna.pipelines.private.scheduling_py.cluster.allocation_failures.try_add_worker_with_defense`
+    catches only :class:`resources.AllocationError`, leaving every
+    other exception type to propagate (validated by
+    ``test_planner_runtime_error_propagates`` and
+    ``test_planner_index_error_propagates`` in the suite above).
+    These tests pin the four Phase B branches:
+
+    1. Pre-donor add raising ``AllocationError`` is absorbed.
+    2. Pre-donor add raising ``AllocationError`` with the kill
+       switch off re-raises after the ERROR log + counter increment.
+    3. Post-donor-commit retry raising ``AllocationError`` is
+       absorbed (donor removals already committed atomically; the
+       cycle accepts the asymmetric outcome and the next cycle
+       re-balances).
+    4. Post-donor-commit retry returning ``None`` (probe-to-commit
+       planner divergence, not a placement exhaustion) still raises
+       :class:`SchedulerInvariantError` regardless of the kill
+       switch.
+    """
+
+    def test_pre_donor_allocation_error_is_absorbed_with_default_skip_switch(self) -> None:
+        """A pre-donor ``AllocationError`` is absorbed and only the failure flag flips.
+
+        The wrapper logs the failure, increments the per-stage
+        counter, sets
+        :attr:`FloorServices.floor_allocation.aborted_cycle`,
+        and Phase B returns without re-raising so the rest of the
+        autoscale cycle can run.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem([("A", None)]))
+        ctx = _RaisingAddContext(resources.AllocationError("synthetic placement failure"))
+
+        FloorPhase().run(
+            _make_cycle(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                _problem_state([("A", 0, 1, False)]),
+            ),
+            scheduler.runner.floor_services,
+        )
+
+        assert ctx.calls == [0]
+        assert scheduler.runner.floor_services.donor_executor.allocation_gate.aborted_cycle is True
+
+    def test_pre_donor_allocation_error_propagates_when_skip_switch_off(self) -> None:
+        """``skip_cycle_on_allocation_error=False`` re-raises the pre-donor ``AllocationError``.
+
+        The wrapper still emits the ERROR log + counter increment
+        before re-raising, but it does NOT set the cycle-skip flag
+        (which is reserved for the absorb path); the autoscaler
+        thread sees the original exception.
+        """
+        cfg = SaturationAwareConfig(skip_cycle_on_allocation_error=False)
+        scheduler = SaturationAwareScheduler(cfg)
+        scheduler.setup(_problem([("A", None)]))
+        ctx = _RaisingAddContext(resources.AllocationError("synthetic placement failure"))
+
+        with pytest.raises(resources.AllocationError, match="synthetic placement failure"):
+            FloorPhase().run(
+                _make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                scheduler.runner.floor_services,
+            )
+
+        assert ctx.calls == [0]
+        assert scheduler.runner.floor_services.donor_executor.allocation_gate.aborted_cycle is False
+
+    def test_post_donor_commit_allocation_error_is_absorbed(self) -> None:
+        """A post-commit retry raising ``AllocationError`` is absorbed; donor removals persist.
+
+        The donor coordinator already committed the worker removals
+        atomically. The post-commit retry is wrapped through the
+        same defense layer so an ``AllocationError`` (cluster shape
+        no longer fits) sets the cycle-skip flag and Phase B
+        returns instead of raising; the asymmetric outcome (donor
+        stage -1, receiver +0) is accepted and the next cycle
+        re-evaluates against the freed capacity.
+        """
+        cfg = SaturationAwareConfig(
+            stage_defaults=SaturationAwareStageConfig(min_workers=1),
+            per_stage_overrides={"receiver": SaturationAwareStageConfig(min_workers=2)},
+        )
+        scheduler = SaturationAwareScheduler(cfg, pipeline_name="test-pipe")
+        scheduler.setup(_problem([("donor", None), ("receiver", None)], total_cpus_per_node=4))
+        ps = _problem_state([("donor", 3, 1, False), ("receiver", 1, 1, False)])
+        err = resources.AllocationError("synthetic post-commit placement failure")
+        donor_plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="donor-w0", age=0),),
+            receiver_stage_index=1,
+        )
+
+        with patch(
+            "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+            side_effect=[None, err, None],
+        ):
+            with patch.object(
+                DonorCoordinator,
+                "acquire",
+                return_value=DonorAcquireResult(
+                    plan=donor_plan,
+                    attempted_plan=donor_plan,
+                    reject_reason=None,
+                    placement_reject_reason="",
+                    gate_result=None,
+                ),
+            ):
+                with patch(
+                    "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                    return_value={"donor": 0, "receiver": 0},
+                ):
+                    scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert scheduler.runner.floor_services.donor_executor.allocation_gate.aborted_cycle is True
+
+    def test_post_donor_commit_none_return_raises_invariant_error(self) -> None:
+        """A post-commit retry returning ``None`` (probe-to-commit divergence) raises invariant error.
+
+        ``None`` from ``try_add_worker`` after a probe-approved
+        donor plan committed means the planner reported the
+        receiver placeable during the probe and unplaceable during
+        the commit using the SAME FGD allocator state. That is a
+        scheduler defect, not a benign cluster-full event, so the
+        defense layer's ``AllocationError`` absorption does NOT
+        apply: ``SchedulerInvariantError`` is raised regardless of
+        the kill switch.
+        """
+        cfg = SaturationAwareConfig(
+            stage_defaults=SaturationAwareStageConfig(min_workers=1),
+            per_stage_overrides={"receiver": SaturationAwareStageConfig(min_workers=2)},
+        )
+        scheduler = SaturationAwareScheduler(cfg, pipeline_name="test-pipe")
+        scheduler.setup(_problem([("donor", None), ("receiver", None)], total_cpus_per_node=4))
+        ps = _problem_state([("donor", 3, 1, False), ("receiver", 1, 1, False)])
+        donor_plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="donor-w0", age=0),),
+            receiver_stage_index=1,
+        )
+
+        with patch(
+            "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+            side_effect=[None, None],
+        ):
+            with patch.object(
+                DonorCoordinator,
+                "acquire",
+                return_value=DonorAcquireResult(
+                    plan=donor_plan,
+                    attempted_plan=donor_plan,
+                    reject_reason=None,
+                    placement_reject_reason="",
+                    gate_result=None,
+                ),
+            ):
+                with pytest.raises(SchedulerInvariantError, match="planner snapshot diverged"):
+                    scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert scheduler.runner.floor_services.donor_executor.allocation_gate.aborted_cycle is False, (
+            "SchedulerInvariantError must not engage the AllocationError absorb path"
+        )
+
+    def test_post_donor_commit_malformed_acquire_result_raises_invariant_error(self) -> None:
+        """A coordinator returning ``committed=True`` with ``plan=None`` raises the invariant error.
+
+        :attr:`DonorAcquireResult.committed` is defined as ``self.plan
+        is not None`` (donor/types.py:204), so an attrs-constructed
+        instance cannot violate the pairing. A coordinator defect
+        (or a hypothetical subclass that overrides ``committed``)
+        returning a mismatched pair is a contract violation that
+        must surface as :class:`SchedulerInvariantError` -
+        operator-actionable and visible in the structured error
+        log - instead of a context-free ``AttributeError`` from the
+        downstream ``plan.removals`` dereference. The raise also
+        survives ``python -O`` where an ``assert`` would be
+        stripped, which was the historical guard at this site.
+        """
+        cfg = SaturationAwareConfig(
+            stage_defaults=SaturationAwareStageConfig(min_workers=1),
+            per_stage_overrides={"receiver": SaturationAwareStageConfig(min_workers=2)},
+        )
+        scheduler = SaturationAwareScheduler(cfg, pipeline_name="test-pipe")
+        scheduler.setup(_problem([("donor", None), ("receiver", None)], total_cpus_per_node=4))
+        ps = _problem_state([("donor", 3, 1, False), ("receiver", 1, 1, False)])
+
+        with patch(
+            "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+            return_value=None,
+        ):
+            with patch.object(DonorCoordinator, "acquire", return_value=_MalformedAcquireResult()):
+                with pytest.raises(
+                    SchedulerInvariantError,
+                    match=r"post-commit retry returned None for receiver 'receiver'",
+                ):
+                    scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert scheduler.runner.floor_services.donor_executor.allocation_gate.aborted_cycle is False, (
+            "SchedulerInvariantError must not engage the AllocationError absorb path"
+        )

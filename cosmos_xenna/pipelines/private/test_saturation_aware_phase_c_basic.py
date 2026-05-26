@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"""Tests for ``SaturationAwareScheduler._run_phase_c_grow``.
+"""Tests for the saturation-aware Phase C grow entry point (``phases.phase_c.run``).
 
 Phase C applies positive intent deltas as planner adds via
 ``ctx.try_add_worker``. The contract under test:
@@ -28,9 +28,10 @@ Phase C applies positive intent deltas as planner adds via
     * Finished stages are skipped.
     * The post-Phase-C invariant gate runs after the grow.
 
-Most tests inject the intent dict directly via
-``patch.object(scheduler, "_compute_intent_deltas", ...)`` so each
-adversarial case can be exercised without rigging classifier
+Most tests inject the intent dict directly by patching
+``IntentPhase._compute_intent_deltas`` on
+``cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase``
+so each adversarial case can be exercised without rigging classifier
 signals; one integration test exercises the end-to-end signal path.
 """
 
@@ -42,8 +43,10 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.invariants import PhaseBoundary
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+from cosmos_xenna.pipelines.private.scheduling_py.invariants.checks import PhaseBoundary
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -158,13 +161,33 @@ def _autoscale_with_intents(
     state: data_structures.ProblemState,
     intents: dict[str, int],
 ) -> data_structures.Solution:
-    """Run autoscale with ``intents`` injected as ``_compute_intent_deltas`` output."""
+    """Run autoscale with ``intents`` injected as the patched ``intent_phase.compute`` output."""
 
-    def _inject(_ctx: object, _state: object, **_kwargs: object) -> dict[str, int]:
+    def _inject(_services: object, _cycle: object, **_kwargs: object) -> dict[str, int]:
         return dict(intents)
 
-    with patch.object(scheduler, "_compute_intent_deltas", side_effect=_inject):
+    with patch(
+        "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+        side_effect=_inject,
+    ):
         return scheduler.autoscale(time=0.0, problem_state=state)
+
+
+class _MalformedAcquireResult:
+    """Test double simulating a coordinator that violates the DonorAcquireResult invariant.
+
+    The real :class:`DonorAcquireResult.committed` is a ``@property``
+    defined as ``self.plan is not None`` (donor/types.py:204), so
+    an attrs-constructed instance can never report ``committed=True``
+    paired with ``plan=None``. This double duck-types the two
+    attributes ``SaturationGrowPhase`` reads after a successful
+    commit (``committed`` and ``plan``) so the phase's defensive
+    coordinator-invariant raise is reachable from a test without
+    exercising a real coordinator defect.
+    """
+
+    committed = True
+    plan = None
 
 
 class TestPhaseCBasicGrowth:
@@ -325,24 +348,30 @@ class TestPhaseCInvariantBoundary:
     """The post-Phase-C invariant gate runs after the grow."""
 
     def test_invariants_invoked_at_phase_c_boundary(self) -> None:
-        """``check_invariants_after_phase`` is called with ``PhaseBoundary.PHASE_C`` after grow."""
+        """``check_invariants_after_phase`` is called with ``PhaseBoundary.GROW`` after grow."""
         scheduler = _scheduler([("A", None)])
         state = _problem_state([("A", 1, 1, False)])
 
+        # ``check_invariants_after_phase`` is bound on the runner-driven
+        # ``PhaseInvariantSuite`` (see ``phase_invariants.py``); a single
+        # patch covers every per-phase boundary call. The Phase C boundary
+        # is the third invocation in the canonical phase order.
         with patch(
-            "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase"
-        ) as phase_check:
+            "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_invariants_after_phase"
+        ) as boundary_check:
             _autoscale_with_intents(scheduler, state, {"A": 1})
 
-        phase_names = [call.kwargs["phase_name"] for call in phase_check.call_args_list]
-        assert PhaseBoundary.PHASE_C in phase_names
+        phase_c_calls = [
+            call for call in boundary_check.call_args_list if call.kwargs["phase_name"] is PhaseBoundary.GROW
+        ]
+        assert len(phase_c_calls) == 1
 
 
 class TestSaturationDrivenIntegration:
     """End-to-end: a SATURATED_CRITICAL classifier signal grows the stage via Phase C."""
 
     def test_saturated_critical_signal_grows_via_phase_c(self) -> None:
-        """A real classifier signal flowing through ``_compute_intent_deltas`` triggers a Phase C add."""
+        """A real classifier signal flowing through ``intent_phase.compute`` triggers a Phase C add."""
         scheduler = _scheduler([("hot", None)])
         # 4 workers, 8 slots/worker = 32 slots; 31 used + 1 empty -> ratio ~ 0.03,
         # below activation threshold for c=8 -> SATURATED_CRITICAL on first cycle.
@@ -370,5 +399,58 @@ class TestSaturationDrivenIntegration:
         solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(solution.stages[0].new_workers) > 0
-        assert scheduler._last_intent_deltas["hot"] > 0
-        assert len(solution.stages[0].new_workers) == scheduler._last_intent_deltas["hot"]
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
+        assert len(solution.stages[0].new_workers) == scheduler.last_cycle.intent.deltas["hot"]
+
+
+class TestPhaseCDonorCoordinatorInvariantDefense:
+    """Phase C raises :class:`SchedulerInvariantError` when the coordinator violates its contract.
+
+    :attr:`DonorAcquireResult.committed` is defined as
+    ``self.plan is not None`` (donor/types.py:204), so an
+    attrs-constructed instance cannot report ``committed=True``
+    paired with ``plan=None``. A coordinator defect (or a
+    hypothetical subclass that overrides ``committed``) returning
+    a mismatched pair is surfaced by the phase as a hard
+    ``SchedulerInvariantError`` rather than a context-free
+    ``AttributeError`` from the downstream ``plan.removals``
+    dereference. The raise also survives ``python -O`` where the
+    historical ``assert`` would have been stripped.
+    """
+
+    def test_post_commit_malformed_acquire_result_raises_invariant_error(self) -> None:
+        """A malformed acquire result hits the ``DonorBackedAddExecutor`` invariant guard.
+
+        Forces the donor fallback by patching ``try_add_worker``
+        to return ``None`` on every call (cluster placement
+        exhausted from the receiver's perspective) so the
+        ``coordinator.acquire`` patch is reached. The executor
+        first runs a post-commit receiver retry; when that retry
+        also returns ``None`` the executor raises
+        :class:`SchedulerInvariantError` with the planner-divergence
+        message. The malformed ``plan=None`` companion check is
+        unreachable in this scenario because the retry-None guard
+        fires first, but either guard surfaces the same operator-
+        actionable invariant break.
+        """
+        # Two-stage problem so Phase C has another stage to consider
+        # as a donor candidate; one CPU per worker on a 4-CPU node
+        # so the cluster is already at capacity once both stages have
+        # one worker.
+        scheduler = _scheduler([("donor", None), ("receiver", None)])
+        state = _problem_state([("donor", 3, 1, False), ("receiver", 1, 1, False)])
+
+        with patch(
+            "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+            return_value=None,
+        ):
+            with patch.object(DonorCoordinator, "acquire", return_value=_MalformedAcquireResult()):
+                with pytest.raises(
+                    SchedulerInvariantError,
+                    match=r"post-commit retry returned None for receiver 'receiver'",
+                ):
+                    _autoscale_with_intents(scheduler, state, {"receiver": 1})
+
+        assert scheduler.runner.grow_services.donor_executor.allocation_gate.aborted_cycle is False, (
+            "SchedulerInvariantError must not engage the AllocationError absorb path"
+        )

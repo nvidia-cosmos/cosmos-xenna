@@ -35,7 +35,7 @@ on ``config.mode_specific``.
 """
 
 from cosmos_xenna.pipelines.private import autoscaling_algorithms, specs
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.streaming import _make_scheduler_algorithm
 
 

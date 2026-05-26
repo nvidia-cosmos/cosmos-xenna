@@ -26,12 +26,12 @@ import math
 import attrs
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import (
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import (
+    compute_capacity_target_workers,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import (
     ResolvedThresholds,
     derive_utilization_target,
-)
-from cosmos_xenna.pipelines.private.scheduling_py.pressure import (
-    compute_capacity_target_workers,
 )
 
 

@@ -34,11 +34,32 @@ from typing import cast
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import (
-    SaturationAwareScheduler,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.manual.executors import (
+    ManualDeleteExecutor,
     _select_workers_to_delete_youngest_first,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import AutoscaleCycle
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
+
+
+def _make_cycle(
+    ctx: data_structures.AutoscalePlanContext,
+    problem_state: data_structures.ProblemState,
+) -> AutoscaleCycle:
+    """Build a minimal ``AutoscaleCycle`` for direct phase-method tests.
+
+    Phase A reads ``cycle.ctx`` and ``cycle.problem_state`` only;
+    the cross-cycle state references default to empty maps so the
+    helper stays one line at the call site.
+    """
+    return AutoscaleCycle(
+        ctx=ctx,
+        problem_state=problem_state,
+        time=0.0,
+        cycle_counter=0,
+        pipeline_name="",
+    )
 
 
 def _cluster() -> resources.ClusterResources:
@@ -274,10 +295,14 @@ class TestManualShrinkScheduler:
         ctx = _RejectingRemoveContext()
         problem_state = _problem_state([("A", 2, 1, False)])
 
+        # ``ManualDeleteExecutor.execute`` takes the narrow per-phase service
+        # bundle, not the whole scheduler. The runner builds the service object
+        # during ``setup()``, so we reuse it instead of fabricating a fresh
+        # ``ManualServices`` from scheduler internals.
         with pytest.raises(RuntimeError, match="snapshot inconsistency"):
-            scheduler._run_phase_a_delete(
-                cast(data_structures.AutoscalePlanContext, ctx),
-                problem_state,
+            ManualDeleteExecutor().execute(
+                cycle=_make_cycle(cast(data_structures.AutoscalePlanContext, ctx), problem_state),
+                services=scheduler.runner.manual_services,
             )
 
         assert ctx.calls == [(0, "A-w0")]

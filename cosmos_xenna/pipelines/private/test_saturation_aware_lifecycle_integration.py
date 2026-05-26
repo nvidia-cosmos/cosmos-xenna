@@ -43,8 +43,8 @@ consecutive ``autoscale()`` cycles and pins one cross-feature seam:
 from collections.abc import Callable, Iterable
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -98,7 +98,7 @@ def _stage_state(
     per-worker sum exactly equals the stage-level total. Floor division
     alone would lose the remainder (e.g. 10 slots / 3 workers -> 3 each
     -> sum=9 != 10), making the warmup-excluding aggregator
-    (:meth:`SaturationAwareScheduler._aggregate_slot_signals_excluding_warmup`)
+    (:meth:`WarmupTracker.filter_slot_signals`)
     disagree with the stage-level signal whenever the test driver feeds
     a non-divisible total. The base/remainder split assigns the extra
     slots to the first ``remainder`` workers so the sum is exact and
@@ -302,14 +302,14 @@ class TestColdStartQuiescenceReleases:
         # The Phase B floor still adds a worker, but the intent dict is empty.
         # Reading after cycle 2 verifies the cycle-1 transition did not leak
         # a stale cycle-0 intent forward.
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {
             StageState.SATURATED,
             StageState.SATURATED_CRITICAL,
         }, "post-release classifier must observe the SATURATED signal once gate releases"
         # After release, the classifier streak must have advanced past zero
         # because cycles 1 and 2 each fed it a non-empty signal.
-        assert runtime.classifier_streak >= 1
+        assert runtime.classifier.streak >= 1
         # No cycle should have rejected the structural Solution shape; every
         # cycle must produce a stage entry for "hot".
         assert all(len(sol.stages) == 1 for sol in solutions)
@@ -343,17 +343,17 @@ class TestWarmupGraceExcludesFromTrustGate:
         # Three cycles inside the warmup window (t in {0, 10, 20} <= grace=60s).
         warmup_solutions = _run_cycles(scheduler, state_factory, num_cycles=3, cycle_interval_s=10.0)
 
-        runtime_in_warmup = scheduler._stage_states["hot"]
-        assert runtime_in_warmup.valid_signal_samples == 0, (
+        runtime_in_warmup = scheduler.ledgers.stage_states["hot"]
+        assert runtime_in_warmup.classifier.valid_signal_samples == 0, (
             f"warmup workers must not advance valid_signal_samples while inside grace, "
-            f"got {runtime_in_warmup.valid_signal_samples}"
+            f"got {runtime_in_warmup.classifier.valid_signal_samples}"
         )
         # While the trust gate is closed, Phase C cannot grow even on a
         # SATURATED signal -- Phase B floor adds may still happen, but Phase C
         # is gated by the trust counter. Verify the recommendation history
         # stayed empty across all three warmup cycles (no per-stage pipeline
         # ran, so no recommendation was recorded).
-        history_in_warmup = scheduler._recommendation_histories["hot"]
+        history_in_warmup = scheduler.ledgers.recommendation_histories["hot"]
         assert len(history_in_warmup._buffer) == 0, (
             "no per-stage pipeline iterations should have recorded a recommendation "
             "while every worker was still in warmup grace"
@@ -371,10 +371,10 @@ class TestWarmupGraceExcludesFromTrustGate:
             start_time_s=70.0,
         )
 
-        runtime_post = scheduler._stage_states["hot"]
-        assert runtime_post.valid_signal_samples >= min_data_points, (
+        runtime_post = scheduler.ledgers.stage_states["hot"]
+        assert runtime_post.classifier.valid_signal_samples >= min_data_points, (
             f"valid_signal_samples must reach min_data_points={min_data_points} after the "
-            f"warmup grace expires, got {runtime_post.valid_signal_samples}"
+            f"warmup grace expires, got {runtime_post.classifier.valid_signal_samples}"
         )
         # Both phases of the run produced structurally valid solutions.
         assert all(len(sol.stages) == 1 for sol in warmup_solutions + post_warmup_solutions)
@@ -423,8 +423,8 @@ class TestSteadyState30CyclesNoOscillation:
         # The classifier must stay in NORMAL across the whole horizon -- a
         # SATURATED or OVER_PROVISIONED transition mid-run would mean the
         # signal we believed was NORMAL drifted out of band.
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state is StageState.NORMAL
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state is StageState.NORMAL
 
 
 class TestDemandSpikeStabilizationHoldsNewLevel:
@@ -461,8 +461,8 @@ class TestDemandSpikeStabilizationHoldsNewLevel:
             f"sustained SATURATED signal must fire Phase C grow at least once across "
             f"{len(solutions)} cycles, got {total_adds} adds"
         )
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {
             StageState.SATURATED,
             StageState.SATURATED_CRITICAL,
         }, "classifier must stay in the saturated band while signal sustains"
@@ -539,5 +539,5 @@ class TestDemandDropStabilizationHoldsFloor:
             f"sustained OVER_PROVISIONED signal must converge live count to floor={floor}; "
             f"trace={live_per_cycle}, final={current_live}"
         )
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state is StageState.OVER_PROVISIONED
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state is StageState.OVER_PROVISIONED

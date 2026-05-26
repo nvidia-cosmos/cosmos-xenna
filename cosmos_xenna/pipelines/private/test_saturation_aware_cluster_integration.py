@@ -26,7 +26,7 @@ no phantom worker ids, floor + survivor counts respected).
 from collections.abc import Callable
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -132,7 +132,7 @@ def _build_scheduler(
 
     Regime-aware aggressiveness is disabled so the trust-gate reset
     that runs on every Halfin-Whitt regime transition
-    (``_update_regime_aware_aggressiveness``) does not interfere with
+    (``RegimeController.update``) does not interfere with
     these cluster-placement scenarios. The tests in this file pin
     per-node placement behaviour, not regime adaptation; without the
     silencer the saturated-stage fixtures would (per design) trip a
@@ -217,12 +217,13 @@ class TestNodeDisappearanceDoesNotCrashRunningPipeline:
 
         for stage in ("A", "B", "C"):
             lost_ids = {f"{stage}-node-1-w0"}
-            assert lost_ids.isdisjoint(scheduler._worker_ages), (
-                f"stale node-1 ids leaked into _worker_ages for {stage}: {lost_ids & set(scheduler._worker_ages)}"
+            assert lost_ids.isdisjoint(scheduler.ledgers.worker_ages), (
+                f"stale node-1 ids leaked into _worker_ages for {stage}: "
+                f"{lost_ids & set(scheduler.ledgers.worker_ages)}"
             )
-            assert lost_ids.isdisjoint(scheduler._worker_ready_first_seen_at), (
-                f"stale node-1 ids leaked into _worker_ready_first_seen_at for {stage}: "
-                f"{lost_ids & set(scheduler._worker_ready_first_seen_at)}"
+            assert lost_ids.isdisjoint(scheduler.ledgers.warmup.tracked_ids()), (
+                f"stale node-1 ids leaked into WarmupTracker for {stage}: "
+                f"{lost_ids & set(scheduler.ledgers.warmup.tracked_ids())}"
             )
 
         for stage_idx, stage_name in enumerate(("A", "B", "C")):
@@ -368,10 +369,9 @@ class TestClusterScaleInConsolidatesRemainingCapacity:
             f"deleted={len(hot_solution.deleted_workers)})"
         )
 
-        assert lost_ids.isdisjoint(scheduler._worker_ages), (
-            f"node-1 ids leaked into _worker_ages after loss: {lost_ids & set(scheduler._worker_ages)}"
+        assert lost_ids.isdisjoint(scheduler.ledgers.worker_ages), (
+            f"node-1 ids leaked into _worker_ages after loss: {lost_ids & set(scheduler.ledgers.worker_ages)}"
         )
-        assert lost_ids.isdisjoint(scheduler._worker_ready_first_seen_at), (
-            f"node-1 ids leaked into _worker_ready_first_seen_at: "
-            f"{lost_ids & set(scheduler._worker_ready_first_seen_at)}"
+        assert lost_ids.isdisjoint(scheduler.ledgers.warmup.tracked_ids()), (
+            f"node-1 ids leaked into WarmupTracker: {lost_ids & set(scheduler.ledgers.warmup.tracked_ids())}"
         )

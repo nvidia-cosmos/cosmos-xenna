@@ -1,10 +1,10 @@
 # Operator Tuning Guide
 
 This is the operator's quick-reference for tuning the saturation-aware
-scheduler in production. The per-feature decision docs (`00-overview`
-through the latest numbered decision docs in this folder; see
-`README.md` for the full index) explain **why** each knob exists;
-this guide explains **which knob to turn when**.
+scheduler in production. The six numbered concept notes
+(`01-signals-and-classification.md` through `06-safeguards.md`) plus
+[`README.md`](README.md) explain **why** each knob exists; this guide
+explains **which knob to turn when**.
 
 > **Source of truth**: every default and range below is mirrored in
 > [`cosmos-xenna/cosmos_xenna/pipelines/private/specs.py`](../../../cosmos_xenna/pipelines/private/specs.py)
@@ -23,7 +23,7 @@ Tune scheduler knobs when:
   cluster default — multi-minute model warmup, latency-critical
   serving, or extreme task-size variance — and the per-stage
   override path documented in
-  [02 — Configuration model](02-configuration-model.md) gives you
+  [README — Where each decision lives](README.md#9-where-each-decision-lives-code-map) gives you
   scoped control.
 
 **Do not tune** when:
@@ -32,7 +32,7 @@ Tune scheduler knobs when:
   `over_provisioned_streak_min_cycles + stabilization_window_cycles_down`
   steady-state cycles — most "first-impression" symptoms are
   cold-start artefacts that the slow-start mechanisms
-  ([10](10-slow-start-mechanisms.md)) clear automatically.
+  ([decisions](02-decisions-and-growth.md)) clear automatically.
 - The symptom is a single-cycle anomaly. The hysteresis,
   EWMA smoothing, and streak counters are designed to absorb
   one-off noise without operator intervention.
@@ -57,7 +57,7 @@ more conservative.
   removing workers despite long streak counters — the threshold
   is firing on transients.
 
-See [08 — Auto-derived thresholds](08-auto-derived-thresholds.md).
+See [01 — Signals and classification](01-signals-and-classification.md).
 
 ### Streak counters (asymmetric stabilization)
 
@@ -69,11 +69,11 @@ See [08 — Auto-derived thresholds](08-auto-derived-thresholds.md).
 
 Cross-field invariant: `over_provisioned_streak_min_cycles >
 saturated_streak_min_cycles` (validated; see
-[17 — Config validation](17-config-validation.md)). The
+[README — Where each decision lives](README.md#9-where-each-decision-lives-code-map)). The
 asymmetry is by design: a wrong scale-up is cheap; a wrong
 scale-down kills warm GPU state.
 
-See [07 — Streak stabilization](07-streak-stabilization.md).
+See [02 — Decisions and growth](02-decisions-and-growth.md).
 
 ### Worker bounds (`min_workers`, `max_workers`)
 
@@ -86,7 +86,7 @@ See [07 — Streak stabilization](07-streak-stabilization.md).
 
 `min_workers` is enforced **structurally** in Phase B every
 cycle. `max_workers` clamps Phase C grow. See
-[16 — Hard caps and floors](16-hard-caps-and-floors.md).
+[06 — Safeguards](06-safeguards.md).
 
 ### Warmup grace windows
 
@@ -97,7 +97,7 @@ cycle. `max_workers` clamps Phase C grow. See
 
 Workers younger than these windows are excluded from EWMA
 contribution and donor selection respectively. See
-[10 — Slow-start mechanisms](10-slow-start-mechanisms.md).
+[02 — Decisions and growth](02-decisions-and-growth.md).
 
 ### Cluster-level cycle period
 
@@ -109,7 +109,7 @@ contribution and donor selection respectively. See
 
 The Forced-Flow-Law `D_k`-driven Phase C grow priority and Phase D
 shrink protection (see
-[25 — Bottleneck decision integration](25-bottleneck-decision-integration.md))
+[04 — Bottleneck awareness](04-bottleneck-awareness.md))
 add five cluster-wide knobs. Defaults are set so the gate self-disables
 on homogeneous clusters; most pipelines never need to tune these.
 
@@ -124,7 +124,7 @@ on homogeneous clusters; most pipelines never need to tune these.
 ### Backlog-time pressure gate
 
 The classifier's compound pressure signal documented in
-[06 — Backlog-time pressure signal](06-backlog-time-signal.md) has six
+[01 — Signals and classification](01-signals-and-classification.md) has six
 per-stage knobs. Most pipelines run with the defaults; the only one
 operators typically tune is `target_backlog_seconds`.
 
@@ -138,7 +138,7 @@ operators typically tune is `target_backlog_seconds`.
 
 Tuning workflow:
 
-1. **Watch the gauges first.** [22 — Prometheus metrics](22-prometheus-metrics.md)
+1. **Watch the gauges first.** [README — Trade-offs and observability](README.md#11-trade-offs-and-known-limitations)
    exposes `xenna_stage_observed_throughput`, `xenna_stage_backlog_time`,
    and `xenna_stage_pressure_ewma`. If `pressure_ewma` consistently sits
    in the `[1.5, 3.0]` band during steady-state operation but the
@@ -156,29 +156,29 @@ Tuning workflow:
 The effective response time is `interval_s * streak_min_cycles`.
 Lowering `interval_s` makes the autoscaler more reactive but also
 amplifies the cost of the per-cycle work. The watchdog
-([18 — Loop watchdog](18-loop-watchdog.md)) makes excessive
+([06 — Safeguards](06-safeguards.md)) makes excessive
 runtime visible.
 
 ## Symptom-to-knob index
 
 | Symptom | First knob to try | Decision doc |
 |---|---|---|
-| Stages oscillate between adding and removing workers | Increase `over_provisioned_streak_min_cycles` (longer scale-down patience) | [07](07-streak-stabilization.md) |
-| Phase D shrinks a freshly-warmed worker | Increase `worker_warmup_measurement_grace_s` and `donor_warmup_grace_s` | [10](10-slow-start-mechanisms.md), [15](15-idle-first-scale-down.md) |
-| New stage takes minutes to ramp under sustained load | Increase `saturation_aggressiveness` (`0.30` → `0.45`); confirm `enable_dag_priority_growth=True` | [08](08-auto-derived-thresholds.md), [12](12-multi-target-dag-growth.md) |
-| Mid-DAG bottleneck stays last in the grow order | Confirm `enable_bottleneck_priority_growth=True` and inspect `xenna_stage_bottleneck_score`: if the gate is silent, the heterogeneity ratio is below `bottleneck_heterogeneity_threshold` (default `2.0`); raise the metric (or lower the threshold toward `1.5`) so the gate engages | [25](25-bottleneck-decision-integration.md) |
-| Bottleneck stage shrinks during transient idle | Confirm `enable_bottleneck_shrink_protection=True`; inspect Phase D INFO logs for `bottleneck shrink protected`. If absent, the gate is disengaged (cluster too homogeneous, see threshold guidance above) | [25](25-bottleneck-decision-integration.md) |
-| Slot-pin SATURATED fires but no scale-up happens | Inspect `xenna_stage_pressure_ewma`; if `< pressure_saturation_threshold` (1.0) the demotion gate is correctly suppressing transient bursts. Decrease `target_backlog_seconds` if the pipeline truly is latency-critical and the queue drains too fast for the gate. | [06](06-backlog-time-signal.md), [22](22-prometheus-metrics.md) |
-| OVER_PROVISIONED stage refuses to scale down | Inspect `xenna_stage_pressure_ewma`; values `> pressure_normal_threshold` (0.3) are demoting to NORMAL because the queue is stuck downstream. Fix the downstream bottleneck first; only as a last resort raise `pressure_normal_threshold`. | [06](06-backlog-time-signal.md) |
-| `xenna_stage_pressure_ewma` is unexpectedly noisy | Lower `pressure_smoothing_level` (`0.20` → `0.10`); confirm `xenna_stage_observed_throughput` itself is not noisy first | [06](06-backlog-time-signal.md) |
-| Cluster-full pipeline never bootstraps a new stage | Confirm `floor_stuck_grace_cycles` is non-zero (default `6`); check Phase B donor logs | [13](13-cross-stage-donor.md) |
-| Cross-stage donor rotates the same worker every cycle | Increase `cross_stage_donor_anti_flap_cycles` (default `30`) | [13](13-cross-stage-donor.md) |
-| Regime detector enters / exits SUPER_HW every few cycles | Increase `regime_transition_streak_cycles` (default `3` → `5`) | [09](09-regime-aware-aggressiveness.md) |
-| Cycle p95 exceeds the watchdog WARN line | Profile first; tune `interval_s` only after profiling rules out an algorithmic issue | [18](18-loop-watchdog.md) |
-| Object-store full → autoscaler still tries to grow | Lower `memory_pressure_critical_threshold` (default `0.85`) | [20](20-memory-pressure-gate.md) |
-| Stage spec override silently ignored | Verify the resolver tier path (`StageSpec.saturation_aware` highest) | [02](02-configuration-model.md), [17](17-config-validation.md) |
-| Stuck-plan counter ticks every cycle | Likely cluster-full; check Phase C / donor logs and consider raising the matching stage's `max_workers` | [21](21-allocation-error-tolerance.md) |
-| Pipeline hangs on cold start, no workers placed | Check `floor_stuck_grace_cycles` exhausted → `RuntimeError`; the cluster is genuinely too small to satisfy `min_workers` | [16](16-hard-caps-and-floors.md) |
+| Stages oscillate between adding and removing workers | Increase `over_provisioned_streak_min_cycles` (longer scale-down patience) | [decisions](02-decisions-and-growth.md) |
+| Phase D shrinks a freshly-warmed worker | Increase `worker_warmup_measurement_grace_s` and `donor_warmup_grace_s` | [decisions](02-decisions-and-growth.md) |
+| New stage takes minutes to ramp under sustained load | Increase `saturation_aggressiveness` (`0.30` → `0.45`); confirm `enable_dag_priority_growth=True` | [signals](01-signals-and-classification.md), [bottleneck](04-bottleneck-awareness.md) |
+| Mid-DAG bottleneck stays last in the grow order | Confirm `enable_bottleneck_priority_growth=True` and inspect `xenna_stage_bottleneck_score`: if the gate is silent, the heterogeneity ratio is below `bottleneck_heterogeneity_threshold` (default `2.0`); raise the metric (or lower the threshold toward `1.5`) so the gate engages | [bottleneck](04-bottleneck-awareness.md) |
+| Bottleneck stage shrinks during transient idle | Confirm `enable_bottleneck_shrink_protection=True`; inspect Phase D INFO logs for `bottleneck shrink protected`. If absent, the gate is disengaged (cluster too homogeneous, see threshold guidance above) | [bottleneck](04-bottleneck-awareness.md) |
+| Slot-pin SATURATED fires but no scale-up happens | Inspect `xenna_stage_pressure_ewma`; if `< pressure_saturation_threshold` (1.0) the demotion gate is correctly suppressing transient bursts. Decrease `target_backlog_seconds` if the pipeline truly is latency-critical and the queue drains too fast for the gate. | [signals](01-signals-and-classification.md), [README](README.md#11-trade-offs-and-known-limitations) |
+| OVER_PROVISIONED stage refuses to scale down | Inspect `xenna_stage_pressure_ewma`; values `> pressure_normal_threshold` (0.3) are demoting to NORMAL because the queue is stuck downstream. Fix the downstream bottleneck first; only as a last resort raise `pressure_normal_threshold`. | [signals](01-signals-and-classification.md) |
+| `xenna_stage_pressure_ewma` is unexpectedly noisy | Lower `pressure_smoothing_level` (`0.20` → `0.10`); confirm `xenna_stage_observed_throughput` itself is not noisy first | [signals](01-signals-and-classification.md) |
+| Cluster-full pipeline never bootstraps a new stage | Confirm `floor_stuck_grace_cycles` is non-zero (default `6`); check Phase B donor logs | [donor](03-cross-stage-rebalancing.md) |
+| Cross-stage donor rotates the same worker every cycle | Increase `cross_stage_donor_anti_flap_cycles` (default `30`) | [donor](03-cross-stage-rebalancing.md) |
+| Regime detector enters / exits SUPER_HW every few cycles | Increase `regime_transition_streak_cycles` (default `3` → `5`) | [bottleneck](04-bottleneck-awareness.md) |
+| Cycle p95 exceeds the watchdog WARN line | Profile first; tune `interval_s` only after profiling rules out an algorithmic issue | [safeguards](06-safeguards.md) |
+| Object-store full → autoscaler still tries to grow | Lower `memory_pressure_critical_threshold` (default `0.85`) | [safeguards](06-safeguards.md) |
+| Stage spec override silently ignored | Verify the resolver tier path (`StageSpec.saturation_aware` highest) | [README](README.md), [README](README.md) |
+| Stuck-plan counter ticks every cycle | Likely cluster-full; check Phase C / donor logs and consider raising the matching stage's `max_workers` | [safeguards](06-safeguards.md) |
+| Pipeline hangs on cold start, no workers placed | Check `floor_stuck_grace_cycles` exhausted → `RuntimeError`; the cluster is genuinely too small to satisfy `min_workers` | [safeguards](06-safeguards.md) |
 
 ## Workload-class example configurations
 
@@ -264,13 +264,221 @@ shape on the stage's resource spec.
   only when the *cost of being below the floor* is concrete
   (warm engine state, redundancy, latency SLO).
 
+## Debug one unexpected decision
+
+Start with the stage and the cycle number from the cycle-summary
+INFO log line.
+
+1. **Classifier state.** Was the stage `SATURATED`,
+   `SATURATED_CRITICAL`, `NORMAL`, or `OVER_PROVISIONED`?
+   Inspect `xenna_stage_classifier_state{stage,pipeline}` at the
+   cycle in question.
+2. **Pressure signal.** Were slots full and was queue pressure
+   above threshold? See
+   `xenna_stage_slots_empty_ratio_ewma` and
+   `xenna_stage_backlog_time_seconds`.
+3. **Stabilizers.** Did EWMA smoothing, streak counters,
+   warmup grace, or HOLD-mode suppress the recommendation? Read
+   `xenna_stage_streak_cycles` and the stage's classifier-streak
+   in the cycle-summary log.
+4. **Placement feasibility.** Did Rust placement reject a
+   `try_add_worker` because the cluster was full or fragmented?
+   Look for `xenna_scheduler_allocation_failures_total` increments
+   and the structured `phase_c` allocation-failure log line.
+5. **Safety gates.** Did floors, caps, memory pressure, donor
+   anti-flap, or bottleneck protection override the action?
+   `xenna_scheduler_memory_pressure_active`,
+   `xenna_scheduler_stuck_plan_active`, and the structured
+   `phase_d` shrink-outcome log line cover these cases.
+
+If the answer is not visible from these metrics and logs alone,
+that is an observability bug — open it as a follow-up rather
+than re-running the pipeline under a profiler.
+
+## Worst-case cycle duration
+
+The autoscale cycle runs every `interval_s` seconds. If the
+cycle itself takes too long, the autoscaler falls behind
+real-time signal collection and recommendations lag.
+
+Watch `xenna_scheduler_cycle_duration_seconds` (p95). If p95
+approaches `interval_s`, either:
+
+- raise `interval_s` (cluster-wide), accepting slower reaction; or
+- shrink the active stage set (the cycle cost scales with the
+  number of non-finished stages).
+
+The `loop_watchdog` emits a WARN when one cycle exceeds
+`cycle_time_warn_threshold * interval_s` (default `0.5 *
+interval_s`). One isolated WARN is not actionable; sustained
+WARNs are.
+
+## Advanced tuning fields
+
+The "Primary knobs" section above covers ~80% of operator tuning. The
+categories below are expert-tier: they exist for diagnosis, niche
+workloads, or A/B comparison. Defaults match the recommended production
+behaviour, so reach for an expert field only when a documented symptom
+matches one of the categories below; otherwise leave the default in
+place.
+
+This section points to the right `specs.py` field block and concept
+doc per feature. It does NOT duplicate the per-field defaults, ranges,
+or rationale — those live in the field comments and validators on
+[`SaturationAwareConfig`](../../../cosmos_xenna/pipelines/private/specs.py)
+and `SaturationAwareStageConfig`. When this section and `specs.py`
+disagree, `specs.py` wins.
+
+### Cross-stage donor (cluster rebalancing)
+
+Anti-flap, eligibility, scoring weights, multi-donor resource-fit
+search, and post-plan economic gate for the saturation-mode donor
+fallback. The floor-mode donor reuses the same selection /
+resource-fit pipeline but skips the economic gate.
+
+- `specs.py` fields: `SaturationAwareConfig.enable_cross_stage_donor`,
+  `donor_must_be_strictly_upstream`,
+  `cross_stage_donor_require_over_provisioned`,
+  `cross_stage_donor_exclude_hold_state`,
+  `cross_stage_donor_anti_flap_cycles`,
+  `cross_stage_donor_streak_bonus`,
+  `cross_stage_donor_bottleneck_weight`,
+  `cross_stage_donor_intent_weight`,
+  `cross_stage_donor_streak_cap`,
+  `cross_stage_donor_spread_threshold`,
+  `cross_stage_donor_throughput_tolerance`,
+  `cross_stage_donor_donor_flip_tolerance`,
+  `cross_stage_donor_max_plan_size`,
+  `cross_stage_donor_max_plan_combinations`.
+- Decision doc: [03 — Cross-stage rebalancing](03-cross-stage-rebalancing.md).
+
+### Regime detection (aggressiveness adaptation)
+
+Lifts `saturation_aggressiveness` when the cluster sits in the
+super-Halfin-Whitt regime so scale-up reacts faster, with hysteresis
+to prevent flapping. Disable for queueing-theory-purity A/B comparisons
+or when the cluster-wide idle-fraction signal is too noisy to trust.
+
+- `specs.py` fields:
+  `SaturationAwareConfig.enable_regime_aware_aggressiveness`,
+  `super_halfin_whitt_aggressiveness_lift`,
+  `regime_transition_streak_cycles`.
+- Decision doc: [04 — Bottleneck awareness](04-bottleneck-awareness.md).
+
+### Growth mode state machine (per-stage HOLD)
+
+Per-stage state machine that prevents growth-after-shrink ping-pong by
+holding a stage in HOLD mode for the standard post-shrink window. The
+field is a single enable flag; disable only for diagnosis or to
+isolate the contribution of streak counters and the stabilization
+window to scale-up behaviour.
+
+- `specs.py` field:
+  `SaturationAwareStageConfig.enable_growth_mode_state_machine`.
+- Decision doc: [02 — Decisions and growth](02-decisions-and-growth.md).
+
+### Bottleneck scoring and engagement (Forced-Flow-Law `D_k`)
+
+The primary section above covers the three operator-facing bottleneck
+knobs (`bottleneck_d_k_smoothing_level`,
+`bottleneck_heterogeneity_threshold`,
+`bottleneck_engagement_persistence_cycles`). The fields below are the
+cluster-heterogeneity warn-streak and warn-threshold that drive the
+"recommend lowering capacity on cheap stages" operator hint.
+
+- `specs.py` fields:
+  `SaturationAwareConfig.cluster_heterogeneity_warn_threshold`,
+  `cluster_heterogeneity_warn_streak`.
+- Decision doc: [04 — Bottleneck awareness](04-bottleneck-awareness.md).
+
+### Memory-pressure gate
+
+Cluster-wide kill switch that freezes Phase C grow when the Ray
+object-store `used_fraction` exceeds the configured threshold.
+Phase A (manual), Phase B (floor), and Phase D (shrink) keep running.
+Lower the threshold to be more conservative; disable only for
+A/B comparison.
+
+- `specs.py` fields: `SaturationAwareConfig.enable_memory_pressure_gate`,
+  `memory_pressure_critical_threshold`,
+  `memory_pressure_polling_interval_s`.
+- Decision doc: [06 — Safeguards](06-safeguards.md).
+
+### Streak counters, EWMA smoothing, stabilization windows
+
+The primary section above covers the three streak-count knobs that
+operators usually tune (`saturated_streak_min_cycles`,
+`over_provisioned_streak_min_cycles`,
+`saturated_critical_streak_min_cycles`). The fields below are the
+smoothing-level, window-size, and data-sufficiency knobs that almost
+never need adjustment outside of diagnosing a specific signal-noise
+problem.
+
+- `specs.py` fields (signal smoothing):
+  `SaturationAwareStageConfig.slots_empty_ratio_smoothing_level`,
+  `classifier_signal_noise_smoothing_level`,
+  `pressure_smoothing_level` (covered in primary above).
+- `specs.py` fields (asymmetric stabilization windows):
+  `SaturationAwareStageConfig.stabilization_window_cycles_up`,
+  `stabilization_window_cycles_down`.
+- `specs.py` fields (data sufficiency gate):
+  `SaturationAwareStageConfig.min_data_points`,
+  `setup_phase_quiescence_enabled`.
+- `specs.py` fields (classifier zone deadbands):
+  `SaturationAwareStageConfig.saturation_deadband_pct`.
+- Decision doc: [02 — Decisions and growth](02-decisions-and-growth.md).
+
+### Auto-derived thresholds (`K / √c` formula)
+
+Per-stage `saturation_threshold` and `activation_threshold` auto-derive
+from `saturation_aggressiveness` on the first `autoscale()` cycle.
+Operators rarely touch these directly — change
+`saturation_aggressiveness` (covered in primary above) instead. The
+fields below are the floor / ceiling clamps and the
+`activation_to_saturation_ratio` that operators only touch for
+extreme `c` values where the formula collides with a real-world floor.
+
+- `specs.py` fields:
+  `SaturationAwareStageConfig.saturation_threshold`,
+  `activation_threshold`,
+  `auto_threshold_min`,
+  `auto_threshold_max`,
+  `activation_to_saturation_ratio`,
+  `over_provisioned_threshold`.
+- Decision doc: [01 — Signals and classification](01-signals-and-classification.md).
+
+### Stuck-plan detector and allocation-error tolerance
+
+Detects pathological stages whose intent stays non-zero but never
+satisfied for `stuck_plan_detection_cycles` cycles (typically because
+the cluster is full and donor fallback is exhausted). Lower the
+detection threshold to trip the operator alert sooner.
+`skip_cycle_on_allocation_error` controls whether the Phase C
+allocation-failure absorb path skips the rest of the cycle or
+re-raises.
+
+- `specs.py` fields:
+  `SaturationAwareConfig.stuck_plan_detection_cycles`,
+  `skip_cycle_on_allocation_error`,
+  `floor_stuck_grace_cycles`.
+- Decision doc: [06 — Safeguards](06-safeguards.md).
+
+### Loop watchdog and cycle-time alerting
+
+The autoscaler watchdog that fires a WARN when a single cycle exceeds
+`cycle_time_warn_threshold * interval_s`. Covered in the primary
+"Worst-case cycle duration" section above; included here for
+completeness so this section carries the full expert-tier surface.
+
+- `specs.py` field: `SaturationAwareConfig.cycle_time_warn_threshold`.
+- Decision doc: [06 — Safeguards](06-safeguards.md).
+
 ## See also
 
-- [README](README.md) — index of all decision-rationale docs.
-- [02 — Configuration model](02-configuration-model.md) — the
-  three-tier resolver that decides which override wins.
-- [17 — Config validation](17-config-validation.md) — what fails
-  at startup vs at runtime, and which cross-field invariants are
-  enforced.
-- [22 — Prometheus metrics](22-prometheus-metrics.md) — how to
-  observe whether a tune actually changed behaviour.
+- [README](README.md) — index of all concept docs and the
+  notation table.
+- [README — Where each decision lives](README.md#9-where-each-decision-lives-code-map)
+  — owning module per concept, plus the three-tier override
+  resolver and what is validated at startup vs at runtime.
+- [README — Trade-offs and known limitations](README.md#11-trade-offs-and-known-limitations)
+  — how to observe whether a tune actually changed behaviour.

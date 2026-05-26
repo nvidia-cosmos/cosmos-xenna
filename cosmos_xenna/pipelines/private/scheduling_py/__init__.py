@@ -14,17 +14,4 @@
 # limitations under the License.
 
 
-"""Pure-Python streaming-mode autoscaler package.
-
-``SaturationAwareScheduler`` is intentionally **not** re-exported here:
-its module constructs Prometheus metrics at import time, so eager
-re-export would register saturation-aware series for fragmentation-based
-pipelines that never observe them. Callers should import the class from
-``cosmos_xenna.pipelines.private.scheduling_py.saturation_aware``.
-"""
-
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-
-__all__ = [
-    "SchedulerInvariantError",
-]
+"""Pure-Python streaming-mode autoscaler package."""

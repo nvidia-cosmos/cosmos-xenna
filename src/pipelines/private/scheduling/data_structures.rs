@@ -81,12 +81,18 @@ impl ProblemStage {
 /// * `num_used_slots` - Number of task slots currently occupied on this worker
 ///   at sample time. Defaults to 0; consumers that do not populate this
 ///   field treat the default as "no signal" (any worker is equally
-///   eligible for selection).
+///   eligible for selection). The `#[serde(default)]` attribute keeps
+///   JSON payloads emitted before this field was added (e.g. by older
+///   tooling or persisted state) deserializable: a missing entry
+///   resolves to 0, matching both the `Default` derive and the
+///   Python constructor's `num_used_slots = 0` default. Round-tripping
+///   payloads that already carry the field is unaffected.
 #[pyclass(get_all, set_all)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProblemWorkerGroupState {
     pub id: String,
     pub resources: Vec<resources::WorkerResources>,
+    #[serde(default)]
     pub num_used_slots: usize,
 }
 
@@ -778,5 +784,22 @@ mod tests {
         assert_eq!(restored.id, original.id);
         assert_eq!(restored.num_used_slots, original.num_used_slots);
         assert_eq!(restored.resources.len(), original.resources.len());
+    }
+
+    #[test]
+    fn deserialize_legacy_payload_without_num_used_slots_defaults_to_zero() {
+        // JSON emitted before `num_used_slots` was added omits the field
+        // entirely. `#[serde(default)]` on the field must let the legacy
+        // payload deserialize, resolving the missing value to 0 to match
+        // both the `Default` derive and the Python constructor's
+        // `num_used_slots = 0` default.
+        let legacy = r#"{"id":"w_legacy","resources":[]}"#;
+
+        let restored =
+            ProblemWorkerGroupState::deserialize(legacy).expect("legacy payload must deserialize");
+
+        assert_eq!(restored.id, "w_legacy");
+        assert_eq!(restored.num_used_slots, 0);
+        assert!(restored.resources.is_empty());
     }
 }

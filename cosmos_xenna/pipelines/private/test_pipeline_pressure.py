@@ -21,7 +21,7 @@ pipeline derives from three primitives:
 *   ``compute_pressure`` -- the pure ``utilisation * normalized_backlog``
     multiplier with the cold-start cap.
 *   ``compute_backlog_time`` -- the Little's Law gauge value (seconds).
-*   ``_resolve_pressure_signal`` -- glues both together, refreshes the
+*   ``PressureSignalResolver`` -- glues both together, refreshes the
     per-stage EWMA, and emits the Prometheus gauges.
 
 These tests pin each primitive's contract independently and then verify
@@ -36,14 +36,18 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import run_per_stage_pipeline
-from cosmos_xenna.pipelines.private.scheduling_py.pressure import (
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import (
     BACKLOG_CAP,
     compute_backlog_time,
     compute_pressure,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import StageDecisionPipeline
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
+    StageRuntimeState,
+    StageState,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
@@ -75,10 +79,10 @@ def cfg() -> SaturationAwareStageConfig:
     )
 
 
-def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> _StageRuntimeState:
+def _fresh_state(cfg: SaturationAwareStageConfig, name: str = "TestStage") -> StageRuntimeState:
     """Build a runtime state with thresholds pre-resolved (mirrors test_saturation_aware_pipeline.py)."""
     resolved = _resolve_auto_thresholds(cfg, slots_per_actor=8)
-    return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
+    return StageRuntimeState(stage_name=name, classifier=ClassifierState(resolved_thresholds=resolved))
 
 
 class TestComputePressureEmptyQueue:
@@ -297,6 +301,16 @@ class TestComputePressureInputValidation:
                 target_backlog_seconds=30.0,
             )
 
+    def test_negative_input_queue_depth_is_rejected(self) -> None:
+        """Negative queue depth indicates an upstream bug; do not treat it as empty."""
+        with pytest.raises(ValueError, match=r"input_queue_depth must be >= 0, got -1"):
+            compute_pressure(
+                slots_empty_ratio_ewma=0.20,
+                input_queue_depth=-1,
+                observed_throughput=10.0,
+                target_backlog_seconds=30.0,
+            )
+
 
 class TestComputeBacklogTimeInputValidation:
     """The gauge helper enforces the same ``backlog_cap`` precondition as compute_pressure."""
@@ -339,16 +353,25 @@ class TestComputeBacklogTimeInputValidation:
                 target_backlog_seconds=30.0,
             )
 
+    def test_negative_input_queue_depth_is_rejected(self) -> None:
+        """Negative queue depth indicates an upstream bug; do not treat it as empty."""
+        with pytest.raises(ValueError, match=r"input_queue_depth must be >= 0, got -3"):
+            compute_backlog_time(
+                input_queue_depth=-3,
+                observed_throughput=10.0,
+                target_backlog_seconds=30.0,
+            )
+
 
 class TestResolvePressureSignalIntegration:
-    """``run_per_stage_pipeline`` smooths pressure into ``stage_state.pressure_ewma``."""
+    """``run_per_stage_pipeline`` smooths pressure into ``stage_state.pressure.ewma``."""
 
     def test_first_cycle_initialises_pressure_ewma_with_raw_value(self, cfg: SaturationAwareStageConfig) -> None:
         """``update_ewma(None, raw, alpha)`` returns ``raw`` on the first cycle."""
         state = _fresh_state(cfg)
-        assert state.pressure_ewma is None
+        assert state.pressure.ewma is None
 
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -363,13 +386,13 @@ class TestResolvePressureSignalIntegration:
         # slots_empty_ratio_ewma = 2/(2+8) = 0.20 -> utilisation = 0.80
         # W_q = 100 / 1 = 100s; normalized = 100/30 = 3.33 -> clamp to 3.0
         # raw pressure = 0.80 * 3.0 = 2.40
-        assert state.pressure_ewma is not None
-        assert math.isclose(state.pressure_ewma, 0.80 * BACKLOG_CAP, rel_tol=1e-9)
+        assert state.pressure.ewma is not None
+        assert math.isclose(state.pressure.ewma, 0.80 * BACKLOG_CAP, rel_tol=1e-9)
 
     def test_subsequent_cycle_smooths_with_alpha(self, cfg: SaturationAwareStageConfig) -> None:
         """Second cycle blends ``alpha * raw + (1 - alpha) * prior``."""
         state = _fresh_state(cfg)
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -379,11 +402,11 @@ class TestResolvePressureSignalIntegration:
             observed_throughput_sample=1.0,
             pipeline_name="test",
         )
-        first_pressure = state.pressure_ewma
+        first_pressure = state.pressure.ewma
         assert first_pressure is not None
 
         # Second cycle: queue empties -> raw pressure goes to 0
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -395,19 +418,19 @@ class TestResolvePressureSignalIntegration:
         )
         # alpha = 0.20; blended = 0.20 * 0.0 + 0.80 * first_pressure
         expected = 0.20 * 0.0 + 0.80 * first_pressure
-        assert state.pressure_ewma is not None
-        assert math.isclose(state.pressure_ewma, expected, rel_tol=1e-9)
+        assert state.pressure.ewma is not None
+        assert math.isclose(state.pressure.ewma, expected, rel_tol=1e-9)
 
     def test_zero_total_slots_skips_pressure_update(self, cfg: SaturationAwareStageConfig) -> None:
-        """Zero ready actors and no prior EWMA: ``_resolve_classifier_signal`` returns None;
+        """Zero ready actors and no prior EWMA: ``ClassifierSignalResolver.resolve`` returns None;
         the pressure helper is intentionally not called so the next valid cycle does not
         smooth in stale data."""
         state = _fresh_state(cfg)
         # Both classifier and pressure EWMAs unset.
-        assert state.slots_empty_ratio_ewma is None
-        assert state.pressure_ewma is None
+        assert state.classifier.slots_empty_ratio_ewma is None
+        assert state.pressure.ewma is None
 
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,
@@ -420,7 +443,7 @@ class TestResolvePressureSignalIntegration:
 
         assert delta == 0
         # Classifier short-circuited -> pressure helper was not called.
-        assert state.pressure_ewma is None
+        assert state.pressure.ewma is None
 
 
 class TestPipelinePressureThreading:
@@ -430,7 +453,7 @@ class TestPipelinePressureThreading:
         """End-to-end: slot pin in SATURATED band + high pressure -> classifier returns SATURATED."""
         state = _fresh_state(cfg)
         # 9 used / 1 empty -> ratio 0.10 (in SATURATED band, 0.05 < 0.10 < 0.15)
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=9,
             num_empty_slots=1,
@@ -440,7 +463,7 @@ class TestPipelinePressureThreading:
             observed_throughput_sample=1.0,
             pipeline_name="test",
         )
-        assert state.classifier_state == StageState.SATURATED
+        assert state.classifier.state == StageState.SATURATED
 
     def test_low_pressure_demotes_slot_pin_to_normal(self, cfg: SaturationAwareStageConfig) -> None:
         """Slot pin in SATURATED band BUT queue drains faster than target -> NORMAL via demotion."""
@@ -448,7 +471,7 @@ class TestPipelinePressureThreading:
         # 9 used / 1 empty -> ratio 0.10 (SATURATED band by slot ratio alone)
         # W_q = 5 / 100 = 0.05s; normalized_backlog = 0.05 / 30 = 0.00167 (well below 1.0)
         # pressure = 0.90 * 0.00167 = 0.0015 (below pressure_saturation_threshold = 1.0)
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=9,
             num_empty_slots=1,
@@ -458,7 +481,7 @@ class TestPipelinePressureThreading:
             observed_throughput_sample=100.0,
             pipeline_name="test",
         )
-        assert state.classifier_state == StageState.NORMAL
+        assert state.classifier.state == StageState.NORMAL
 
 
 class TestClassifierTraceLogging:
@@ -484,7 +507,7 @@ class TestClassifierTraceLogging:
         """Single cycle emits one DEBUG record with all expected key=value fields."""
         state = _fresh_state(cfg)
 
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -532,7 +555,7 @@ class TestClassifierTraceLogging:
             pressure_normal_threshold=0.3,
         )
         state = _fresh_state(cfg)
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -544,7 +567,7 @@ class TestClassifierTraceLogging:
         )
 
         loguru_caplog.clear()
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=0,
@@ -572,7 +595,7 @@ class TestClassifierTraceLogging:
     ) -> None:
         """Repeating the same inputs holds the state and silences INFO logs."""
         state = _fresh_state(cfg)
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,
@@ -584,7 +607,7 @@ class TestClassifierTraceLogging:
         )
 
         loguru_caplog.clear()
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=8,
             num_empty_slots=2,

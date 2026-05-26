@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Bounded multi-donor resource-fit search contract.
 
-``_resource_fit_plan`` is the donor-side feasibility oracle: it takes
-a gate-filtered candidate pool and an autoscale planner context, then
-asks the planner whether each combination of removals would unblock
-the receiver's placement. The first feasible combination wins, smallest
-plan_size first, with deterministic tiebreak on
+``ResourceFitPlanner.find`` is the donor-side feasibility oracle: it
+takes a gate-filtered candidate pool and an autoscale planner context,
+then asks the planner whether each combination of removals would
+unblock the receiver's placement. The first feasible combination wins,
+smallest plan_size first, with deterministic tiebreak on
 ``(age ASC, worker_id ASC, stage_index ASC)``.
 
 Tests pin each contract in isolation:
@@ -38,11 +39,39 @@ from collections.abc import Mapping
 import attrs
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorPlan,
-    DonorWorker,
-    _resource_fit_plan,
-)
+from cosmos_xenna.pipelines.private.scheduling_py.donor.resource_fit import ResourceFitPlanner
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker
+
+
+def _resource_fit_plan(
+    *,
+    receiver_stage_index: int,
+    candidates: list[DonorWorker],
+    worker_nodes: Mapping[str, str],
+    ctx: object,
+    max_plan_size: int,
+    max_plan_combinations: int,
+    removable_by_stage: Mapping[int, int],
+) -> DonorPlan | None:
+    """Construct a ``ResourceFitPlanner`` and dispatch ``find``.
+
+    Tests call this helper once per assertion so each test exercises
+    the public class API (``ResourceFitPlanner(...).find(...)``)
+    through a single call site; the production module exports
+    ``ResourceFitPlanner`` only.
+
+    """
+    planner = ResourceFitPlanner(
+        max_plan_size=max_plan_size,
+        max_plan_combinations=max_plan_combinations,
+    )
+    return planner.find(
+        receiver_stage_index=receiver_stage_index,
+        candidates=candidates,
+        worker_nodes=worker_nodes,
+        ctx=ctx,  # type: ignore[arg-type]
+        removable_by_stage=removable_by_stage,
+    )
 
 
 @attrs.frozen
@@ -114,7 +143,7 @@ class TestEmptyOrInvalidInputs:
             receiver_stage_index=1,
             candidates=[],
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=32,
             removable_by_stage={},
@@ -132,7 +161,7 @@ class TestEmptyOrInvalidInputs:
             receiver_stage_index=1,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=0,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -150,7 +179,7 @@ class TestEmptyOrInvalidInputs:
             receiver_stage_index=1,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=0,
             removable_by_stage=_unbounded_budget(candidates),
@@ -176,7 +205,7 @@ class TestSingleWorkerPlan:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -207,7 +236,7 @@ class TestMultiWorkerPlan:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -246,7 +275,7 @@ class TestLocalityIteration:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes=worker_nodes,
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=2,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -273,7 +302,7 @@ class TestMaxPlanCombinationsCap:
             receiver_stage_index=1,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=1,
             max_plan_combinations=1,
             removable_by_stage=_unbounded_budget(candidates),
@@ -295,7 +324,7 @@ class TestExhaustionReturnsNone:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=2,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -325,7 +354,7 @@ class TestSmallestSizeWinsAcrossSizes:
             receiver_stage_index=1,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -356,7 +385,7 @@ class TestParametricBoundedness:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=max_size,
             max_plan_combinations=64,
             removable_by_stage=_unbounded_budget(candidates),
@@ -390,7 +419,7 @@ class TestPhaseTwoCrossNodeFallback:
             receiver_stage_index=3,
             candidates=candidates,
             worker_nodes=worker_nodes,
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=4,
             max_plan_combinations=32,
             removable_by_stage=_unbounded_budget(candidates),
@@ -408,7 +437,7 @@ class TestDonorPlanInvariant:
 
     def test_empty_removals_raises_value_error(self) -> None:
         """An empty plan is meaningless -- ``None`` is the canonical 'no donation' sentinel."""
-        with pytest.raises(ValueError, match=r"removals must contain at least one DonorWorker"):
+        with pytest.raises(ValueError, match=r"'removals' must be >= 1"):
             DonorPlan(removals=(), receiver_stage_index=0)
 
 
@@ -441,7 +470,7 @@ class TestPerStageRemovableBudget:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=2,
             max_plan_combinations=32,
             removable_by_stage={0: 1, 1: 1},
@@ -473,7 +502,7 @@ class TestPerStageRemovableBudget:
             receiver_stage_index=2,
             candidates=candidates,
             worker_nodes={},
-            ctx=ctx,  # type: ignore[arg-type]
+            ctx=ctx,
             max_plan_size=2,
             max_plan_combinations=32,
             removable_by_stage={0: 1},

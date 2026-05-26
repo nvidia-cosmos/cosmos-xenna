@@ -41,11 +41,13 @@ import pytest
 # materialized lazily via ``materialized_saturation_aware()`` in the
 # saturation-aware branch only.
 _SA_METRIC_MODULES = (
-    "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
-    "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
-    "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
-    "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
-    "cosmos_xenna.pipelines.private.scheduling_py.pressure",
+    "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware",
+    "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.scoring",
+    "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity",
+    "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics",
+    "cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure",
+    "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.loop_watchdog",
+    "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure",
 )
 
 
@@ -74,11 +76,13 @@ class TestLazySaturationAwareMetricRegistration:
             import sys
             import cosmos_xenna.pipelines.private.scheduling_py  # noqa: F401
             sa_modules = [
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
-                "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
-                "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
-                "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
-                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.scoring",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics",
+                "cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure",
             ]
             loaded = [m for m in sa_modules if m in sys.modules]
             print(",".join(loaded))
@@ -95,11 +99,13 @@ class TestLazySaturationAwareMetricRegistration:
             import sys
             import cosmos_xenna.pipelines.private.streaming  # noqa: F401
             sa_modules = [
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
-                "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
-                "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
-                "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
-                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.scoring",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics",
+                "cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure",
             ]
             loaded = [m for m in sa_modules if m in sys.modules]
             print(",".join(loaded))
@@ -133,11 +139,13 @@ class TestLazySaturationAwareMetricRegistration:
             import cosmos_xenna.pipelines.private.specs as specs
             spec = specs.StreamingSpecificSpec()
             sa_modules = [
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware",
-                "cosmos_xenna.pipelines.private.scheduling_py.bottleneck",
-                "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure",
-                "cosmos_xenna.pipelines.private.scheduling_py.loop_watchdog",
-                "cosmos_xenna.pipelines.private.scheduling_py.pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.scoring",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.metrics",
+                "cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure",
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.loop_watchdog",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure",
             ]
             print(json.dumps({
                 "loaded": [m for m in sa_modules if m in sys.modules],

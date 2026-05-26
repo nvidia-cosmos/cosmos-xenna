@@ -26,8 +26,8 @@ import math
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.classifier import classify
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.classifier import classify
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 
@@ -61,7 +61,6 @@ class TestSaturatedCriticalPressureDemotion:
         # demotes -> NORMAL.
         result = classify(
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             pressure_ewma=0.0,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -74,7 +73,6 @@ class TestSaturatedCriticalPressureDemotion:
         """Slot pin AND pressure > critical threshold -> CRITICAL."""
         result = classify(
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             pressure_ewma=2.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -87,7 +85,6 @@ class TestSaturatedCriticalPressureDemotion:
         """When ``pressure_ewma is None`` the slot-pin contract is preserved."""
         result = classify(
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             pressure_ewma=None,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -100,7 +97,6 @@ class TestSaturatedCriticalPressureDemotion:
         """The CRITICAL pressure gate is strict (``>`` not ``>=``)."""
         result = classify(
             slots_empty_ratio_ewma=0.0,
-            input_queue_depth=10,
             pressure_ewma=2.0,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -119,7 +115,6 @@ class TestSaturatedPressureDemotion:
         """Slot pin in SATURATED band but pressure < saturation threshold -> NORMAL."""
         result = classify(
             slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
             pressure_ewma=0.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -132,7 +127,6 @@ class TestSaturatedPressureDemotion:
         """Slot pin AND pressure > saturation threshold -> SATURATED."""
         result = classify(
             slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
             pressure_ewma=1.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -145,7 +139,6 @@ class TestSaturatedPressureDemotion:
         """``pressure_ewma=None`` preserves slot-only behaviour for SATURATED."""
         result = classify(
             slots_empty_ratio_ewma=0.10,
-            input_queue_depth=10,
             pressure_ewma=None,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -163,7 +156,6 @@ class TestOverProvisionedPressureDemotion:
         # ratio = 0.6 > over_provisioned = 0.50; queue > 0; pressure (0.1) <= normal (0.3).
         result = classify(
             slots_empty_ratio_ewma=0.6,
-            input_queue_depth=10,
             pressure_ewma=0.1,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -176,7 +168,6 @@ class TestOverProvisionedPressureDemotion:
         """Idle slots + queue > 0 + pressure > normal threshold -> NORMAL (downstream stuck)."""
         result = classify(
             slots_empty_ratio_ewma=0.6,
-            input_queue_depth=10,
             pressure_ewma=0.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -189,7 +180,6 @@ class TestOverProvisionedPressureDemotion:
         """Empty queue + idle slots + high pressure (downstream stuck) -> NORMAL."""
         result = classify(
             slots_empty_ratio_ewma=0.6,
-            input_queue_depth=0,
             pressure_ewma=2.5,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -209,7 +199,6 @@ class TestOverProvisionedPressureDemotion:
         """
         result = classify(
             slots_empty_ratio_ewma=0.6,
-            input_queue_depth=0,
             pressure_ewma=0.1,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -222,7 +211,6 @@ class TestOverProvisionedPressureDemotion:
         """``pressure_ewma=None`` preserves the legacy OVER_PROVISIONED behaviour."""
         result = classify(
             slots_empty_ratio_ewma=0.6,
-            input_queue_depth=10,
             pressure_ewma=None,
             prev_state=StageState.NORMAL,
             saturation_threshold=0.15,
@@ -247,7 +235,6 @@ class TestNonFiniteEwmaRejection:
         with pytest.raises(ValueError, match=r"slots_empty_ratio_ewma must be finite"):
             classify(
                 slots_empty_ratio_ewma=math.nan,
-                input_queue_depth=10,
                 pressure_ewma=0.5,
                 prev_state=StageState.NORMAL,
                 saturation_threshold=0.15,
@@ -260,7 +247,6 @@ class TestNonFiniteEwmaRejection:
         with pytest.raises(ValueError, match=r"slots_empty_ratio_ewma must be finite"):
             classify(
                 slots_empty_ratio_ewma=math.inf,
-                input_queue_depth=10,
                 pressure_ewma=0.5,
                 prev_state=StageState.NORMAL,
                 saturation_threshold=0.15,
@@ -273,7 +259,6 @@ class TestNonFiniteEwmaRejection:
         with pytest.raises(ValueError, match=r"pressure_ewma must be finite when provided"):
             classify(
                 slots_empty_ratio_ewma=0.0,
-                input_queue_depth=10,
                 pressure_ewma=math.nan,
                 prev_state=StageState.NORMAL,
                 saturation_threshold=0.15,

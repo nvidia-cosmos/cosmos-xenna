@@ -25,9 +25,9 @@ Pin the contract:
      stage count does not match the problem's stage count.
   3. ``check_no_nan_in_classifier_state`` raises when any per-stage
      EWMA value is ``NaN`` or ``+/-Inf``.
-  4. ``check_floor_after_phase_d`` raises when Phase D reduces a
+  4. ``check_floor_after_shrink`` raises when Shrink reduces a
      non-manual non-finished stage below its configured floor (or
-     grows it; Phase D may only remove workers).
+     grows it; Shrink may only remove workers).
   5. ``check_stuck_plan_monotonicity`` raises when a stuck-plan
      counter transitions other than reset-to-0 or strict +1.
   6. The scheduler's ``autoscale`` method invokes the gates between
@@ -40,17 +40,25 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.errors import SchedulerInvariantError
-from cosmos_xenna.pipelines.private.scheduling_py.invariants import (
+from cosmos_xenna.pipelines.private.scheduling_py.invariants.checks import (
     PhaseBoundary,
-    check_floor_after_phase_d,
+    check_floor_after_shrink,
     check_invariants_after_phase,
     check_no_nan_in_classifier_state,
     check_solution_shape,
     check_stuck_plan_monotonicity,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer import CycleFinalizer
+from cosmos_xenna.pipelines.private.scheduling_py.phases.floor.floor_phase import FloorPhase
+from cosmos_xenna.pipelines.private.scheduling_py.phases.grow.grow_phase import SaturationGrowPhase
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.shrink_phase import SaturationShrinkPhase
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
+    PressureState,
+    StageRuntimeState,
+)
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -164,14 +172,14 @@ class TestCheckInvariantsAfterPhase:
         problem = _problem([("A", None), ("B", None)])
         problem_state = _problem_state([("A", 1, 1, False), ("B", 0, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_invariants_after_phase(phase_name=PhaseBoundary.PHASE_A, problem=problem, ctx=ctx)
+        check_invariants_after_phase(phase_name=PhaseBoundary.MANUAL, problem=problem, ctx=ctx)
 
     def test_zero_stage_problem_does_not_raise(self) -> None:
         """A zero-stage problem with an empty ctx is a valid no-op boundary."""
         problem = _problem([])
         ctx = _ShapeMismatchContext(returned_stages=0)
         check_invariants_after_phase(
-            phase_name=PhaseBoundary.PHASE_A,
+            phase_name=PhaseBoundary.MANUAL,
             problem=problem,
             ctx=cast(data_structures.AutoscalePlanContext, ctx),
         )
@@ -180,9 +188,9 @@ class TestCheckInvariantsAfterPhase:
         """A ctx that reports more stages than the problem raises with operator context."""
         problem = _problem([("A", None), ("B", None)])
         ctx = _ShapeMismatchContext(returned_stages=3)
-        with pytest.raises(SchedulerInvariantError, match=r"After phase_a:.*reports 3 stages.*has 2"):
+        with pytest.raises(SchedulerInvariantError, match=r"After manual:.*reports 3 stages.*has 2"):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_A,
+                phase_name=PhaseBoundary.MANUAL,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -193,7 +201,7 @@ class TestCheckInvariantsAfterPhase:
         ctx = _ShapeMismatchContext(returned_stages=1)
         with pytest.raises(SchedulerInvariantError, match=r"reports 1 stages.*has 3"):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_B,
+                phase_name=PhaseBoundary.FLOOR,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -203,7 +211,7 @@ class TestCheckInvariantsAfterPhase:
 
         Pins that the gate cannot leak ``IndexError`` from
         ``ctx.pending_add_count(idx)`` when the planner reports fewer
-        stages than the problem -- the shape check must fire first so the
+        stages than the problem - the shape check must fire first so the
         cheaper ``ctx.num_stages()`` discrepancy surfaces as a clean
         ``SchedulerInvariantError``.
         """
@@ -222,7 +230,7 @@ class TestCheckInvariantsAfterPhase:
         ctx = _ShortCtxThatRaisesInPendingCounts()
         with pytest.raises(SchedulerInvariantError, match=r"reports 1 stages.*has 3"):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_A,
+                phase_name=PhaseBoundary.MANUAL,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -233,7 +241,7 @@ class TestCheckInvariantsAfterPhase:
         ctx = _NegativePendingContext(num_stages=3, negative_add_for=1)
         with pytest.raises(SchedulerInvariantError, match=r"stage 'B'.*pending_add_count=-1"):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_A,
+                phase_name=PhaseBoundary.MANUAL,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -244,7 +252,7 @@ class TestCheckInvariantsAfterPhase:
         ctx = _NegativePendingContext(num_stages=2, negative_remove_for=0)
         with pytest.raises(SchedulerInvariantError, match=r"stage 'A'.*pending_remove_count=-1"):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_B,
+                phase_name=PhaseBoundary.FLOOR,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -258,7 +266,7 @@ class TestCheckInvariantsAfterPhase:
             match=r"stage 'A'.*pending_add_count=-1.*pending_remove_count=-1",
         ):
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_A,
+                phase_name=PhaseBoundary.MANUAL,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -272,10 +280,10 @@ class TestCheckInvariantsAfterPhase:
         """
         problem = _problem([("A", None), ("B", None)])
         ctx = _NegativePendingContext(num_stages=2, negative_add_for=0)
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.invariants.logger.error") as error:
+        with patch("cosmos_xenna.pipelines.private.scheduling_py.invariants.checks.logger.error") as error:
             with pytest.raises(SchedulerInvariantError):
                 check_invariants_after_phase(
-                    phase_name=PhaseBoundary.PHASE_A,
+                    phase_name=PhaseBoundary.MANUAL,
                     problem=problem,
                     ctx=cast(data_structures.AutoscalePlanContext, ctx),
                 )
@@ -291,7 +299,7 @@ class TestCheckInvariantsAfterPhase:
         ctx = _NegativePendingContext(num_stages=1, negative_add_for=0)
         with pytest.raises(SchedulerInvariantError) as exc_info:
             check_invariants_after_phase(
-                phase_name=PhaseBoundary.PHASE_A,
+                phase_name=PhaseBoundary.MANUAL,
                 problem=problem,
                 ctx=cast(data_structures.AutoscalePlanContext, ctx),
             )
@@ -312,7 +320,7 @@ class TestCheckSolutionShape:
         problem_state = _problem_state([("A", 1, 1, False), ("B", 0, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
         solution = ctx.into_solution()
-        check_solution_shape(phase_name=PhaseBoundary.INTO_SOLUTION, problem=problem, solution=solution)
+        check_solution_shape(phase_name=PhaseBoundary.SOLUTION_DRAIN, problem=problem, solution=solution)
 
     def test_solution_with_extra_stage_raises(self) -> None:
         """A solution with more stages than the problem raises with operator context."""
@@ -320,7 +328,7 @@ class TestCheckSolutionShape:
         solution = _MalformedSolution(num_stages=3)
         with pytest.raises(SchedulerInvariantError, match=r"Solution has 3 stages.*problem has 2"):
             check_solution_shape(
-                phase_name=PhaseBoundary.INTO_SOLUTION,
+                phase_name=PhaseBoundary.SOLUTION_DRAIN,
                 problem=problem,
                 solution=cast(data_structures.Solution, solution),
             )
@@ -331,7 +339,7 @@ class TestCheckSolutionShape:
         solution = _MalformedSolution(num_stages=1)
         with pytest.raises(SchedulerInvariantError, match=r"Solution has 1 stages.*problem has 3"):
             check_solution_shape(
-                phase_name=PhaseBoundary.INTO_SOLUTION,
+                phase_name=PhaseBoundary.SOLUTION_DRAIN,
                 problem=problem,
                 solution=cast(data_structures.Solution, solution),
             )
@@ -355,16 +363,14 @@ class TestSchedulerWiringDoesNotRaise:
         )
         assert len(solution.stages) == 2
 
-    def test_problem_state_missing_stage_raises_scheduler_invariant_error_before_phase_a(self) -> None:
-        """Shape mismatches surface as invariant errors before Phase A indexes the snapshot."""
+    def test_problem_state_missing_stage_raises_scheduler_invariant_error_before_manual(self) -> None:
+        """Shape mismatches surface as invariant errors before the Manual phase indexes the snapshot."""
         scheduler = SaturationAwareScheduler(
             SaturationAwareConfig(stage_defaults=SaturationAwareStageConfig(min_workers=1)),
         )
         scheduler.setup(_problem([("A", None), ("B", None)]))
 
-        with pytest.raises(
-            SchedulerInvariantError, match=r"Before phase_a:.*problem_state has 1 stages.*problem has 2"
-        ):
+        with pytest.raises(SchedulerInvariantError, match=r"Before manual:.*problem_state has 1 stages.*problem has 2"):
             scheduler.autoscale(
                 time=0.0,
                 problem_state=_problem_state([("A", 1, 1, False)]),
@@ -373,8 +379,8 @@ class TestSchedulerWiringDoesNotRaise:
     def test_scheduler_invokes_invariants_at_each_phase_boundary(self) -> None:
         """The scheduler's autoscale path calls the invariant gate after each phase.
 
-        Verifies the wiring -- the gate is invoked between Phase A,
-        Phase B, Phase C, and after ``into_solution()`` -- by patching
+        Verifies the wiring - the gate is invoked between Phase A,
+        Phase B, Phase C, and after ``into_solution()`` - by patching
         the helpers and asserting their call counts. A future refactor
         that drops one of the calls will break this test, surfacing
         the regression at review time rather than in production.
@@ -385,28 +391,36 @@ class TestSchedulerWiringDoesNotRaise:
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)]))
+        # Phase-boundary invariants are owned by ``PhaseInvariantSuite``
+        # in ``scheduling_py/phase_invariants.py``; the runner invokes
+        # the matching ``check_after_phase_*`` method after each phase.
+        # Patch the single bound symbol the suite holds and assert
+        # ``check_invariants_after_phase`` fires once per boundary
+        # (Phase A, B, C, D) with the matching ``phase_name`` kwarg.
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase"
-            ) as phase_check,
-            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape") as shape_check,
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_invariants_after_phase"
+            ) as boundary_check,
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer.check_solution_shape"
+            ) as shape_check,
         ):
             scheduler.autoscale(
                 time=0.0,
                 problem_state=_problem_state([("A", 1, 1, False)]),
             )
-        # Four phase boundaries: after Phase A, Phase B, Phase C, and Phase D.
-        assert phase_check.call_count == 4
+        # Four boundary invocations: Phase A, B, C, D - one per phase
+        # boundary owned by the runner-driven invariant suite.
+        assert boundary_check.call_count == 4
+        boundary_calls = [call.kwargs["phase_name"] for call in boundary_check.call_args_list]
+        assert boundary_calls == [
+            PhaseBoundary.MANUAL,
+            PhaseBoundary.FLOOR,
+            PhaseBoundary.GROW,
+            PhaseBoundary.SHRINK,
+        ]
         # One Solution-shape check (after into_solution).
         assert shape_check.call_count == 1
-        # The phase boundaries are tagged so operators can locate the violating phase.
-        phase_names = {call.kwargs["phase_name"] for call in phase_check.call_args_list}
-        assert phase_names == {
-            PhaseBoundary.PHASE_A,
-            PhaseBoundary.PHASE_B,
-            PhaseBoundary.PHASE_C,
-            PhaseBoundary.PHASE_D,
-        }
 
     def test_phase_a_invariant_failure_stops_before_phase_b(self) -> None:
         """A Phase A invariant failure propagates and prevents later plan mutation."""
@@ -416,13 +430,19 @@ class TestSchedulerWiringDoesNotRaise:
         scheduler.setup(_problem([("A", None)]))
         error = SchedulerInvariantError("phase-a corrupted")
 
+        def _raise_at_phase_a(*, phase_name: PhaseBoundary, **_: object) -> None:
+            if phase_name is PhaseBoundary.MANUAL:
+                raise error
+
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase",
-                side_effect=error,
-            ) as phase_check,
-            patch.object(scheduler, "_run_phase_b_floor") as phase_b_floor,
-            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape") as shape_check,
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_invariants_after_phase",
+                side_effect=_raise_at_phase_a,
+            ) as boundary_check,
+            patch.object(FloorPhase, "run") as phase_b_floor,
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer.check_solution_shape"
+            ) as shape_check,
         ):
             with pytest.raises(SchedulerInvariantError, match="phase-a corrupted"):
                 scheduler.autoscale(
@@ -430,8 +450,10 @@ class TestSchedulerWiringDoesNotRaise:
                     problem_state=_problem_state([("A", 1, 1, False)]),
                 )
 
-        assert phase_check.call_count == 1
-        assert phase_check.call_args.kwargs["phase_name"] is PhaseBoundary.PHASE_A
+        # Phase A's invariant fires once and raises; the runner never
+        # reaches Phase B (the floor phase) or the solution drain.
+        assert boundary_check.call_count == 1
+        assert boundary_check.call_args.kwargs["phase_name"] is PhaseBoundary.MANUAL
         phase_b_floor.assert_not_called()
         shape_check.assert_not_called()
 
@@ -442,20 +464,22 @@ class TestSchedulerWiringDoesNotRaise:
         )
         scheduler.setup(_problem([("A", None)]))
 
-        def _fail_on_phase_b(**kwargs: object) -> None:
-            if kwargs["phase_name"] is PhaseBoundary.PHASE_B:
+        def _raise_at_phase_b(*, phase_name: PhaseBoundary, **_: object) -> None:
+            if phase_name is PhaseBoundary.FLOOR:
                 raise SchedulerInvariantError("phase-b corrupted")
 
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase",
-                side_effect=_fail_on_phase_b,
-            ) as phase_check,
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_invariants_after_phase",
+                side_effect=_raise_at_phase_b,
+            ) as boundary_check,
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.data_structures."
+                "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware.data_structures."
                 "AutoscalePlanContext.into_solution"
             ) as into_solution,
-            patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape") as shape_check,
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer.check_solution_shape"
+            ) as shape_check,
         ):
             with pytest.raises(SchedulerInvariantError, match="phase-b corrupted"):
                 scheduler.autoscale(
@@ -463,8 +487,12 @@ class TestSchedulerWiringDoesNotRaise:
                     problem_state=_problem_state([("A", 1, 1, False)]),
                 )
 
-        phase_names = [call.kwargs["phase_name"] for call in phase_check.call_args_list]
-        assert phase_names == [PhaseBoundary.PHASE_A, PhaseBoundary.PHASE_B]
+        # Phase A's invariant fires successfully, then Phase B's
+        # raises; the runner never reaches Phase C, Phase D, or
+        # the solution drain.
+        assert boundary_check.call_count == 2
+        boundary_calls = [call.kwargs["phase_name"] for call in boundary_check.call_args_list]
+        assert boundary_calls == [PhaseBoundary.MANUAL, PhaseBoundary.FLOOR]
         into_solution.assert_not_called()
         shape_check.assert_not_called()
 
@@ -475,12 +503,15 @@ class TestSchedulerWiringDoesNotRaise:
         )
         scheduler.setup(_problem([("A", None)]))
 
+        # ``CycleFinalizer`` is ``@attrs.frozen`` so per-instance
+        # patching is rejected; patching the class method instead
+        # intercepts the call on the live frozen instance.
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape",
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer.check_solution_shape",
                 side_effect=SchedulerInvariantError("solution shape corrupted"),
             ) as shape_check,
-            patch.object(scheduler, "_persist_worker_ages") as persist_worker_ages,
+            patch.object(CycleFinalizer, "_persist_worker_ages") as persist_worker_ages,
         ):
             with pytest.raises(SchedulerInvariantError, match="solution shape corrupted"):
                 scheduler.autoscale(
@@ -491,13 +522,13 @@ class TestSchedulerWiringDoesNotRaise:
         assert shape_check.call_count == 1
         persist_worker_ages.assert_not_called()
 
-    def test_scheduler_invokes_post_phase_c_and_phase_d_invariants(self) -> None:
+    def test_scheduler_invokes_post_grow_and_shrink_invariants(self) -> None:
         """The scheduler invokes the NaN, floor, and monotonicity gates.
 
-        Pins the wiring contract for the gates added with Phase C / D:
-        ``check_no_nan_in_classifier_state`` runs once after Phase C
-        and ``check_floor_after_phase_d`` plus
-        ``check_stuck_plan_monotonicity`` run once after Phase D.
+        Pins the wiring contract for the gates added with Grow / Shrink:
+        ``check_no_nan_in_classifier_state`` runs once after Grow
+        and ``check_floor_after_shrink`` plus
+        ``check_stuck_plan_monotonicity`` run once after Shrink.
         """
         cfg = SaturationAwareConfig(
             floor_stuck_grace_cycles=0,
@@ -505,15 +536,22 @@ class TestSchedulerWiringDoesNotRaise:
         )
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem([("A", None)]))
+        # The post-Grow NaN gate and post-Shrink floor gate are owned
+        # by ``PhaseInvariantSuite``; both are bound at the
+        # ``phase_invariants`` module so a single patch path covers
+        # the symbol the runner reaches through.
+        # ``check_stuck_plan_monotonicity`` is invoked by
+        # ``StuckPlanInvariant`` (post-cycle), so its patch path
+        # stays under ``post_cycle``.
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_no_nan_in_classifier_state"
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_no_nan_in_classifier_state"
             ) as nan_check,
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_floor_after_phase_d"
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_floor_after_shrink"
             ) as floor_check,
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_stuck_plan_monotonicity"
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle.check_stuck_plan_monotonicity"
             ) as mono_check,
         ):
             scheduler.autoscale(
@@ -521,9 +559,9 @@ class TestSchedulerWiringDoesNotRaise:
                 problem_state=_problem_state([("A", 1, 1, False)]),
             )
         assert nan_check.call_count == 1
-        assert nan_check.call_args.kwargs["phase_name"] is PhaseBoundary.PHASE_C
+        assert nan_check.call_args.kwargs["phase_name"] is PhaseBoundary.GROW
         assert floor_check.call_count == 1
-        assert floor_check.call_args.kwargs["phase_name"] is PhaseBoundary.PHASE_D
+        assert floor_check.call_args.kwargs["phase_name"] is PhaseBoundary.SHRINK
         assert mono_check.call_count == 1
 
     def test_corrupted_ewma_mid_phase_c_raises_before_phase_d(self) -> None:
@@ -540,26 +578,27 @@ class TestSchedulerWiringDoesNotRaise:
         scheduler.setup(_problem([("A", None)]))
 
         def _corrupt_ewma_during_phase_c(
-            ctx: data_structures.AutoscalePlanContext,
-            problem_state: data_structures.ProblemState,
+            phase_self: SaturationGrowPhase,
+            cycle: object,
+            services: object,
         ) -> None:
-            del ctx, problem_state
-            scheduler._stage_states["A"].slots_empty_ratio_ewma = float("nan")
+            del phase_self, cycle, services
+            scheduler.ledgers.stage_states["A"].classifier.slots_empty_ratio_ewma = float("nan")
 
         with (
-            patch.object(scheduler, "_run_phase_c_grow", side_effect=_corrupt_ewma_during_phase_c),
-            patch.object(scheduler, "_run_phase_d_shrink") as phase_d,
+            patch.object(SaturationGrowPhase, "run", autospec=True, side_effect=_corrupt_ewma_during_phase_c),
+            patch.object(SaturationShrinkPhase, "run", autospec=True) as phase_d_apply,
         ):
             with pytest.raises(
                 SchedulerInvariantError,
-                match=r"phase_c.*'A'.*slots_empty_ratio_ewma=nan",
+                match=r"grow.*'A'.*slots_empty_ratio_ewma=nan",
             ):
                 scheduler.autoscale(
                     time=0.0,
                     problem_state=_problem_state([("A", 1, 1, False)]),
                 )
 
-        phase_d.assert_not_called()
+        phase_d_apply.assert_not_called()
 
 
 class TestCheckNoNanInClassifierState:
@@ -568,54 +607,48 @@ class TestCheckNoNanInClassifierState:
     def test_empty_state_dict_does_not_raise(self) -> None:
         """An empty per-stage state map is a valid no-op boundary (zero stages)."""
         check_no_nan_in_classifier_state(
-            phase_name=PhaseBoundary.PHASE_C,
+            phase_name=PhaseBoundary.GROW,
             stage_runtime_states={},
         )
 
     def test_finite_mid_cycle_values_do_not_raise(self) -> None:
         """A mix of valid floats, zeros, and ``None`` passes the check."""
         states = {
-            "A": _StageRuntimeState(
+            "A": StageRuntimeState(
                 stage_name="A",
-                slots_empty_ratio_ewma=0.42,
-                last_valid_slots_empty_ratio_ewma=0.42,
+                classifier=ClassifierState(slots_empty_ratio_ewma=0.42, last_valid_slots_empty_ratio_ewma=0.42),
             ),
-            "B": _StageRuntimeState(stage_name="B"),
-            "C": _StageRuntimeState(
+            "B": StageRuntimeState(stage_name="B"),
+            "C": StageRuntimeState(
                 stage_name="C",
-                slots_empty_ratio_ewma=0.0,
-                last_valid_slots_empty_ratio_ewma=0.0,
+                classifier=ClassifierState(slots_empty_ratio_ewma=0.0, last_valid_slots_empty_ratio_ewma=0.0),
             ),
         }
         check_no_nan_in_classifier_state(
-            phase_name=PhaseBoundary.PHASE_C,
+            phase_name=PhaseBoundary.GROW,
             stage_runtime_states=states,
         )
 
     def test_nan_slots_empty_ratio_raises_with_stage_name(self) -> None:
         """``NaN`` in ``slots_empty_ratio_ewma`` surfaces the stage name and field."""
         states = {
-            "A": _StageRuntimeState(stage_name="A"),
-            "B": _StageRuntimeState(
-                stage_name="B",
-                slots_empty_ratio_ewma=float("nan"),
-            ),
+            "A": StageRuntimeState(stage_name="A"),
+            "B": StageRuntimeState(stage_name="B", classifier=ClassifierState(slots_empty_ratio_ewma=float("nan"))),
         }
         with pytest.raises(
             SchedulerInvariantError,
             match=r"stage 'B'.*slots_empty_ratio_ewma=nan",
         ):
             check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
+                phase_name=PhaseBoundary.GROW,
                 stage_runtime_states=states,
             )
 
     def test_positive_inf_last_valid_ewma_raises(self) -> None:
         """``+Inf`` in ``last_valid_slots_empty_ratio_ewma`` raises with operator context."""
         states = {
-            "A": _StageRuntimeState(
-                stage_name="A",
-                last_valid_slots_empty_ratio_ewma=float("inf"),
+            "A": StageRuntimeState(
+                stage_name="A", classifier=ClassifierState(last_valid_slots_empty_ratio_ewma=float("inf"))
             ),
         }
         with pytest.raises(
@@ -623,16 +656,15 @@ class TestCheckNoNanInClassifierState:
             match=r"stage 'A'.*last_valid_slots_empty_ratio_ewma=inf",
         ):
             check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
+                phase_name=PhaseBoundary.GROW,
                 stage_runtime_states=states,
             )
 
     def test_negative_inf_last_valid_ewma_raises(self) -> None:
         """``-Inf`` is rejected even though it never arises from sane EWMA arithmetic."""
         states = {
-            "A": _StageRuntimeState(
-                stage_name="A",
-                last_valid_slots_empty_ratio_ewma=float("-inf"),
+            "A": StageRuntimeState(
+                stage_name="A", classifier=ClassifierState(last_valid_slots_empty_ratio_ewma=float("-inf"))
             ),
         }
         with pytest.raises(
@@ -640,39 +672,35 @@ class TestCheckNoNanInClassifierState:
             match=r"stage 'A'.*last_valid_slots_empty_ratio_ewma=-inf",
         ):
             check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
+                phase_name=PhaseBoundary.GROW,
                 stage_runtime_states=states,
             )
 
     def test_nan_pressure_ewma_raises_with_stage_name(self) -> None:
         """``NaN`` in ``pressure_ewma`` surfaces the stage name and field."""
         states = {
-            "A": _StageRuntimeState(stage_name="A"),
-            "B": _StageRuntimeState(
-                stage_name="B",
-                pressure_ewma=float("nan"),
-            ),
+            "A": StageRuntimeState(stage_name="A"),
+            "B": StageRuntimeState(stage_name="B", pressure=PressureState(ewma=float("nan"))),
         }
         with pytest.raises(
             SchedulerInvariantError,
             match=r"stage 'B'.*pressure_ewma=nan",
         ):
             check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
+                phase_name=PhaseBoundary.GROW,
                 stage_runtime_states=states,
             )
 
     def test_stage_name_with_newline_is_repr_escaped(self) -> None:
         """Stage names containing newlines are ``!r``-escaped to prevent log forging."""
         states = {
-            "stage\nFAKE_LOG_LINE": _StageRuntimeState(
-                stage_name="stage\nFAKE_LOG_LINE",
-                slots_empty_ratio_ewma=float("nan"),
+            "stage\nFAKE_LOG_LINE": StageRuntimeState(
+                stage_name="stage\nFAKE_LOG_LINE", classifier=ClassifierState(slots_empty_ratio_ewma=float("nan"))
             ),
         }
         with pytest.raises(SchedulerInvariantError) as exc_info:
             check_no_nan_in_classifier_state(
-                phase_name=PhaseBoundary.PHASE_C,
+                phase_name=PhaseBoundary.GROW,
                 stage_runtime_states=states,
             )
         msg = str(exc_info.value)
@@ -688,31 +716,31 @@ class TestCheckFloorAfterPhaseD:
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 1, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={0: 1},
-            pre_phase_d_worker_counts={0: 1},
+            pre_shrink_worker_counts={0: 1},
         )
 
-    def test_phase_d_shrunk_below_floor_raises_with_stage_name(self) -> None:
-        """A stage that Phase D reduced below the floor (from at-floor) raises."""
+    def test_shrink_below_floor_raises_with_stage_name(self) -> None:
+        """A stage that Shrink reduced below the floor (from at-floor) raises."""
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 1, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
         with pytest.raises(
             SchedulerInvariantError,
-            match=r"stage 'A'.*1 workers but the configured minimum-worker floor is 2.*pre-Phase-D was 2",
+            match=r"stage 'A'.*1 workers but the configured minimum-worker floor is 2.*pre-Shrink was 2",
         ):
-            check_floor_after_phase_d(
-                phase_name=PhaseBoundary.PHASE_D,
+            check_floor_after_shrink(
+                phase_name=PhaseBoundary.SHRINK,
                 problem=problem,
                 problem_state=problem_state,
                 ctx=ctx,
                 stage_floors={0: 2},
-                pre_phase_d_worker_counts={0: 2},
+                pre_shrink_worker_counts={0: 2},
             )
 
     def test_phase_d_left_below_floor_stage_untouched_does_not_raise(self) -> None:
@@ -720,13 +748,13 @@ class TestCheckFloorAfterPhaseD:
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 1, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={0: 5},
-            pre_phase_d_worker_counts={0: 1},
+            pre_shrink_worker_counts={0: 1},
         )
 
     def test_phase_d_grew_workers_raises(self) -> None:
@@ -738,13 +766,13 @@ class TestCheckFloorAfterPhaseD:
             SchedulerInvariantError,
             match=r"stage 'A'.*grew from 2 workers to 3",
         ):
-            check_floor_after_phase_d(
-                phase_name=PhaseBoundary.PHASE_D,
+            check_floor_after_shrink(
+                phase_name=PhaseBoundary.SHRINK,
                 problem=problem,
                 problem_state=problem_state,
                 ctx=ctx,
                 stage_floors={0: 1},
-                pre_phase_d_worker_counts={0: 2},
+                pre_shrink_worker_counts={0: 2},
             )
 
     def test_manual_stage_skipped_regardless_of_count(self) -> None:
@@ -752,13 +780,13 @@ class TestCheckFloorAfterPhaseD:
         problem = _problem([("A", 0)])
         problem_state = _problem_state([("A", 0, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={0: 5},
-            pre_phase_d_worker_counts={0: 0},
+            pre_shrink_worker_counts={0: 0},
         )
 
     def test_finished_stage_skipped_regardless_of_count(self) -> None:
@@ -766,13 +794,13 @@ class TestCheckFloorAfterPhaseD:
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 0, 1, True)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={0: 5},
-            pre_phase_d_worker_counts={0: 0},
+            pre_shrink_worker_counts={0: 0},
         )
 
     def test_normal_shrink_to_floor_does_not_raise(self) -> None:
@@ -780,13 +808,13 @@ class TestCheckFloorAfterPhaseD:
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 2, 1, False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={0: 2},
-            pre_phase_d_worker_counts={0: 5},
+            pre_shrink_worker_counts={0: 5},
         )
 
     def test_missing_pre_phase_d_count_raises_invariant_error(self) -> None:
@@ -798,13 +826,13 @@ class TestCheckFloorAfterPhaseD:
             SchedulerInvariantError,
             match=r"stage 'A'.*index 0.*KeyError.*Planner-state shape mismatch",
         ):
-            check_floor_after_phase_d(
-                phase_name=PhaseBoundary.PHASE_D,
+            check_floor_after_shrink(
+                phase_name=PhaseBoundary.SHRINK,
                 problem=problem,
                 problem_state=problem_state,
                 ctx=ctx,
                 stage_floors={0: 1},
-                pre_phase_d_worker_counts={},
+                pre_shrink_worker_counts={},
             )
 
     def test_missing_stage_floor_raises_invariant_error(self) -> None:
@@ -816,31 +844,31 @@ class TestCheckFloorAfterPhaseD:
             SchedulerInvariantError,
             match=r"stage 'A'.*KeyError.*Planner-state shape mismatch",
         ):
-            check_floor_after_phase_d(
-                phase_name=PhaseBoundary.PHASE_D,
+            check_floor_after_shrink(
+                phase_name=PhaseBoundary.SHRINK,
                 problem=problem,
                 problem_state=problem_state,
                 ctx=ctx,
                 stage_floors={},
-                pre_phase_d_worker_counts={0: 1},
+                pre_shrink_worker_counts={0: 1},
             )
 
     def test_finished_stage_with_missing_phase_d_entries_is_skipped(self) -> None:
         """A finished stage absent from Phase-D-only maps is skipped before the lookup."""
         # Pinning forward-compat: the is_finished early-exit must run BEFORE
-        # the worker_ids_by_stage / stage_floors / pre_phase_d_worker_counts
+        # the worker_ids_by_stage / stage_floors / pre_shrink_worker_counts
         # dereference so a future refactor that excludes finished stages
         # from those maps cannot regress this branch into a false invariant.
         problem = _problem([("A", None)])
         problem_state = _problem_state([("A", 0, 1, True)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem, problem_state)
-        check_floor_after_phase_d(
-            phase_name=PhaseBoundary.PHASE_D,
+        check_floor_after_shrink(
+            phase_name=PhaseBoundary.SHRINK,
             problem=problem,
             problem_state=problem_state,
             ctx=ctx,
             stage_floors={},
-            pre_phase_d_worker_counts={},
+            pre_shrink_worker_counts={},
         )
 
 
@@ -913,7 +941,7 @@ class TestCheckStuckPlanMonotonicity:
 
         Pins that the helper does not short-circuit on the first valid
         transition: stage ``A`` increments legitimately, stage ``B``
-        also increments legitimately, but stage ``C`` decrements -- the
+        also increments legitimately, but stage ``C`` decrements - the
         helper must surface ``C`` regardless of where it appears in the
         dict's iteration order.
         """

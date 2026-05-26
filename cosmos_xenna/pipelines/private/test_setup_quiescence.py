@@ -24,7 +24,7 @@ covered:
   * **Cold-start** (``pending > 0`` and ``ready == 0``) -- skips the
     entire per-stage intent pipeline so the classifier streak and
     recommendation history are not polluted by zero-signal cycles.
-    No entry appears in ``_last_intent_deltas`` for that stage.
+    No entry appears in ``cycle.intent.deltas`` for that stage.
   * **Hot-pending** (``pending > 0`` and ``ready > 0``) -- runs the
     pipeline against the real signal from ready actors but clamps
     positive intents (Phase C scale-up) to ``0``. Negative intents
@@ -39,8 +39,8 @@ streaming layer. The gate honours the per-stage
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -236,7 +236,7 @@ class TestColdStartSkipsIntentPipeline:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert "hot" not in scheduler._last_intent_deltas
+        assert "hot" not in scheduler.last_cycle.intent.deltas
 
     def test_cold_start_does_not_advance_classifier_state(self) -> None:
         """Classifier streak / state is untouched by a cold-start cycle.
@@ -263,9 +263,9 @@ class TestColdStartSkipsIntentPipeline:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state is StageState.NORMAL
-        assert runtime.classifier_streak == 0
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state is StageState.NORMAL
+        assert runtime.classifier.streak == 0
 
     def test_cold_start_does_not_record_into_recommendation_history(self) -> None:
         """The stabilization-window buffer is not advanced during cold-start."""
@@ -286,7 +286,7 @@ class TestColdStartSkipsIntentPipeline:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        history = scheduler._recommendation_histories["hot"]
+        history = scheduler.ledgers.recommendation_histories["hot"]
         assert len(history._buffer) == 0
 
     def test_cold_start_solution_has_no_new_workers_for_stage(self) -> None:
@@ -325,7 +325,7 @@ class TestColdStartSkipsIntentPipeline:
         # Using a value above ``min_data_points`` makes the test
         # robust to future default-value tweaks: any non-zero pre-gap
         # value must drop to zero after the skip.
-        scheduler._stage_states["hot"].valid_signal_samples = 5
+        scheduler.ledgers.stage_states["hot"].classifier.valid_signal_samples = 5
 
         ps = data_structures.ProblemState(
             [
@@ -343,7 +343,7 @@ class TestColdStartSkipsIntentPipeline:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._stage_states["hot"].valid_signal_samples == 0
+        assert scheduler.ledgers.stage_states["hot"].classifier.valid_signal_samples == 0
 
 
 class TestColdStartTransitionsCleanly:
@@ -367,14 +367,14 @@ class TestColdStartTransitionsCleanly:
             ]
         )
         scheduler.autoscale(time=0.0, problem_state=ps_cold)
-        assert "hot" not in scheduler._last_intent_deltas
+        assert "hot" not in scheduler.last_cycle.intent.deltas
 
         ps_hot = _saturated_signal(name="hot", num_workers=4)
         scheduler.autoscale(time=10.0, problem_state=data_structures.ProblemState([ps_hot]))
 
-        assert "hot" in scheduler._last_intent_deltas
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
+        assert "hot" in scheduler.last_cycle.intent.deltas
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
 
 
 class TestHotPendingClampsPhaseC:
@@ -387,7 +387,7 @@ class TestHotPendingClampsPhaseC:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas["hot"] == 0
+        assert scheduler.last_cycle.intent.deltas["hot"] == 0
 
     def test_hot_pending_does_not_freeze_classifier(self) -> None:
         """The classifier still observes the live signal during hot-pending.
@@ -401,8 +401,8 @@ class TestHotPendingClampsPhaseC:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["hot"]
-        assert runtime.classifier_state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
+        runtime = scheduler.ledgers.stage_states["hot"]
+        assert runtime.classifier.state in {StageState.SATURATED, StageState.SATURATED_CRITICAL}
 
     def test_hot_pending_solution_has_no_phase_c_adds(self) -> None:
         """End-to-end: SATURATED + pending -> ``Solution`` has zero new workers."""
@@ -420,12 +420,12 @@ class TestHotPendingClampsPhaseC:
 
         ps_blocked = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=4, num_pending_actors=1)])
         scheduler.autoscale(time=0.0, problem_state=ps_blocked)
-        assert scheduler._last_intent_deltas["hot"] == 0
+        assert scheduler.last_cycle.intent.deltas["hot"] == 0
 
         ps_free = data_structures.ProblemState([_saturated_signal(name="hot", num_workers=4, num_pending_actors=0)])
         solution = scheduler.autoscale(time=10.0, problem_state=ps_free)
 
-        assert scheduler._last_intent_deltas["hot"] > 0
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
         assert len(solution.stages[0].new_workers) >= 1
 
 
@@ -455,12 +455,12 @@ class TestHotPendingPreservesPhaseDIntent:
         for cycle in range(3):
             scheduler.autoscale(time=cycle * 10.0, problem_state=ps)
 
-        runtime = scheduler._stage_states["cold"]
-        assert runtime.classifier_state is StageState.OVER_PROVISIONED
-        assert runtime.classifier_streak >= 2
+        runtime = scheduler.ledgers.stage_states["cold"]
+        assert runtime.classifier.state is StageState.OVER_PROVISIONED
+        assert runtime.classifier.streak >= 2
         # The classifier streak ripened despite the hot-pending state, so
         # the next cycle's negative intent passes through Phase D.
-        assert scheduler._last_intent_deltas["cold"] <= 0
+        assert scheduler.last_cycle.intent.deltas["cold"] <= 0
 
 
 class TestQuiescenceDisabledByConfig:
@@ -491,7 +491,7 @@ class TestQuiescenceDisabledByConfig:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert "hot" in scheduler._last_intent_deltas
+        assert "hot" in scheduler.last_cycle.intent.deltas
 
     def test_disabled_gate_lets_hot_pending_grow(self) -> None:
         """SATURATED + pending + gate disabled -> positive intent is not clamped."""
@@ -500,7 +500,7 @@ class TestQuiescenceDisabledByConfig:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas["hot"] > 0
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
 
 
 class TestNoQuiescenceWithoutPending:
@@ -513,7 +513,7 @@ class TestNoQuiescenceWithoutPending:
 
         solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas["hot"] > 0
+        assert scheduler.last_cycle.intent.deltas["hot"] > 0
         assert len(solution.stages[0].new_workers) >= 1
 
 
@@ -550,8 +550,8 @@ class TestMixedQuiescenceAcrossStages:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert "bootstrap" not in scheduler._last_intent_deltas
-        assert scheduler._last_intent_deltas["running"] > 0
+        assert "bootstrap" not in scheduler.last_cycle.intent.deltas
+        assert scheduler.last_cycle.intent.deltas["running"] > 0
 
 
 class TestFinishedStageBypassesGate:
@@ -582,7 +582,7 @@ class TestFinishedStageBypassesGate:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._last_intent_deltas == {}
+        assert scheduler.last_cycle.intent.deltas == {}
 
 
 @pytest.mark.parametrize("pending", [1, 2, 5, 100])
@@ -608,4 +608,4 @@ class TestColdStartGateIsBoundaryStable:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert "hot" not in scheduler._last_intent_deltas
+        assert "hot" not in scheduler.last_cycle.intent.deltas

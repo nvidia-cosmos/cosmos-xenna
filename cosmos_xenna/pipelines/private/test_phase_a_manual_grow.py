@@ -33,8 +33,23 @@ from unittest.mock import patch
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import AutoscaleCycle
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig
+
+
+def _make_cycle(
+    ctx: data_structures.AutoscalePlanContext,
+    problem_state: data_structures.ProblemState,
+) -> AutoscaleCycle:
+    """Build a minimal ``AutoscaleCycle`` for direct phase-method tests."""
+    return AutoscaleCycle(
+        ctx=ctx,
+        problem_state=problem_state,
+        time=0.0,
+        cycle_counter=0,
+        pipeline_name="",
+    )
 
 
 def _cluster(total_cpus: int = 16) -> resources.ClusterResources:
@@ -95,7 +110,16 @@ def _problem_state(
 
 
 class _RaisingAddContext:
-    """Fake planner that surfaces a hard placement-context failure."""
+    """Fake planner that surfaces a hard placement-context failure.
+
+    Exposes the minimal surface ``ManualGrowExecutor.execute`` reaches:
+    ``try_add_worker`` (the call site under test) and
+    ``cluster_snapshot`` (consumed by the shared
+    :mod:`allocation_failures` defense layer when it absorbs an
+    :class:`resources.AllocationError`). The snapshot is fixed
+    cluster geometry; the test only asserts on the absorb / re-raise
+    contract, not on the snapshot content.
+    """
 
     def __init__(self, exc: Exception | None = None) -> None:
         self.calls: list[int] = []
@@ -105,6 +129,10 @@ class _RaisingAddContext:
         """Raise the same exception type a corrupted planner context would raise."""
         self.calls.append(stage_index)
         raise self._exc
+
+    def cluster_snapshot(self) -> resources.ClusterResources:
+        """Return a stable cluster snapshot for the absorb path's diagnostic log."""
+        return _cluster()
 
 
 class TestManualGrowScheduler:
@@ -184,7 +212,7 @@ class TestManualGrowScheduler:
         # Growth should add at most (4 - 1) = 3 new workers, then stop.
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_requested([("A", 10)], total_cpus=4))
-        with patch("cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.logger.warning") as warning:
+        with patch("cosmos_xenna.pipelines.private.scheduling_py.phases.manual.executors.logger.warning") as warning:
             solution = scheduler.autoscale(
                 time=0.0,
                 problem_state=_problem_state([("A", 1, 1, False)]),
@@ -252,16 +280,6 @@ class TestManualGrowScheduler:
         assert len(solution.stages[0].deleted_workers) == 3
         assert len(solution.stages[1].new_workers) == 3
 
-    def test_grow_called_before_setup_raises_runtime_error(self) -> None:
-        """Calling the grow phase before ``setup`` fails with a clear scheduler error."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
-
-        with pytest.raises(RuntimeError, match="_run_phase_a_grow called before setup"):
-            scheduler._run_phase_a_grow(
-                cast(data_structures.AutoscalePlanContext, _RaisingAddContext()),
-                _problem_state([("A", 0, 1, False)]),
-            )
-
     def test_planner_exception_propagates(self) -> None:
         """Hard planner failures are not downgraded to best-effort capacity exhaustion."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
@@ -269,9 +287,12 @@ class TestManualGrowScheduler:
         ctx = _RaisingAddContext()
 
         with pytest.raises(RuntimeError, match="planner context is drained"):
-            scheduler._run_phase_a_grow(
-                cast(data_structures.AutoscalePlanContext, ctx),
-                _problem_state([("A", 0, 1, False)]),
+            scheduler.runner.manual_services.grow_executor.execute(
+                cycle=_make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                services=scheduler.runner.manual_services,
             )
 
         assert ctx.calls == [0]
@@ -283,9 +304,103 @@ class TestManualGrowScheduler:
         ctx = _RaisingAddContext(IndexError("stage_index 0 out of range"))
 
         with pytest.raises(IndexError, match="stage_index 0 out of range"):
-            scheduler._run_phase_a_grow(
-                cast(data_structures.AutoscalePlanContext, ctx),
-                _problem_state([("A", 0, 1, False)]),
+            scheduler.runner.manual_services.grow_executor.execute(
+                cycle=_make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                services=scheduler.runner.manual_services,
             )
 
         assert ctx.calls == [0]
+
+
+class TestManualGrowAllocationErrorDefense:
+    """Pin the Phase A side of the shared allocation-failure defense layer.
+
+    The wrapper in
+    :func:`cosmos_xenna.pipelines.private.scheduling_py.cluster.allocation_failures.try_add_worker_with_defense`
+    catches only :class:`resources.AllocationError`, leaving every
+    other exception type to propagate (validated by
+    ``test_planner_exception_propagates`` and
+    ``test_planner_index_error_propagates`` in the suite above).
+    These tests pin Phase A's contract for the absorb-vs-re-raise
+    branch and the early-return semantics that protect subsequent
+    manual stages from a cycle-wide cluster outage.
+    """
+
+    def test_allocation_error_is_absorbed_with_default_skip_switch(self) -> None:
+        """An ``AllocationError`` is absorbed when ``skip_cycle_on_allocation_error`` is on (default).
+
+        The wrapper logs the failure, increments the per-stage
+        counter, sets
+        :attr:`ManualServices.manual_allocation.aborted_cycle`,
+        and Phase A returns without re-raising so the rest of the
+        autoscale cycle can run.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_requested([("A", 2)]))
+        ctx = _RaisingAddContext(resources.AllocationError("synthetic placement failure"))
+
+        scheduler.runner.manual_services.grow_executor.execute(
+            cycle=_make_cycle(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                _problem_state([("A", 0, 1, False)]),
+            ),
+            services=scheduler.runner.manual_services,
+        )
+
+        assert ctx.calls == [0]
+        assert scheduler.runner.manual_services.grow_executor.allocation_gate.aborted_cycle is True
+
+    def test_allocation_error_propagates_when_skip_switch_off(self) -> None:
+        """``skip_cycle_on_allocation_error=False`` re-raises the ``AllocationError``.
+
+        The wrapper still emits the ERROR log + counter increment
+        before re-raising, but it does NOT set the cycle-skip flag
+        (which is reserved for the absorb path); the autoscaler
+        thread sees the original exception.
+        """
+        cfg = SaturationAwareConfig(skip_cycle_on_allocation_error=False)
+        scheduler = SaturationAwareScheduler(cfg)
+        scheduler.setup(_problem_with_requested([("A", 2)]))
+        ctx = _RaisingAddContext(resources.AllocationError("synthetic placement failure"))
+
+        with pytest.raises(resources.AllocationError, match="synthetic placement failure"):
+            scheduler.runner.manual_services.grow_executor.execute(
+                cycle=_make_cycle(
+                    cast(data_structures.AutoscalePlanContext, ctx),
+                    _problem_state([("A", 0, 1, False)]),
+                ),
+                services=scheduler.runner.manual_services,
+            )
+
+        assert ctx.calls == [0]
+        assert scheduler.runner.manual_services.grow_executor.allocation_gate.aborted_cycle is False
+
+    def test_allocation_error_absorb_skips_subsequent_manual_stages(self) -> None:
+        """Absorbing on stage A short-circuits manual grow for the rest of the cycle.
+
+        With two manual stages requesting workers and the planner
+        raising ``AllocationError`` on every call, the wrapper
+        absorbs the first stage's failure and Phase A returns
+        before iterating to the second stage; the planner is
+        therefore called exactly once.
+        """
+        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler.setup(_problem_with_requested([("A", 2), ("B", 2)]))
+        ctx = _RaisingAddContext(resources.AllocationError("synthetic placement failure"))
+
+        scheduler.runner.manual_services.grow_executor.execute(
+            cycle=_make_cycle(
+                cast(data_structures.AutoscalePlanContext, ctx),
+                _problem_state([("A", 0, 1, False), ("B", 0, 1, False)]),
+            ),
+            services=scheduler.runner.manual_services,
+        )
+
+        assert ctx.calls == [0], (
+            "Phase A must short-circuit after absorbing the first AllocationError "
+            "rather than iterating into stage B's grow loop"
+        )
+        assert scheduler.runner.manual_services.grow_executor.allocation_gate.aborted_cycle is True

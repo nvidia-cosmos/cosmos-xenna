@@ -17,7 +17,7 @@
 """Tests for the cluster heterogeneity ratio helper.
 
 Pin the contract of
-:func:`cosmos_xenna.pipelines.private.scheduling_py.bottleneck.compute_heterogeneity_ratio`:
+:func:`cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity.compute_heterogeneity_ratio`:
 
   * Ratio matches ``max(D_k) / min(D_k)`` over stages whose service
     time was finite this cycle. Cold-start stages (NaN, zero, or
@@ -44,12 +44,12 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger as loguru_logger
 
-from cosmos_xenna.pipelines.private.scheduling_py import bottleneck
-from cosmos_xenna.pipelines.private.scheduling_py.bottleneck import (
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck import heterogeneity
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity import (
     HeterogeneityWarnState,
     compute_heterogeneity_ratio,
-    identify_bottleneck,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.identity import identify_bottleneck
 
 
 @pytest.fixture
@@ -89,12 +89,63 @@ def gauge_observations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, dic
             return
         captured.append((float(value), dict(tags or {})))
 
-    monkeypatch.setattr(bottleneck._HETEROGENEITY_RATIO_GAUGE, "set", fake_set)
+    monkeypatch.setattr(heterogeneity._HETEROGENEITY_RATIO_GAUGE, "set", fake_set)
     return captured
 
 
 class TestComputeHeterogeneityRatio:
     """Pins the cluster heterogeneity ratio helper contract."""
+
+    def test_warn_threshold_at_one_is_rejected_without_mutating_state(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+    ) -> None:
+        """A homogeneous cluster has ratio ``1.0``; the floor must be strictly greater."""
+        state = HeterogeneityWarnState(streak_cycles=3, has_fired=True)
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_threshold must be finite and > 1.0"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=1.0,
+                warn_streak_cycles=3,
+            )
+
+        assert gauge_observations == []
+        assert state.streak_cycles == 3
+        assert state.has_fired is True
+
+    def test_warn_threshold_nan_is_rejected(self) -> None:
+        """``NaN`` would make every finite ratio look above threshold."""
+        state = HeterogeneityWarnState()
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_threshold must be finite and > 1.0"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=math.nan,
+                warn_streak_cycles=3,
+            )
+
+        assert state.streak_cycles == 0
+
+    def test_warn_streak_cycles_zero_is_rejected(self) -> None:
+        """A zero streak would fire on the first above-threshold cycle."""
+        state = HeterogeneityWarnState(streak_cycles=2, has_fired=False)
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_streak_cycles must be an integer >= 1"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=0,
+            )
+
+        assert state.streak_cycles == 2
+        assert state.has_fired is False
 
     def test_ratio_correctness_three_stages(
         self,

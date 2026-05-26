@@ -37,9 +37,10 @@ import threading
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.regime import Regime
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck import bottleneck_phase
+from cosmos_xenna.pipelines.private.scheduling_py.regime.regime import Regime
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageRuntimeState, StageState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -136,53 +137,53 @@ def _problem_state_with_slot_signals(
 
 def _current_regime(scheduler: SaturationAwareScheduler) -> Regime:
     """Return the scheduler's current regime without narrowing the mutable field in tests."""
-    return scheduler._regime_state.current_regime
+    return scheduler.ledgers.regime_state.current_regime
 
 
 class TestSetup:
     """``setup()`` builds a per-stage runtime state map keyed by stage name."""
 
     def test_state_map_keyed_by_stage_name(self) -> None:
-        """One ``_StageRuntimeState`` per stage, keyed by the stage's name."""
+        """One ``StageRuntimeState`` per stage, keyed by the stage's name."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A", "B", "C"]))
-        assert set(scheduler._stage_states) == {"A", "B", "C"}
+        assert set(scheduler.ledgers.stage_states) == {"A", "B", "C"}
         for name in ("A", "B", "C"):
-            assert isinstance(scheduler._stage_states[name], _StageRuntimeState)
-            assert scheduler._stage_states[name].stage_name == name
+            assert isinstance(scheduler.ledgers.stage_states[name], StageRuntimeState)
+            assert scheduler.ledgers.stage_states[name].stage_name == name
 
     def test_stage_names_preserve_pipeline_order(self) -> None:
-        """``_stage_names`` reflects DAG order so deterministic iteration matches Solution order."""
+        """``stage_names`` reflects DAG order so deterministic iteration matches Solution order."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["upstream", "middle", "downstream"]))
-        assert scheduler._stage_names == ["upstream", "middle", "downstream"]
+        assert scheduler.pipeline.stage_names == ("upstream", "middle", "downstream")
 
     def test_runtime_state_starts_at_default_values(self) -> None:
-        """Newly constructed runtime state matches ``_StageRuntimeState`` defaults."""
+        """Newly constructed runtime state matches ``StageRuntimeState`` defaults."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        state = scheduler._stage_states["A"]
-        assert state.slots_empty_ratio_ewma is None
-        assert state.last_valid_slots_empty_ratio_ewma is None
-        assert state.classifier_streak == 0
-        assert state.growth_streak == 0
-        assert state.prev_workers == 0
+        state = scheduler.ledgers.stage_states["A"]
+        assert state.classifier.slots_empty_ratio_ewma is None
+        assert state.classifier.last_valid_slots_empty_ratio_ewma is None
+        assert state.classifier.streak == 0
+        assert state.growth.streak == 0
+        assert state.growth.prev_workers == 0
 
     def test_handles_single_stage_pipeline(self) -> None:
         """Smallest non-trivial pipeline -- one stage."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["only"]))
-        assert scheduler._stage_names == ["only"]
-        assert list(scheduler._stage_states) == ["only"]
+        assert scheduler.pipeline.stage_names == ("only",)
+        assert list(scheduler.ledgers.stage_states) == ["only"]
 
     def test_setup_can_be_called_again_to_rebuild_state(self) -> None:
         """A second ``setup()`` replaces the prior state; useful for test isolation and reset paths."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         scheduler.setup(_problem_with_stages(["X", "Y"]))
-        assert scheduler._stage_names == ["X", "Y"]
-        assert "A" not in scheduler._stage_states
-        assert set(scheduler._stage_states) == {"X", "Y"}
+        assert scheduler.pipeline.stage_names == ("X", "Y")
+        assert "A" not in scheduler.ledgers.stage_states
+        assert set(scheduler.ledgers.stage_states) == {"X", "Y"}
 
     def test_setup_stores_problem_and_config_by_reference(self) -> None:
         """Scheduler holds the same objects passed in (no deep copy).
@@ -196,16 +197,16 @@ class TestSetup:
         scheduler = SaturationAwareScheduler(config)
         scheduler.setup(problem)
         assert scheduler._config is config
-        assert scheduler._problem is problem
+        assert scheduler.pipeline.problem is problem
 
     def test_handles_many_stages_pipeline(self) -> None:
         """20-stage pipeline: state map size, order, and uniqueness all verified at scale."""
         stage_names = [f"Stage-{i:02d}" for i in range(20)]
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(stage_names))
-        assert scheduler._stage_names == stage_names
-        assert len(scheduler._stage_states) == 20
-        assert all(scheduler._stage_states[name].stage_name == name for name in stage_names)
+        assert scheduler.pipeline.stage_names == tuple(stage_names)
+        assert len(scheduler.ledgers.stage_states) == 20
+        assert all(scheduler.ledgers.stage_states[name].stage_name == name for name in stage_names)
 
 
 class TestAutoscaleNoOpShape:
@@ -343,14 +344,14 @@ class TestAutoscaleEdgeCases:
         """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        original_dict = scheduler._stage_states
-        original_state_a = scheduler._stage_states["A"]
+        original_dict = scheduler.ledgers.stage_states
+        original_state_a = scheduler.ledgers.stage_states["A"]
 
         for _ in range(3):
             scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 2)]))
 
-        assert scheduler._stage_states is original_dict
-        assert scheduler._stage_states["A"] is original_state_a
+        assert scheduler.ledgers.stage_states is original_dict
+        assert scheduler.ledgers.stage_states["A"] is original_state_a
 
 
 class TestUpdateWithMeasurementsAccumulator:
@@ -360,19 +361,19 @@ class TestUpdateWithMeasurementsAccumulator:
         """Empty measurements leave the count AND service-time accumulators untouched."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        # Deep-copy so any in-place mutation of a ``_StageRuntimeState`` value
+        # Deep-copy so any in-place mutation of a ``StageRuntimeState`` value
         # by ``update_with_measurements`` would surface as inequality below;
-        # a shallow ``dict(...)`` would alias the same ``_StageRuntimeState``
+        # a shallow ``dict(...)`` would alias the same ``StageRuntimeState``
         # references and mask the regression.
-        snapshot_before = copy.deepcopy(scheduler._stage_states)
+        snapshot_before = copy.deepcopy(scheduler.ledgers.stage_states)
         # ``setup()`` zero-initialises both per-stage accumulators.
-        assert scheduler._completed_counts == {"A": 0}
-        assert scheduler._completed_service_time_sums == {"A": 0.0}
+        assert scheduler.ledgers.measurements.completed_counts == {"A": 0}
+        assert scheduler.ledgers.measurements.completed_service_time_sums == {"A": 0.0}
         empty_measurements = data_structures.Measurements(time=0.0, stage_measurements=[])
         scheduler.update_with_measurements(time=0.0, measurements=empty_measurements)
-        assert scheduler._stage_states == snapshot_before
-        assert scheduler._completed_counts == {"A": 0}
-        assert scheduler._completed_service_time_sums == {"A": 0.0}
+        assert scheduler.ledgers.stage_states == snapshot_before
+        assert scheduler.ledgers.measurements.completed_counts == {"A": 0}
+        assert scheduler.ledgers.measurements.completed_service_time_sums == {"A": 0.0}
 
     def test_task_count_accumulates_across_calls(self) -> None:
         """Each ``TaskMeasurement`` adds 1 to the per-stage count regardless of ``num_returns``."""
@@ -394,7 +395,7 @@ class TestUpdateWithMeasurementsAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms1)
-        assert scheduler._completed_counts["A"] == 3
+        assert scheduler.ledgers.measurements.completed_counts["A"] == 3
 
         # Second batch: 2 more tasks -> running total = 5.
         ms2 = data_structures.Measurements(
@@ -409,7 +410,7 @@ class TestUpdateWithMeasurementsAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=1.0, measurements=ms2)
-        assert scheduler._completed_counts["A"] == 5
+        assert scheduler.ledgers.measurements.completed_counts["A"] == 5
 
     def test_per_stage_attribution_follows_dag_order(self) -> None:
         """Stage order from the Problem zips with the rust ``stages`` iterator."""
@@ -428,7 +429,7 @@ class TestUpdateWithMeasurementsAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        assert scheduler._completed_counts == {"upstream": 1, "downstream": 4}
+        assert scheduler.ledgers.measurements.completed_counts == {"upstream": 1, "downstream": 4}
 
     def test_setup_resets_measurement_accumulators(self) -> None:
         """A second ``setup()`` zeroes out the count AND service-time accumulators from the prior pipeline."""
@@ -444,16 +445,16 @@ class TestUpdateWithMeasurementsAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        assert scheduler._completed_counts["A"] == 7
-        assert scheduler._completed_service_time_sums["A"] == pytest.approx(7 * 0.5)
+        assert scheduler.ledgers.measurements.completed_counts["A"] == 7
+        assert scheduler.ledgers.measurements.completed_service_time_sums["A"] == pytest.approx(7 * 0.5)
 
         # New pipeline -> fresh counters and BOTH per-cycle snapshots
         # cleared so the next sample is cold-start.
         scheduler.setup(_problem_with_stages(["X", "Y"]))
-        assert scheduler._completed_counts == {"X": 0, "Y": 0}
-        assert scheduler._completed_service_time_sums == {"X": 0.0, "Y": 0.0}
-        assert scheduler._last_throughput_sample == {}
-        assert scheduler._last_service_time_sample == {}
+        assert scheduler.ledgers.measurements.completed_counts == {"X": 0, "Y": 0}
+        assert scheduler.ledgers.measurements.completed_service_time_sums == {"X": 0.0, "Y": 0.0}
+        assert scheduler.ledgers.measurements.last_throughput_sample == {}
+        assert scheduler.ledgers.measurements.last_service_time_sample == {}
 
 
 class TestConsumeThroughputSamples:
@@ -476,12 +477,12 @@ class TestConsumeThroughputSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        samples = scheduler._consume_throughput_samples(now_ts=1.0)
+        samples = scheduler.ledgers.measurements.consume_throughput_samples(now_ts=1.0)
         # Cold-start: every stage seeds the snapshot with current count, returns 0.0.
         assert samples == {"A": 0.0, "B": 0.0}
         # Snapshot now holds the cold-start (count, ts) pair.
-        assert scheduler._last_throughput_sample["A"] == (10, 1.0)
-        assert scheduler._last_throughput_sample["B"] == (20, 1.0)
+        assert scheduler.ledgers.measurements.last_throughput_sample["A"] == (10, 1.0)
+        assert scheduler.ledgers.measurements.last_throughput_sample["B"] == (20, 1.0)
 
     def test_steady_state_returns_dcount_over_dt(self) -> None:
         """Second cycle returns ``(now_count - prev_count) / (now_ts - prev_ts)``."""
@@ -498,7 +499,7 @@ class TestConsumeThroughputSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms1)
-        scheduler._consume_throughput_samples(now_ts=1.0)
+        scheduler.ledgers.measurements.consume_throughput_samples(now_ts=1.0)
 
         # Cycle 2: 20 more tasks, sampled at t=2.0 -> dcount=20, dt=1.0 -> 20.0 tasks/sec.
         ms2 = data_structures.Measurements(
@@ -510,7 +511,7 @@ class TestConsumeThroughputSamples:
             ],
         )
         scheduler.update_with_measurements(time=1.0, measurements=ms2)
-        samples = scheduler._consume_throughput_samples(now_ts=2.0)
+        samples = scheduler.ledgers.measurements.consume_throughput_samples(now_ts=2.0)
         assert samples == {"A": 20.0}
 
     def test_zero_dt_yields_zero_throughput_no_division_error(self) -> None:
@@ -525,9 +526,9 @@ class TestConsumeThroughputSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        scheduler._consume_throughput_samples(now_ts=5.0)
+        scheduler.ledgers.measurements.consume_throughput_samples(now_ts=5.0)
         # Same now_ts -> dt = 0; must short-circuit to 0.0 instead of dividing.
-        samples = scheduler._consume_throughput_samples(now_ts=5.0)
+        samples = scheduler.ledgers.measurements.consume_throughput_samples(now_ts=5.0)
         assert samples == {"A": 0.0}
 
     def test_negative_dcount_clamps_to_zero(self) -> None:
@@ -542,13 +543,13 @@ class TestConsumeThroughputSamples:
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         # Manually seed a high snapshot count.
-        scheduler._completed_counts["A"] = 100
-        scheduler._consume_throughput_samples(now_ts=1.0)
-        assert scheduler._last_throughput_sample["A"] == (100, 1.0)
+        scheduler.ledgers.measurements.completed_counts["A"] = 100
+        scheduler.ledgers.measurements.consume_throughput_samples(now_ts=1.0)
+        assert scheduler.ledgers.measurements.last_throughput_sample["A"] == (100, 1.0)
 
         # Reset the counter (NOT the snapshot) and sample again.
-        scheduler._completed_counts["A"] = 50
-        samples = scheduler._consume_throughput_samples(now_ts=2.0)
+        scheduler.ledgers.measurements.completed_counts["A"] = 50
+        samples = scheduler.ledgers.measurements.consume_throughput_samples(now_ts=2.0)
         assert samples == {"A": 0.0}
 
 
@@ -574,8 +575,8 @@ class TestServiceTimeAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        assert scheduler._completed_counts["A"] == 3
-        assert scheduler._completed_service_time_sums["A"] == pytest.approx(3.0)
+        assert scheduler.ledgers.measurements.completed_counts["A"] == 3
+        assert scheduler.ledgers.measurements.completed_service_time_sums["A"] == pytest.approx(3.0)
 
     def test_per_stage_service_time_attribution(self) -> None:
         """Stage order in ``StageMeasurements`` zips with ``self._stage_names`` for both accumulators."""
@@ -596,8 +597,8 @@ class TestServiceTimeAccumulator:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        assert scheduler._completed_service_time_sums["fast"] == pytest.approx(0.2)
-        assert scheduler._completed_service_time_sums["slow"] == pytest.approx(8.0)
+        assert scheduler.ledgers.measurements.completed_service_time_sums["fast"] == pytest.approx(0.2)
+        assert scheduler.ledgers.measurements.completed_service_time_sums["slow"] == pytest.approx(8.0)
 
 
 class TestConsumeServiceTimeSamples:
@@ -620,14 +621,14 @@ class TestConsumeServiceTimeSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        samples = scheduler._consume_service_time_samples()
+        samples = scheduler.ledgers.measurements.consume_service_time_samples()
         # Cold-start: every stage returns NaN; bottleneck.py / heterogeneity.py fold NaN into
         # the cold-start branch (gauge observes NaN, stage skipped from argmax).
         assert math.isnan(samples["A"])
         assert math.isnan(samples["B"])
         # Snapshot now holds the cold-start (count, sum) pair so the next cycle has a delta.
-        assert scheduler._last_service_time_sample["A"] == (10, pytest.approx(5.0))
-        assert scheduler._last_service_time_sample["B"] == (20, pytest.approx(40.0))
+        assert scheduler.ledgers.measurements.last_service_time_sample["A"] == (10, pytest.approx(5.0))
+        assert scheduler.ledgers.measurements.last_service_time_sample["B"] == (20, pytest.approx(40.0))
 
     def test_steady_state_returns_dsum_over_dcount(self) -> None:
         """Second cycle returns ``(now_sum - prev_sum) / (now_count - prev_count)``."""
@@ -644,7 +645,7 @@ class TestConsumeServiceTimeSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms1)
-        scheduler._consume_service_time_samples()
+        scheduler.ledgers.measurements.consume_service_time_samples()
 
         # Cycle 2: 20 more tasks at 1.0s each -> dsum 20.0s, dcount 20 -> mean 1.0s.
         ms2 = data_structures.Measurements(
@@ -656,7 +657,7 @@ class TestConsumeServiceTimeSamples:
             ],
         )
         scheduler.update_with_measurements(time=1.0, measurements=ms2)
-        samples = scheduler._consume_service_time_samples()
+        samples = scheduler.ledgers.measurements.consume_service_time_samples()
         assert samples["A"] == pytest.approx(1.0)
 
     def test_no_progress_cycle_returns_nan(self) -> None:
@@ -672,10 +673,10 @@ class TestConsumeServiceTimeSamples:
             ],
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms)
-        scheduler._consume_service_time_samples()
+        scheduler.ledgers.measurements.consume_service_time_samples()
 
         # Second cycle with no new measurements -> dcount=0 -> NaN.
-        samples = scheduler._consume_service_time_samples()
+        samples = scheduler.ledgers.measurements.consume_service_time_samples()
         assert math.isnan(samples["A"])
 
     def test_independent_snapshots_from_throughput_consumer(self) -> None:
@@ -700,9 +701,9 @@ class TestConsumeServiceTimeSamples:
         )
         scheduler.update_with_measurements(time=0.0, measurements=ms1)
         # Throughput first.
-        scheduler._consume_throughput_samples(now_ts=1.0)
+        scheduler.ledgers.measurements.consume_throughput_samples(now_ts=1.0)
         # Then service time.
-        scheduler._consume_service_time_samples()
+        scheduler.ledgers.measurements.consume_service_time_samples()
 
         # Cycle 2.
         ms2 = data_structures.Measurements(
@@ -714,9 +715,9 @@ class TestConsumeServiceTimeSamples:
             ],
         )
         scheduler.update_with_measurements(time=1.0, measurements=ms2)
-        scheduler._consume_throughput_samples(now_ts=2.0)
+        scheduler.ledgers.measurements.consume_throughput_samples(now_ts=2.0)
         # Even after throughput consumer ran, service-time delta must be (5 tasks * 2.0s) / 5 = 2.0s.
-        samples = scheduler._consume_service_time_samples()
+        samples = scheduler.ledgers.measurements.consume_service_time_samples()
         assert samples["A"] == pytest.approx(2.0)
 
 
@@ -734,8 +735,8 @@ class TestSKEwmaState:
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A", "B"]))
 
-        assert set(scheduler._s_k_ewma) == {"A", "B"}
-        assert all(math.isnan(v) for v in scheduler._s_k_ewma.values())
+        assert set(scheduler.ledgers.s_k_ewma.view()) == {"A", "B"}
+        assert all(math.isnan(v) for v in scheduler.ledgers.s_k_ewma.view().values())
 
     def test_first_finite_sample_replaces_nan_seed_without_blending(self) -> None:
         """Cold-start: first finite S_k for a stage is taken as-is (no alpha blend)."""
@@ -744,10 +745,10 @@ class TestSKEwmaState:
         )
         scheduler.setup(_problem_with_stages(["A", "B"]))
 
-        scheduler._update_s_k_ewma({"A": 1.5, "B": math.nan})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 1.5, "B": math.nan})
 
-        assert scheduler._s_k_ewma["A"] == pytest.approx(1.5)
-        assert math.isnan(scheduler._s_k_ewma["B"])
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(1.5)
+        assert math.isnan(scheduler.ledgers.s_k_ewma.get("B"))
 
     def test_warm_step_applies_ewma_blend(self) -> None:
         """Subsequent finite samples blend with the prior value via alpha."""
@@ -755,11 +756,11 @@ class TestSKEwmaState:
         scheduler = SaturationAwareScheduler(cfg)
         scheduler.setup(_problem_with_stages(["A"]))
 
-        scheduler._update_s_k_ewma({"A": 1.0})
-        scheduler._update_s_k_ewma({"A": 5.0})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 1.0})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 5.0})
 
         # 1.0 * 0.75 + 5.0 * 0.25 = 0.75 + 1.25 = 2.0
-        assert scheduler._s_k_ewma["A"] == pytest.approx(2.0)
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(2.0)
 
     def test_missed_sample_preserves_previous_value(self) -> None:
         """A NaN sample must not corrupt or zero out the prior EWMA."""
@@ -768,23 +769,27 @@ class TestSKEwmaState:
         )
         scheduler.setup(_problem_with_stages(["A"]))
 
-        scheduler._update_s_k_ewma({"A": 2.5})
-        scheduler._update_s_k_ewma({"A": math.nan})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 2.5})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": math.nan})
 
-        assert scheduler._s_k_ewma["A"] == pytest.approx(2.5)
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(2.5)
 
     def test_reset_on_setup_drops_prior_state(self) -> None:
         """Re-setup of a recycled scheduler clears the EWMA and bottleneck meta."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        scheduler._update_s_k_ewma({"A": 1.5})
-        assert math.isfinite(scheduler._s_k_ewma["A"])
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 1.5})
+        assert math.isfinite(scheduler.ledgers.s_k_ewma.get("A"))
 
         scheduler.setup(_problem_with_stages(["A", "B"]))
 
-        assert all(math.isnan(v) for v in scheduler._s_k_ewma.values())
-        assert scheduler._last_bottleneck_meta is None
-        assert scheduler._bottleneck_engagement_state.last_announced is None
+        assert all(math.isnan(v) for v in scheduler.ledgers.s_k_ewma.view().values())
+        # ``setup()`` clears the most-recent-cycle observability
+        # hook; ``_last_cycle is None`` and the scheduler's own
+        # cycle counter resets to zero.
+        assert scheduler.last_cycle is None
+        assert scheduler.ledgers.cycle_counter == 0
+        assert scheduler.ledgers.bottleneck_engagement_state.last_announced is None
 
     def test_zero_or_negative_sample_treated_as_missed(self) -> None:
         """``S_k <= 0`` is bogus and never replaces a finite EWMA."""
@@ -793,11 +798,11 @@ class TestSKEwmaState:
         )
         scheduler.setup(_problem_with_stages(["A"]))
 
-        scheduler._update_s_k_ewma({"A": 1.0})
-        scheduler._update_s_k_ewma({"A": 0.0})
-        scheduler._update_s_k_ewma({"A": -0.5})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 1.0})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": 0.0})
+        bottleneck_phase._update_s_k_ewma(scheduler.runner.bottleneck_services, {"A": -0.5})
 
-        assert scheduler._s_k_ewma["A"] == pytest.approx(1.0)
+        assert scheduler.ledgers.s_k_ewma.get("A") == pytest.approx(1.0)
 
 
 class TestPressureEndToEnd:
@@ -880,7 +885,7 @@ class TestPressureEndToEnd:
         # Cycle 1 is cold-start for throughput (no prior snapshot) so observed_throughput=0.0
         # which triggers the cold-start branch in compute_pressure -> normalized_backlog=cap.
         # pressure should be positive (utilisation * cap).
-        first_pressure = scheduler._stage_states["A"].pressure_ewma
+        first_pressure = scheduler.ledgers.stage_states["A"].pressure.ewma
         assert first_pressure is not None
         assert first_pressure > 0.0
 
@@ -898,7 +903,7 @@ class TestPressureEndToEnd:
 
         # Cycle 2 has a real throughput sample (50 tasks/sec); the EWMA blends it
         # with the cycle 1 cold-start value so pressure stays elevated.
-        second_pressure = scheduler._stage_states["A"].pressure_ewma
+        second_pressure = scheduler.ledgers.stage_states["A"].pressure.ewma
         assert second_pressure is not None
         # pressure_ewma is bounded by BACKLOG_CAP * 1.0 = 3.0; >= 0 sanity.
         assert 0.0 <= second_pressure <= 3.0
@@ -931,7 +936,7 @@ class TestUpdateWithMeasurementsThreadSafety:
         for t in threads:
             t.join()
 
-        assert scheduler._completed_counts["A"] == 50
+        assert scheduler.ledgers.measurements.completed_counts["A"] == 50
 
 
 class TestAutoscalePlanContextLifecycle:
@@ -1029,7 +1034,7 @@ class TestThresholdResolutionTiming:
         """``setup()`` cannot resolve -- ``slots_per_worker`` only arrives in ``autoscale()``."""
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        assert scheduler._stage_states["A"].resolved_thresholds is None
+        assert scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds is None
 
     def test_first_autoscale_resolves_thresholds_from_runtime_slots_per_worker(self) -> None:
         """First cycle reads ``ProblemStageState.slots_per_worker`` and auto-derives.
@@ -1046,8 +1051,8 @@ class TestThresholdResolutionTiming:
         ps = _problem_state([("small_c", 1, 1), ("large_c", 1, 64)])
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        small_resolved = scheduler._stage_states["small_c"].resolved_thresholds
-        large_resolved = scheduler._stage_states["large_c"].resolved_thresholds
+        small_resolved = scheduler.ledgers.stage_states["small_c"].classifier.resolved_thresholds
+        large_resolved = scheduler.ledgers.stage_states["large_c"].classifier.resolved_thresholds
         assert small_resolved is not None
         assert large_resolved is not None
         assert small_resolved.slots_per_actor == 1
@@ -1068,12 +1073,12 @@ class TestThresholdResolutionTiming:
         scheduler.setup(_problem_with_stages(["A"]))
         # First cycle: resolve at slots=8.
         scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 8)]))
-        first_resolved = scheduler._stage_states["A"].resolved_thresholds
+        first_resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert first_resolved is not None
         assert first_resolved.slots_per_actor == 8
         # Second cycle: same stage, different slots_per_worker -- resolution is sticky.
         scheduler.autoscale(time=10.0, problem_state=_problem_state([("A", 1, 64)]))
-        second_resolved = scheduler._stage_states["A"].resolved_thresholds
+        second_resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert second_resolved is first_resolved
         assert second_resolved.slots_per_actor == 8
 
@@ -1096,7 +1101,7 @@ class TestRegimeAwareAggressiveness:
             scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 4, 8)]))
         assert _current_regime(scheduler) is Regime.SUB_HALFIN_WHITT
         # Stage thresholds resolved with base aggressiveness 0.30.
-        resolved = scheduler._stage_states["A"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert resolved is not None
         assert resolved.saturation_aggressiveness == pytest.approx(0.30)
 
@@ -1118,7 +1123,7 @@ class TestRegimeAwareAggressiveness:
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
             scheduler.autoscale(time=0.0, problem_state=ps)
-        resolved = scheduler._stage_states["A"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert resolved is not None
         # Base 0.30 + lift 0.15 = 0.45.
         assert resolved.saturation_aggressiveness == pytest.approx(0.45)
@@ -1130,7 +1135,7 @@ class TestRegimeAwareAggressiveness:
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
             scheduler.autoscale(time=0.0, problem_state=ps)
-        resolved = scheduler._stage_states["A"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert resolved is not None
         assert resolved.saturation_aggressiveness == pytest.approx(0.35)
 
@@ -1165,7 +1170,7 @@ class TestRegimeAwareAggressiveness:
             scheduler.autoscale(time=0.0, problem_state=ps)
         # Regime state stays at default (sub-HW); thresholds resolved at base.
         assert _current_regime(scheduler) is Regime.SUB_HALFIN_WHITT
-        resolved = scheduler._stage_states["A"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert resolved is not None
         assert resolved.saturation_aggressiveness == pytest.approx(0.30)
 
@@ -1183,7 +1188,7 @@ class TestRegimeAwareAggressiveness:
         for _ in range(3):
             scheduler.autoscale(time=0.0, problem_state=idle)
         assert _current_regime(scheduler) is Regime.SUB_HALFIN_WHITT
-        resolved = scheduler._stage_states["A"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds
         assert resolved is not None
         assert resolved.saturation_aggressiveness == pytest.approx(0.30)
 
@@ -1199,7 +1204,7 @@ class TestRegimeAwareAggressiveness:
         scheduler.setup(_problem_with_stages(["B"]))
         scheduler.autoscale(time=0.0, problem_state=_problem_state([("B", 4, 8)]))
         assert _current_regime(scheduler) is Regime.SUB_HALFIN_WHITT
-        resolved = scheduler._stage_states["B"].resolved_thresholds
+        resolved = scheduler.ledgers.stage_states["B"].classifier.resolved_thresholds
         assert resolved is not None
         assert resolved.saturation_aggressiveness == pytest.approx(0.30)
 
@@ -1251,7 +1256,7 @@ class TestRegimeAwareAggressiveness:
         thresholds. When the regime transitions to super-Halfin-Whitt
         the scheduler resets the classifier state to ``NORMAL`` and
         the streak to ``0`` (see
-        :meth:`_update_regime_aware_aggressiveness`); the per-stage
+        :meth:`RegimeController.update`); the per-stage
         decision pipeline then re-classifies the live signal under
         the new thresholds and may produce a different state and a
         post-reset streak. The contract tested here is that neither
@@ -1261,19 +1266,19 @@ class TestRegimeAwareAggressiveness:
         """
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
-        runtime = scheduler._stage_states["A"]
-        runtime.classifier_state = StageState.SATURATED
-        runtime.classifier_streak = 7
+        runtime = scheduler.ledgers.stage_states["A"]
+        runtime.classifier.state = StageState.SATURATED
+        runtime.classifier.streak = 7
 
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert _current_regime(scheduler) is Regime.SUPER_HALFIN_WHITT
-        assert runtime.classifier_streak < 7
-        assert runtime.resolved_thresholds is not None
+        assert runtime.classifier.streak < 7
+        assert runtime.classifier.resolved_thresholds is not None
         assert (
-            runtime.resolved_thresholds.saturation_aggressiveness
+            runtime.classifier.resolved_thresholds.saturation_aggressiveness
             > SaturationAwareConfig().stage_defaults.saturation_aggressiveness
         )
 
@@ -1301,18 +1306,37 @@ class TestExecutedDeltaRecording:
         """The scheduler invokes ``record_executed_delta`` once per stage with an intent."""
         from unittest.mock import patch as _patch
 
+        from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import (
+            StageDecisionPipeline,
+        )
+
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A", "B"]))
         ps = _problem_state([("A", 1, 1), ("B", 1, 1)])
 
         captured: list[tuple[str, int]] = []
 
-        def _capture(*, stage_state: _StageRuntimeState, delta_executed: int, config: object) -> None:
+        def _capture(
+            self: StageDecisionPipeline,
+            *,
+            stage_state: StageRuntimeState,
+            delta_executed: int,
+            config: object,
+        ) -> None:
             captured.append((stage_state.stage_name, delta_executed))
 
-        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 0, "B": 0}):
-            with _patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.record_executed_delta",
+        # ``record_executed_delta`` is now a method on
+        # ``StageDecisionPipeline``; SaturationShrinkPhase
+        # (``phases.phase_d``) constructs a pipeline and invokes
+        # the method, so the patch targets the class itself.
+        with _patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"A": 0, "B": 0},
+        ):
+            with _patch.object(
+                StageDecisionPipeline,
+                "record_executed_delta",
+                autospec=True,
                 side_effect=_capture,
             ):
                 scheduler.autoscale(time=0.0, problem_state=ps)
@@ -1329,25 +1353,43 @@ class TestExecutedDeltaRecording:
         """When Phase C executes fewer adds than the recommendation, the recorded delta matches the commit."""
         from unittest.mock import patch as _patch
 
+        from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import (
+            StageDecisionPipeline,
+        )
+
         scheduler = SaturationAwareScheduler(SaturationAwareConfig())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state([("A", 1, 1)])
 
         captured: list[int] = []
 
-        def _capture(*, stage_state: _StageRuntimeState, delta_executed: int, config: object) -> None:
+        def _capture(
+            self: StageDecisionPipeline,
+            *,
+            stage_state: StageRuntimeState,
+            delta_executed: int,
+            config: object,
+        ) -> None:
             captured.append(delta_executed)
 
         # Recommendation is +3 but the first try_add_worker returns None
         # (cluster exhausted) so Phase C executes 0 adds. Recorded delta
-        # must be 0, NOT the recommendation.
-        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 3}):
+        # must be 0, NOT the recommendation. ``record_executed_delta`` is
+        # now a method on ``StageDecisionPipeline``; ``SaturationShrinkPhase``
+        # constructs a pipeline and invokes the method, so the patch
+        # targets the class itself.
+        with _patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"A": 3},
+        ):
             with _patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 return_value=None,
             ):
-                with _patch(
-                    "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.record_executed_delta",
+                with _patch.object(
+                    StageDecisionPipeline,
+                    "record_executed_delta",
+                    autospec=True,
                     side_effect=_capture,
                 ):
                     scheduler.autoscale(time=0.0, problem_state=ps)
@@ -1370,7 +1412,10 @@ class TestInvariantPropagation:
         ps = _problem_state([("A", 1, 1)])
 
         err = RuntimeError("synthetic scheduler invariant violation")
-        with _patch.object(scheduler, "_compute_intent_deltas", return_value={"A": 1}):
+        with _patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"A": 1},
+        ):
             with _patch(
                 "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
                 side_effect=err,

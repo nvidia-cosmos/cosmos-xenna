@@ -14,121 +14,44 @@
 # limitations under the License.
 
 
-"""Tests for the donor warmup grace in saturation-aware scheduling.
+"""Donor warmup grace integration with Phase D shrink and the scheduler.
 
-The donor warmup grace
-(``donor_warmup_grace_s``, default 180 s) protects a freshly-ready
-worker from being yanked out of its stage before the dispatcher
-has had time to fill its queue. The grace gates two consumers:
+The donor warmup grace (``donor_warmup_grace_s``, default 180 s)
+protects a freshly-ready worker from being yanked out of its stage
+before the dispatcher has had time to fill its queue. Three
+contracts ship from this module, all integration-level (helper-
+level coverage of ``SaturationPolicy``'s warmup exclusion lives in
+``test_donor_policy.py``):
 
-  * Phase D shrink victim selection
-    (:func:`select_workers_to_remove_oldest_first`) skips workers
-    whose ready age is below ``donor_warmup_grace_s`` so a
-    saturation-driven shrink cannot delete a worker that has not
-    yet contributed real measurements.
-  * Saturation-mode cross-stage donor selection
-    (:func:`find_saturation_donor`) skips the same workers so a
-    receiver does not absorb a donor that is still in its own
-    warmup window.
-
-Floor-mode donor selection
-(:func:`select_youngest_eligible_donor`) deliberately bypasses
-the grace because the floor is a hard structural requirement;
-deadlocking on warmup-protected donors is worse than killing a
-young donor.
-
-This module pins:
-
-  * Both helpers honour an ``excluded_worker_ids`` parameter that
-    filters the candidate pool.
-  * ``None`` and empty sets preserve the unfiltered legacy
-    contract.
-  * A stage whose entire worker pool is in the excluded set
-    becomes ineligible (donor) or untouched (Phase D).
-  * The five-layer anti-flap and donor-floor checks still apply
-    independently of the excluded set.
-  * The :class:`SaturationAwareScheduler` populates
-    ``_donor_warmup_excluded_ids`` every cycle from the live
-    ready-first-seen map and threads it through to both helpers.
-  * Floor-mode donor selection has no ``excluded_worker_ids``
-    parameter and therefore admits warmup workers unchanged.
-  * The scheduler-level Phase D shrink log distinguishes the
-    warmup-grace branch from floor / fraction caps so operators
+*   Phase D shrink victim selection
+    (:func:`select_workers_to_remove_oldest_first`) honours the
+    ``excluded_worker_ids`` parameter so warmup-protected workers
+    never enter the victim list.
+*   The :class:`SaturationAwareScheduler` populates
+    ``_last_cycle.donor_warmup_excluded_ids`` every cycle from the
+    live ready-first-seen map managed by ``WarmupTracker`` and the
+    ``donor_warmup_grace_s`` configuration.
+*   The scheduler-level Phase D shrink log distinguishes the
+    warmup-grace branch from the floor / fraction caps so operators
     can locate the binding constraint in the log stream.
+
+The donor selection asymmetry between Phase B (FloorPolicy, no
+warmup exclusion) and Phase C (SaturationPolicy, excludes warmup
+workers) is covered by ``test_donor_policy.py`` and the
+shape-integration test ``test_saturation_aware_donor_shape_integration.py``.
 """
 
 import logging
 from collections.abc import Iterator
-from typing import Any
 from unittest.mock import patch
 
-import attrs
 import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorDecision,
-    DonorPlan,
-    DonorWorker,
-    find_saturation_donor,
-    select_youngest_eligible_donor,
-)
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.scale_down import select_workers_to_remove_oldest_first
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.scale_down import select_workers_to_remove_oldest_first
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
-
-
-@attrs.frozen
-class _AlwaysFeasibleProbeResult:
-    """Stand-in for ``rust_apc.PlacementProbeResult`` that always reports feasible."""
-
-    feasible: bool = True
-    reject_reason: str = ""
-
-
-@attrs.define
-class _AlwaysFeasibleCtx:
-    """Fake autoscale planner context whose probe always reports feasible."""
-
-    def probe_add_after_removals(
-        self,
-        removals: list[tuple[int, str]],
-        add_stage_index: int,
-    ) -> _AlwaysFeasibleProbeResult:
-        del removals, add_stage_index
-        return _AlwaysFeasibleProbeResult()
-
-
-def _single_donor(value: DonorDecision | DonorPlan | None) -> DonorWorker:
-    """Assert the value resolves to a single-worker plan and return its sole removal."""
-    assert value is not None, "selector returned None"
-    plan = value.plan if isinstance(value, DonorDecision) else value
-    assert len(plan.removals) == 1, f"expected single-worker plan, got {len(plan.removals)}"
-    return plan.removals[0]
-
-
-def _stage_runtime_over_provisioned(
-    *,
-    name: str,
-    streak: int = 30,
-    growth_mode: GrowthMode = GrowthMode.TRACKING,
-) -> _StageRuntimeState:
-    """Build a runtime state representing a stable OVER_PROVISIONED stage."""
-    state = _StageRuntimeState(stage_name=name)
-    state.classifier_state = StageState.OVER_PROVISIONED
-    state.classifier_streak = streak
-    state.growth_mode = growth_mode
-    return state
-
-
-def _stage_runtime_saturated(name: str) -> _StageRuntimeState:
-    """Build a runtime state representing a SATURATED receiver stage."""
-    state = _StageRuntimeState(stage_name=name)
-    state.classifier_state = StageState.SATURATED
-    state.classifier_streak = 30
-    return state
 
 
 class TestPhaseDShrinkVictimFilter:
@@ -205,192 +128,8 @@ class TestPhaseDShrinkVictimFilter:
         assert victims == ["a-w1"]
 
 
-class TestSaturationDonorWarmupFilter:
-    """``find_saturation_donor`` honours the excluded set."""
-
-    @pytest.fixture
-    def base_kwargs(self) -> dict[str, Any]:
-        """Shared call kwargs that pin the receiver / config / state baseline."""
-        cfg = SaturationAwareConfig(
-            enable_cross_stage_donor=True,
-            # Anti-flap and donation-interval validators require >= 1 cycle.
-            # Use the minimums so a high ``cycle`` value (10_000) leaves us
-            # outside any cooldown window for the purposes of the tests.
-            cross_stage_donor_anti_flap_cycles=30,
-            cross_stage_donor_require_over_provisioned=True,
-            cross_stage_donor_exclude_hold_state=True,
-            donor_must_be_strictly_upstream=True,
-            stage_defaults=SaturationAwareStageConfig(
-                min_workers=1,
-                # Cross-validation requires anti-flap >= longest streak;
-                # match the anti-flap of 30.
-                over_provisioned_streak_min_cycles=30,
-                worker_warmup_measurement_grace_s=0.0,
-                donor_warmup_grace_s=0.0,
-            ),
-        )
-        return {
-            "receiver_stage_index": 1,
-            "receiver_stage_name": "B",
-            "stage_names": ["A", "B"],
-            "stage_floors": {0: 1, 1: 1},
-            "worker_ages": {"a-w0": 50, "a-w1": 1, "a-w2": 1},
-            "worker_nodes": {},
-            "stage_states": {
-                "A": _stage_runtime_over_provisioned(name="A", streak=30),
-                "B": _stage_runtime_saturated("B"),
-            },
-            "config": cfg,
-            "stage_configs": {
-                "A": cfg.stage_defaults,
-                "B": cfg.stage_defaults,
-            },
-            # Cycle far enough out that no cooldown window applies.
-            "cycle": 10_000,
-            "last_donation_cycle": {},
-            "ctx": _AlwaysFeasibleCtx(),
-        }
-
-    def test_excluded_donor_skipped(self, base_kwargs: dict[str, Any]) -> None:
-        """An excluded donor candidate is skipped; the next eligible worker is picked."""
-        donor = _single_donor(
-            find_saturation_donor(
-                worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
-                excluded_worker_ids=frozenset({"a-w0"}),
-                **base_kwargs,
-                receiver_intent=0,
-                d_k_now={},
-                effective_capacities={},
-                s_k_ewma={},
-                slots_per_worker_by_stage={},
-            )
-        )
-
-        assert donor.worker_id != "a-w0"
-        assert donor.worker_id in {"a-w1", "a-w2"}
-
-    def test_full_donor_pool_excluded_returns_none(self, base_kwargs: dict[str, Any]) -> None:
-        """When every donor stage's workers are excluded, no donor is selected."""
-        result = find_saturation_donor(
-            worker_ids_by_stage=[["a-w0", "a-w1", "a-w2"], ["b-w0"]],
-            excluded_worker_ids=frozenset({"a-w0", "a-w1", "a-w2"}),
-            **base_kwargs,
-            receiver_intent=0,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            slots_per_worker_by_stage={},
-        )
-
-        assert result is None
-
-    def test_none_excluded_set_includes_all_workers(self, base_kwargs: dict[str, Any]) -> None:
-        """``excluded_worker_ids=None`` matches the unfiltered contract; every worker is eligible."""
-        donor = _single_donor(
-            find_saturation_donor(
-                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-                excluded_worker_ids=None,
-                **base_kwargs,
-                receiver_intent=0,
-                d_k_now={},
-                effective_capacities={},
-                s_k_ewma={},
-                slots_per_worker_by_stage={},
-            )
-        )
-
-        # The youngest donor wins (a-w1 has age 1 vs a-w0 age 50).
-        assert donor.worker_id == "a-w1"
-
-    def test_excluded_does_not_bypass_floor(self, base_kwargs: dict[str, Any]) -> None:
-        """A stage at its floor is still ineligible regardless of the excluded set."""
-        # Floor of A is 1; A has only one worker -> not eligible to donate.
-        result = find_saturation_donor(
-            worker_ids_by_stage=[["a-w0"], ["b-w0"]],
-            excluded_worker_ids=frozenset(),
-            **base_kwargs,
-            receiver_intent=0,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            slots_per_worker_by_stage={},
-        )
-
-        assert result is None
-
-    def test_excluded_does_not_bypass_master_toggle(self, base_kwargs: dict[str, Any]) -> None:
-        """``enable_cross_stage_donor=False`` short-circuits before the excluded check."""
-        cfg = SaturationAwareConfig(
-            enable_cross_stage_donor=False,
-            stage_defaults=SaturationAwareStageConfig(
-                min_workers=1,
-                over_provisioned_streak_min_cycles=30,
-                worker_warmup_measurement_grace_s=0.0,
-                donor_warmup_grace_s=0.0,
-            ),
-        )
-        kwargs = dict(base_kwargs)
-        kwargs["config"] = cfg
-        kwargs["stage_configs"] = {"A": cfg.stage_defaults, "B": cfg.stage_defaults}
-
-        result = find_saturation_donor(
-            worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-            excluded_worker_ids=frozenset(),
-            **kwargs,
-            receiver_intent=0,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            slots_per_worker_by_stage={},
-        )
-
-        assert result is None
-
-
-class TestFloorDonorSelectionUnfiltered:
-    """``select_youngest_eligible_donor`` does NOT honour any excluded set.
-
-    Floor-mode donor selection is unconditional; deadlocking the
-    floor on warmup-protected donors is a worse failure mode than
-    killing a young donor because the floor is a hard structural
-    invariant.
-    """
-
-    def test_floor_donor_picks_warmup_worker_when_only_choice(self) -> None:
-        """Even a freshly-ready worker is fair game for floor enforcement."""
-        donor = _single_donor(
-            select_youngest_eligible_donor(
-                receiver_stage_index=1,
-                stage_floors={0: 1, 1: 1},
-                worker_ids_by_stage=[["a-w0", "a-w1"], ["b-w0"]],
-                worker_ages={"a-w0": 50, "a-w1": 0},  # a-w1 is brand new
-                worker_nodes={},
-                ctx=_AlwaysFeasibleCtx(),
-                max_plan_size=4,
-                max_plan_combinations=32,
-            )
-        )
-
-        # The youngest donor wins regardless of "warmup" status.
-        assert donor.worker_id == "a-w1"
-
-    def test_floor_donor_signature_has_no_excluded_param(self) -> None:
-        """Defensive: floor donor's call signature pins the contract.
-
-        The absence of an ``excluded_worker_ids`` parameter is the
-        contract: anyone adding one in the future would silently
-        change the floor invariant from "always pick the youngest"
-        to "pick the youngest non-warmup", which can deadlock the
-        floor on a slow-warming stage.
-        """
-        import inspect
-
-        sig = inspect.signature(select_youngest_eligible_donor)
-        assert "excluded_worker_ids" not in sig.parameters
-
-
 class TestSchedulerDonorWarmupExcludedCache:
-    """``SaturationAwareScheduler`` populates ``_donor_warmup_excluded_ids`` per cycle."""
+    """``SaturationAwareScheduler`` populates ``donor_warmup_excluded_ids`` per cycle."""
 
     def _scheduler(self, *, donor_grace_s: float = 60.0) -> SaturationAwareScheduler:
         """Build a one-stage scheduler with the requested donor grace."""
@@ -430,6 +169,7 @@ class TestSchedulerDonorWarmupExcludedCache:
         worker_ids: list[str],
         slots_per_worker: int = 8,
     ) -> data_structures.ProblemStageState:
+        """Build a ProblemStageState with one worker_group per worker_id."""
         worker_groups = [
             data_structures.ProblemWorkerGroupState.make(
                 wid,
@@ -458,7 +198,7 @@ class TestSchedulerDonorWarmupExcludedCache:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._donor_warmup_excluded_ids == frozenset({"hot-w0", "hot-w1", "hot-w2"})
+        assert scheduler.last_cycle.donor_warmup_excluded_ids == frozenset({"hot-w0", "hot-w1", "hot-w2"})
 
     def test_excluded_set_clears_after_grace_elapses(self) -> None:
         """All workers age past ``donor_warmup_grace_s`` -> empty excluded set."""
@@ -468,7 +208,7 @@ class TestSchedulerDonorWarmupExcludedCache:
         scheduler.autoscale(time=0.0, problem_state=ps)
         scheduler.autoscale(time=60.0, problem_state=ps)
 
-        assert scheduler._donor_warmup_excluded_ids == frozenset()
+        assert scheduler.last_cycle.donor_warmup_excluded_ids == frozenset()
 
     def test_mixed_age_excluded_set_contains_only_young_workers(self) -> None:
         """Workers added on a later cycle live in the excluded set; survivors do not."""
@@ -483,7 +223,7 @@ class TestSchedulerDonorWarmupExcludedCache:
 
         # hot-w0 first_seen=0, age=70 -> mature
         # hot-w1, hot-w2 first_seen=70, age=0 -> warmup
-        assert scheduler._donor_warmup_excluded_ids == frozenset({"hot-w1", "hot-w2"})
+        assert scheduler.last_cycle.donor_warmup_excluded_ids == frozenset({"hot-w1", "hot-w2"})
 
     def test_grace_zero_means_no_exclusion(self) -> None:
         """``donor_warmup_grace_s=0`` always returns an empty excluded set."""
@@ -492,14 +232,14 @@ class TestSchedulerDonorWarmupExcludedCache:
 
         scheduler.autoscale(time=0.0, problem_state=ps)
 
-        assert scheduler._donor_warmup_excluded_ids == frozenset()
+        assert scheduler.last_cycle.donor_warmup_excluded_ids == frozenset()
 
     def test_setup_resets_excluded_set(self) -> None:
-        """A fresh ``setup()`` clears the excluded-set cache."""
+        """A fresh ``setup()`` resets the most-recent cycle to the sentinel empty cycle."""
         scheduler = self._scheduler(donor_grace_s=60.0)
         ps = data_structures.ProblemState([self._stage_state_with_workers(name="hot", worker_ids=["hot-w0"])])
         scheduler.autoscale(time=0.0, problem_state=ps)
-        assert scheduler._donor_warmup_excluded_ids != frozenset()
+        assert scheduler.last_cycle.donor_warmup_excluded_ids != frozenset()
 
         cluster = resources.ClusterResources(
             nodes={
@@ -522,7 +262,12 @@ class TestSchedulerDonorWarmupExcludedCache:
             )
         )
 
-        assert scheduler._donor_warmup_excluded_ids == frozenset()
+        # ``setup()`` resets the most-recent-cycle observability hook;
+        # ``_last_cycle is None`` and the scheduler's own cycle counter
+        # resets to zero. The next ``autoscale()`` populates a fresh
+        # ``cycle.donor_warmup_excluded_ids`` from ``WarmupTracker``.
+        assert scheduler.last_cycle is None
+        assert scheduler.ledgers.cycle_counter == 0
 
 
 @pytest.mark.parametrize("grace_s", [10.0, 60.0, 180.0, 600.0])
@@ -580,12 +325,16 @@ class TestParametricDonorGraceBoundary:
         )
 
         scheduler.autoscale(time=0.0, problem_state=ps)
-        excluded_below = scheduler._build_donor_warmup_excluded_ids(
+        excluded_below = scheduler.ledgers.warmup.excluded_ids(
             [["hot-w0"]],
+            scheduler.pipeline.stage_names,
+            scheduler.pipeline.stage_config,
             now=grace_s - 1e-9,
         )
-        excluded_at = scheduler._build_donor_warmup_excluded_ids(
+        excluded_at = scheduler.ledgers.warmup.excluded_ids(
             [["hot-w0"]],
+            scheduler.pipeline.stage_names,
+            scheduler.pipeline.stage_config,
             now=grace_s,
         )
 
@@ -700,7 +449,7 @@ class TestPhaseDShrinkLogWarmupBranch:
           * floor=1 so floor would allow up to 3 removals; fraction
             cap=1.0 so fraction does not bind either.
           * Patched intent ``-2`` -> requested_remove=2, actual_remove=2.
-          * ``_donor_warmup_excluded_ids`` covers the entire pool ->
+          * ``donor_warmup_excluded_ids`` covers the entire pool ->
             ``select_workers_to_remove_oldest_first`` returns ``[]`` ->
             effective_remove=0.
 
@@ -715,7 +464,10 @@ class TestPhaseDShrinkLogWarmupBranch:
         scheduler = self._scheduler_with_warmup(donor_grace_s=60.0, min_workers=1)
         ps = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -2}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": -2},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
         warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
@@ -760,16 +512,25 @@ class TestPhaseDShrinkLogWarmupBranch:
         ps_full = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
 
         # Cycle 1: seed first-seen for w0, w1 only.
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": 0},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps_early)
         # Cycle 2: w2, w3 join. Their first_seen=70.
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": 0},
+        ):
             scheduler.autoscale(time=70.0, problem_state=ps_full)
         loguru_caplog.clear()
         # Cycle 3 at now=70 -> w0, w1 age=70 (mature), w2, w3 age=0 (warmup).
         # Intent -3 -> actual_remove=min(3, 4-1, 4)=3 -> helper excludes {w2, w3}
         # -> victims=[w0, w1] -> effective_remove=2 -> deficit=1.
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -3}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": -3},
+        ):
             scheduler.autoscale(time=70.0, problem_state=ps_full)
 
         warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
@@ -806,12 +567,18 @@ class TestPhaseDShrinkLogWarmupBranch:
         ps = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3"])
 
         # Cycle 1 seeds first-seen at 0.
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": 0},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps)
         loguru_caplog.clear()
         # Cycle 2 at now=120 -> all workers age=120 (mature, > 60s grace).
         # Intent -10 -> requested=10, actual=min(10, 4-2, 4*1.0)=2 -> deficit=8 (floor-bound).
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -10}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": -10},
+        ):
             scheduler.autoscale(time=120.0, problem_state=ps)
 
         warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]
@@ -852,12 +619,21 @@ class TestPhaseDShrinkLogWarmupBranch:
         ps_early = self._state_with_workers(worker_ids=["hot-w0", "hot-w1"])
         ps_full = self._state_with_workers(worker_ids=["hot-w0", "hot-w1", "hot-w2", "hot-w3", "hot-w4", "hot-w5"])
 
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": 0},
+        ):
             scheduler.autoscale(time=0.0, problem_state=ps_early)
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": 0}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": 0},
+        ):
             scheduler.autoscale(time=70.0, problem_state=ps_full)
         loguru_caplog.clear()
-        with patch.object(scheduler, "_compute_intent_deltas", return_value={"hot": -10}):
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            return_value={"hot": -10},
+        ):
             scheduler.autoscale(time=70.0, problem_state=ps_full)
 
         warmup_logs = [r for r in loguru_caplog.records if "donor warmup grace left" in r.message]

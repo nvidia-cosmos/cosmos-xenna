@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,64 +13,107 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration contracts for the donor planner that span Phase B and Phase C.
+
+"""Integration contracts for the donor coordinator that span Phase B and Phase C.
 
 Two architectural contracts live here:
 
-*   Multi-donor anti-flap accounting: ``_record_donation_success``
-    advances ``_last_donation_cycle`` for every **distinct** donor
+*   Multi-donor anti-flap accounting: ``SaturationPolicy.on_commit``
+    advances ``last_donation_cycle`` for every **distinct** donor
     stage in ``DonorPlan.removals``. The contract matters when a
     multi-worker plan draws workers from the same donor stage twice
     (the timestamp is set exactly once per stage) and when it draws
     from multiple distinct stages (every stage's timestamp advances
     in lock step).
-*   Phase B vs Phase C economic-gate split:
-    ``select_youngest_eligible_donor`` (Phase B floor) accepts a
-    donor that ``find_saturation_donor`` (Phase C saturation) would
-    reject on the signal-trust gate. Floor enforcement is non-
-    negotiable and bypasses every economic / trust gate; saturation
-    mode applies all of them.
+*   Floor vs Saturation policy asymmetry through
+    ``DonorCoordinator.acquire``: a donor that ``SaturationPolicy``
+    rejects on the signal-trust eligibility filter is still admitted
+    by ``FloorPolicy``. Floor enforcement is structural and bypasses
+    the trust / economic gates that saturation mode applies.
 
-Helper-level coverage of ``_resource_fit_plan``, the economic gate,
-the decision-log schema, mid-plan atomicity failures, and probe-vs-
-actual disagreements lives in ``test_donor_resource_fit.py``,
-``test_donor_economics.py``, ``test_saturation_aware_donor.py``,
-``test_saturation_aware_donor_saturation.py``, and
-``test_saturation_aware_allocation_error.py``; this file does not
-duplicate those.
+Helper-level coverage of ``ResourceFitPlanner``, the economic gate,
+and ``DonorCoordinator`` failure modes lives in
+``test_donor_resource_fit.py``, ``test_donor_economics.py``, and
+``test_donor_coordinator.py``; this file does not duplicate those.
 """
 
 import attrs
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.donor import (
-    DonorPlan,
-    DonorWorker,
-    find_saturation_donor,
-    select_youngest_eligible_donor,
+from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+from cosmos_xenna.pipelines.private.scheduling_py.donor.economic_gate import EconomicGate
+from cosmos_xenna.pipelines.private.scheduling_py.donor.planning_context import DonorPlanningContext
+from cosmos_xenna.pipelines.private.scheduling_py.donor.policy import FloorPolicy, SaturationPolicy
+from cosmos_xenna.pipelines.private.scheduling_py.donor.resource_fit import ResourceFitPlanner
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker, RejectReason
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import StageCycleView
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
+    GrowthMode,
+    GrowthState,
+    StageRuntimeState,
+    StageState,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.state import GrowthMode, StageState, _StageRuntimeState
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
+
+
+def _saturation_policy(config: SaturationAwareConfig | None = None) -> SaturationPolicy:
+    """Build a ``SaturationPolicy`` with an injected economic gate.
+
+    Mirrors the helper in ``test_donor_policy.py`` so the
+    integration tests build the policy through the same path as
+    the unit tests; the production scheduler wires the gate in
+    ``setup()``.
+
+    """
+    return SaturationPolicy(gate=EconomicGate(config=config if config is not None else SaturationAwareConfig()))
+
+
+def _coordinator() -> DonorCoordinator:
+    """Build a default-bounded coordinator for the integration tests.
+
+    Generous search bounds keep the tests focused on the policy
+    asymmetry and on-commit accounting; the production scheduler
+    configures these bounds in ``setup()``.
+
+    """
+    return DonorCoordinator(planner=ResourceFitPlanner(max_plan_size=4, max_plan_combinations=32))
 
 
 @attrs.frozen
 class _AlwaysFeasibleProbeResult:
+    """Probe stub that always reports the candidate plan as feasible."""
+
     feasible: bool = True
     reject_reason: str = ""
 
 
 @attrs.define
 class _AlwaysFeasibleCtx:
-    """Fake autoscale planner context whose probe always reports feasible."""
+    """Fake autoscale planner context for unit-level coordinator integration.
+
+    ``probe_add_after_removals`` returns feasible unconditionally so
+    the commit-time probe never blocks the test. ``remove_workers_atomically``
+    is a noop returning True so ``DonorTransaction.commit`` reaches
+    the success branch and the coordinator invokes
+    ``policy.on_commit``.
+
+    """
 
     def probe_add_after_removals(
         self,
         removals: list[tuple[int, str]],
         add_stage_index: int,
     ) -> _AlwaysFeasibleProbeResult:
+        """Always-feasible probe stub; the coordinator never sees a probe rejection."""
         del removals, add_stage_index
         return _AlwaysFeasibleProbeResult()
+
+    def remove_workers_atomically(self, removals: list[tuple[int, str]]) -> bool:
+        """Atomic-remove stub; the coordinator never sees a removal failure."""
+        del removals
+        return True
 
 
 def _cluster(*, total_cpus_per_node: int = 4) -> resources.ClusterResources:
@@ -106,25 +149,12 @@ def _problem(stage_names: list[str]) -> data_structures.Problem:
     )
 
 
-def _over_provisioned_state(name: str, *, streak: int = 30) -> _StageRuntimeState:
-    """Runtime state representing a steady OVER_PROVISIONED stage."""
-    return _StageRuntimeState(
-        stage_name=name,
-        classifier_state=StageState.OVER_PROVISIONED,
-        classifier_streak=streak,
-        growth_mode=GrowthMode.TRACKING,
-        growth_streak=10,
-    )
-
-
-def _saturated_state(name: str, *, streak: int = 99) -> _StageRuntimeState:
+def _saturated_state(name: str, *, streak: int = 99) -> StageRuntimeState:
     """Runtime state representing a steady SATURATED stage."""
-    return _StageRuntimeState(
+    return StageRuntimeState(
         stage_name=name,
-        classifier_state=StageState.SATURATED,
-        classifier_streak=streak,
-        growth_mode=GrowthMode.TRACKING,
-        growth_streak=10,
+        classifier=ClassifierState(state=StageState.SATURATED, streak=streak),
+        growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
     )
 
 
@@ -147,14 +177,44 @@ def _config(**overrides: object) -> SaturationAwareConfig:
     return SaturationAwareConfig(**base)  # type: ignore[arg-type]
 
 
-class TestRecordDonationSuccessAntiFlapPerDistinctStage:
-    """``_record_donation_success`` advances ``_last_donation_cycle`` for every distinct donor stage."""
+def _make_donor_context(scheduler: SaturationAwareScheduler, stage_names: list[str]) -> DonorPlanningContext:
+    """Build a minimal ``DonorPlanningContext`` bound to the scheduler's live ledger.
+
+    Carries only the fields ``SaturationPolicy.on_commit`` consults:
+    the stage-name tuple (for the stage_index -> name translation)
+    and the live ``last_donation_cycle`` reference so the policy's
+    in-place mutation flows back to the scheduler's cross-cycle
+    ledger. Other planning-context fields default to empty;
+    on_commit does not read them.
+
+    """
+    return DonorPlanningContext(
+        stage_names=tuple(stage_names),
+        stage_configs={},
+        stage_states={},
+        stage_floors={},
+        worker_ids_by_stage=(),
+        worker_ages={},
+        worker_node_map={},
+        d_k_now={},
+        effective_capacities={},
+        s_k_ewma={},
+        slots_per_worker_by_stage={},
+        donor_warmup_exclusions=frozenset(),
+        cycle_counter=scheduler.ledgers.cycle_counter,
+        last_donation_cycle=scheduler.ledgers.last_donation_cycle,
+        config=scheduler._config,
+    )
+
+
+class TestSaturationPolicyOnCommitAntiFlapPerDistinctStage:
+    """``SaturationPolicy.on_commit`` advances ``last_donation_cycle`` for every distinct donor stage."""
 
     def test_two_workers_from_same_stage_advance_one_timestamp(self) -> None:
         """Two removals from the same donor stage produce one ledger entry, not two."""
         scheduler = SaturationAwareScheduler(_config())
         scheduler.setup(_problem(["A", "B", "C"]))
-        scheduler._cycle_counter = 7
+        scheduler.ledgers.cycle_counter = 7
         plan = DonorPlan(
             removals=(
                 DonorWorker(stage_index=0, worker_id="A-w0", age=1),
@@ -163,15 +223,15 @@ class TestRecordDonationSuccessAntiFlapPerDistinctStage:
             receiver_stage_index=2,
         )
 
-        scheduler._record_donation_success(plan=plan)
+        _saturation_policy().on_commit(plan, _make_donor_context(scheduler, ["A", "B", "C"]))
 
-        assert scheduler._last_donation_cycle == {"A": 7}
+        assert scheduler.ledgers.last_donation_cycle == {"A": 7}
 
     def test_two_workers_from_distinct_stages_advance_each_timestamp(self) -> None:
         """A multi-stage plan timestamps every distinct donor stage at the current cycle."""
         scheduler = SaturationAwareScheduler(_config())
         scheduler.setup(_problem(["A", "B", "C"]))
-        scheduler._cycle_counter = 11
+        scheduler.ledgers.cycle_counter = 11
         plan = DonorPlan(
             removals=(
                 DonorWorker(stage_index=0, worker_id="A-w0", age=1),
@@ -180,38 +240,40 @@ class TestRecordDonationSuccessAntiFlapPerDistinctStage:
             receiver_stage_index=2,
         )
 
-        scheduler._record_donation_success(plan=plan)
+        _saturation_policy().on_commit(plan, _make_donor_context(scheduler, ["A", "B", "C"]))
 
-        assert scheduler._last_donation_cycle == {"A": 11, "B": 11}
+        assert scheduler.ledgers.last_donation_cycle == {"A": 11, "B": 11}
 
 
-class TestPhaseBFloorBypassesSignalTrust:
-    """Floor mode (Phase B) admits donors that saturation mode rejects on signal-trust.
+class TestPolicyAsymmetryFloorBypassesSignalTrust:
+    """Floor mode admits a donor that saturation mode rejects on the signal-trust filter.
 
-    Pins the architectural contract that
-    ``select_youngest_eligible_donor`` does not consult the
-    signal-trust / spread / throughput / donor-flip / balance gates;
-    floor enforcement is non-negotiable. ``find_saturation_donor``
-    on the same input rejects because the donor's clamped streak
-    fails the ``cross_stage_donor_min_trust`` threshold.
+    Pins the architectural contract that ``FloorPolicy.filter_eligible_donors``
+    does NOT consult the signal-trust gate; floor enforcement is
+    structural. The same donor pool is rejected by
+    ``SaturationPolicy`` because ``SaturationPolicy.filter_eligible_donors``
+    drops donors whose ``signal_trust < cross_stage_donor_min_trust``.
+    The asymmetry is observed end-to-end through ``DonorCoordinator.acquire``:
+    one policy returns ``NO_CANDIDATES``, the other returns a
+    committed plan.
+
     """
 
     def test_low_trust_donor_rejected_by_saturation_admitted_by_floor(self) -> None:
-        """The same donor pool yields ``None`` for saturation mode and a plan for floor mode."""
+        """Same donor pool: saturation -> NO_CANDIDATES, floor -> committed plan."""
         # Donor A has classifier_streak=3 (clears the layer-1
         # over_provisioned + streak gate) and noise_ewma=0 ->
         # signal_trust = min(3, 60) / (1 + 0) = 3.0. Configure
         # ``cross_stage_donor_min_trust=10.0`` so saturation mode
-        # rejects on layer 4 specifically. Floor mode does not consult
-        # the trust gate; it must still admit A.
+        # drops A on the eligibility filter. Floor mode does not
+        # consult the trust gate; it must still admit A.
         config = _config(cross_stage_donor_min_trust=10.0)
+        stage_names = ["A", "B"]
         stage_states = {
-            "A": _StageRuntimeState(
+            "A": StageRuntimeState(
                 stage_name="A",
-                classifier_state=StageState.OVER_PROVISIONED,
-                classifier_streak=3,  # trust = 3.0; below min_trust = 10.0.
-                growth_mode=GrowthMode.TRACKING,
-                growth_streak=10,
+                classifier=ClassifierState(state=StageState.OVER_PROVISIONED, streak=3),
+                growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
             ),
             "B": _saturated_state("B"),
         }
@@ -225,46 +287,67 @@ class TestPhaseBFloorBypassesSignalTrust:
                 worker_warmup_measurement_grace_s=0.0,
                 donor_warmup_grace_s=0.0,
             )
-            for name in ("A", "B")
+            for name in stage_names
         }
 
-        # Saturation mode rejects on signal-trust.
-        saturation_decision = find_saturation_donor(
-            receiver_stage_index=1,
-            receiver_stage_name="B",
-            stage_names=["A", "B"],
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            worker_nodes={},
-            stage_states=stage_states,
-            config=config,
-            stage_configs=stage_configs,
-            cycle=100,
-            last_donation_cycle={},
-            ctx=_AlwaysFeasibleCtx(),  # type: ignore[arg-type]
+        # Shared planning context. ``last_donation_cycle`` is the
+        # only mutable field; the saturation path may write to it on
+        # commit, the floor path leaves it alone.
+        last_donation_cycle: dict[str, int] = {}
+        receiver_view = StageCycleView(
+            stage_index=1,
+            stage_name="B",
+            runtime_state=stage_states["B"],
+            current_workers=1,
+        )
+        ctx = _AlwaysFeasibleCtx()
+        coordinator = _coordinator()
+
+        def _build_context(*, exclude_warmup: bool = False) -> DonorPlanningContext:
+            return DonorPlanningContext(
+                stage_names=tuple(stage_names),
+                stage_configs=stage_configs,
+                stage_states=stage_states,
+                stage_floors={0: 1, 1: 1},
+                worker_ids_by_stage=(("A-w0", "A-w1"), ("B-w0",)),
+                worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
+                worker_node_map={},
+                d_k_now={},
+                effective_capacities={},
+                s_k_ewma={},
+                slots_per_worker_by_stage={},
+                donor_warmup_exclusions=frozenset(),
+                cycle_counter=100,
+                last_donation_cycle=last_donation_cycle,
+                config=config,
+            )
+
+        # Saturation mode drops the low-trust donor from eligibility
+        # so no candidates remain.
+        saturation_result = coordinator.acquire(
+            policy=_saturation_policy(config),
+            context=_build_context(),
+            receiver_view=receiver_view,
             receiver_intent=1,
-            d_k_now={},
-            effective_capacities={},
-            s_k_ewma={},
-            slots_per_worker_by_stage={},
+            ctx=ctx,  # type: ignore[arg-type]
         )
 
-        assert saturation_decision is None, "Saturation mode must reject the low-trust donor on the signal-trust gate"
-
-        # Floor mode admits the same donor on the same pool.
-        floor_plan = select_youngest_eligible_donor(
-            receiver_stage_index=1,
-            stage_floors={0: 1, 1: 1},
-            worker_ids_by_stage=[["A-w0", "A-w1"], ["B-w0"]],
-            worker_ages={"A-w0": 5, "A-w1": 3, "B-w0": 2},
-            worker_nodes={},
-            ctx=_AlwaysFeasibleCtx(),  # type: ignore[arg-type]
-            max_plan_size=4,
-            max_plan_combinations=32,
+        assert saturation_result.committed is False
+        assert saturation_result.reject_reason is RejectReason.NO_CANDIDATES, (
+            "Saturation mode must reject the low-trust donor on the eligibility filter"
         )
 
-        assert floor_plan is not None, (
+        # Floor mode admits the same donor and commits the plan.
+        floor_result = coordinator.acquire(
+            policy=FloorPolicy(),
+            context=_build_context(),
+            receiver_view=receiver_view,
+            receiver_intent=1,
+            ctx=ctx,  # type: ignore[arg-type]
+        )
+
+        assert floor_result.committed is True, (
             "Floor mode must admit the same donor; signal-trust does not gate floor enforcement"
         )
-        assert floor_plan.removals[0].stage_index == 0
+        assert floor_result.plan is not None
+        assert floor_result.plan.removals[0].stage_index == 0

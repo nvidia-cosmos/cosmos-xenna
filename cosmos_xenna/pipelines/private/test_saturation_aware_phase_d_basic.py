@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"""Tests for ``SaturationAwareScheduler._run_phase_d_shrink``.
+"""Tests for the saturation-aware Phase D shrink entry point (``phases.phase_d.run``).
 
 Phase D applies negative intent deltas as planner removes via
 ``ctx.try_remove_worker``. Selection is consolidation-first
@@ -43,8 +43,11 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.invariants import PhaseBoundary
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.invariants.checks import PhaseBoundary
+from cosmos_xenna.pipelines.private.scheduling_py.phases.grow.grow_phase import SaturationGrowPhase
+from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.shrink_phase import SaturationShrinkPhase
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import AutoscaleCycle
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 from cosmos_xenna.pipelines.private.streaming import Autoscaler
 from cosmos_xenna.ray_utils import actor_pool
@@ -339,7 +342,10 @@ def _autoscale_with_intents(
     intents: dict[str, int],
 ) -> data_structures.Solution:
     """Run autoscale with injected signed intent deltas."""
-    with patch.object(scheduler, "_compute_intent_deltas", return_value=dict(intents)):
+    with patch(
+        "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+        return_value=dict(intents),
+    ):
         return scheduler.autoscale(time=0.0, problem_state=state)
 
 
@@ -463,7 +469,7 @@ class TestPhaseDScaleDownContract:
     def test_oldest_workers_are_deleted_before_younger_workers(self) -> None:
         """Worker age decides deletion order before the worker-id tiebreaker."""
         scheduler, _ = _problem([("A", None)])
-        scheduler._worker_ages = {
+        scheduler.ledgers.worker_ages = {
             "young": 0,
             "old": 10,
             "middle": 5,
@@ -525,7 +531,7 @@ class TestPhaseDScaleDownContract:
 
         def _record_phase(**kwargs: object) -> None:
             phase_name = cast(PhaseBoundary, kwargs["phase_name"])
-            if phase_name is PhaseBoundary.PHASE_D:
+            if phase_name is PhaseBoundary.SHRINK:
                 ctx = cast(data_structures.AutoscalePlanContext, kwargs["ctx"])
                 assert ctx.pending_remove_count(0) == 1
             call_order.append(phase_name)
@@ -533,20 +539,25 @@ class TestPhaseDScaleDownContract:
         def _record_solution_shape(**_kwargs: object) -> None:
             call_order.append("solution_shape")
 
+        # ``check_invariants_after_phase`` is bound on the runner-driven
+        # ``PhaseInvariantSuite`` (see ``phase_invariants.py``); a single
+        # patch covers every per-phase boundary call. The recorder
+        # appends ``kwargs['phase_name']`` so the canonical phase order
+        # observed by the runner is reconstructible from ``call_order``.
         with (
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_invariants_after_phase",
+                "cosmos_xenna.pipelines.private.scheduling_py.invariants.suite.check_invariants_after_phase",
                 side_effect=_record_phase,
             ),
             patch(
-                "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.check_solution_shape",
+                "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer.check_solution_shape",
                 side_effect=_record_solution_shape,
             ),
         ):
             _autoscale_with_intents(scheduler, state, {"A": -1})
 
-        assert PhaseBoundary.PHASE_D in call_order
-        assert call_order.index(PhaseBoundary.PHASE_D) < call_order.index("solution_shape")
+        assert PhaseBoundary.SHRINK in call_order
+        assert call_order.index(PhaseBoundary.SHRINK) < call_order.index("solution_shape")
 
     def test_idle_worker_is_selected_before_busy_worker(self) -> None:
         """Idle workers are removed before busy workers regardless of age.
@@ -582,7 +593,7 @@ class TestPhaseDScaleDownContract:
     def test_unready_zero_signal_is_eligible_for_idle_first_shrink(self) -> None:
         """Current policy treats a not-yet-ready worker-group signal as idle."""
         scheduler, _ = _problem([("A", None)])
-        scheduler._worker_ages = {"busy-old": 100, "unready-new": 0}
+        scheduler.ledgers.worker_ages = {"busy-old": 100, "unready-new": 0}
         state = _problem_state(
             [("A", ["busy-old", "unready-new"], False)],
             worker_used_slots={"busy-old": 1, "unready-new": 0},
@@ -1053,7 +1064,7 @@ class TestPhaseDConsolidationTiebreak:
     def test_cpu_only_stage_falls_back_to_idle_age_id_ordering(self) -> None:
         """A CPU-only stage has no GPU footprint; consolidation degrades to the prior 3-key sort."""
         scheduler, _ = _problem([("A", None)])
-        scheduler._worker_ages = {"A-w0": 100, "A-w1": 50, "A-w2": 1}
+        scheduler.ledgers.worker_ages = {"A-w0": 100, "A-w1": 50, "A-w2": 1}
         state = _problem_state([("A", ["A-w0", "A-w1", "A-w2"], False)])
 
         solution = _autoscale_with_intents(scheduler, state, {"A": -2})
@@ -1066,7 +1077,7 @@ class TestPhaseDConsolidationTiebreak:
     def test_equal_gpu_fraction_falls_back_to_idle_age_id(self) -> None:
         """When every actor sees the same GPU fraction, the secondary keys decide."""
         scheduler, _ = _gpu_problem([("A", None)])
-        scheduler._worker_ages = {"A-young": 1, "A-mid": 5, "A-old": 50}
+        scheduler.ledgers.worker_ages = {"A-young": 1, "A-mid": 5, "A-old": 50}
         # All three workers on GPUs with the same total fraction. The secondary
         # idle/age/id key picks the oldest of the three for deletion.
         state = _gpu_problem_state(
@@ -1483,7 +1494,7 @@ class TestBottleneckShrinkProtection:
     @staticmethod
     def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
         """Pre-populate intrinsic ``S_k`` EWMA so identify_bottleneck engages with caption as argmax."""
-        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        scheduler.ledgers.s_k_ewma.set_many({"download": 0.5, "caption": 4.0, "write": 0.5})
 
     def test_engaged_bottleneck_with_negative_intent_is_not_shrunk(self) -> None:
         """Toggle ON, engaged, intent<0, no ceiling overflow -> stage NOT shrunk."""
@@ -1507,7 +1518,7 @@ class TestBottleneckShrinkProtection:
             {"download": 0, "caption": -2, "write": 0},
         )
 
-        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_stage_index = list(scheduler.pipeline.stage_names).index("caption")
         deleted = [w.id for w in solution.stages[caption_stage_index].deleted_workers]
         assert deleted == [], "engaged bottleneck must not shrink on transient idle"
 
@@ -1533,7 +1544,7 @@ class TestBottleneckShrinkProtection:
             {"download": -2, "caption": -2, "write": 0},
         )
 
-        download_stage_index = scheduler._stage_names.index("download")
+        download_stage_index = list(scheduler.pipeline.stage_names).index("download")
         download_deleted = solution.stages[download_stage_index].deleted_workers
         assert len(download_deleted) == 2, "non-bottleneck stage should still shrink"
 
@@ -1559,7 +1570,7 @@ class TestBottleneckShrinkProtection:
             {"download": 0, "caption": -2, "write": 0},
         )
 
-        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_stage_index = list(scheduler.pipeline.stage_names).index("caption")
         caption_deleted = solution.stages[caption_stage_index].deleted_workers
         assert len(caption_deleted) == 2, "toggle off -> protection skipped, shrink applied"
 
@@ -1587,7 +1598,7 @@ class TestBottleneckShrinkProtection:
             {"download": 0, "caption": 0, "write": 0},
         )
 
-        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_stage_index = list(scheduler.pipeline.stage_names).index("caption")
         caption_deleted = solution.stages[caption_stage_index].deleted_workers
         assert len(caption_deleted) == 2, "ceiling overflow forces shrink even on bottleneck"
 
@@ -1613,7 +1624,7 @@ class TestBottleneckShrinkProtection:
             {"download": 0, "caption": -2, "write": 0},
         )
 
-        caption_stage_index = scheduler._stage_names.index("caption")
+        caption_stage_index = list(scheduler.pipeline.stage_names).index("caption")
         caption_deleted = solution.stages[caption_stage_index].deleted_workers
         assert len(caption_deleted) == 2, "cold-start disengaged -> shrink proceeds"
 
@@ -1643,7 +1654,7 @@ class TestBottleneckShrinkProtectionLogDebounce:
     @staticmethod
     def _engage_bottleneck(scheduler: SaturationAwareScheduler) -> None:
         """Pre-populate intrinsic ``S_k`` EWMA so identify_bottleneck engages with caption as argmax."""
-        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        scheduler.ledgers.s_k_ewma.set_many({"download": 0.5, "caption": 4.0, "write": 0.5})
 
     def _scheduler_with_protection_on(self) -> SaturationAwareScheduler:
         scheduler, _problem_obj = _problem(
@@ -1720,47 +1731,60 @@ class TestBottleneckShrinkProtectionLogDebounce:
         )
 
     def test_setup_resets_protection_ledger(self) -> None:
-        """``setup()`` clears ``_bottleneck_protected_stages_logged``."""
+        """``setup()`` clears ``protected_stages_previous_cycle``."""
         scheduler = self._scheduler_with_protection_on()
-        scheduler._bottleneck_protected_stages_logged = {"caption", "stale_stage"}
+        scheduler.runner.shrink_services.bottleneck_protection.replace_snapshot({"caption", "stale_stage"})
 
-        scheduler.setup(scheduler._problem)  # type: ignore[arg-type]
+        captured_problem = scheduler.pipeline.problem
+        scheduler.setup(captured_problem)
 
-        assert scheduler._bottleneck_protected_stages_logged == set(), (
+        assert scheduler.runner.shrink_services.bottleneck_protection.previous_cycle == set(), (
             "setup() must clear the protection ledger so a recycled scheduler emits a fresh log"
         )
 
 
 class TestPhaseCDDefensiveAssertion:
-    """Phase C / Phase D refuse to run before the bottleneck calc block populates ``_last_bottleneck_meta``."""
+    """Phase C / Phase D refuse to run before the bottleneck phase populates ``cycle.bottleneck``."""
 
     def test_phase_c_raises_on_unpopulated_meta(self) -> None:
-        """Calling ``_run_phase_c_grow`` directly with a None meta raises a clear ``RuntimeError``."""
+        """Calling ``phase_c.run`` with a cycle whose ``bottleneck`` is unset raises ``AttributeError``."""
         scheduler, problem_obj = _problem(
             [("A", None)],
             cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
             total_cpus=8,
         )
-        scheduler._last_bottleneck_meta = None
         ps = _problem_state([("A", ["A-w0"], False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem_obj, ps)
+        cycle = AutoscaleCycle(
+            ctx=ctx,
+            problem_state=ps,
+            time=0.0,
+            cycle_counter=1,
+            pipeline_name="test",
+        )
 
-        with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase C"):
-            scheduler._run_phase_c_grow(ctx, ps)
+        with pytest.raises(AttributeError):
+            SaturationGrowPhase().run(cycle, scheduler.runner.grow_services)
 
     def test_phase_d_raises_on_unpopulated_meta(self) -> None:
-        """Calling ``_run_phase_d_shrink`` directly with a None meta raises a clear ``RuntimeError``."""
+        """``SaturationShrinkPhase.run`` raises ``AttributeError`` when ``cycle.bottleneck`` is unset."""
         scheduler, problem_obj = _problem(
             [("A", None)],
             cfg=SaturationAwareConfig(floor_stuck_grace_cycles=0),
             total_cpus=8,
         )
-        scheduler._last_bottleneck_meta = None
         ps = _problem_state([("A", ["A-w0"], False)])
         ctx = data_structures.AutoscalePlanContext.from_problem_state(problem_obj, ps)
+        cycle = AutoscaleCycle(
+            ctx=ctx,
+            problem_state=ps,
+            time=0.0,
+            cycle_counter=1,
+            pipeline_name="test",
+        )
 
-        with pytest.raises(RuntimeError, match="bottleneck calc block must run before phase D"):
-            scheduler._run_phase_d_shrink(ctx, ps)
+        with pytest.raises(AttributeError):
+            SaturationShrinkPhase().run(cycle, scheduler.runner.shrink_services)
 
 
 class TestBottleneckEngagementLogToggleGate:
@@ -1784,11 +1808,11 @@ class TestBottleneckEngagementLogToggleGate:
 
     @staticmethod
     def _set_disengaged_homogeneous(scheduler: SaturationAwareScheduler) -> None:
-        scheduler._s_k_ewma = {"download": 1.0, "caption": 1.0, "write": 1.0}
+        scheduler.ledgers.s_k_ewma.set_many({"download": 1.0, "caption": 1.0, "write": 1.0})
 
     @staticmethod
     def _set_engaged_heterogeneous(scheduler: SaturationAwareScheduler) -> None:
-        scheduler._s_k_ewma = {"download": 0.5, "caption": 4.0, "write": 0.5}
+        scheduler.ledgers.s_k_ewma.set_many({"download": 0.5, "caption": 4.0, "write": 0.5})
 
     def _drive_engagement_transition(self, scheduler: SaturationAwareScheduler) -> None:
         """Run two cycles: cycle 1 disengaged, cycle 2 engaged.

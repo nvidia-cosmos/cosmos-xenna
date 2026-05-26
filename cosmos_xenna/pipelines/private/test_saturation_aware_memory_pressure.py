@@ -32,7 +32,7 @@ intent is frozen for the cycle. The pinned contract:
     ``memory_pressure_polling_interval_s`` (default ``5.0`` s) so
     the per-cycle hot path makes at most one Ray API call per
     polling window.
-  * A Ray API failure degrades gracefully -- the gate assumes
+  * A Ray API failure degrades gracefully - the gate assumes
     pressure inactive, emits one WARN, and Phase C runs as if no
     gate were configured.
   * ``setup()`` clears the cached monitor state so a re-setup
@@ -48,11 +48,16 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
-MEMORY_PRESSURE_MODULE = "cosmos_xenna.pipelines.private.scheduling_py.memory_pressure"
-SATURATION_AWARE_MODULE = "cosmos_xenna.pipelines.private.scheduling_py.saturation_aware"
+MEMORY_PRESSURE_MODULE = "cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure"
+SATURATION_AWARE_MODULE = "cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware"
+# The preflight builder pre-computes ``cycle.is_memory_pressure_active``
+# via ``time.monotonic()`` (aliased as ``_time``); deterministic clock
+# injection targets this module since Phase C now reads the precomputed
+# flag instead of re-evaluating the monitor.
+PREFLIGHT_MODULE = "cosmos_xenna.pipelines.private.scheduling_py.lifecycle.preflight"
 
 
 @pytest.fixture
@@ -214,13 +219,16 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=5.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 3},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert solution.stages[0].new_workers == []
-        assert scheduler._memory_pressure_monitor.last_pressure_active is True
-        assert scheduler._memory_pressure_monitor.last_used_fraction == pytest.approx(0.95)
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is True
+        assert scheduler.ledgers.memory_pressure.last_used_fraction == pytest.approx(0.95)
 
     def test_low_pressure_runs_phase_c_normally(self) -> None:
         """``used_fraction=0.20 < threshold=0.85`` -> Phase C grows, gauge inactive."""
@@ -229,13 +237,16 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=80.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 3},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(solution.stages[0].new_workers) == 3
-        assert scheduler._memory_pressure_monitor.last_pressure_active is False
-        assert scheduler._memory_pressure_monitor.last_used_fraction == pytest.approx(0.20)
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is False
+        assert scheduler.ledgers.memory_pressure.last_used_fraction == pytest.approx(0.20)
 
     def test_floor_unaffected_by_pressure(self) -> None:
         """Below-floor stage gains a worker via Phase B even under high memory pressure."""
@@ -244,13 +255,16 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=5.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 0},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(solution.stages[0].new_workers) == 1
         assert solution.stages[0].deleted_workers == []
-        assert scheduler._memory_pressure_monitor.last_pressure_active is True
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is True
 
     def test_phase_d_shrink_unaffected_by_pressure(self) -> None:
         """Negative intent under high pressure still removes a worker via Phase D."""
@@ -259,13 +273,16 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=5.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": -1}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": -1},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert solution.stages[0].new_workers == []
         assert len(solution.stages[0].deleted_workers) == 1
-        assert scheduler._memory_pressure_monitor.last_pressure_active is True
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is True
 
     def test_polling_failure_degrades_gracefully(
         self,
@@ -285,14 +302,17 @@ class TestMemoryPressureGate:
                 f"{MEMORY_PRESSURE_MODULE}.ray.available_resources",
                 return_value={"object_store_memory": 5.0},
             ),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 3},
+            ),
         ):
             solution_first = scheduler.autoscale(time=0.0, problem_state=ps)
 
         warn_records = [r for r in loguru_caplog.records if "memory pressure gate: failed to query" in r.message]
         assert len(warn_records) == 1
         assert warn_records[0].levelno == logging.WARNING
-        assert scheduler._memory_pressure_monitor.last_pressure_active is False
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is False
         assert len(solution_first.stages[0].new_workers) == 3
 
     def test_ray_not_initialized_degrades_silently(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
@@ -304,13 +324,16 @@ class TestMemoryPressureGate:
             patch(f"{MEMORY_PRESSURE_MODULE}.ray.is_initialized", return_value=False),
             patch(f"{MEMORY_PRESSURE_MODULE}.ray.cluster_resources") as cluster_mock,
             patch(f"{MEMORY_PRESSURE_MODULE}.ray.available_resources") as available_mock,
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 3},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(solution.stages[0].new_workers) == 3
-        assert scheduler._memory_pressure_monitor.last_pressure_active is False
-        assert scheduler._memory_pressure_monitor.last_used_fraction == 0.0
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is False
+        assert scheduler.ledgers.memory_pressure.last_used_fraction == 0.0
         cluster_mock.assert_not_called()
         available_mock.assert_not_called()
         assert "memory pressure gate: failed to query" not in loguru_caplog.text
@@ -322,13 +345,16 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=0.0, available=0.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 3}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 3},
+            ),
         ):
             solution = scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert len(solution.stages[0].new_workers) == 3
-        assert scheduler._memory_pressure_monitor.last_pressure_active is False
-        assert scheduler._memory_pressure_monitor.last_used_fraction == 0.0
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is False
+        assert scheduler.ledgers.memory_pressure.last_used_fraction == 0.0
 
     def test_pressure_clear_emits_recovery_log(self, loguru_caplog: pytest.LogCaptureFixture) -> None:
         """Active pressure followed by a fresh low-pressure poll logs a single recovery INFO."""
@@ -348,14 +374,17 @@ class TestMemoryPressureGate:
                     {"object_store_memory": 80.0},
                 ],
             ),
-            patch(f"{SATURATION_AWARE_MODULE}.time.monotonic", side_effect=[0.0, 6.0]),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}),
+            patch(f"{PREFLIGHT_MODULE}._time.monotonic", side_effect=[0.0, 6.0]),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 0},
+            ),
         ):
             scheduler.autoscale(time=0.0, problem_state=ps)
             scheduler.autoscale(time=6.0, problem_state=ps)
 
-        assert scheduler._memory_pressure_monitor.last_pressure_active is False
-        assert scheduler._memory_pressure_monitor.last_used_fraction == pytest.approx(0.20)
+        assert scheduler.ledgers.memory_pressure.last_pressure_active is False
+        assert scheduler.ledgers.memory_pressure.last_used_fraction == pytest.approx(0.20)
         clear_records = [r for r in loguru_caplog.records if "memory pressure gate: CLEARED" in r.message]
         assert len(clear_records) == 1
         assert clear_records[0].levelno == logging.INFO
@@ -367,9 +396,12 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=50.0) as ray_patch,
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}),
             patch(
-                f"{SATURATION_AWARE_MODULE}.time.monotonic",
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 0},
+            ),
+            patch(
+                f"{PREFLIGHT_MODULE}._time.monotonic",
                 side_effect=[0.0, 2.0, 6.0],
             ),
         ):
@@ -379,7 +411,7 @@ class TestMemoryPressureGate:
 
         assert ray_patch.cluster_mock.call_count == 2
         assert ray_patch.available_mock.call_count == 2
-        assert scheduler._memory_pressure_monitor.poll_count == 2
+        assert scheduler.ledgers.memory_pressure.poll_count == 2
 
     def test_setup_resets_monitor_state(self) -> None:
         """A re-``setup()`` clears the cached pressure state."""
@@ -388,11 +420,14 @@ class TestMemoryPressureGate:
 
         with (
             _patch_ray_resources(total=100.0, available=5.0),
-            patch.object(scheduler, "_compute_intent_deltas", return_value={"stage": 0}),
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 0},
+            ),
         ):
             scheduler.autoscale(time=0.0, problem_state=ps)
 
-        monitor = scheduler._memory_pressure_monitor
+        monitor = scheduler.ledgers.memory_pressure
         before_active = monitor.last_pressure_active
         before_poll_at = monitor.last_poll_at
         before_used_fraction = monitor.last_used_fraction
@@ -423,7 +458,7 @@ class TestMemoryPressureGate:
         # one must not silently leave this test asserting on the
         # pre-setup object. Re-resolving the attribute keeps the
         # assertion targeting whatever monitor is live after setup.
-        monitor = scheduler._memory_pressure_monitor
+        monitor = scheduler.ledgers.memory_pressure
         after_active = monitor.last_pressure_active
         after_poll_at = monitor.last_poll_at
         after_used_fraction = monitor.last_used_fraction
@@ -435,7 +470,7 @@ class TestMemoryPressureGate:
 
     def test_reset_drives_gauges_to_cleared_defaults(self) -> None:
         """``reset()`` writes 0.0 to both gauges so a scrape between reset and the next poll sees the cleared state."""
-        from cosmos_xenna.pipelines.private.scheduling_py.memory_pressure import MemoryPressureMonitor
+        from cosmos_xenna.pipelines.private.scheduling_py.cluster.memory_pressure import MemoryPressureMonitor
 
         monitor = MemoryPressureMonitor(
             polling_interval_s=5.0,

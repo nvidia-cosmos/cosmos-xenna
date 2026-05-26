@@ -36,7 +36,7 @@ choice:
   * ``input_queue_depth`` flows into the classifier as a pre-batch
     task count without unit conversion.
 
-Tests build ``_StageRuntimeState`` directly via the
+Tests build ``StageRuntimeState`` directly via the
 ``make_runtime_state`` factory fixture and exercise
 ``run_per_stage_pipeline`` on synthetic integer signals. No real
 Ray actor pool, ``SaturationAwareScheduler`` instance, or full
@@ -49,25 +49,24 @@ from typing import Any
 import pytest
 
 from cosmos_xenna.pipelines.private import data_structures, resources
-from cosmos_xenna.pipelines.private.scheduling_py import pipeline as pipeline_mod
-from cosmos_xenna.pipelines.private.scheduling_py.auto_thresholds import _resolve_auto_thresholds
-from cosmos_xenna.pipelines.private.scheduling_py.pipeline import (
-    _resolve_classifier_signal,
-    record_executed_delta,
-    run_per_stage_pipeline,
+from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import (
+    ClassifierSignalResolver,
+    StageDecisionPipeline,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.state import (
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
+    ClassifierState,
     GrowthMode,
+    StageRuntimeState,
     StageState,
-    _StageRuntimeState,
     compute_slots_empty_ratio,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 # Type alias for the factory fixture. Keyword-only kwargs match the
-# fixture body below; ``Callable[..., _StageRuntimeState]`` is the
+# fixture body below; ``Callable[..., StageRuntimeState]`` is the
 # minimal annotation pytest's runtime needs.
-RuntimeStateFactory = Callable[..., _StageRuntimeState]
+RuntimeStateFactory = Callable[..., StageRuntimeState]
 
 
 def _explicit_threshold_config(**overrides: Any) -> SaturationAwareStageConfig:
@@ -87,10 +86,10 @@ def _explicit_threshold_config(**overrides: Any) -> SaturationAwareStageConfig:
 
 @pytest.fixture
 def make_runtime_state() -> RuntimeStateFactory:
-    """Factory returning a ready-to-use ``_StageRuntimeState`` per call.
+    """Factory returning a ready-to-use ``StageRuntimeState`` per call.
 
     Production resolves classifier thresholds on the first
-    ``autoscale()`` cycle; tests construct ``_StageRuntimeState``
+    ``autoscale()`` cycle; tests construct ``StageRuntimeState``
     directly so they must populate ``resolved_thresholds`` themselves.
     The factory uses ``_explicit_threshold_config`` by default so the
     resolved pair is ``(saturation=0.15, activation=0.05)`` regardless
@@ -103,10 +102,10 @@ def make_runtime_state() -> RuntimeStateFactory:
         cfg: SaturationAwareStageConfig | None = None,
         slots_per_actor: int = 8,
         name: str = "TestStage",
-    ) -> _StageRuntimeState:
+    ) -> StageRuntimeState:
         config = cfg if cfg is not None else _explicit_threshold_config()
         resolved = _resolve_auto_thresholds(config, slots_per_actor=slots_per_actor)
-        return _StageRuntimeState(stage_name=name, resolved_thresholds=resolved)
+        return StageRuntimeState(stage_name=name, classifier=ClassifierState(resolved_thresholds=resolved))
 
     return _make
 
@@ -194,7 +193,7 @@ class TestRatioInvarianceUnderSlotRedistribution:
 
         # Cold-start ``update_ewma`` returns the live sample, so a single
         # cycle exercises the full classifier path on both states.
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state_a,
             num_used_slots=used_a,
             num_empty_slots=empty_a,
@@ -202,7 +201,7 @@ class TestRatioInvarianceUnderSlotRedistribution:
             current_workers=1,
             config=cfg,
         )
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state_b,
             num_used_slots=used_b,
             num_empty_slots=empty_b,
@@ -210,8 +209,8 @@ class TestRatioInvarianceUnderSlotRedistribution:
             current_workers=1,
             config=cfg,
         )
-        assert state_a.classifier_state == state_b.classifier_state
-        assert state_a.slots_empty_ratio_ewma == pytest.approx(state_b.slots_empty_ratio_ewma)
+        assert state_a.classifier.state == state_b.classifier.state
+        assert state_a.classifier.slots_empty_ratio_ewma == pytest.approx(state_b.classifier.slots_empty_ratio_ewma)
 
 
 class TestCapacitySumInvariant:
@@ -283,7 +282,7 @@ class TestClassifierInvariantUnderProportionalCountDoubling:
         state = make_runtime_state()
 
         # Cycle 1: slots_per_worker=2, 50% utilization (used=2, empty=2).
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=2,
             num_empty_slots=2,
@@ -291,10 +290,10 @@ class TestClassifierInvariantUnderProportionalCountDoubling:
             current_workers=1,
             config=cfg,
         )
-        first_state = state.classifier_state
+        first_state = state.classifier.state
 
         # Cycle 2: slots_per_worker=4, still 50% utilization (used=4, empty=4).
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=4,
             num_empty_slots=4,
@@ -302,9 +301,9 @@ class TestClassifierInvariantUnderProportionalCountDoubling:
             current_workers=1,
             config=cfg,
         )
-        assert state.classifier_state == first_state
+        assert state.classifier.state == first_state
         # EWMA value rests at 0.5 because both samples were 0.5.
-        assert state.slots_empty_ratio_ewma == pytest.approx(0.5)
+        assert state.classifier.slots_empty_ratio_ewma == pytest.approx(0.5)
 
 
 class TestEwmaPersistenceAcrossSlotsPerWorkerChanges:
@@ -320,7 +319,7 @@ class TestEwmaPersistenceAcrossSlotsPerWorkerChanges:
 
         # Phase 1: 10 cycles at slots_per_worker=2 (modeled as used=2, empty=2).
         for _ in range(10):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=2,
                 num_empty_slots=2,
@@ -328,12 +327,12 @@ class TestEwmaPersistenceAcrossSlotsPerWorkerChanges:
                 current_workers=1,
                 config=cfg,
             )
-        first_phase_state = state.classifier_state
+        first_phase_state = state.classifier.state
 
         # Phase 2: 10 cycles at slots_per_worker=4 with proportional load
         # doubling. Same logical 50% utilization.
         for _ in range(10):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=4,
                 num_empty_slots=4,
@@ -342,9 +341,9 @@ class TestEwmaPersistenceAcrossSlotsPerWorkerChanges:
                 config=cfg,
             )
 
-        assert state.slots_empty_ratio_ewma == pytest.approx(0.5, abs=0.01)
+        assert state.classifier.slots_empty_ratio_ewma == pytest.approx(0.5, abs=0.01)
         # Classifier state stable across the slot-redistribution boundary.
-        assert state.classifier_state == first_phase_state
+        assert state.classifier.state == first_phase_state
 
 
 class TestWorkerCountMidCycleChange:
@@ -366,7 +365,7 @@ class TestWorkerCountMidCycleChange:
 
         # Phase 1: 5 workers x 2 slots = 10 total slots, 50% busy.
         for _ in range(10):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=5,
                 num_empty_slots=5,
@@ -374,11 +373,11 @@ class TestWorkerCountMidCycleChange:
                 current_workers=5,
                 config=cfg,
             )
-        first_phase_state = state.classifier_state
+        first_phase_state = state.classifier.state
 
         # Phase 2: 10 workers x 2 slots = 20 total slots, 50% busy.
         for _ in range(10):
-            run_per_stage_pipeline(
+            StageDecisionPipeline().compute_recommendation(
                 stage_state=state,
                 num_used_slots=10,
                 num_empty_slots=10,
@@ -387,8 +386,8 @@ class TestWorkerCountMidCycleChange:
                 config=cfg,
             )
 
-        assert state.slots_empty_ratio_ewma == pytest.approx(0.5, abs=0.01)
-        assert state.classifier_state == first_phase_state
+        assert state.classifier.slots_empty_ratio_ewma == pytest.approx(0.5, abs=0.01)
+        assert state.classifier.state == first_phase_state
 
 
 class TestGranularityFloorForTinyStages:
@@ -424,7 +423,7 @@ class TestGranularityFloorForTinyStages:
         cfg = _explicit_threshold_config(slots_empty_ratio_smoothing_level=1.0)
         state = make_runtime_state(cfg=cfg)
 
-        run_per_stage_pipeline(
+        StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=num_used_slots,
             num_empty_slots=num_empty_slots,
@@ -432,48 +431,11 @@ class TestGranularityFloorForTinyStages:
             current_workers=1,
             config=cfg,
         )
-        assert state.classifier_state == expected_state
-
-
-class TestInputQueueDepthUnitsConsistency:
-    """``input_queue_depth`` flows into the classifier as a pre-batch task count."""
-
-    def test_pre_batch_queue_depth_passes_unchanged_into_classifier(
-        self,
-        make_runtime_state: RuntimeStateFactory,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Spy on ``classify`` and confirm the kwarg matches the supplied value."""
-        captured: dict[str, Any] = {}
-
-        def _spy_classify(**kwargs: Any) -> StageState:
-            captured.update(kwargs)
-            return StageState.NORMAL
-
-        # Patch the imported name inside the pipeline module so the
-        # spy observes the actual call site.
-        monkeypatch.setattr(pipeline_mod, "classify", _spy_classify)
-
-        cfg = _explicit_threshold_config()
-        state = make_runtime_state()
-        # Arbitrary pre-batch task count chosen to be unambiguous
-        # against any plausible default (0, 1) or sample-counted
-        # alternative (e.g. multiples of stage_batch_size).
-        expected_queue_depth = 17
-
-        run_per_stage_pipeline(
-            stage_state=state,
-            num_used_slots=2,
-            num_empty_slots=2,
-            input_queue_depth=expected_queue_depth,
-            current_workers=1,
-            config=cfg,
-        )
-        assert captured["input_queue_depth"] == expected_queue_depth
+        assert state.classifier.state == expected_state
 
 
 class TestZeroActorColdStartPath:
-    """``_resolve_classifier_signal`` and the pipeline correctly handle zero slots."""
+    """``ClassifierSignalResolver`` and the pipeline correctly handle zero slots."""
 
     def test_resolve_classifier_signal_returns_none_at_cold_start_with_zero_slots(
         self,
@@ -484,9 +446,9 @@ class TestZeroActorColdStartPath:
         state = make_runtime_state()
 
         # Pre-condition: factory leaves the carry-forward field unset.
-        assert state.last_valid_slots_empty_ratio_ewma is None
+        assert state.classifier.last_valid_slots_empty_ratio_ewma is None
 
-        result = _resolve_classifier_signal(
+        result = ClassifierSignalResolver().resolve(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,
@@ -509,7 +471,7 @@ class TestZeroActorColdStartPath:
         cfg = _explicit_threshold_config()
         state = make_runtime_state()
 
-        delta = run_per_stage_pipeline(
+        delta = StageDecisionPipeline().compute_recommendation(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,
@@ -517,15 +479,15 @@ class TestZeroActorColdStartPath:
             current_workers=0,
             config=cfg,
         )
-        record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
+        StageDecisionPipeline().record_executed_delta(stage_state=state, delta_executed=delta, config=cfg)
         assert delta == 0
         # Classifier untouched: state and streak remain at defaults.
-        assert state.classifier_state is StageState.NORMAL
-        assert state.classifier_streak == 0
+        assert state.classifier.state is StageState.NORMAL
+        assert state.classifier.streak == 0
         # Growth-mode timer ticks regardless of signal availability so
         # HOLD eventually exits to TRACKING even with no samples.
-        assert state.growth_mode is GrowthMode.ACQUIRING
-        assert state.growth_streak == 1
+        assert state.growth.mode is GrowthMode.ACQUIRING
+        assert state.growth.streak == 1
 
     def test_carry_forward_value_used_when_slots_zero_and_prior_ewma_present(
         self,
@@ -537,11 +499,11 @@ class TestZeroActorColdStartPath:
 
         # Seed the carry-forward field with a NORMAL-band value
         # (between saturation_threshold=0.15 and
-        # over_provisioned_threshold=0.50). ``_resolve_classifier_signal``
+        # over_provisioned_threshold=0.50). ``ClassifierSignalResolver``
         # must return this value verbatim because total slots == 0.
-        state.last_valid_slots_empty_ratio_ewma = 0.30
+        state.classifier.last_valid_slots_empty_ratio_ewma = 0.30
 
-        result = _resolve_classifier_signal(
+        result = ClassifierSignalResolver().resolve(
             stage_state=state,
             num_used_slots=0,
             num_empty_slots=0,

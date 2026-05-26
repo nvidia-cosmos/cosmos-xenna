@@ -39,7 +39,7 @@ import pytest
 from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import resources, specs
-from cosmos_xenna.pipelines.private.scheduling_py.streaming_backpressure import (
+from cosmos_xenna.pipelines.private.scheduling_py.cluster.streaming_backpressure import (
     _SETUP_AWARE_MAX_QUEUED_FLOOR,
     compute_max_queued,
     resolve_setup_aware_max_queued_enabled,

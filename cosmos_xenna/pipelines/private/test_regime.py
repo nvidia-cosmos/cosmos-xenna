@@ -24,7 +24,7 @@ import math
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.regime import (
+from cosmos_xenna.pipelines.private.scheduling_py.regime.regime import (
     Regime,
     RegimeDetectorState,
     compute_regime_signal,
