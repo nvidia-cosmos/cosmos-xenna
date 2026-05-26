@@ -262,6 +262,7 @@ class TestSaturationDonorWarmupFilter:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -278,6 +279,7 @@ class TestSaturationDonorWarmupFilter:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert result is None
@@ -293,6 +295,7 @@ class TestSaturationDonorWarmupFilter:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -310,6 +313,7 @@ class TestSaturationDonorWarmupFilter:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert result is None
@@ -337,6 +341,7 @@ class TestSaturationDonorWarmupFilter:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert result is None

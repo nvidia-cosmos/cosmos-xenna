@@ -34,8 +34,26 @@ plumbs through Phase C / Phase D. Short form:
 | `balance_score` | `1.0 / max(1.0, max_k D_k / min_k D_k)`. Score = 1 means perfectly balanced; scores approaching 0 mean a single stage dominates. Observed on the `xenna_scheduler_pipeline_balance_score` gauge.   |
 
 The gate's post-plan simulation (`_compute_post_plan_d_k`) holds
-`S_k` fixed, recomputes `c_k` per affected stage from the planned
-removals, and divides to produce the post-plan `D_k` mapping.
+`S_k` fixed and recomputes `c_k` per affected stage in service-
+channel units (`slots_per_worker × allocations`):
+
+- Each donor worker removed releases
+  `slots_per_worker[donor]` channels (non-SPMD: one allocation per
+  worker; SPMD groups under-count their channel loss because the
+  helper does not see per-group allocation counts — an acceptable
+  simplification because SPMD donor stages are rare and the
+  donor-flip guard remains conservative even when channel loss is
+  understated).
+- The receiver gains `slots_per_worker[receiver]` channels exactly
+  once per donation commit, NOT per donor in the plan.
+  `_run_phase_c_grow` calls `try_add_worker` once per
+  `_attempt_cross_stage_donation` invocation regardless of plan
+  size; subsequent receiver additions in the same cycle are
+  separate donation commits with their own gate evaluations.
+
+Dividing the projected `c_k` by the held-fixed `S_k` produces the
+post-plan `D_k` mapping the gate compares against the cycle's
+measured `D_k`.
 
 ## Problem
 

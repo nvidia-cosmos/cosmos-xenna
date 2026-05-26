@@ -189,8 +189,16 @@ class TestSignalTrust:
 class TestComputePostPlanDk:
     """Post-plan simulator subtracts/adds capacity per affected stage."""
 
-    def test_donor_loses_one_channel_receiver_gains_per_removal(self) -> None:
-        """Capacity bookkeeping is per-removal: 2 removals -> +2 receiver, -2 across donors."""
+    def test_donor_loses_slots_per_worker_per_removal_receiver_gains_once(self) -> None:
+        """Capacity bookkeeping respects channel units.
+
+        A donation cycle removes N donors and adds exactly ONE receiver
+        worker (regardless of plan size) -- ``_run_phase_c_grow`` calls
+        ``try_add_worker`` once per ``_attempt_cross_stage_donation``.
+        With ``slots_per_worker=1`` for both stages, removing 2 donor
+        workers drops donor capacity by 2 channels and gains the
+        receiver 1 channel.
+        """
         plan = DonorPlan(
             removals=(
                 DonorWorker(stage_index=0, worker_id="a-w0", age=1),
@@ -208,12 +216,37 @@ class TestComputePostPlanDk:
             stage_names=["A", "B"],
             effective_capacities=effective_capacities,
             s_k_ewma=s_k_ewma,
+            slots_per_worker_by_stage={"A": 1, "B": 1},
         )
 
-        # A capacity: 4 - 2 = 2 -> S/c = 4/2 = 2.0.
-        # B capacity: 1 + 2 = 3 -> S/c = 4/3 = 1.333...
+        # A capacity: 4 - 2*slots_A = 4 - 2 = 2 -> S/c = 4/2 = 2.0.
+        # B capacity: 1 + slots_B = 1 + 1 = 2 -> S/c = 4/2 = 2.0.
         assert math.isclose(d_after["A"], 2.0, rel_tol=1e-9)
-        assert math.isclose(d_after["B"], 4.0 / 3.0, rel_tol=1e-9)
+        assert math.isclose(d_after["B"], 2.0, rel_tol=1e-9)
+
+    def test_donor_loss_scales_with_slots_per_worker(self) -> None:
+        """A stage with ``slots_per_worker=2`` releases 2 channels per worker removed."""
+        plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
+            receiver_stage_index=1,
+        )
+        d_k_now = {"A": 1.0, "B": 1.0}
+        effective_capacities = {"A": 4, "B": 4}
+        s_k_ewma = {"A": 4.0, "B": 4.0}
+
+        d_after = _compute_post_plan_d_k(
+            d_k_now=d_k_now,
+            plan=plan,
+            stage_names=["A", "B"],
+            effective_capacities=effective_capacities,
+            s_k_ewma=s_k_ewma,
+            slots_per_worker_by_stage={"A": 2, "B": 2},
+        )
+
+        # A capacity: 4 - 1*slots_A = 4 - 2 = 2 -> S/c = 4/2 = 2.0.
+        # B capacity: 4 + slots_B = 4 + 2 = 6 -> S/c = 4/6 = 0.666...
+        assert math.isclose(d_after["A"], 2.0, rel_tol=1e-9)
+        assert math.isclose(d_after["B"], 4.0 / 6.0, rel_tol=1e-9)
 
     def test_output_keys_match_input_keys(self) -> None:
         """The result preserves ``d_k_now``'s keys exactly (no extras, no drops)."""
@@ -229,6 +262,7 @@ class TestComputePostPlanDk:
             stage_names=["A", "B", "C"],
             effective_capacities={"A": 2, "B": 1, "C": 1},
             s_k_ewma={"A": 2.0, "B": 1.0, "C": 1.0},
+            slots_per_worker_by_stage={},
         )
 
         assert set(d_after) == {"A", "B", "C"}
@@ -261,6 +295,7 @@ class TestEconomicGateAccept:
             effective_capacities=effective_capacities,
             s_k_ewma=s_k_ewma,
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.accepted is True
@@ -291,6 +326,7 @@ class TestEconomicGateRejections:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.reject_reason is RejectReason.SIGNAL_TRUST
@@ -326,6 +362,7 @@ class TestEconomicGateRejections:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.reject_reason is RejectReason.SPREAD_BELOW_THRESHOLD
@@ -354,6 +391,7 @@ class TestEconomicGateRejections:
             effective_capacities={"A": 2, "B": 4},
             s_k_ewma={"A": 4.0, "B": 4.0},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.reject_reason is RejectReason.THROUGHPUT_REGRESSION
@@ -383,6 +421,7 @@ class TestEconomicGateRejections:
             effective_capacities={"A": 2, "B": 1},
             s_k_ewma={"A": 1.0, "B": 1.0},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         # A flips from 0.5 -> 1.0 (1.0/1=1.0); max_d_before is 1.0.
@@ -397,12 +436,21 @@ class TestEconomicGateRejections:
             effective_capacities={"A": 2, "B": 1},
             s_k_ewma={"A": 2.0, "B": 1.0},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.reject_reason is RejectReason.DONOR_FLIP_GUARD
 
     def test_balance_regression_rejects_only_when_throughput_tied(self) -> None:
-        """Balance regression fires only when throughput is tied within tolerance."""
+        """Balance regression fires only when throughput is tied within tolerance.
+
+        Three-stage fixture where the donor (A) and receiver (B) are
+        not the cluster bottleneck (C is); the swap leaves ``max_d``
+        unchanged at C (throughput tied) but widens ``max/min``
+        because A's post-plan ``D_k`` shrinks below B's pre-plan
+        value. Throughput / donor-flip tolerances are wide so only
+        the balance gate can fire.
+        """
         cfg = _config(
             cross_stage_donor_throughput_tolerance=100.0,
             cross_stage_donor_donor_flip_tolerance=100.0,
@@ -415,34 +463,12 @@ class TestEconomicGateRejections:
         states = {
             "A": _state("A", slots_empty_ewma=0.5, streak=60),
             "B": _state("B", pressure_ewma=2.0, streak=60),
+            "C": _state("C", pressure_ewma=0.0, streak=60),
         }
-        # Pick s_k / capacities so throughput is unchanged but balance worsens:
-        # before: A=1, B=1 -> max=min=1, ratio=1, balance=1.0
-        # after donating from A (cap 4->3) to B (cap 1->2):
-        #   A_after = 1*4/3 = 1.333, B_after = 1*1/2 = 0.5
-        #   max_after=1.333, min_after=0.5 -> ratio=2.667, balance=1/2.667=0.375
-        # max_d before = 1.0; max_d after = 1.333; throughput drops 1.0 -> 0.75.
-        # That's a throughput regression. Need throughput preserved.
-        # Alternative: design so the receiver's post-plan max D drops EQUAL to
-        # the donor's post-plan rise. Symmetric S_k = 4, A goes 4->3 (D=1.0->1.333),
-        # B goes 1->2 (D=4->2). max before = 4, max after = 2 -> throughput RISES.
-        # Throughput up means abs(after - before) is large -> not tied -> balance gate skipped.
-        #
-        # To trigger balance gate exclusively: need throughput identical pre/post
-        # while balance shifts. Symmetric capacity swap: A(4->3), B(3->4); s_k same.
-        # max stays at S/3 in both cycles -> tied. min shifts: A_after=S/3, B_after=S/4
-        # -> ratio = (S/3)/(S/4) = 4/3, balance = 1/(4/3) = 0.75.
-        # min before: A=S/4, B=S/3 -> ratio = (S/3)/(S/4) = 4/3, balance = 0.75.
-        # That ties -> not useful.
-        #
-        # For a real balance regression: need the swap to widen the spread.
-        # Use 3 stages where the donor stage and receiver are NOT the bottleneck.
-        plan = DonorPlan(
-            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
-            receiver_stage_index=1,
-        )
-        states["C"] = _state("C", pressure_ewma=0.0, streak=60)
 
+        # Pre-plan:  A=4/4=1, B=4/4=1, C=5/1=5. max=5, min=1, balance=0.2.
+        # Post-plan: A=4/3=1.33, B=4/5=0.8, C=5. max=5 (tied), min=0.8,
+        # balance=1/(5/0.8)=0.16. Drop 0.04 > balance_tolerance 0 -> reject.
         result = _evaluate_economic_gate(
             plan=plan,
             stage_names=["A", "B", "C"],
@@ -452,13 +478,9 @@ class TestEconomicGateRejections:
             effective_capacities={"A": 4, "B": 4, "C": 1},
             s_k_ewma={"A": 4.0, "B": 4.0, "C": 5.0},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
-        # max_d_before = 5 (C). After: A: 4/3 = 1.333, B: 4/5 = 0.8, C: 5.
-        # max_d stays 5; throughput tied.
-        # min before: 1; min after: 0.8. ratio_before = 5; ratio_after = 5/0.8=6.25.
-        # balance_before = 1/5 = 0.2; balance_after = 1/6.25 = 0.16.
-        # 0.16 < 0.2 - 0.0 -> regression -> reject.
         assert result.reject_reason is RejectReason.BALANCE_REGRESSION
 
 
@@ -486,6 +508,7 @@ class TestEconomicGateColdStart:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         assert result.accepted is True
@@ -534,6 +557,7 @@ class TestGateResultStability:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         with pytest.raises(attrs.exceptions.FrozenInstanceError):
@@ -563,6 +587,7 @@ class TestDecisionLogSchema:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         line = _format_donor_decision_log(
@@ -619,6 +644,7 @@ class TestDecisionLogSchema:
             effective_capacities={},
             s_k_ewma={},
             config=cfg,
+            slots_per_worker_by_stage={},
         )
 
         line = _format_donor_decision_log(
@@ -742,6 +768,7 @@ class TestRejectionPathEmitsDebug:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
 
         assert decision is None

@@ -135,7 +135,7 @@ use super::resources as rds;
 ///   a youngest-first index across stages build it in O(W) by joining
 ///   this map against the per-stage current-worker maps. Stale ids --
 ///   workers that were in the seed but are no longer in
-///   `state.stages.worker_groups` -- are silently dropped.
+///   `state.stages.worker_groups` - are silently dropped.
 #[pyclass]
 pub struct AutoscalePlanContext {
     cluster: rds::ClusterResources,
@@ -718,15 +718,19 @@ impl AutoscalePlanContext {
                     return Ok(false);
                 };
 
-                self.cluster
-                    .release_allocations(&removed.resources)
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "AutoscalePlanContext.try_remove_worker: failed to release SPMD \
+                if let Err(e) = self.cluster.release_allocations(&removed.resources) {
+                    // Rollback: re-insert the removed entry so the map stays
+                    // consistent with the cluster's allocation state when the
+                    // Err propagates. Mirrors the empty-resources rollback in
+                    // the non-SPMD branch and the per-removal rollback in
+                    // `remove_workers_atomically`.
+                    groups.insert(worker_id.to_string(), removed);
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "AutoscalePlanContext.try_remove_worker: failed to release SPMD \
                          worker group {} for stage {}: {:?}",
-                            worker_id, stage_name, e
-                        ))
-                    })?;
+                        worker_id, stage_name, e
+                    )));
+                }
                 if self.cancel_pending_add(&stage_name, worker_id) {
                     // Cancel-pending-add: the worker was added earlier in
                     // this same cycle (so its worker_ages entry was age 0)
@@ -775,13 +779,18 @@ impl AutoscalePlanContext {
                         worker_id, stage_name
                     )));
                 };
-                self.cluster.release_allocation(resource).map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                if let Err(e) = self.cluster.release_allocation(resource) {
+                    // Rollback: same contract as the SPMD branch and the
+                    // empty-resources path above - re-insert the removed
+                    // entry so the map stays consistent with cluster state
+                    // before the Err propagates.
+                    workers.insert(worker_id.to_string(), removed);
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "AutoscalePlanContext.try_remove_worker: failed to release worker \
                          {} for stage {}: {:?}",
                         worker_id, stage_name, e
-                    ))
-                })?;
+                    )));
+                }
                 if self.cancel_pending_add(&stage_name, worker_id) {
                     // Cancel-pending-add: the worker was added earlier in
                     // this same cycle (so its worker_ages entry was age 0)
@@ -1137,7 +1146,7 @@ impl AutoscalePlanContext {
     /// Drains the per-stage `pending_adds` / `pending_removes` lists into
     /// the matching `StageSolution` entries (one per stage, ordered by
     /// stage position). The per-stage `slots_per_worker` is the value
-    /// captured at construction time -- the planner does not change
+    /// captured at construction time - the planner does not change
     /// `slots_per_worker`; it is a per-stage configuration property
     /// preserved unchanged.
     ///
@@ -1200,8 +1209,8 @@ impl AutoscalePlanContext {
     /// each worker's age in autoscale cycles (0 for workers placed
     /// fresh this cycle, positive integers for workers carried over
     /// from previous cycles). Workers staged for removal are still
-    /// included -- they may be reused via the FGD reuse path before
-    /// `into_solution` runs -- so callers building an age-aware index
+    /// included - they may be reused via the FGD reuse path before
+    /// `into_solution` runs - so callers building an age-aware index
     /// must intersect this map with the per-stage current-worker maps
     /// to filter out scheduled-for-removal entries. After
     /// `into_solution` drains `pending_removes`, callers should
@@ -1239,7 +1248,7 @@ impl AutoscalePlanContext {
     /// success and every `try_remove_worker` success applied so far
     /// in this cycle.
     ///
-    /// Workers staged for removal are NOT present here -- they have
+    /// Workers staged for removal are NOT present here - they have
     /// been moved to `pending_removes`. Workers staged as fresh
     /// adds ARE present (the planner inserts them into
     /// `current_workers` / `current_worker_groups` on success).
@@ -3096,7 +3105,7 @@ mod tests {
         // Pre-seed a worker, remove it (-> pending_removes), then
         // try_add_worker which reuses the placement (-> cancels remove).
         // The Solution must contain neither an add nor a delete for
-        // that worker -- it stays in the live set throughout the cycle.
+        // that worker - it stays in the live set throughout the cycle.
         let problem = ds::Problem {
             cluster_resources: make_empty_cluster(1, 1.0),
             stages: vec![make_cpu_stage("stage_a")],
@@ -3451,7 +3460,7 @@ mod tests {
         // Mixed case: caller passes a partial seed (some workers were
         // observed in prior cycles, others are brand-new this cycle
         // because they were just created externally between cycles).
-        // Missing entries default to 0 -- treat unknown ids as freshly
+        // Missing entries default to 0 - treat unknown ids as freshly
         // observed rather than rejecting the call.
         let problem = ds::Problem {
             cluster_resources: make_empty_cluster(1, 2.0),
@@ -3818,7 +3827,7 @@ mod tests {
     #[test]
     fn worker_ages_zero_stage_pipeline_drops_every_seed_entry_as_stale() {
         // Boundary: zero-stage pipeline with a non-empty seed yields
-        // an empty map -- no stage means no workers, so every seed
+        // an empty map - no stage means no workers, so every seed
         // entry is stale and silently filtered.
         let problem = ds::Problem {
             cluster_resources: make_empty_cluster(1, 1.0),
@@ -4262,7 +4271,7 @@ mod tests {
 #[cfg(test)]
 mod batch_removal_and_probe_tests {
     //! Cover `remove_workers_atomically`, `cluster_snapshot`, and
-    //! `probe_add_after_removals` -- the additive Rust surface used
+    //! `probe_add_after_removals` - the additive Rust surface used
     //! by the cross-stage donor and Phase B floor transfer paths.
 
     use super::*;
@@ -4444,7 +4453,7 @@ mod batch_removal_and_probe_tests {
     fn remove_workers_atomically_cancels_pending_add_for_same_cycle_worker() {
         // Worker added earlier in the same cycle; removing it cancels
         // the pending add (both pending lists end empty, age entry
-        // dropped) -- matches try_remove_worker's same-cycle semantics.
+        // dropped) - matches try_remove_worker's same-cycle semantics.
         let (mut ctx, _ids) = ctx_with_cpu_workers(0);
         // Add a fresh worker via the planner so it appears in
         // pending_adds with age 0.

@@ -182,7 +182,7 @@ All cross-stage donor knobs live on
 
 | Field                                              | Default | Effect                                                                                  |
 | -------------------------------------------------- | ------- | --------------------------------------------------------------------------------------- |
-| `enable_cross_stage_donor`                         | `True`  | Master toggle for both modes. `False` disables donor logic; floor enforcement may raise. |
+| `enable_cross_stage_donor`                         | `True`  | Master toggle for saturation mode (Phase C). `False` disables saturation-driven donations; floor mode (Phase B) does not consult this flag because floor enforcement is non-negotiable. |
 | `donor_must_be_strictly_upstream`                  | `True`  | Saturation mode: reject donors at or downstream of receiver in DAG order.                |
 | `cross_stage_donor_require_over_provisioned`       | `True`  | Layer 1: require donor classifier OVER_PROVISIONED + full streak.                        |
 | `cross_stage_donor_exclude_hold_state`             | `True`  | Layer 2: reject donors whose growth mode is HOLD.                                        |

@@ -2173,6 +2173,11 @@ class SaturationAwareScheduler:
         worker_ids_by_stage = ctx.worker_ids_by_stage()
         worker_ages = ctx.worker_ages()
         worker_nodes = self._build_worker_node_map(problem_state)
+        # ``effective_capacities`` is in service channels (slots_per_worker
+        # * total_allocations), so the gate's post-plan simulation needs
+        # the per-stage slots-per-worker scalar to convert worker-level
+        # removals/additions into channel-level capacity deltas.
+        slots_per_worker_by_stage = {stage.stage_name: stage.slots_per_worker for stage in problem_state.rust.stages}
         stage_configs = {name: self._stage_cfg(name) for name in self._stage_names}
 
         decision = find_saturation_donor(
@@ -2193,6 +2198,7 @@ class SaturationAwareScheduler:
             d_k_now=self._d_k_now,
             effective_capacities=self._effective_capacities,
             s_k_ewma=self._s_k_ewma,
+            slots_per_worker_by_stage=slots_per_worker_by_stage,
             excluded_worker_ids=self._donor_warmup_excluded_ids,
         )
         if decision is None:

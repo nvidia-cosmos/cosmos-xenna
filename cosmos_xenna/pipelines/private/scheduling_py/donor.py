@@ -40,6 +40,7 @@ cascading into another stage's bootstrap.
 import enum
 import itertools
 import math
+import statistics
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -334,10 +335,10 @@ def _resource_fit_plan(
             if len(same_node) < plan_size:
                 continue
             for combo in itertools.combinations(same_node, plan_size):
-                combo_key = tuple(w.worker_id for w in combo)
-                seen_combos.add(combo_key)
                 if evaluations >= max_plan_combinations:
                     break
+                combo_key = tuple(w.worker_id for w in combo)
+                seen_combos.add(combo_key)
                 evaluations += 1
                 removals = [(w.stage_index, w.worker_id) for w in combo]
                 probe = ctx.probe_add_after_removals(removals, receiver_stage_index)
@@ -354,12 +355,12 @@ def _resource_fit_plan(
         if evaluations >= max_plan_combinations:
             continue
         for combo in itertools.combinations(sorted_candidates, plan_size):
+            if evaluations >= max_plan_combinations:
+                break
             combo_key = tuple(w.worker_id for w in combo)
             if combo_key in seen_combos:
                 continue
             seen_combos.add(combo_key)
-            if evaluations >= max_plan_combinations:
-                break
             evaluations += 1
             removals = [(w.stage_index, w.worker_id) for w in combo]
             probe = ctx.probe_add_after_removals(removals, receiver_stage_index)
@@ -486,17 +487,33 @@ def _compute_post_plan_d_k(
     stage_names: list[str],
     effective_capacities: Mapping[str, int],
     s_k_ewma: Mapping[str, float],
+    slots_per_worker_by_stage: Mapping[str, int],
 ) -> dict[str, float]:
-    """Simulate ``D_k`` after ``plan`` would be committed.
+    """Simulate ``D_k`` after one donation cycle commits ``plan``.
 
-    Each donor worker subtracts one channel from its donor stage's
-    effective capacity; every removal contributes one channel to
-    the receiver stage's capacity. The intrinsic ``S_k`` EWMA is
-    held fixed (a single cycle's donor plan cannot retroactively
-    change a stage's measured per-task service time). The output
-    covers exactly the same keys as ``d_k_now`` so the caller can
-    feed it directly into the throughput / donor-flip / balance
-    checks without aligning indices.
+    ``effective_capacities`` is in service channels
+    (``slots_per_worker * total_allocations``), so capacity deltas
+    must be in the same unit:
+
+    *   Each donor worker removed releases
+        ``slots_per_worker_by_stage[donor]`` channels (non-SPMD: one
+        worker_group with one allocation; SPMD groups under-count
+        their channel loss because the helper does not see per-group
+        allocation counts -- this is an acceptable simplification
+        because SPMD donor stages are rare and the gate's donor-flip
+        guard remains conservative even when channel loss is
+        understated).
+    *   The receiver gains ``slots_per_worker_by_stage[receiver]``
+        channels exactly once per donation commit, NOT per donor in
+        the plan. ``_run_phase_c_grow`` calls ``try_add_worker``
+        once per ``_attempt_cross_stage_donation`` invocation
+        (regardless of ``len(plan.removals)``); subsequent receiver
+        additions in the same cycle are separate donation commits
+        with their own gate evaluations.
+
+    The intrinsic ``S_k`` EWMA is held fixed across the simulation
+    because a single cycle's donor plan cannot retroactively change
+    measured per-task service time.
 
     Args:
         d_k_now: Current cycle's actor-normalized ``D_k`` mapping.
@@ -504,25 +521,35 @@ def _compute_post_plan_d_k(
         plan: Candidate donor plan to simulate.
         stage_names: Stage names in problem order; used to map
             ``DonorWorker.stage_index`` -> stage name.
-        effective_capacities: Pre-plan effective capacity per
-            stage (counts non-warmup ready actors per
-            ``_effective_ready_capacity``).
-        s_k_ewma: Intrinsic service time EWMA per stage; held
+        effective_capacities: Pre-plan effective capacity per stage
+            in channels (``slots_per_worker * total_allocations``,
+            per :meth:`SaturationAwareScheduler._effective_ready_capacity`).
+        s_k_ewma: Intrinsic service-time EWMA per stage; held
             fixed across the simulation.
+        slots_per_worker_by_stage: Per-stage ``slots_per_worker``
+            from ``problem_state.rust.stages[*].slots_per_worker``.
+            Used as the per-worker channel multiplier for both
+            donor and receiver capacity deltas. Missing entries
+            default to ``1`` (treats the stage as one channel per
+            worker).
 
     Returns:
-        ``{stage: post_plan_D_k}`` over the same keys as
-        ``d_k_now``. ``compute_d_k`` handles non-finite or
-        zero-capacity inputs by returning ``math.nan``, matching
-        the production identifier-bottleneck path.
+        ``{stage: post_plan_D_k}`` over the same keys as ``d_k_now``.
+        ``compute_d_k`` handles non-finite or zero-capacity inputs
+        by returning ``math.nan``, matching the production
+        bottleneck-identification path.
 
     """
     capacity_after = dict(effective_capacities)
     for worker in plan.removals:
         donor_name = stage_names[worker.stage_index]
-        capacity_after[donor_name] = capacity_after.get(donor_name, 0) - 1
+        donor_slots = slots_per_worker_by_stage.get(donor_name, 1)
+        capacity_after[donor_name] = capacity_after.get(donor_name, 0) - donor_slots
     receiver_name = stage_names[plan.receiver_stage_index]
-    capacity_after[receiver_name] = capacity_after.get(receiver_name, 0) + len(plan.removals)
+    receiver_slots = slots_per_worker_by_stage.get(receiver_name, 1)
+    # Phase C adds exactly one receiver worker per donation commit,
+    # regardless of plan size.
+    capacity_after[receiver_name] = capacity_after.get(receiver_name, 0) + receiver_slots
     return {name: compute_d_k(s_k_ewma.get(name, math.nan), capacity_after.get(name, 0)) for name in d_k_now}
 
 
@@ -592,6 +619,7 @@ def _evaluate_economic_gate(
     d_k_now: Mapping[str, float],
     effective_capacities: Mapping[str, int],
     s_k_ewma: Mapping[str, float],
+    slots_per_worker_by_stage: Mapping[str, int],
     config: SaturationAwareConfig,
 ) -> _GateResult:
     """Apply the throughput-first commit gate to a candidate donor plan.
@@ -653,7 +681,9 @@ def _evaluate_economic_gate(
     )
 
     finite_d_k = [v for v in d_k_now.values() if math.isfinite(v) and v > 0.0]
-    median_d_k = sorted(finite_d_k)[len(finite_d_k) // 2] if finite_d_k else math.nan
+    # Use ``statistics.median`` so the gate's median definition matches
+    # the rest of the scheduler (bottleneck.py) on every length parity.
+    median_d_k = statistics.median(finite_d_k) if finite_d_k else math.nan
     receiver_value = _receiver_value(
         receiver_state,
         num_workers=len(plan.removals),
@@ -671,6 +701,7 @@ def _evaluate_economic_gate(
         stage_names=stage_names,
         effective_capacities=effective_capacities,
         s_k_ewma=s_k_ewma,
+        slots_per_worker_by_stage=slots_per_worker_by_stage,
     )
     max_d_before = _max_finite(d_k_now)
     max_d_after = _max_finite(d_after)
@@ -758,12 +789,15 @@ def _format_donor_decision_log(
 ) -> str:
     """Build the structured decision-log string for a donor commit or rejection.
 
-    The output is a single line with the same field order regardless of
-    whether the line is an INFO commit or a DEBUG rejection. Missing
-    inputs (early-return rejections that have no plan or gate result)
-    are rendered as ``nan`` for floats, ``[]`` for lists, and the empty
-    string for ``placement_reject_reason``; the schema stays stable so
-    log consumers can split on field names without conditional parsing.
+    Common fields appear in the same order in both INFO commit and
+    DEBUG reject variants. The DEBUG variant additionally prefixes
+    two reason fields (``reject_reason``, ``placement_reject_reason``)
+    immediately after the line marker; commit variants omit them.
+    Missing inputs (early-return rejections that have no plan or gate
+    result) are rendered as ``nan`` for floats, ``[]`` for lists, and
+    the empty string for ``placement_reject_reason``; the common
+    suffix stays stable so log consumers can split on field names
+    without conditional parsing.
 
     Args:
         receiver_name: Receiver stage name.
@@ -889,6 +923,7 @@ def find_saturation_donor(
     d_k_now: Mapping[str, float],
     effective_capacities: Mapping[str, int],
     s_k_ewma: Mapping[str, float],
+    slots_per_worker_by_stage: Mapping[str, int],
     excluded_worker_ids: frozenset[str] | None = None,
 ) -> DonorDecision | None:
     """Pick a donor plan for saturation-driven Phase C growth.
@@ -1152,6 +1187,7 @@ def find_saturation_donor(
         d_k_now=d_k_now,
         effective_capacities=effective_capacities,
         s_k_ewma=s_k_ewma,
+        slots_per_worker_by_stage=slots_per_worker_by_stage,
         config=config,
     )
     if gate_result.reject_reason is not None:

@@ -247,6 +247,7 @@ class TestPhaseBFloorBypassesSignalTrust:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert saturation_decision is None, "Saturation mode must reject the low-trust donor on the signal-trust gate"

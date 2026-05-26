@@ -233,6 +233,7 @@ def _find_donor(
         d_k_now=d_k_now,
         effective_capacities=effective_capacities,
         s_k_ewma=s_k_ewma,
+        slots_per_worker_by_stage={},
     )
     return decision.plan if decision is not None else None
 
@@ -367,6 +368,7 @@ class TestFindSaturationDonorMasterToggle:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -402,6 +404,7 @@ class TestFindSaturationDonorClassifierLayer:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -429,6 +432,7 @@ class TestFindSaturationDonorClassifierLayer:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -457,6 +461,7 @@ class TestFindSaturationDonorClassifierLayer:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -490,6 +495,7 @@ class TestFindSaturationDonorHoldLayer:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -523,6 +529,7 @@ class TestFindSaturationDonorReceiverAntiFlap:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -552,6 +559,7 @@ class TestFindSaturationDonorReceiverAntiFlap:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -591,6 +599,7 @@ class TestFindSaturationDonorSameDonorEligibleAcrossCycles:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -623,6 +632,7 @@ class TestFindSaturationDonorStrictUpstream:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -651,6 +661,7 @@ class TestFindSaturationDonorStrictUpstream:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
@@ -684,6 +695,7 @@ class TestFindSaturationDonorFloorPreservation:
             d_k_now={},
             effective_capacities={},
             s_k_ewma={},
+            slots_per_worker_by_stage={},
         )
 
         assert donor is None
@@ -721,6 +733,7 @@ class TestFindSaturationDonorYoungestSelection:
                 d_k_now={},
                 effective_capacities={},
                 s_k_ewma={},
+                slots_per_worker_by_stage={},
             )
         )
 
