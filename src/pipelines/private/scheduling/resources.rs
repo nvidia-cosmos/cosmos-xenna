@@ -508,6 +508,11 @@ impl GpuResources {
         }
     }
 
+    #[getter]
+    fn get_used_fraction(&self) -> f32 {
+        self.used_fraction.to_num::<f32>()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "GpuResources(index={}, uuid_={:?}, used_fraction={})",

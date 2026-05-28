@@ -77,12 +77,23 @@ impl ProblemStage {
 ///
 /// # Attributes
 /// * `id` - Unique identifier for the worker group.
-/// * `workers` - List of workers in this group.
+/// * `resources` - Per-allocation resource list.
+/// * `num_used_slots` - Number of task slots currently occupied on this worker
+///   at sample time. Defaults to 0; consumers that do not populate this
+///   field treat the default as "no signal" (any worker is equally
+///   eligible for selection). The `#[serde(default)]` attribute keeps
+///   JSON payloads emitted before this field was added (e.g. by older
+///   tooling or persisted state) deserializable: a missing entry
+///   resolves to 0, matching both the `Default` derive and the
+///   Python constructor's `num_used_slots = 0` default. Round-tripping
+///   payloads that already carry the field is unaffected.
 #[pyclass(get_all, set_all)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProblemWorkerGroupState {
     pub id: String,
     pub resources: Vec<resources::WorkerResources>,
+    #[serde(default)]
+    pub num_used_slots: usize,
 }
 
 #[pymethods]
@@ -99,6 +110,7 @@ impl ProblemWorkerGroupState {
         Self {
             id: state.id,
             resources: state.allocations,
+            num_used_slots: 0,
         }
     }
 
@@ -107,12 +119,28 @@ impl ProblemWorkerGroupState {
         Self {
             id: state.id,
             resources: vec![state.allocation],
+            num_used_slots: 0,
         }
     }
 
+    /// Construct a `ProblemWorkerGroupState`.
+    ///
+    /// The `num_used_slots` field is an optional keyword argument
+    /// defaulting to 0 so existing call sites that built
+    /// `ProblemWorkerGroupState` from two positional arguments continue to
+    /// compile unchanged.
     #[new]
-    pub fn py_new(id: String, resources: Vec<resources::WorkerResources>) -> Self {
-        Self { id, resources }
+    #[pyo3(signature = (id, resources, num_used_slots = 0))]
+    pub fn py_new(
+        id: String,
+        resources: Vec<resources::WorkerResources>,
+        num_used_slots: usize,
+    ) -> Self {
+        Self {
+            id,
+            resources,
+            num_used_slots,
+        }
     }
 
     /// Converts this state to a Worker instance.
@@ -130,26 +158,53 @@ impl ProblemWorkerGroupState {
         }
     }
 
-    pub fn to_worker(&self, stage_name: String) -> resources::Worker {
-        if self.resources.len() > 1 {
-            panic!(
-                "Cannot convert ProblemWorkerGroupState to Worker if there are multiple allocations"
-            );
+    /// Convert this state into a single-allocation `Worker`.
+    ///
+    /// Returns `PyValueError` if `resources` does not have exactly
+    /// one allocation. The previous implementation panicked on
+    /// multi-allocation input, which propagated as a process-level
+    /// crash through PyO3 instead of a recoverable Python exception.
+    pub fn to_worker(&self, stage_name: String) -> PyResult<resources::Worker> {
+        if self.resources.len() != 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ProblemWorkerGroupState.to_worker: worker {} for stage {} \
+                 must have exactly one resource allocation, got {}",
+                self.id,
+                stage_name,
+                self.resources.len(),
+            )));
         }
-        resources::Worker {
+        Ok(resources::Worker {
             id: self.id.clone(),
             stage_name,
             allocation: self.resources[0].clone(),
-        }
+        })
     }
 
-    pub fn serialize(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    /// Serialize this state to a JSON string.
+    ///
+    /// Returns `PyRuntimeError` if the serializer fails. Serde rarely
+    /// fails on flat owned structs, but we surface any failure as a
+    /// Python exception instead of panicking through PyO3.
+    pub fn serialize(&self) -> PyResult<String> {
+        serde_json::to_string(self).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "ProblemWorkerGroupState serialize failed: {err}"
+            ))
+        })
     }
 
+    /// Deserialize a JSON string into a `ProblemWorkerGroupState`.
+    ///
+    /// Returns `PyValueError` on malformed JSON instead of panicking
+    /// through PyO3.
     #[staticmethod]
-    pub fn deserialize(data: &str) -> Self {
-        serde_json::from_str(data).unwrap()
+    pub fn deserialize(data: &str) -> PyResult<Self> {
+        serde_json::from_str(data).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "ProblemWorkerGroupState deserialize failed: {err}"
+            ))
+        })
     }
 }
 
@@ -157,32 +212,81 @@ impl ProblemWorkerGroupState {
 ///
 /// # Attributes
 /// * `stage_name` - Name identifier for this stage.
-/// * `workers` - List of workers currently assigned to this stage.
+/// * `worker_groups` - List of worker groups currently assigned to this stage.
 /// * `slots_per_worker` - Number of task slots available per worker.
 /// * `is_finished` - Boolean indicating if this stage has completed processing.
+/// * `num_used_slots` - Number of task slots currently occupied across all
+///   workers in the stage at sample time. Defaults to 0; consumers that do
+///   not populate this field treat the default as "no signal".
+/// * `num_empty_slots` - Number of task slots currently free across all
+///   workers in the stage at sample time. Combined with `num_used_slots`,
+///   gives the total in-stage slot capacity at sample time. Defaults to 0.
+/// * `input_queue_depth` - Number of pre-batch tasks queued upstream of this
+///   stage at sample time. Defaults to 0.
+/// * `num_pending_actors` - Number of actors currently in setup phases (not
+///   yet ready to process tasks). Defaults to 0; the saturation-aware
+///   scheduler combines this with `worker_groups.len()` (the ready-actor
+///   count) to detect the setup-phase quiescence condition described by the
+///   `setup_phase_quiescence_enabled` configuration field.
 #[pyclass(get_all, set_all)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProblemStageState {
     pub stage_name: String,
     pub worker_groups: Vec<ProblemWorkerGroupState>,
     pub slots_per_worker: usize,
     pub is_finished: bool,
+    pub num_used_slots: usize,
+    pub num_empty_slots: usize,
+    pub input_queue_depth: usize,
+    pub num_pending_actors: usize,
 }
 
 #[pymethods]
 impl ProblemStageState {
+    /// Construct a `ProblemStageState`.
+    ///
+    /// The slot-signal fields (`num_used_slots`, `num_empty_slots`,
+    /// `input_queue_depth`) and the setup-phase quiescence signal
+    /// (`num_pending_actors`) are optional keyword arguments defaulting to 0
+    /// so existing call sites that built `ProblemStageState` from four
+    /// positional arguments continue to compile unchanged.
     #[new]
+    #[pyo3(signature = (
+        stage_name,
+        worker_groups,
+        slots_per_worker,
+        is_finished,
+        num_used_slots = 0,
+        num_empty_slots = 0,
+        input_queue_depth = 0,
+        num_pending_actors = 0,
+    ))]
+    // The 8-argument signature is mandated by PyO3: the Rust `#[new]`
+    // constructor must mirror the `#[pyo3(signature = (...))]` Python
+    // keyword surface (4 required positional + 4 optional defaulted
+    // signal fields). Collapsing the optional fields into a config
+    // struct would change the Python API and break existing call
+    // sites that pass them positionally.
+    #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         stage_name: String,
         worker_groups: Vec<ProblemWorkerGroupState>,
         slots_per_worker: usize,
         is_finished: bool,
+        num_used_slots: usize,
+        num_empty_slots: usize,
+        input_queue_depth: usize,
+        num_pending_actors: usize,
     ) -> Self {
         Self {
             stage_name,
             worker_groups,
             slots_per_worker,
             is_finished,
+            num_used_slots,
+            num_empty_slots,
+            input_queue_depth,
+            num_pending_actors,
         }
     }
 
@@ -262,7 +366,7 @@ impl Display for ProblemState {
 /// # Attributes
 /// * `cluster_resources` - Total available resources in the cluster.
 /// * `stages` - List of all stages that need resource allocation.
-#[pyclass]
+#[pyclass(get_all, set_all)]
 #[derive(Debug, Clone)]
 pub struct Problem {
     pub cluster_resources: resources::ClusterResources,
@@ -313,6 +417,22 @@ impl StageSolution {
     }
 }
 
+#[pymethods]
+impl StageSolution {
+    /// Construct an empty StageSolution from Python.
+    ///
+    /// Used by pure-Python schedulers that need to produce
+    /// `Solution` outputs without going through the Rust autoscaler.
+    /// Callers populate `new_workers` and `deleted_workers` via the
+    /// `set_all`-exposed setters; mirrors the existing `#[new]`
+    /// constructors on `ProblemWorkerGroupState`, `ProblemStageState`,
+    /// `ProblemState`, and `Problem`.
+    #[new]
+    pub fn py_new(slots_per_worker: usize) -> Self {
+        Self::new(slots_per_worker)
+    }
+}
+
 /// Represents the complete result of the allocation problem.
 ///
 /// Contains the complete set of changes to be applied to the system.
@@ -327,6 +447,16 @@ pub struct Solution {
 
 #[pymethods]
 impl Solution {
+    /// Construct an empty Solution from Python.
+    ///
+    /// Used by pure-Python schedulers that need to assemble a
+    /// `Solution` from a list of `StageSolution`s without going
+    /// through the Rust autoscaler. Callers populate `stages` via
+    /// the `set_all`-exposed setter.
+    #[new]
+    pub fn py_new() -> Self {
+        Self::default()
+    }
     pub fn num_new_workers_per_stage(&self) -> Vec<usize> {
         self.stages.iter().map(|x| x.new_workers.len()).collect()
     }
@@ -536,4 +666,140 @@ pub fn register_module(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .add_class::<Measurements>()?
         .finish();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Boundary tests for the Python-facing data structures.
+    //!
+    //! These tests pin the PyO3 contract: malformed inputs must surface
+    //! as recoverable Python exceptions (returned as `Err(PyErr)`),
+    //! never as Rust panics propagated through PyO3 (which abort the
+    //! autoscaler thread). Tests check `is_err()` only; formatting the
+    //! `PyErr` value requires an initialized Python interpreter that
+    //! the Rust unit-test harness does not bring up.
+    use super::*;
+    use crate::pipelines::private::scheduling::resources as rds;
+
+    fn make_single_alloc(node: &str, cpus: f32) -> rds::WorkerResources {
+        rds::WorkerResources {
+            node: node.to_string(),
+            cpus: rds::FixedUtil::from_num(cpus),
+            gpus: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn to_worker_returns_err_for_multi_allocation_state() {
+        // ProblemWorkerGroupState built with two allocations represents
+        // an SPMD worker group; converting it to a flat single-allocation
+        // Worker would silently drop one allocation. Previously panicked
+        // through PyO3 and aborted the autoscaler thread; now must
+        // surface as a recoverable error.
+        let state = ProblemWorkerGroupState {
+            id: "w0".to_string(),
+            resources: vec![
+                make_single_alloc("node0", 1.0),
+                make_single_alloc("node1", 1.0),
+            ],
+            num_used_slots: 0,
+        };
+
+        assert!(
+            state.to_worker("stage_a".to_string()).is_err(),
+            "multi-allocation conversion must error, not panic"
+        );
+    }
+
+    #[test]
+    fn to_worker_returns_err_for_empty_allocation_state() {
+        // An empty resources vector previously triggered an out-of-bounds
+        // index panic on `self.resources[0]`. The new contract is a
+        // recoverable error.
+        let state = ProblemWorkerGroupState {
+            id: "w_empty".to_string(),
+            resources: Vec::new(),
+            num_used_slots: 0,
+        };
+
+        assert!(
+            state.to_worker("stage_a".to_string()).is_err(),
+            "empty-allocation conversion must error, not panic"
+        );
+    }
+
+    #[test]
+    fn to_worker_succeeds_for_single_allocation_state() {
+        // Happy path: a single allocation produces a single-allocation
+        // Worker carrying the same id/stage name/allocation.
+        let state = ProblemWorkerGroupState {
+            id: "w_solo".to_string(),
+            resources: vec![make_single_alloc("node0", 2.0)],
+            num_used_slots: 3,
+        };
+
+        let worker = state
+            .to_worker("stage_b".to_string())
+            .expect("single allocation must succeed");
+
+        assert_eq!(worker.id, "w_solo");
+        assert_eq!(worker.stage_name, "stage_b");
+        assert_eq!(worker.allocation.node, "node0");
+    }
+
+    #[test]
+    fn deserialize_returns_err_for_malformed_json() {
+        // Malformed JSON used to panic through
+        // `serde_json::from_str().unwrap()`; the new contract is a
+        // recoverable error.
+        assert!(
+            ProblemWorkerGroupState::deserialize("not-json").is_err(),
+            "malformed JSON must error, not panic"
+        );
+    }
+
+    #[test]
+    fn deserialize_returns_err_for_empty_string() {
+        assert!(
+            ProblemWorkerGroupState::deserialize("").is_err(),
+            "empty input must error, not panic"
+        );
+    }
+
+    #[test]
+    fn serialize_deserialize_round_trip() {
+        // Happy path covering the renamed PyResult signatures: serialize
+        // returns Ok(String) for a flat owned struct; deserialize round
+        // trips the value back to the original state.
+        let original = ProblemWorkerGroupState {
+            id: "w_round".to_string(),
+            resources: vec![make_single_alloc("node0", 1.5)],
+            num_used_slots: 7,
+        };
+
+        let serialized = original.serialize().expect("serialize must succeed");
+        let restored =
+            ProblemWorkerGroupState::deserialize(&serialized).expect("deserialize must succeed");
+
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.num_used_slots, original.num_used_slots);
+        assert_eq!(restored.resources.len(), original.resources.len());
+    }
+
+    #[test]
+    fn deserialize_legacy_payload_without_num_used_slots_defaults_to_zero() {
+        // JSON emitted before `num_used_slots` was added omits the field
+        // entirely. `#[serde(default)]` on the field must let the legacy
+        // payload deserialize, resolving the missing value to 0 to match
+        // both the `Default` derive and the Python constructor's
+        // `num_used_slots = 0` default.
+        let legacy = r#"{"id":"w_legacy","resources":[]}"#;
+
+        let restored =
+            ProblemWorkerGroupState::deserialize(legacy).expect("legacy payload must deserialize");
+
+        assert_eq!(restored.id, "w_legacy");
+        assert_eq!(restored.num_used_slots, 0);
+        assert!(restored.resources.is_empty());
+    }
 }

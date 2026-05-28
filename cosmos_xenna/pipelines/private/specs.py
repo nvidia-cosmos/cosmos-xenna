@@ -332,8 +332,16 @@ class StageSpec(typing.Generic[T, V]):
     max_setup_failure_percentage: float | None = None
 
     # Over-provision factor for this stage. It is applied to the measured processing
-    # speed of the stage to influence the worker allocation.
+    # speed of the stage to influence the worker allocation. Honoured only when
+    # ``StreamingSpecificSpec.scheduler == SchedulerKind.FRAGMENTATION_BASED``;
+    # the saturation-aware scheduler ignores this field.
     over_provision_factor: float | None = None
+
+    # Per-stage override for the saturation-aware scheduler. When ``None`` the
+    # scheduler resolver falls through to ``SaturationAwareConfig.per_stage_overrides``
+    # and then ``SaturationAwareConfig.stage_defaults``. Honoured only when
+    # ``StreamingSpecificSpec.scheduler == SchedulerKind.SATURATION_AWARE``.
+    saturation_aware: "SaturationAwareStageConfig | None" = None
 
     def name(self, index: int | None = None) -> str:
         if index is None:
@@ -349,7 +357,7 @@ class StageSpec(typing.Generic[T, V]):
             )
         validate_stage(self.stage, cluster_resources)
 
-    def override_with_pipeline_params(self, p: PipelineConfig) -> StageSpec:
+    def override_with_pipeline_params(self, p: PipelineConfig) -> StageSpec[T, V]:
         """Maybe override some fields using the global params.
 
         The StageSpec and PipelineSpec share some params we want to override the stage with the global params if the
@@ -357,7 +365,7 @@ class StageSpec(typing.Generic[T, V]):
         """
         c = copy.deepcopy(self)
 
-        def _override_if_none(attr_name: str):  # noqa: ANN202
+        def _override_if_none(attr_name: str) -> None:
             if getattr(c, attr_name) is None:
                 setattr(c, attr_name, getattr(p, attr_name))
 
@@ -370,6 +378,842 @@ class StageSpec(typing.Generic[T, V]):
         _override_if_none("worker_restart_interval_m")
         _override_if_none("max_setup_failure_percentage")
         return c
+
+
+class SchedulerKind(enum.StrEnum):
+    """Streaming-mode autoscaler implementation.
+
+    ``FRAGMENTATION_BASED`` (default) selects the Rust-backed
+    ``FragmentationBasedAutoscaler``. ``SATURATION_AWARE`` selects the
+    pure-Python saturation-aware scheduler. The flag is read once at
+    ``Autoscaler.__init__`` and frozen for the lifetime of the run.
+
+    Inherits from ``enum.StrEnum`` (Python 3.11+); each member is a
+    string usable in JSON, YAML, and f-string interpolation without
+    ``.value`` access.
+    """
+
+    FRAGMENTATION_BASED = "fragmentation_based"
+    SATURATION_AWARE = "saturation_aware"
+
+    @property
+    def supports_setup_aware_queue(self) -> bool:
+        """Whether this scheduler kind reads the per-stage ``setup_aware_max_queued`` flag.
+
+        The setup-aware backpressure cap (in
+        ``streaming_backpressure.compute_max_queued``) is gated by a
+        per-stage tunable that only the saturation-aware scheduler
+        consumes; the Rust-backed fragmentation-based path has no
+        equivalent config field and ignores the flag. Exposing the
+        capability on the enum keeps the per-stage backpressure
+        resolver from naming a specific ``SchedulerKind`` value and
+        leaves the abstraction boundary at the scheduler-kind layer
+        instead of at the backpressure helper. Future scheduler kinds
+        that wish to opt in just return ``True`` here.
+        """
+        return self is SchedulerKind.SATURATION_AWARE
+
+
+@attrs.define
+class SaturationAwareStageConfig:
+    """Per-stage tunables for the saturation-aware scheduler.
+
+    Each stage may use a different instance, allowing workloads with
+    materially different signal profiles to coexist on the same cluster
+    (e.g. a stage with multi-minute model warmup alongside a stage that
+    warms in seconds).
+
+    Default values apply unless overridden via:
+
+    1. ``StageSpec.saturation_aware`` (programmatic, per stage)
+    2. ``SaturationAwareConfig.per_stage_overrides[stage_name]`` (cluster-level keyed by name)
+    3. ``SaturationAwareConfig.stage_defaults`` (cluster-wide default)
+
+    Detailed tuning guidance per workload class lives in
+    ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
+
+    Configuration tiers:
+        Per-field tier classification (primary / expert) lives in the
+        operator quick-reference at
+        ``docs/scheduler/saturation-aware/tuning.md``. The "Primary
+        knobs" section there groups every knob most operators ever
+        touch; the "Advanced tuning fields" appendix groups the rest
+        by feature. Fields are kept on this class so tests,
+        programmatic overrides, and future operator-facing surfacing
+        remain possible without a config migration. Defaults match
+        the recommended production behaviour; reach for any field
+        only when a documented symptom matches a row in
+        ``tuning.md``.
+
+    """
+
+    # Per-field tier classification (primary / expert) lives in
+    # ``docs/scheduler/saturation-aware/tuning.md`` (the operator
+    # quick-reference). Inline per-field ``# tier:`` markers were
+    # intentionally NOT added: tuning.md is the single operator-facing
+    # source of truth, so an inline marker here would create a second
+    # source of truth that can drift from the operator doc.
+
+    # Minimum cycles with at least one ready actor before the classifier is
+    # trusted for that stage. Acts as a count-based data-sufficiency gate.
+    min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
+
+    # Operator-facing aggressiveness knob. The Halfin-Whitt parameter (beta)
+    # in the K/sqrt(c) Erlang-C M/M/c knee formula. Higher values make every
+    # stage's saturation threshold trigger sooner; the default 0.30 is the
+    # canonical balanced QED value. Power users tune this single primary knob;
+    # the explicit threshold overrides below stay available for stage-level
+    # pinning. Range: [0.10, 0.60]. Tuning guidance lives in
+    # ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
+    saturation_aggressiveness: float = attrs.field(
+        default=0.30,
+        validator=attrs.validators.and_(attrs.validators.ge(0.10), attrs.validators.le(0.60)),
+    )
+    # Slots-empty fraction below which a stage is classified SATURATED
+    # (sustained -> ordinary scale-up). ``None`` (the default) auto-derives
+    # on the first ``autoscale()`` cycle from ``saturation_aggressiveness``
+    # and the stage's runtime ``slots_per_worker`` via the K/sqrt(c) formula
+    # clamped to ``[auto_threshold_min, auto_threshold_max]``. An explicit
+    # numeric value pins the threshold for this stage and bypasses the
+    # formula. Cross-field: the resolved triple must satisfy
+    # activation < saturation < over_provisioned_threshold (enforced at
+    # resolution time).
+    #
+    # Migration note: prior to the K/sqrt(c) auto-derivation the field
+    # defaulted to 0.15 (and ``activation_threshold`` to 0.05). The new
+    # ``None`` / auto default produces different values per
+    # ``slots_per_actor``; e.g. at the project default ``slots_per_actor=2``
+    # the auto value is ~0.21 (saturation) / ~0.07 (activation), ~40% more
+    # aggressive than the legacy default. Pin both fields to ``0.15`` and
+    # ``0.05`` to preserve the legacy behaviour exactly.
+    saturation_threshold: float | None = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))),
+    )
+    # Slots-empty fraction below which a stage is classified SATURATED_CRITICAL
+    # (burst response). ``None`` (the default) auto-derives on the first
+    # ``autoscale()`` cycle as ``saturation * activation_to_saturation_ratio``.
+    # An explicit numeric value pins the threshold for this stage. Cross-field:
+    # the resolved value must be strictly less than the resolved
+    # ``saturation_threshold`` (enforced at resolution time).
+    #
+    # Migration note: see ``saturation_threshold`` above. Pin both
+    # ``saturation_threshold`` and this field to the legacy 0.15 / 0.05 to
+    # preserve pre-auto-derivation behaviour exactly.
+    activation_threshold: float | None = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))),
+    )
+    # Lower clamp on the auto-derived ``saturation_threshold``. Acts as a
+    # safety floor: even at very large ``c`` the formula cannot pin the
+    # threshold below this value, preventing the classifier from firing on
+    # single-slot transients in 100+ slot stages.
+    auto_threshold_min: float = attrs.field(
+        default=0.02,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(0.10)),
+    )
+    # Upper clamp on the auto-derived ``saturation_threshold``. Acts as a
+    # safety ceiling: even at ``c=1`` the formula cannot exceed this value.
+    # Must be strictly less than ``over_provisioned_threshold`` so the
+    # auto-derived saturation never collides with the over-provisioned
+    # zone (cross-field validator below).
+    auto_threshold_max: float = attrs.field(
+        default=0.45,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Fraction of the resolved saturation threshold at which the
+    # SATURATED_CRITICAL zone begins; consumed only when
+    # ``activation_threshold`` is auto-derived. Default 0.33 reproduces the
+    # legacy ``0.05 / 0.15 = 0.33`` ratio.
+    activation_to_saturation_ratio: float = attrs.field(
+        default=0.33,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.lt(1.0)),
+    )
+    # Slots-empty fraction above which a stage is classified OVER_PROVISIONED
+    # (sustained -> scale-down). Not auto-derived: the over-provisioned zone
+    # sits in the flat tail of the M/M/c response-time curve and is largely
+    # c-insensitive, so a fixed default works for almost any c. Cross-field:
+    # must be > the resolved saturation threshold (validated at resolution
+    # time).
+    over_provisioned_threshold: float = attrs.field(
+        default=0.50,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Fractional band around saturation_threshold within which the classifier
+    # holds the previous state to prevent edge oscillation.
+    saturation_deadband_pct: float = attrs.field(
+        default=0.15,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+    # Fractional band around over_provisioned_threshold; conventionally larger
+    # than the saturation-side band so scale-down requires stronger evidence.
+    over_provisioned_deadband_pct: float = attrs.field(
+        default=0.30,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Cycles a stage must remain SATURATED before scale-up is applied.
+    saturated_streak_min_cycles: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
+    # Cycles in SATURATED_CRITICAL before burst delta is applied.
+    saturated_critical_streak_min_cycles: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # Cycles a stage must remain OVER_PROVISIONED before scale-down is applied.
+    # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
+    over_provisioned_streak_min_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+
+    # When True, HOLD blocks SATURATED grow during post-shrink stabilization.
+    # When False, HOLD has no effect and the stage grows whenever the
+    # capacity target exceeds the current worker count.
+    enable_growth_mode_state_machine: bool = True
+    # Hard cap on the per-cycle additions any growth decision may produce.
+    # Bounds the blast radius when the capacity target jumps far above
+    # the current worker count (e.g. on a sudden burst of upstream load).
+    aggressive_growth_max_per_cycle: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
+
+    # Weight on the NEW sample in the EWMA recursion:
+    #   smoothed = level * new + (1 - level) * prior
+    # Higher values are more responsive (less smoothing);
+    # lower values smooth more heavily.
+    # Default 0.20 gives ~3-cycle half-life.
+    # 0.0 is rejected (would freeze the smoothed value forever).
+    slots_empty_ratio_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Recommendation history depth for the scale-up direction.
+    stabilization_window_cycles_up: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
+    # Recommendation history depth for the scale-down direction.
+    # Cross-field: must be > stabilization_window_cycles_up for asymmetric stabilization.
+    stabilization_window_cycles_down: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+
+    # Maximum fraction of a stage's current actors that may be deleted in a
+    # single cycle. Prevents cliff scale-downs that starve downstream stages.
+    max_scale_down_fraction_per_cycle: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Setup-phase quiescence gate. When True (default) and a stage has any
+    # pending actors at the start of an autoscale cycle, the saturation-aware
+    # scheduler suppresses scale-up decisions for that stage until at least
+    # one of the pending actors becomes ready. Cold-start (pending > 0 and
+    # ready == 0) skips the entire intent pipeline so the classifier streak
+    # and stabilization-window buffer are not polluted by zero-signal cycles;
+    # hot-pending (pending > 0 and ready > 0) clamps positive intents to 0
+    # so Phase C does not pile additional adds on top of an in-flight setup.
+    # Phase D scale-down and Phase B floor are unaffected.
+    setup_phase_quiescence_enabled: bool = True
+    # Per-worker measurement grace: after a worker first appears in the
+    # ready snapshot, its slot samples are excluded from per-stage averages
+    # until this many seconds elapse. This keeps freshly-ready actors from
+    # biasing the EWMA while the dispatcher is still filling their queues.
+    worker_warmup_measurement_grace_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
+    # Donor warmup grace: after a worker first appears in the ready
+    # snapshot, it is excluded from Phase D and saturation-donor victim
+    # pools until this many seconds elapse.
+    donor_warmup_grace_s: float = attrs.field(default=180.0, validator=attrs.validators.ge(0.0))
+
+    # Optional cluster-wide minimum workers for this stage. ``None`` means the
+    # implicit one-worker floor (1) applies. Useful for pre-warming stages with
+    # long model load. When the cluster cannot satisfy the floor during the
+    # worker-floor enforcement step, the scheduler raises ``RuntimeError``
+    # (fail-fast on infeasible config).
+    min_workers: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional per-node minimum workers for this stage. ``None`` means no
+    # per-node floor. Composes with ``min_workers``: effective floor is
+    # ``max(min_workers, min_workers_per_node * num_nodes)`` when both are set.
+    min_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional cluster-wide cap on the number of workers for this stage.
+    # ``None`` means unbounded (cluster capacity is the ceiling). Cross-field:
+    # must be >= min_workers when both are set.
+    max_workers: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+    # Optional per-node cap on workers of this stage. ``None`` means
+    # unbounded by this knob. Cross-field: must be >= min_workers_per_node.
+    max_workers_per_node: int | None = attrs.field(default=None, validator=attrs_utils.validate_optional_positive_int)
+
+    # Setup-aware queue cap: lower the upstream ``max_queued`` cap while the
+    # stage is in cold start (pending actors exist, no ready actors yet).
+    setup_aware_max_queued: bool = True
+
+    # Backlog-time compound classifier knobs (06-backlog-time-signal.md).
+    #
+    # The classifier currently fires SATURATED whenever the slots-empty EWMA
+    # crosses ``saturation_threshold``. That signal is utilisation-only: it
+    # does not distinguish a transient occupancy burst (a brief queue spike
+    # that drains itself) from a persistent build-up of upstream backlog.
+    # The pressure compound combines utilisation with a normalised backlog
+    # time (Little's Law ``W_q = queue / throughput`` divided by an
+    # operator-facing target) so genuine saturation requires BOTH factors to
+    # be elevated; either factor near zero kills the product. The classifier
+    # then uses the smoothed pressure as a demotion gate inside the existing
+    # slot-ratio branches (no restructuring of the zone shape).
+
+    # Queue drain time at which ``normalized_backlog == 1.0``. Operator-facing
+    # primary knob; the three pressure thresholds derive their effective
+    # semantics from this value. A higher target tolerates longer queues
+    # before the classifier reads pressure as elevated.
+    target_backlog_seconds: float = attrs.field(
+        default=30.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # EWMA alpha on the composite pressure signal. Same semantics as
+    # ``slots_empty_ratio_smoothing_level``: ``1.0`` disables smoothing,
+    # smaller values dampen noise. Default ``0.20`` mirrors the slot EWMA
+    # half-life so the two smoothed signals converge on similar timescales.
+    pressure_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # In the SATURATED branch (``slots_empty_ratio_ewma < saturation_boundary``):
+    # smoothed pressure below this threshold demotes the classifier output to
+    # ``NORMAL`` because the queue is draining despite busy slots (transient
+    # burst). Default ``1.0`` matches the natural unit boundary
+    # ``utilisation == 1.0 AND queue drains in target_backlog_seconds``.
+    pressure_saturation_threshold: float = attrs.field(
+        default=1.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # In the SATURATED_CRITICAL branch
+    # (``slots_empty_ratio_ewma < activation_threshold``): smoothed pressure
+    # MUST exceed this threshold to fire CRITICAL; otherwise the classifier
+    # demotes to ``NORMAL``. Higher than ``pressure_saturation_threshold``
+    # because CRITICAL needs a genuinely large backlog at near-zero free
+    # slots, not just slot pinning.
+    pressure_critical_threshold: float = attrs.field(
+        default=2.0,
+        validator=attrs.validators.gt(0.0),
+    )
+    # In the OVER_PROVISIONED branch
+    # (``slots_empty_ratio_ewma >= over_provisioned_boundary AND queue > 0``):
+    # smoothed pressure ABOVE this threshold demotes to ``NORMAL`` because
+    # the queue is stuck elsewhere (downstream bottleneck) and shrinking
+    # would make the downstream stall worse. Lower than
+    # ``pressure_saturation_threshold``.
+    pressure_normal_threshold: float = attrs.field(
+        default=0.3,
+        validator=attrs.validators.gt(0.0),
+    )
+
+    def __attrs_post_init__(self) -> None:
+        """Validate cross-field invariants only.
+
+        Single-field constraints (positive integers, fractions in [0, 1], ...)
+        are enforced by ``attrs.field(validator=...)`` on each field above.
+        This method handles invariants that span two or more fields.
+
+        Raises:
+            ValueError: When two or more fields are set to mutually
+                inconsistent values.
+        """
+        # Threshold ordering - classifier zones must not overlap. Only
+        # validated here when both auto-derivable thresholds are explicit
+        # (the resolver enforces the same invariant on the resolved values
+        # when one or both are auto).
+        if self.saturation_threshold is not None and self.activation_threshold is not None:
+            if not (self.activation_threshold < self.saturation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"activation_threshold={self.activation_threshold} must be < "
+                    f"saturation_threshold={self.saturation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+        elif self.saturation_threshold is not None:
+            # Saturation pinned, activation auto. The pinned saturation must
+            # at least leave room for the over-provisioned ordering.
+            if not (self.saturation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"saturation_threshold={self.saturation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+        elif self.activation_threshold is not None:
+            # Activation pinned, saturation auto. The pinned activation must
+            # not already exceed the over-provisioned threshold (defensive --
+            # the resolver also re-checks this against the resolved saturation).
+            if not (self.activation_threshold < self.over_provisioned_threshold):
+                msg = (
+                    f"Threshold ordering violated: "
+                    f"activation_threshold={self.activation_threshold} must be < "
+                    f"over_provisioned_threshold={self.over_provisioned_threshold}"
+                )
+                raise ValueError(msg)
+
+        # Auto-threshold clamps - the auto-derived saturation threshold
+        # must be drawn from a non-empty interval; the upper clamp must
+        # leave room for the lower one.
+        if not (self.auto_threshold_min < self.auto_threshold_max):
+            msg = (
+                f"auto_threshold_min ({self.auto_threshold_min}) must be < "
+                f"auto_threshold_max ({self.auto_threshold_max})"
+            )
+            raise ValueError(msg)
+
+        # Auto-threshold ceiling vs over-provisioned floor - any auto-derived
+        # saturation that hits the upper clamp must still be strictly below
+        # the over-provisioned threshold; otherwise the resolver's zone
+        # ordering fails when a regime-aware lift pushes the formula output
+        # into the clamp at small slots_per_actor.
+        if not (self.auto_threshold_max < self.over_provisioned_threshold):
+            msg = (
+                f"auto_threshold_max ({self.auto_threshold_max}) must be < "
+                f"over_provisioned_threshold ({self.over_provisioned_threshold}) "
+                "so the auto-derived saturation never collides with the "
+                "over-provisioned zone."
+            )
+            raise ValueError(msg)
+
+        # Slow-start grace ordering - donor grace must cover worker grace.
+        if self.donor_warmup_grace_s < self.worker_warmup_measurement_grace_s:
+            msg = (
+                f"donor_warmup_grace_s ({self.donor_warmup_grace_s}) must be >= "
+                f"worker_warmup_measurement_grace_s ({self.worker_warmup_measurement_grace_s})"
+            )
+            raise ValueError(msg)
+
+        # Streak ordering - shrink streak must dominate growth streak.
+        if self.over_provisioned_streak_min_cycles <= self.saturated_streak_min_cycles:
+            msg = (
+                f"over_provisioned_streak_min_cycles ({self.over_provisioned_streak_min_cycles}) must be "
+                f"strictly > saturated_streak_min_cycles ({self.saturated_streak_min_cycles}) "
+                f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # Stabilization windows - down dominates up.
+        if self.stabilization_window_cycles_down <= self.stabilization_window_cycles_up:
+            msg = (
+                f"stabilization_window_cycles_down ({self.stabilization_window_cycles_down}) must be > "
+                f"stabilization_window_cycles_up ({self.stabilization_window_cycles_up}) "
+                f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # Min <= max relations (when both sides set).
+        if self.min_workers is not None and self.max_workers is not None and self.min_workers > self.max_workers:
+            msg = f"min_workers ({self.min_workers}) must be <= max_workers ({self.max_workers})"
+            raise ValueError(msg)
+        if (
+            self.min_workers_per_node is not None
+            and self.max_workers_per_node is not None
+            and self.min_workers_per_node > self.max_workers_per_node
+        ):
+            msg = (
+                f"min_workers_per_node ({self.min_workers_per_node}) must be <= "
+                f"max_workers_per_node ({self.max_workers_per_node})"
+            )
+            raise ValueError(msg)
+
+        # Pressure-threshold ordering: ``critical > saturation > normal``.
+        if not (self.pressure_critical_threshold > self.pressure_saturation_threshold):
+            msg = (
+                f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be > "
+                f"pressure_saturation_threshold ({self.pressure_saturation_threshold}); "
+                "CRITICAL needs a strictly larger pressure than SATURATED to fire."
+            )
+            raise ValueError(msg)
+        if not (self.pressure_saturation_threshold > self.pressure_normal_threshold):
+            msg = (
+                f"pressure_saturation_threshold ({self.pressure_saturation_threshold}) must be > "
+                f"pressure_normal_threshold ({self.pressure_normal_threshold}); "
+                "SATURATED needs a strictly larger pressure than the OVER_PROVISIONED demotion gate."
+            )
+            raise ValueError(msg)
+        # Local import keeps ``pressure.py``'s gauge registration SA-only;
+        # a top-level import would trigger it from every non-SA pipeline.
+        from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.pressure import BACKLOG_CAP
+
+        if self.pressure_critical_threshold > BACKLOG_CAP:
+            msg = (
+                f"pressure_critical_threshold ({self.pressure_critical_threshold}) must be <= "
+                f"{BACKLOG_CAP} (the backlog cap on the composite pressure signal); "
+                "thresholds above the cap can never fire."
+            )
+            raise ValueError(msg)
+
+
+@attrs.define
+class SaturationAwareConfig:
+    """Cluster-level (global) tunables for the saturation-aware scheduler.
+
+    Holds cluster-wide configuration plus the per-stage default and explicit
+    per-stage override registry. Stage-local tunables live on
+    ``SaturationAwareStageConfig``; see that class for resolution order.
+    Detailed tuning guidance per workload class lives in
+    ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
+
+    Configuration tiers:
+        Per-field tier classification (primary / expert) lives in the
+        operator quick-reference at
+        ``docs/scheduler/saturation-aware/tuning.md``. The "Primary
+        knobs" section there groups every knob most operators ever
+        touch; the "Advanced tuning fields" appendix groups the rest
+        by feature. Defaults match the recommended production
+        behaviour; reach for any field only when a documented symptom
+        matches a row in ``tuning.md``.
+
+    """
+
+    # Per-field tier classification (primary / expert) lives in
+    # ``docs/scheduler/saturation-aware/tuning.md`` (the operator
+    # quick-reference). Inline per-field ``# tier:`` markers were
+    # intentionally NOT added: tuning.md is the single operator-facing
+    # source of truth, so an inline marker here would create a second
+    # source of truth that can drift from the operator doc.
+
+    # Cycle period for the autoscaler control loop, in seconds. Effective
+    # response time is ``interval_s * streak_min_cycles``.
+    interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
+
+    # When True, detect the cluster's Halfin-Whitt regime per cycle and lift
+    # ``saturation_aggressiveness`` by ``super_halfin_whitt_aggressiveness_lift``
+    # whenever the cluster sits in the super-Halfin-Whitt regime.
+    # The lift makes scale-up faster without changing scale-down.
+    # Set False to pin the aggressiveness at its base value and skip
+    # regime tracking entirely -
+    # useful for diagnosis or queueing-theory-purity A/B comparisons.
+    enable_regime_aware_aggressiveness: bool = attrs.field(
+        default=True,
+        validator=attrs.validators.instance_of(bool),
+    )
+    # Additive lift applied to ``saturation_aggressiveness`` when the
+    # cluster is in super-Halfin-Whitt. Default 0.15 shifts the canonical
+    # 0.30 base to 0.45 (the auto-derived ``saturation_threshold``
+    # increases proportionally, so the classifier fires SATURATED earlier
+    # in the empty-slot ratio band). Range ``[0.0, 0.5]``; setting to
+    # 0.0 disables the numeric lift but still runs regime tracking.
+    super_halfin_whitt_aggressiveness_lift: float = attrs.field(
+        default=0.15,
+        validator=attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(0.5)),
+    )
+    # Consecutive cycles required to commit a regime transition (in either
+    # direction). Hysteresis prevents a noisy ``cluster_idle_fraction``
+    # oscillating around the regime threshold from flapping the effective
+    # aggressiveness.
+    regime_transition_streak_cycles: int = attrs.field(default=3, validator=attrs_utils.validate_positive_int)
+
+    # When True, growth attempts are sorted by DAG depth descending
+    # (downstream stages first). Reflects the invariant that pipeline
+    # throughput is bounded by the tail stage.
+    enable_dag_priority_growth: bool = True
+    # When True, on allocation failure the scheduler may take a worker from
+    # an upstream stage to feed the receiver (cluster-full rebalance).
+    enable_cross_stage_donor: bool = True
+    # When True, a donor must have strictly smaller DAG depth than the
+    # receiver (never take from a downstream stage).
+    donor_must_be_strictly_upstream: bool = True
+
+    # When True, donor candidates must be in OVER_PROVISIONED state with a
+    # full streak (not merely non-SATURATED). Strongest anti-flap layer.
+    cross_stage_donor_require_over_provisioned: bool = True
+    # When True, donors in HOLD growth mode are ineligible.
+    cross_stage_donor_exclude_hold_state: bool = True
+    # Cycles a stage must wait after donating before it can receive via
+    # cross-stage logic. Cross-field: must dominate the longest stage's
+    # over_provisioned_streak_min_cycles. The receiver-was-recent-donor
+    # ledger is the only across-cycle anti-flap safeguard for the donor
+    # path; the per-cycle receiver cap and the donor-side cooldown are
+    # subsumed by the OVER_PROVISIONED + streak gate (across cycles)
+    # and the natural per-receiver intent bound (within one cycle).
+    cross_stage_donor_anti_flap_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+
+    # Streak bonus applied to donor cost so long-OVER_PROVISIONED stages
+    # are perceived as cheaper donors. Cost expression:
+    # ``donor_cost = slots_empty_ratio_ewma * num_workers
+    #                - cross_stage_donor_streak_bonus * min(streak, streak_cap)``.
+    # A larger value tilts selection toward stages with sustained idle slots.
+    cross_stage_donor_streak_bonus: float = attrs.field(default=0.05, validator=attrs.validators.ge(0.0))
+    # Bottleneck-severity weight applied to receiver value. Value expression:
+    # ``receiver_value = pressure_ewma * num_workers
+    #                    + cross_stage_donor_bottleneck_weight * (D_k - median_D_k)
+    #                    + cross_stage_donor_intent_weight * receiver_intent``.
+    # A larger value pulls demand toward stages with high ``D_k`` relative
+    # to the cluster median.
+    cross_stage_donor_bottleneck_weight: float = attrs.field(default=1.0, validator=attrs.validators.ge(0.0))
+    # Intent weight applied to receiver value (same expression as
+    # ``cross_stage_donor_bottleneck_weight``). A larger value lets a
+    # higher-intent receiver outbid a comparably saturated peer.
+    cross_stage_donor_intent_weight: float = attrs.field(default=0.5, validator=attrs.validators.ge(0.0))
+    # Upper bound on the ``classifier_streak`` term in donor_cost. Prevents
+    # one stage with an arbitrarily long streak from dominating the score.
+    cross_stage_donor_streak_cap: int = attrs.field(default=60, validator=attrs_utils.validate_positive_int)
+    # Minimum ``receiver_value - donor_cost`` required to commit a donation.
+    cross_stage_donor_spread_threshold: float = attrs.field(default=0.5, validator=attrs.validators.ge(0.0))
+
+    # Maximum allowed regression in pipeline throughput estimate
+    # ``1.0 / max_k(D_k)`` before the donor commit gate rejects a plan.
+    cross_stage_donor_throughput_tolerance: float = attrs.field(
+        default=0.01,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Maximum amount a donor stage's post-plan ``D_k`` may exceed the
+    # pre-plan ``max_k(D_k)`` before the donor-flip guard fires.
+    cross_stage_donor_donor_flip_tolerance: float = attrs.field(
+        default=0.10,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Maximum allowed regression in ``balance_score = 1 / max(1, heterogeneity_ratio)``
+    # when ``throughput_estimate`` is tied within ``cross_stage_donor_throughput_tolerance``.
+    cross_stage_donor_balance_tolerance: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.ge(0.0),
+    )
+
+    # Minimum ``signal_trust`` a donor must clear before its classifier
+    # signal is trusted enough to drive a donation. Signal trust is
+    # ``min(streak, trust_streak_cap) / (1 + classifier_signal_noise_ewma)``;
+    # noisy classifiers fail the gate even if their streak is long.
+    cross_stage_donor_min_trust: float = attrs.field(
+        default=1.0,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Upper bound on the streak term in signal_trust. Mirrors the
+    # ``cross_stage_donor_streak_cap`` clamp but is tunable independently
+    # so trust and marginal-value scoring can evolve separately.
+    cross_stage_donor_trust_streak_cap: int = attrs.field(
+        default=60,
+        validator=attrs_utils.validate_positive_int,
+    )
+    # EWMA smoothing level for the per-stage classifier-signal-noise
+    # tracker driving ``signal_trust``. Smaller values respond more slowly
+    # to flicker; uses the same ``(0, 1]`` interval as the other
+    # ``_smoothing_level`` fields.
+    classifier_signal_noise_smoothing_level: float = attrs.field(
+        default=0.2,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # Maximum number of donor workers in one DonorPlan. Bounds the
+    # resource-fit search width.
+    cross_stage_donor_max_plan_size: int = attrs.field(
+        default=4,
+        validator=attrs_utils.validate_positive_int,
+    )
+    # Maximum number of candidate combinations probed per plan size.
+    # Bounds the resource-fit search depth on pathological clusters.
+    cross_stage_donor_max_plan_combinations: int = attrs.field(
+        default=32,
+        validator=attrs_utils.validate_positive_int,
+    )
+
+    # End-of-cycle ``balance_score`` regression tolerance. When the
+    # post-cycle score drops below the pre-cycle score by more than this
+    # amount, one WARN log fires. No hard failure; balance is a secondary
+    # objective and the autoscaler does not raise on regression.
+    cross_stage_donor_balance_regression_tolerance: float = attrs.field(
+        default=0.05,
+        validator=attrs.validators.ge(0.0),
+    )
+    # Number of consecutive cycles the minimum-worker floor enforcement may
+    # fail without receiver progress (cluster placement exhausted AND no
+    # eligible cross-stage donor) before raising ``RuntimeError`` and failing
+    # the pipeline. Default 6 autoscale cycles; wall-clock duration depends on
+    # the scheduler loop cadence.
+    # Set to 0 to disable the grace window: floor enforcement raises on the
+    # first failed no-donor allocation. Counter resets on any successful add
+    # or donation for the receiver stage. Post-donation retry failures raise
+    # immediately because the donor removal cannot be rolled back safely.
+    floor_stuck_grace_cycles: int = attrs.field(
+        default=6,
+        validator=attrs.validators.and_(
+            attrs.validators.instance_of(int),
+            attrs.validators.ge(0),
+        ),
+    )
+
+    # Fraction of ``interval_s`` above which a cycle's wall-clock duration
+    # triggers a WARN log via ``loop_watchdog`` (cluster-wide). Range
+    # ``(0.0, 1.0]``.
+    cycle_time_warn_threshold: float = attrs.field(
+        default=0.5,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+
+    # When True, ``MemoryPressureMonitor`` polls Ray's cluster object-store
+    # memory and freezes Phase C scale-up when used fraction is at or above
+    # the critical threshold below (comparison uses ``>=``).
+    enable_memory_pressure_gate: bool = True
+    # Fraction of cluster object-store memory at or above which the gate
+    # freezes Phase C scale-up. The comparison uses ``>=`` so the
+    # closed-right end of the validator interval ``(0.0, 1.0]`` is
+    # meaningful (a configured ``1.0`` trips when the object store
+    # reports fully saturated).
+    memory_pressure_critical_threshold: float = attrs.field(
+        default=0.85,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Polling interval (seconds) for the Ray cluster memory query.
+    memory_pressure_polling_interval_s: float = attrs.field(default=5.0, validator=attrs.validators.gt(0.0))
+
+    # When True, an absorbed Phase C ``try_add_worker`` exception logs the
+    # per-GPU fragmentation snapshot + bumps the failure counter and skips
+    # the rest of Phase C for that cycle; when False, the exception
+    # propagates so the run-loop crashes loudly.
+    skip_cycle_on_allocation_error: bool = True
+    # Consecutive Phase C cycles a stage must stay stuck before the
+    # detector promotes the per-cycle WARN to a one-shot INFO.
+    stuck_plan_detection_cycles: int = attrs.field(default=18, validator=attrs_utils.validate_positive_int)
+
+    # Ratio of ``max(D_k) / min(D_k)`` (Forced-Flow service demand)
+    # above which the cluster is considered heterogeneous enough that
+    # the dominant bottleneck stage may benefit from a longer
+    # ``over_provisioned_streak_min_cycles`` to absorb measurement
+    # noise. Default 5.0 -- a homogeneous pipeline has a ratio of 1.0,
+    # so the threshold must be strictly greater than 1.0. Values
+    # between 3.0 and 10.0 are typical: lower values fire the tuning
+    # log on mildly skewed pipelines (CPU prep + GPU caption);
+    # higher values quiet the log unless one stage is an order of
+    # magnitude slower than the rest.
+    cluster_heterogeneity_warn_threshold: float = attrs.field(
+        default=5.0,
+        validator=attrs.validators.gt(1.0),
+    )
+    # Number of consecutive autoscale cycles the heterogeneity ratio
+    # must stay above
+    # ``cluster_heterogeneity_warn_threshold`` before exactly one
+    # INFO tuning-recommendation log fires. Default 30 cycles ~= 5 min
+    # at the default ``interval_s = 10.0``. The streak gate prevents
+    # alert fatigue on transient ratio spikes (cold-start, brief
+    # measurement noise) while sustained heterogeneity still
+    # surfaces in operator log scrapes within minutes. After firing
+    # once, the log re-arms only after the ratio drops back to or
+    # below the threshold and climbs above it again.
+    cluster_heterogeneity_warn_streak: int = attrs.field(
+        default=30,
+        validator=attrs_utils.validate_positive_int,
+    )
+
+    # When True, Phase C grow ordering uses the bottleneck argmax (D_k
+    # descending) instead of the legacy DAG-depth fallback. Effective
+    # only when the bottleneck gate is engaged for the cycle; cold-start
+    # and homogeneous clusters fall back automatically.
+    enable_bottleneck_priority_growth: bool = True
+    # When True, Phase D refuses to shrink the engaged bottleneck stage
+    # on transient idle (intent < 0 with no ceiling overflow). Operator
+    # ``requested_num_workers`` and ceiling overflow always bypass.
+    enable_bottleneck_shrink_protection: bool = True
+    # EWMA smoothing factor (alpha) for per-stage D_k. ``0.0`` would
+    # freeze the EWMA forever; ``1.0`` would skip smoothing. Range
+    # ``(0.0, 1.0]``.
+    bottleneck_d_k_smoothing_level: float = attrs.field(
+        default=0.20,
+        validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
+    )
+    # Heterogeneity ratio threshold above which the bottleneck gate
+    # engages. ``max(D_k) / median(D_k)`` for n>=3 stages with finite
+    # D_k; ``max / min`` for n=2 (median is mathematically capped at
+    # 2.0 for two samples). Must be strictly greater than 1.0.
+    bottleneck_heterogeneity_threshold: float = attrs.field(
+        default=2.0,
+        validator=attrs.validators.gt(1.0),
+    )
+    # Consecutive cycles the engagement state must hold before the
+    # transition INFO log fires. Debounces flap-spam at the
+    # heterogeneity gate boundary.
+    bottleneck_engagement_persistence_cycles: int = attrs.field(
+        default=2,
+        validator=attrs_utils.validate_positive_int,
+    )
+
+    # Default ``SaturationAwareStageConfig`` applied to every stage that has
+    # no more specific override.
+    stage_defaults: SaturationAwareStageConfig = attrs.field(factory=SaturationAwareStageConfig)
+    # Optional explicit per-stage overrides keyed by stage name. Each value is
+    # a full ``SaturationAwareStageConfig``; copy ``stage_defaults`` and tweak
+    # the fields you want to change. Lower precedence than
+    # ``StageSpec.saturation_aware``.
+    per_stage_overrides: dict[str, SaturationAwareStageConfig] = attrs.field(factory=dict)
+
+    def __attrs_post_init__(self) -> None:
+        """Validate cluster-wide cross-field invariants for the configs known here.
+
+        Single-field constraints are enforced by ``attrs.field(validator=...)``
+        on each field above. This method validates invariants that span the
+        cluster guardrails and the per-stage configs visible at construction
+        time: ``stage_defaults`` and ``per_stage_overrides``. The
+        higher-precedence ``StageSpec.saturation_aware`` overrides live on
+        ``StageSpec``, not on this cluster config, so they are not yet
+        available; ``SaturationAwareScheduler.__init__`` re-runs
+        ``validate_effective_stage_configs(spec_overrides=...)`` once those
+        runtime overrides are collected, applying the same invariants to the
+        full three-tier set.
+
+        Raises:
+            ValueError: When two or more fields are set to mutually
+                inconsistent values.
+        """
+        self.validate_effective_stage_configs()
+
+    def validate_effective_stage_configs(
+        self,
+        spec_overrides: Sequence[SaturationAwareStageConfig] = (),
+    ) -> None:
+        """Validate cross-field invariants across every effective stage config.
+
+        Called twice in the pipeline-build lifecycle:
+
+        1. Eagerly from ``__attrs_post_init__`` with the default empty
+           ``spec_overrides``, when only ``stage_defaults`` and
+           ``per_stage_overrides`` are knowable. Catches misconfigured
+           cluster configs at the constructor where the bad value was
+           written.
+        2. From ``SaturationAwareScheduler.__init__`` with the collected
+           ``StageSpec.saturation_aware`` overrides, after the pipeline
+           spec is fully assembled. Re-validates the same invariants
+           against the full three-tier set so a higher-precedence
+           override cannot silently weaken a cluster guardrail.
+
+        The validated invariants are monotone in the set of configs (adding
+        more configs to ``all_stage_configs`` can only raise the longest
+        observed streak), so call 2 strictly extends call 1; both calls are
+        required because they fire at different times.
+
+        Args:
+            spec_overrides: Highest-precedence stage configs collected from
+                ``StageSpec.saturation_aware``. Empty (the default) when the
+                cluster config is being constructed standalone, since those
+                overrides are not yet collected at that point.
+
+        Raises:
+            ValueError: When cluster-wide guardrails are weaker than any stage
+                config they must dominate.
+        """
+        all_stage_configs = [self.stage_defaults, *self.per_stage_overrides.values(), *spec_overrides]
+        longest_shrink_streak = max(cfg.over_provisioned_streak_min_cycles for cfg in all_stage_configs)
+        if self.cross_stage_donor_anti_flap_cycles < longest_shrink_streak:
+            msg = (
+                f"cross_stage_donor_anti_flap_cycles ({self.cross_stage_donor_anti_flap_cycles}) must be "
+                f">= the longest over_provisioned_streak_min_cycles across all stage configs "
+                f"({longest_shrink_streak}); otherwise the anti-flap safeguard is weaker than the "
+                f"streak it must dominate."
+            )
+            raise ValueError(msg)
+
+    def get_effective_stage_config(
+        self,
+        stage_name: str,
+        spec_override: SaturationAwareStageConfig | None = None,
+    ) -> SaturationAwareStageConfig:
+        """Resolve the effective stage config using three-tier precedence.
+
+        Args:
+            stage_name: Name of the stage being looked up.
+            spec_override: Override read from ``StageSpec.saturation_aware``,
+                or ``None`` if the stage spec did not set one.
+
+        Returns:
+            The resolved ``SaturationAwareStageConfig`` for the stage.
+            Lookup precedence: ``spec_override`` -> ``per_stage_overrides`` ->
+            ``stage_defaults``.
+
+        """
+        if spec_override is not None:
+            return spec_override
+        if stage_name in self.per_stage_overrides:
+            return self.per_stage_overrides[stage_name]
+        return self.stage_defaults
 
 
 @attrs.define
@@ -421,6 +1265,53 @@ class StreamingSpecificSpec:
     # still applies). End-of-stage teardown bypasses the grace via the
     # ``stages_is_dones`` flag so final drain is never delayed.
     scale_down_grace_after_ready_s: float = 60.0
+
+    # Selects the autoscaler implementation. ``FRAGMENTATION_BASED`` (default)
+    # uses the Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python
+    # saturation-aware scheduler. The flag is read once at
+    # ``Autoscaler.__init__`` and frozen for the lifetime of the run.
+    scheduler: SchedulerKind = attrs.field(
+        default=SchedulerKind.FRAGMENTATION_BASED,
+        converter=SchedulerKind,
+    )
+    # Configuration for the saturation-aware scheduler. Defaults to
+    # ``None`` so a fragmentation-based pipeline never instantiates a
+    # ``SaturationAwareConfig``. The chained factories on
+    # ``SaturationAwareConfig.stage_defaults`` and
+    # ``SaturationAwareStageConfig.__attrs_post_init__`` import
+    # ``scheduling_py.phases.intent.pressure``, which registers Ray ``Gauge`` series
+    # at module load; constructing the SA config eagerly would defeat
+    # the lazy-registration guarantee for FRAGMENTATION_BASED runs.
+    # Callers running on the saturation-aware path reach a non-None
+    # instance via ``materialized_saturation_aware()``.
+    saturation_aware: SaturationAwareConfig | None = attrs.field(default=None)
+
+    def materialized_saturation_aware(self) -> SaturationAwareConfig:
+        """Return the saturation-aware config, materializing a default once when ``None``.
+
+        The ``saturation_aware`` field defaults to ``None`` to keep the
+        fragmentation-based path free of ``scheduling_py.phases.intent.pressure``
+        Ray ``Gauge`` registrations triggered transitively by the
+        ``SaturationAwareConfig`` factory chain. This helper is the
+        single point where the SA-aware code paths force materialization;
+        the resolved instance is cached on the spec so successive calls
+        return the same object (preserves identity for equality checks
+        and any consumer that captures the reference).
+
+        Not thread-safe: the read-then-write on ``self.saturation_aware``
+        is unsynchronized. All current consumers run on the streaming
+        main thread (the autoscaler's background thread never touches
+        ``mode_specific``); a future concurrent caller must take an
+        external lock or this method must be hardened with one.
+
+        Returns:
+            The user-supplied ``SaturationAwareConfig`` if set, otherwise
+            a freshly-built ``SaturationAwareConfig()`` cached on
+            ``self.saturation_aware``.
+        """
+        if self.saturation_aware is None:
+            self.saturation_aware = SaturationAwareConfig()
+        return self.saturation_aware
 
 
 @attrs.define
@@ -510,10 +1401,10 @@ class JobInfo:
 
 @attrs.define
 class ServingQueues:
-    source: multiprocessing.Queue
-    sink: multiprocessing.Queue
+    source: multiprocessing.Queue[Any]
+    sink: multiprocessing.Queue[Any]
 
-    def __deepcopy__(self, memo: dict) -> "ServingQueues":
+    def __deepcopy__(self, memo: dict[Any, Any]) -> "ServingQueues":
         # do a shallow copy
         return ServingQueues(self.source, self.sink)
 
@@ -531,14 +1422,14 @@ class PipelineSpec:
     # offline processing with pre-populated input data
     # TODO: Can we support a generator here?
     input_data: Sequence[Any]
-    stages: Sequence[StageSpec | Stage]
+    stages: Sequence[StageSpec[Any, Any] | Stage[Any, Any]]
     config: PipelineConfig = attrs.field(factory=PipelineConfig)
     job_info: Optional[JobInfo] = None
 
     # online serving with input queue to poll for new requests and output queue to push results
     serving_queues: ServingQueues | None = None
 
-    def _format_stage_spec(self, stage_spec: StageSpec) -> str:
+    def _format_stage_spec(self, stage_spec: StageSpec[Any, Any]) -> str:
         stage = stage_spec.stage
         stage_info = f"   class_name: {type(stage).__name__}\n"
         stage_info += f"   required_resources: {stage.required_resources}\n"
@@ -565,7 +1456,7 @@ class PipelineSpec:
 
 
 class WrappedStage(stage.Interface):
-    def __init__(self, stage: Stage):
+    def __init__(self, stage: Stage[Any, Any]):
         self._stage = stage
 
     def setup_on_node(self, node_info: resources.NodeInfo, worker_metadata: resources.WorkerMetadata) -> None:
@@ -588,7 +1479,10 @@ class StageAndParams:
 
 
 def make_actor_pool_stage_from_stage_spec(
-    pipeline_config: PipelineConfig, spec: StageSpec, stage_idx: int, cluster_resources: resources.ClusterResources
+    pipeline_config: PipelineConfig,
+    spec: StageSpec[Any, Any],
+    stage_idx: int,
+    cluster_resources: resources.ClusterResources,
 ) -> StageAndParams:
     assert spec.slots_per_actor is not None
     assert spec.worker_max_lifetime_m is not None

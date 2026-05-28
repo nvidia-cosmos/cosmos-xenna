@@ -2,6 +2,23 @@
 
 ## Latest
 
+## [0.5.0]
+
+### Released
+
+- 2026-05-20
+
+### Added
+
+- New `SaturationAwareScheduler` - queueing-theory-based streaming autoscaler (state classifier, regime-aware aggressiveness, growth-mode FSM, DAG-priority growth, cross-stage donor rebalancing, idle-first scale-down). Opt in via `StreamingSpecificSpec(scheduler=SchedulerKind.SATURATION_AWARE)`; default remains `FRAGMENTATION_BASED`.
+- `SaturationAwareConfig` + `SaturationAwareStageConfig` with three-tier resolver (`StageSpec.saturation_aware` > `per_stage_overrides` > `stage_defaults`) and validated cluster/per-stage tunables.
+- New Rust `AutoscalePlanContext` exposing `try_add_worker` / `delete_count_workers` / per-stage solution drainers to the Python planner.
+- Operator design + tuning docs under `docs/scheduler/saturation-aware/`.
+
+### Changed
+
+- `ProblemWorkerGroupState` gained `num_used_slots` + worker-age fields (additive; existing call sites unchanged).
+
 ## [0.4.2]
 
 ### Released

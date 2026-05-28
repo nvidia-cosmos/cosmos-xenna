@@ -775,6 +775,30 @@ class ActorPool(Generic[T, V]):
         """Return the number of tasks queued in the pool waiting for an actor slot."""
         return len(self._task_queue)
 
+    def worker_group_num_used_slots(self) -> dict[str, int]:
+        """Return a per-worker-group snapshot of used task slots.
+
+        Sums ``num_used_slots`` across every ready actor in each
+        worker group; pending or unready worker groups appear with
+        zero. Used by the streaming-layer producer to populate the
+        per-worker ``num_used_slots`` saturation signal on
+        ``ProblemWorkerGroupState`` so Phase D scale-down can prefer
+        idle workers over busy ones.
+
+        Returns:
+            Mapping ``{worker_group_id: total_used_slots}``. Worker
+            groups with no ready actors yet (or no actors at all)
+            map to 0.
+        """
+        snapshot: dict[str, int] = {}
+        for worker_group_id, worker_group in self._worker_groups.items():
+            snapshot[worker_group_id] = sum(
+                self._ready_actors[actor_id].num_used_slots
+                for actor_id in worker_group.actors
+                if actor_id in self._ready_actors
+            )
+        return snapshot
+
     @property
     def num_ready_actors(self) -> int:
         return len(self._ready_actors)
@@ -851,7 +875,7 @@ class ActorPool(Generic[T, V]):
         self._worker_groups_to_create.append(worker)
 
     def is_worker_group_ready(self, worker_group_id: str, min_age_s: float = 0.0) -> bool:
-        """Return True iff the group is Ready *and* has been Ready for ``min_age_s``.
+        """Return True if the group is Ready *and* has been Ready for ``min_age_s``.
 
         Used by the autoscaler-application path to defer scale-down of
         worker groups that are still in setup or that just finished setup.

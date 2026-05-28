@@ -71,6 +71,7 @@ fn make_default_state_for_stages(problem: &ds::Problem) -> ds::ProblemState {
                 worker_groups: Vec::new(),
                 slots_per_worker: 2,
                 is_finished: false,
+                ..Default::default()
             })
             .collect(),
     }
@@ -324,6 +325,7 @@ fn main() {
                 worker_groups: s.new_workers.clone(),
                 slots_per_worker: s.slots_per_worker,
                 is_finished: false,
+                ..Default::default()
             })
             .collect(),
     };

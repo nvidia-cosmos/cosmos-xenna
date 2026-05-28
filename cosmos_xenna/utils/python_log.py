@@ -250,3 +250,4 @@ error = _logger.error
 critical = _logger.critical
 exception = _logger.exception
 log = _logger.log
+bind = _logger.bind

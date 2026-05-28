@@ -1,0 +1,394 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Tests for the cluster heterogeneity ratio helper.
+
+Pin the contract of
+:func:`cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity.compute_heterogeneity_ratio`:
+
+  * Ratio matches ``max(D_k) / min(D_k)`` over stages whose service
+    time was finite this cycle. Cold-start stages (NaN, zero, or
+    negative service time) are excluded from numerator and
+    denominator alike.
+  * When fewer than two stages are finite the ratio is undefined;
+    the gauge observes ``math.nan`` and no streak update or log
+    fires.
+  * The streak counter increments each consecutive above-threshold
+    cycle and the INFO log fires exactly once when the streak
+    reaches ``warn_streak_cycles``.
+  * The streak counter resets the moment the ratio drops to or
+    below the threshold; a fresh climb-back can re-arm a second
+    INFO log only after that drop.
+  * The INFO log format matches the regex pinned in the plan row
+    (Liu & Ying 2026 ``ksub`` / ``ksuper`` analog wording).
+"""
+
+import logging
+import math
+import re
+from collections.abc import Iterator
+
+import pytest
+from loguru import logger as loguru_logger
+
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck import heterogeneity
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.heterogeneity import (
+    HeterogeneityWarnState,
+    compute_heterogeneity_ratio,
+)
+from cosmos_xenna.pipelines.private.scheduling_py.phases.bottleneck.identity import identify_bottleneck
+
+
+@pytest.fixture
+def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Bridge loguru records into pytest's stdlib-based ``caplog`` fixture.
+
+    Mirrors the pattern used in ``test_bottleneck_score.py`` and
+    ``test_setup_aware_max_queued.py``: the heterogeneity helper
+    logs via ``cosmos_xenna.utils.python_log`` (a thin loguru
+    wrapper), so caplog cannot see the records unless loguru is
+    bridged into the stdlib handler.
+    """
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").log(msg.record["level"].no, msg.record["message"]),
+        format="{message}",
+    )
+    caplog.set_level(logging.DEBUG, logger="loguru")
+    try:
+        yield caplog
+    finally:
+        loguru_logger.remove(handler_id)
+
+
+@pytest.fixture
+def gauge_observations(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, dict[str, str]]]:
+    """Capture every ``set()`` call on the cluster heterogeneity gauge.
+
+    Mirrors the gauge-capture fixture in ``test_bottleneck_score.py``
+    so the helper can be exercised without a live Ray metrics
+    agent. Each call appends a ``(value, tags)`` tuple to the
+    returned list.
+    """
+    captured: list[tuple[float, dict[str, str]]] = []
+
+    def fake_set(value: float | int | None, tags: dict[str, str] | None = None) -> None:
+        if value is None:
+            return
+        captured.append((float(value), dict(tags or {})))
+
+    monkeypatch.setattr(heterogeneity._HETEROGENEITY_RATIO_GAUGE, "set", fake_set)
+    return captured
+
+
+class TestComputeHeterogeneityRatio:
+    """Pins the cluster heterogeneity ratio helper contract."""
+
+    def test_warn_threshold_at_one_is_rejected_without_mutating_state(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+    ) -> None:
+        """A homogeneous cluster has ratio ``1.0``; the floor must be strictly greater."""
+        state = HeterogeneityWarnState(streak_cycles=3, has_fired=True)
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_threshold must be finite and > 1.0"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=1.0,
+                warn_streak_cycles=3,
+            )
+
+        assert gauge_observations == []
+        assert state.streak_cycles == 3
+        assert state.has_fired is True
+
+    def test_warn_threshold_nan_is_rejected(self) -> None:
+        """``NaN`` would make every finite ratio look above threshold."""
+        state = HeterogeneityWarnState()
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_threshold must be finite and > 1.0"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=math.nan,
+                warn_streak_cycles=3,
+            )
+
+        assert state.streak_cycles == 0
+
+    def test_warn_streak_cycles_zero_is_rejected(self) -> None:
+        """A zero streak would fire on the first above-threshold cycle."""
+        state = HeterogeneityWarnState(streak_cycles=2, has_fired=False)
+
+        with pytest.raises(ValueError, match=r"pipeline 'p1': warn_streak_cycles must be an integer >= 1"):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="p1",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=0,
+            )
+
+        assert state.streak_cycles == 2
+        assert state.has_fired is False
+
+    def test_ratio_correctness_three_stages(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+    ) -> None:
+        """Three finite stages -> gauge observes max(D)/min(D) within tolerance."""
+        state = HeterogeneityWarnState()
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": 0.1, "b": 0.5, "c": 1.0},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=20.0,
+            warn_streak_cycles=30,
+        )
+
+        assert len(gauge_observations) == 1
+        value, tags = gauge_observations[0]
+        assert value == pytest.approx(10.0)
+        assert tags == {"pipeline": "test_pipeline"}
+
+    def test_ratio_excludes_cold_start_stages(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+    ) -> None:
+        """A NaN service time contributes to neither numerator nor denominator."""
+        state = HeterogeneityWarnState()
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": math.nan, "b": 0.5, "c": 1.0},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=20.0,
+            warn_streak_cycles=30,
+        )
+
+        assert len(gauge_observations) == 1
+        value, _tags = gauge_observations[0]
+        assert value == pytest.approx(2.0)
+
+    def test_ratio_undefined_with_fewer_than_two_finite_stages(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Only one finite stage -> gauge NaN, streak reset, no log fires."""
+        state = HeterogeneityWarnState(streak_cycles=5, has_fired=False)
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": math.nan, "b": 0.5},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=2.0,
+            warn_streak_cycles=10,
+        )
+
+        assert len(gauge_observations) == 1
+        value, _tags = gauge_observations[0]
+        assert math.isnan(value)
+        assert state.streak_cycles == 0
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+
+    def test_streak_increments_when_above_threshold(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Below-streak above-threshold cycles increment counter without firing log."""
+        state = HeterogeneityWarnState()
+        warn_streak = 30
+
+        for _ in range(5):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="test_pipeline",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=warn_streak,
+            )
+
+        assert state.streak_cycles == 5
+        assert state.has_fired is False
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert info_logs == []
+
+    def test_log_fires_after_streak_threshold(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Exactly one INFO log fires on the streak-completion cycle, format pinned."""
+        state = HeterogeneityWarnState()
+        warn_streak = 3
+
+        for _ in range(warn_streak):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"fast": 0.1, "slow": 1.0},
+                pipeline_name="test_pipeline",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=warn_streak,
+            )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1, f"expected exactly one INFO log line, got {[r.message for r in info_logs]}"
+        pattern = re.compile(
+            r"high cluster heterogeneity \(ratio=\d+\.\d+ for \d+ cycles\); "
+            r"consider raising over_provisioned_streak_min_cycles for stage "
+            r".+? \(bottleneck D=\d+\.\d+s\) to give it more recovery margin"
+        )
+        assert pattern.fullmatch(info_logs[0].message), (
+            f"INFO log line did not match the pinned format: {info_logs[0].message!r}"
+        )
+        assert "stage 'slow'" in info_logs[0].message
+        assert state.has_fired is True
+
+    def test_streak_resets_below_threshold(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+    ) -> None:
+        """Drop below threshold mid-streak resets counter; next above-threshold restarts at 1."""
+        state = HeterogeneityWarnState()
+        warn_streak = 30
+
+        for _ in range(warn_streak - 1):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="test_pipeline",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=warn_streak,
+            )
+        assert state.streak_cycles == warn_streak - 1
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": 0.5, "b": 1.0},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=5.0,
+            warn_streak_cycles=warn_streak,
+        )
+        assert state.streak_cycles == 0
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": 0.1, "b": 1.0},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=5.0,
+            warn_streak_cycles=warn_streak,
+        )
+        assert state.streak_cycles == 1
+
+    def test_log_does_not_fire_twice_without_drop(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Continued above-threshold cycles after first fire stay silent until drop+climb."""
+        state = HeterogeneityWarnState()
+        warn_streak = 3
+
+        for _ in range(warn_streak + 5):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="test_pipeline",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=warn_streak,
+            )
+        first_pass_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(first_pass_logs) == 1, "first streak completion must fire exactly once even with extra cycles"
+
+        compute_heterogeneity_ratio(
+            d_k_by_stage={"a": 0.5, "b": 1.0},
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=5.0,
+            warn_streak_cycles=warn_streak,
+        )
+        assert state.has_fired is False, "drop below threshold must re-arm the latch"
+
+        for _ in range(warn_streak):
+            compute_heterogeneity_ratio(
+                d_k_by_stage={"a": 0.1, "b": 1.0},
+                pipeline_name="test_pipeline",
+                state=state,
+                warn_threshold=5.0,
+                warn_streak_cycles=warn_streak,
+            )
+
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 2, (
+            f"second streak after drop+climb must fire one new INFO log, got {[r.message for r in info_logs]}"
+        )
+
+    def test_warn_log_names_same_stage_as_identify_bottleneck_on_near_tie(
+        self,
+        gauge_observations: list[tuple[float, dict[str, str]]],
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Near-tied D_k -- warn log MUST name the same stage Phase C/D engages.
+
+        Two stages within ``near_tie_tolerance`` (default 0.05) of
+        the leader; lex-stable tie-break picks the smaller name in
+        both helpers. Pinning this contract guards against the raw
+        ``max(...)`` insertion-order bug where the warn log named
+        whichever stage hashed first while the engagement selector
+        picked the lex-smallest.
+
+        ``"big_slow"`` and ``"big_slowwer"`` are within 1% of each
+        other (well inside the 5% tolerance band); insertion order
+        puts ``"big_slow"`` first in the dict literal but lex order
+        does too -- to make the regression visible, the leader is
+        the second-inserted ``"big_slowwer"`` and the lex-smaller
+        ``"big_slow"`` must win for both helpers.
+        """
+        d_k_by_stage = {"big_slowwer": 1.00, "big_slow": 0.99, "tiny": 0.05}
+
+        state = HeterogeneityWarnState()
+        warn_streak = 1
+        compute_heterogeneity_ratio(
+            d_k_by_stage=d_k_by_stage,
+            pipeline_name="test_pipeline",
+            state=state,
+            warn_threshold=5.0,
+            warn_streak_cycles=warn_streak,
+        )
+        info_logs = [r for r in loguru_caplog.records if r.levelno == logging.INFO]
+        assert len(info_logs) == 1, f"streak completion must fire one INFO log, got {[r.message for r in info_logs]}"
+
+        # ``identify_bottleneck`` for n=3 uses ``max/median``; with two
+        # near-tied leaders that ratio is close to 1.0, so the test
+        # uses the smallest finite engagement threshold above 1.0 to
+        # exercise the tie-break path. A higher threshold would short-
+        # circuit before the lex-stable selection ever runs.
+        identity = identify_bottleneck(d_k_by_stage, heterogeneity_threshold=1.005)
+        assert identity.engaged is True
+        assert identity.stage_name == "big_slow", (
+            "lex-stable tie-break selects the lex-smallest stage in the tolerance band"
+        )
+
+        warn_message = info_logs[0].message
+        assert "stage 'big_slow'" in warn_message, (
+            f"warn log must name the same stage Phase C/D engages ({identity.stage_name!r}); got {warn_message!r}"
+        )

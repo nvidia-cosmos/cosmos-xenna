@@ -44,6 +44,10 @@ use crate::utils::module_builders::ImportablePyModuleBuilder;
 
 use super::{data_structures as ds, fragmentation_allocation_algorithms as frag, resources as rds};
 
+// Trade-off constant for the allocator search: encourages solutions that
+// reuse existing packing by treating reuse as worth this much fragmentation.
+pub(super) const DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT: f32 = 10.0;
+
 // --------------------
 // Estimators
 // --------------------
@@ -67,9 +71,14 @@ impl WorkerIdFactory {
 
     /// Generate a new unique worker ID.
     ///
+    /// Marked `pub` so sibling modules (e.g. `autoscale_plan_context`)
+    /// can drive the factory directly when planning fresh allocations
+    /// outside of `run_fragmentation_autoscaler`. Already exposed to
+    /// Python via `#[pymethods]`.
+    ///
     /// # Returns
     /// A unique string ID representing the worker
-    fn make_new_id(&mut self) -> String {
+    pub fn make_new_id(&mut self) -> String {
         let id = self.count.to_string();
         self.count += 1;
         id
@@ -362,12 +371,26 @@ enum WorkerOrWorkerGroup {
     WorkerGroup(rds::WorkerGroup),
 }
 
+/// Build the seed list for `run_fragmentation_autoscaler` from the
+/// caller-supplied `Problem` + `ProblemState`.
+///
+/// Returns `PyValueError` when the input is structurally malformed
+/// (stage count mismatch, or a non-SPMD worker carrying more than
+/// one resource allocation). Previously this function panicked on
+/// such inputs, which propagated as a hard PyO3 abort.
 fn make_workers_from_problem_state(
     problem: &ds::Problem,
     state: &ds::ProblemState,
-) -> Vec<WorkerOrWorkerGroup> {
+) -> PyResult<Vec<WorkerOrWorkerGroup>> {
+    if problem.stages.len() != state.stages.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "make_workers_from_problem_state: stage count mismatch - \
+             problem has {} stages, state has {}",
+            problem.stages.len(),
+            state.stages.len(),
+        )));
+    }
     let mut out = Vec::new();
-    assert_eq!(problem.stages.len(), state.stages.len());
     for (stage, stage_state) in std::iter::zip(&problem.stages, &state.stages) {
         for w in &stage_state.worker_groups {
             if let rds::WorkerShape::SpmdNodeMultiple(_) = &stage.worker_shape {
@@ -375,11 +398,13 @@ fn make_workers_from_problem_state(
                     w.to_worker_group(stage.name.clone()),
                 ));
             } else {
-                out.push(WorkerOrWorkerGroup::Worker(w.to_worker(stage.name.clone())));
+                out.push(WorkerOrWorkerGroup::Worker(
+                    w.to_worker(stage.name.clone())?,
+                ));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn calculate_input_samples_per_sample(
@@ -453,7 +478,10 @@ fn calculate_num_slots_per_worker_for_all_stages(
     out
 }
 
-fn make_workload_from_state(state: &ds::ProblemState, problem: &ds::Problem) -> frag::Workload {
+pub(super) fn make_workload_from_state(
+    state: &ds::ProblemState,
+    problem: &ds::Problem,
+) -> frag::Workload {
     let mut total_requested: usize = 0;
     let mut per_stage_requested: Vec<usize> = Vec::with_capacity(problem.stages.len());
     for (stage_problem, stage_state) in problem.stages.iter().zip(state.stages.iter()) {
@@ -935,7 +963,7 @@ pub fn run_fragmentation_autoscaler(
             .or_default();
     }
     // Seed with existing workers
-    for w in make_workers_from_problem_state(problem, state) {
+    for w in make_workers_from_problem_state(problem, state)? {
         match w {
             WorkerOrWorkerGroup::WorkerGroup(w) => {
                 cluster
@@ -1041,10 +1069,6 @@ pub fn run_fragmentation_autoscaler(
         c.worker_groups_to_remove_map
             .insert(s.name.clone(), Vec::new());
     }
-    // Trade-off constant for the allocator search: encourages solutions that
-    // reuse existing packing by treating reuse as worth this much fragmentation.
-    let worker_reuse_fragmentation_equivalent: f32 = 10.0;
-
     // Cumulative operation metrics for this autoscaler run
     let mut metrics = AutoscalerOpMetrics::new();
 
@@ -1070,7 +1094,7 @@ pub fn run_fragmentation_autoscaler(
                 if !add_worker_fn(
                     stage,
                     &workload_estimate,
-                    worker_reuse_fragmentation_equivalent,
+                    DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
                     &mut metrics,
                     &mut c,
                 ) {
@@ -1113,7 +1137,7 @@ pub fn run_fragmentation_autoscaler(
             && !add_worker_fn(
                 stage,
                 &workload_estimate,
-                worker_reuse_fragmentation_equivalent,
+                DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
                 &mut metrics,
                 &mut c,
             )
@@ -1166,7 +1190,7 @@ pub fn run_fragmentation_autoscaler(
             if add_worker_fn(
                 &mut active[min_idx],
                 &workload_estimate,
-                worker_reuse_fragmentation_equivalent,
+                DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
                 &mut metrics,
                 &mut c,
             ) {
@@ -1253,7 +1277,7 @@ pub fn run_fragmentation_autoscaler(
                 if add_worker_fn(
                     &mut active[idx],
                     &workload_estimate,
-                    worker_reuse_fragmentation_equivalent,
+                    DEFAULT_WORKER_REUSE_FRAGMENTATION_EQUIVALENT,
                     &mut metrics,
                     &mut c,
                 ) {
@@ -1495,6 +1519,7 @@ mod tests {
                     worker_groups: Vec::new(),
                     slots_per_worker: 2,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         }
@@ -1835,6 +1860,7 @@ mod tests {
                     worker_groups: Vec::new(),
                     slots_per_worker: 1,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         };
@@ -2180,6 +2206,7 @@ mod tests {
                     ],
                 },
             ],
+            num_used_slots: 0,
         };
 
         let existing_worker_group_2 = ds::ProblemWorkerGroupState {
@@ -2214,6 +2241,7 @@ mod tests {
                     ],
                 },
             ],
+            num_used_slots: 0,
         };
 
         let state = ds::ProblemState {
@@ -2222,6 +2250,7 @@ mod tests {
                 worker_groups: vec![existing_worker_group, existing_worker_group_2], // Start with 2 worker groups
                 slots_per_worker: 2,
                 is_finished: false,
+                ..Default::default()
             }],
         };
 
@@ -2341,6 +2370,7 @@ mod tests {
                     worker_groups: s.new_workers.clone(),
                     slots_per_worker: s.slots_per_worker,
                     is_finished: false,
+                    ..Default::default()
                 })
                 .collect(),
         };

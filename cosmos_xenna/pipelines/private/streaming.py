@@ -37,6 +37,10 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.cluster.streaming_backpressure import (
+    compute_max_queued,
+    resolve_setup_aware_max_queued_enabled,
+)
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -218,16 +222,59 @@ def make_task_measurement_from_task_metadata(
 
 def make_problem_worker_state_from_worker_state(
     state: resources.WorkerGroup,
+    *,
+    num_used_slots: int = 0,
 ) -> data_structures.ProblemWorkerGroupState:
-    """Creates a ProblemWorkerState from a Worker instance.
+    """Creates a ``ProblemWorkerGroupState`` snapshot for a worker group.
 
     Args:
-        state: Worker instance containing worker state information.
+        state: ``WorkerGroup`` instance from the allocator (carries
+            id and resource allocations).
+        num_used_slots: Live task-slot occupancy summed across every
+            ready actor in this group. Defaults to 0 for callers that
+            do not yet plumb the per-worker idle signal.
 
     Returns:
-        A new ProblemWorkerState instance.
+        A new ``ProblemWorkerGroupState`` instance.
     """
-    return data_structures.ProblemWorkerGroupState.make(state.id, state.allocations)
+    return data_structures.ProblemWorkerGroupState.make(
+        state.id,
+        state.allocations,
+        num_used_slots=num_used_slots,
+    )
+
+
+def _validate_non_negative_signal(
+    *, stage_name: str, field_name: str, value: int, worker_id: str | None = None
+) -> None:
+    """Reject negative autoscaling signals before they reach Rust ``usize`` fields."""
+    if value >= 0:
+        return
+    worker_clause = f" worker {worker_id!r}" if worker_id is not None else ""
+    msg = f"stage {stage_name!r}{worker_clause} {field_name} must be >= 0, got {value}"
+    raise ValueError(msg)
+
+
+def _validate_allocator_pool_worker_ids(
+    *,
+    stage_name: str,
+    allocator_worker_ids: set[str],
+    pool: actor_pool.ActorPool[typing.Any, typing.Any],
+) -> None:
+    """Ensure production pool and allocator snapshots describe the same worker groups."""
+    pool_worker_groups = getattr(pool, "_worker_groups", None)
+    if not isinstance(pool_worker_groups, dict):
+        return
+    pool_worker_ids = set(pool_worker_groups)
+    if allocator_worker_ids == pool_worker_ids:
+        return
+    allocator_only = sorted(allocator_worker_ids - pool_worker_ids)
+    pool_only = sorted(pool_worker_ids - allocator_worker_ids)
+    msg = (
+        f"stage {stage_name!r} worker-group snapshot mismatch between allocator and actor pool "
+        f"(allocator-only={allocator_only}, pool-only={pool_only})"
+    )
+    raise ValueError(msg)
 
 
 def _required_workers_for_stage(
@@ -281,6 +328,195 @@ def _required_workers_for_stage(
     capacity_per_actor = slots_per_actor * stage_batch_size
     workers_for_backlog = math.ceil(backlog_samples / capacity_per_actor)
     return max(Autoscaler.MIN_WORKERS_PER_STAGE, workers_for_inflight, workers_for_backlog)
+
+
+class _SchedulerAlgorithm(typing.Protocol):
+    """Structural type for the algorithm slot inside ``Autoscaler``.
+
+    Both ``FragmentationBasedAutoscaler`` (Rust-backed) and
+    ``SaturationAwareScheduler`` (pure-Python) satisfy this protocol.
+    Defined as a Protocol so the dispatcher in ``_make_scheduler_algorithm``
+    can assign either implementation without a ``Union`` annotation.
+    """
+
+    def setup(self, problem: data_structures.Problem) -> None: ...
+
+    def update_with_measurements(
+        self,
+        time: float,
+        measurements: data_structures.Measurements,
+    ) -> None: ...
+
+    def autoscale(
+        self,
+        time: float,
+        problem_state: data_structures.ProblemState,
+    ) -> data_structures.Solution: ...
+
+
+def _collect_saturation_aware_stage_overrides(
+    pipeline_spec: specs.PipelineSpec,
+) -> dict[str, specs.SaturationAwareStageConfig]:
+    """Collect ``StageSpec.saturation_aware`` overrides keyed by runtime stage name.
+
+    The Rust-backed ``FragmentationBasedAutoscaler`` does not consume
+    these overrides; only the ``SaturationAwareScheduler`` branch in
+    ``_make_scheduler_algorithm`` reads the result. Stages that are
+    bare ``Stage`` instances (no ``StageSpec`` wrapper) and stages
+    without a ``saturation_aware`` block are silently filtered out so
+    the returned mapping contains exactly the stage names that carry
+    a runtime override.
+
+    Args:
+        pipeline_spec: The pipeline spec being autoscaled. Iterated by
+            position so the keys match ``ProblemStage.name`` produced
+            in ``_make_problem_from_pipeline_spec``.
+
+    Returns:
+        A mapping from runtime stage name to its
+        ``SaturationAwareStageConfig`` override. Empty when no stage
+        carries an override.
+    """
+    return {
+        stage.name(index): stage.saturation_aware
+        for index, stage in enumerate(pipeline_spec.stages)
+        if isinstance(stage, specs.StageSpec) and stage.saturation_aware is not None
+    }
+
+
+def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
+    """Return the autoscale cadence the streaming dispatcher must use.
+
+    For ``SchedulerKind.SATURATION_AWARE`` the cadence comes from
+    ``mode_specific.saturation_aware.interval_s`` (default ``10.0`` s),
+    obtained via ``materialized_saturation_aware()`` so the default
+    SA config is constructed lazily on this branch only.
+    For ``SchedulerKind.FRAGMENTATION_BASED`` the cadence stays at
+    ``mode_specific.autoscale_interval_s`` (default ``180.0`` s),
+    which is the ``StreamingSpecificSpec`` field the dispatcher
+    has always read. Selecting the source by scheduler kind keeps the
+    saturation-aware loop responsive (its watchdog and growth windows
+    are sized for 10s cycles) without changing fragmentation-based
+    pipelines (which intentionally run slower because their solver is
+    expensive).
+
+    Emits one INFO log per call naming the cadence and the source
+    field so deployment changes are auditable. ``run_pipeline``
+    invokes this exactly once during startup, so in production the
+    log fires once per pipeline run; tests that call it repeatedly
+    will see repeated lines, which is intentional - the function is
+    stateless.
+
+    Args:
+        pipeline_spec: Full pipeline spec; only ``config.mode_specific``
+            is inspected.
+
+    Returns:
+        Cycle interval in seconds (always strictly positive; callers
+        such as the dispatcher rate-limiter rely on this contract to
+        invert without ``ZeroDivisionError`` or a negative rate).
+
+    Raises:
+        RuntimeError: ``pipeline_spec.config.mode_specific`` is ``None``
+            (a programmer error - streaming mode requires it).
+        ValueError: The resolved interval is ``<= 0``. The
+            saturation-aware path is already protected by
+            ``attrs.validators.gt(0.0)`` on
+            ``SaturationAwareGlobalConfig.interval_s``; the
+            fragmentation-based path's ``autoscale_interval_s``
+            has no field-level validator, so this resolver
+            enforces the invariant for both paths uniformly.
+    """
+    mode_specific = pipeline_spec.config.mode_specific
+    if mode_specific is None:
+        msg = "effective_autoscale_interval requires StreamingSpecificSpec; got mode_specific=None"
+        raise RuntimeError(msg)
+    kind = mode_specific.scheduler
+    if kind == specs.SchedulerKind.SATURATION_AWARE:
+        interval = mode_specific.materialized_saturation_aware().interval_s
+        source = "mode_specific.saturation_aware.interval_s"
+    else:
+        interval = mode_specific.autoscale_interval_s
+        source = "mode_specific.autoscale_interval_s"
+    if interval <= 0:
+        msg = (
+            f"Autoscale interval must be > 0; got {interval!r} from {source} "
+            f"(scheduler={kind.name}). Set a positive value in the streaming config."
+        )
+        raise ValueError(msg)
+    logger.info(
+        f"Streaming dispatcher autoscale cadence resolved: scheduler={kind} interval_s={interval} source={source}"
+    )
+    return interval
+
+
+def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAlgorithm:
+    """Construct the algorithm for ``Autoscaler._algorithm`` based on the spec.
+
+    Reads ``pipeline_spec.config.mode_specific.scheduler`` once and
+    returns the corresponding instance. Selection is frozen for the
+    lifetime of the run; switching schedulers requires re-instantiating
+    ``Autoscaler``.
+
+    The ``FragmentationBasedAutoscaler`` branch is intentionally a
+    pure passthrough of ``StreamingSpecificSpec`` fields - the
+    Rust-backed solver does not consume any per-stage overrides, so
+    no extra wiring is performed. The ``SaturationAwareScheduler``
+    branch additionally collects ``StageSpec.saturation_aware``
+    overrides via ``_collect_saturation_aware_stage_overrides`` and
+    injects them through the constructor; this is the single
+    integration point for runtime spec overrides on the saturation
+    path.
+
+    Args:
+        pipeline_spec: The full pipeline spec being autoscaled. The
+            factory reads ``config.mode_specific`` for the scheduler
+            kind and per-kind configuration, and (for saturation-aware
+            only) iterates ``stages`` to collect per-stage overrides.
+
+    Returns:
+        An object satisfying the ``_SchedulerAlgorithm`` protocol.
+
+    Raises:
+        AssertionError: If ``pipeline_spec.config.mode_specific`` is
+            ``None``. ``Autoscaler`` is only used in streaming mode,
+            so this is a programmer error (the surrounding
+            ``Autoscaler.__init__`` asserts the same precondition).
+        ValueError: If ``mode_specific.scheduler`` holds an unrecognized
+            ``SchedulerKind`` value (defensive against future enum
+            values that have not been wired up yet), or if collected
+            saturation-aware stage overrides violate cluster-wide
+            guardrails (validation runs inside the
+            ``SaturationAwareScheduler`` constructor).
+
+    """
+    mode_specific = pipeline_spec.config.mode_specific
+    if mode_specific is None:
+        msg = "_make_scheduler_algorithm requires StreamingSpecificSpec; got mode_specific=None"
+        raise RuntimeError(msg)
+    kind = mode_specific.scheduler
+    match kind:
+        case specs.SchedulerKind.FRAGMENTATION_BASED:
+            return autoscaling_algorithms.FragmentationBasedAutoscaler(
+                mode_specific.autoscale_speed_estimation_window_duration_s,
+                mode_specific.autoscale_speed_estimation_min_data_points,
+            )
+        case specs.SchedulerKind.SATURATION_AWARE:
+            # Deferred import keeps the fragmentation-based path free of metric series it never observes.
+            from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+
+            job_info = pipeline_spec.job_info
+            pipeline_name = job_info.pipeline_type if job_info is not None else ""
+            # ``materialized_saturation_aware`` constructs the default
+            # ``SaturationAwareConfig`` here on first access for runs that
+            # opted into the SA scheduler without supplying their own.
+            return SaturationAwareScheduler(
+                mode_specific.materialized_saturation_aware(),
+                stage_spec_overrides=_collect_saturation_aware_stage_overrides(pipeline_spec),
+                pipeline_name=pipeline_name,
+            )
+        case _:
+            typing.assert_never(kind)
 
 
 class Autoscaler:
@@ -382,10 +618,15 @@ class Autoscaler:
         assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
-            mode_specific.autoscale_speed_estimation_window_duration_s,
-            mode_specific.autoscale_speed_estimation_min_data_points,
-        )
+        # ``_make_scheduler_algorithm`` is the single integration point for
+        # scheduler construction: it picks the algorithm class from
+        # ``mode_specific.scheduler``, wires per-kind configuration, and
+        # (for the saturation-aware branch) injects
+        # ``StageSpec.saturation_aware`` overrides through the constructor.
+        # The returned algorithm's override map is fully resolved before
+        # ``setup()`` is called, so the per-cycle hot path never has to
+        # reason about partial configuration.
+        self._algorithm = _make_scheduler_algorithm(pipeline_spec)
         self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
@@ -424,31 +665,152 @@ class Autoscaler:
         self._algorithm.update_with_measurements(time.time(), measurements)
 
     def _make_problem_state(
-        self, actor_pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]
+        self,
+        actor_pools: list[actor_pool.ActorPool],
+        stages_is_dones: list[bool],
+        upstream_queue_lens: list[int],
+        stage_batch_sizes: list[int],
     ) -> data_structures.ProblemState:
         """Creates a `ProblemState` instance from the current pipeline state.
+
+        Populates the per-stage slot signals (``num_used_slots``,
+        ``num_empty_slots``, ``input_queue_depth``) and the
+        setup-phase quiescence signal (``num_pending_actors``) from
+        the live ``ActorPool`` snapshot. Finished stages carry zero
+        on every signal because their autoscaling decisions are
+        short-circuited upstream and any drain-state slot, queue, or
+        pending-actor counts would be misleading saturation signal.
+
+        ``input_queue_depth`` aggregates two backlog sources:
+
+        * ``pool.num_queued_tasks`` -- tasks already pulled into the
+          pool's internal task queue. Bounded by ``compute_max_queued``
+          (the streaming-mode backpressure cap), so this signal alone
+          saturates and hides the true upstream backlog when a stage
+          is the bottleneck.
+        * ``upstream_queue_lens[idx]`` -- samples still sitting in
+          the upstream buffer (the pipeline ``input_queue`` for stage
+          ``0`` or ``queues[idx - 1]`` for downstream stages). These
+          have not yet been batched into pool tasks; the autoscaler
+          must see them or it cannot reason about a backlogged
+          bottleneck stage.
+
+        Unit normalization mirrors the backlog-aware scale-down
+        guard at ``apply_autoscale_result_if_ready``:
+        ``pool.num_queued_tasks`` is in pre-batched tasks, but
+        ``upstream_queue_lens[idx]`` is sample-denominated. Convert
+        the upstream count to tasks via
+        ``ceil(samples / stage_batch_size)`` so the aggregated
+        ``input_queue_depth`` is uniformly in tasks (the unit the
+        saturation-aware classifier and capacity sizer expect).
+
+        ``num_pending_actors`` is the count of actors past
+        :meth:`ActorPool.add_actor` but before
+        :meth:`ActorPool._move_pending_actors_to_ready` -- i.e. ones
+        that the planner has placed but whose ``stage_setup`` has
+        not yet returned. The saturation-aware scheduler combines
+        this with the ready-actor count (``len(workers)``) to detect
+        the half-initialised condition gated by
+        ``setup_phase_quiescence_enabled``.
 
         Args:
             actor_pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths,
+                sample-denominated. Entry ``[i]`` is the number of
+                queued samples waiting to be pulled into ``pools[i]``
+                (the pipeline ``input_queue`` for stage ``0`` or
+                ``queues[i - 1]`` for downstream stages). Must have
+                the same length as ``actor_pools``.
+            stage_batch_sizes: Per-stage declared
+                ``stage_batch_size`` values (each must be ``>= 1``);
+                used to convert ``upstream_queue_lens`` from samples
+                to tasks. Must have the same length as ``actor_pools``.
 
         Returns:
             A `ProblemState` object representing the current state of the pipeline.
+
+        Raises:
+            ValueError: If ``actor_pools``, ``stages_is_dones``,
+                ``upstream_queue_lens``, and ``stage_batch_sizes``
+                do not all have the same length (caller contract
+                violation, surfaced by ``zip(strict=True)``), or if
+                any per-stage signal would be negative
+                (surfaced by ``_validate_non_negative_signal``).
         """
         stages = []
-        for pool, is_done in zip(actor_pools, stages_is_dones, strict=True):
+        for pool, is_done, upstream_samples, stage_batch_size in zip(
+            actor_pools,
+            stages_is_dones,
+            upstream_queue_lens,
+            stage_batch_sizes,
+            strict=True,
+        ):
             workers = self._allocator.get_workers_in_stage(pool.name)
+            if is_done:
+                num_used_slots = 0
+                num_empty_slots = 0
+                input_queue_depth = 0
+                num_pending_actors = 0
+                worker_group_idle: dict[str, int] = {}
+            else:
+                num_used_slots = pool.num_used_slots
+                num_empty_slots = pool.num_empty_slots
+                # Upstream samples not yet pulled into the pool would
+                # otherwise be invisible because ``pool.num_queued_tasks``
+                # is bounded by ``compute_max_queued``. Ceil-div by
+                # ``stage_batch_size`` so the unit matches the pool's
+                # task count.
+                upstream_tasks = math.ceil(upstream_samples / stage_batch_size)
+                input_queue_depth = pool.num_queued_tasks + upstream_tasks
+                num_pending_actors = pool.num_pending_actors
+                worker_group_idle = pool.worker_group_num_used_slots()
+                for field_name, value in (
+                    ("num_used_slots", num_used_slots),
+                    ("num_empty_slots", num_empty_slots),
+                    ("input_queue_depth", input_queue_depth),
+                    ("num_pending_actors", num_pending_actors),
+                ):
+                    _validate_non_negative_signal(stage_name=pool.name, field_name=field_name, value=value)
+                for worker_id, used_slots in worker_group_idle.items():
+                    _validate_non_negative_signal(
+                        stage_name=pool.name,
+                        worker_id=worker_id,
+                        field_name="num_used_slots",
+                        value=used_slots,
+                    )
+                _validate_allocator_pool_worker_ids(
+                    stage_name=pool.name,
+                    allocator_worker_ids={w.id for w in workers},
+                    pool=pool,
+                )
             stages.append(
                 data_structures.ProblemStageState(
                     pool.name,
-                    [make_problem_worker_state_from_worker_state(w) for w in workers],
+                    [
+                        make_problem_worker_state_from_worker_state(
+                            w,
+                            num_used_slots=worker_group_idle.get(w.id, 0),
+                        )
+                        for w in workers
+                    ],
                     pool.slots_per_actor,
                     is_done,
+                    num_used_slots=num_used_slots,
+                    num_empty_slots=num_empty_slots,
+                    input_queue_depth=input_queue_depth,
+                    num_pending_actors=num_pending_actors,
                 )
             )
         return data_structures.ProblemState(stages)
 
-    def start_autoscale_calculation(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
+    def start_autoscale_calculation(
+        self,
+        pools: list[actor_pool.ActorPool],
+        stages_is_dones: list[bool],
+        upstream_queue_lens: list[int],
+        stage_batch_sizes: list[int],
+    ) -> None:
         """Starts a new autoscaling calculation in a background thread.
 
         If a calculation is already in progress, this method does nothing.
@@ -456,6 +818,22 @@ class Autoscaler:
         Args:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths,
+                sample-denominated; passed through to
+                ``_make_problem_state`` so ``input_queue_depth``
+                reflects backlog still sitting in
+                ``input_queue`` / ``queues[idx - 1]`` rather than
+                only the pool's own pulled tasks.
+            stage_batch_sizes: Per-stage declared
+                ``stage_batch_size`` values; used to convert
+                ``upstream_queue_lens`` from samples to tasks.
+
+        Raises:
+            ValueError: Propagated from ``_make_problem_state`` when
+                ``pools``, ``stages_is_dones``, ``upstream_queue_lens``,
+                and ``stage_batch_sizes`` do not all have the same
+                length, or when a per-stage saturation signal would
+                be negative.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
@@ -463,7 +841,12 @@ class Autoscaler:
             return
 
         self._autoscale_start_time = time.time()
-        problem_state = self._make_problem_state(pools, stages_is_dones)
+        problem_state = self._make_problem_state(
+            pools,
+            stages_is_dones,
+            upstream_queue_lens,
+            stage_batch_sizes,
+        )
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
     def apply_autoscale_result_if_ready(
@@ -914,14 +1297,19 @@ def run_pipeline(
     # Create a vector used to track whether a stages are finished or not.
     stage_is_dones = [False for _ in pools]
 
-    # Static per-stage ``stage_batch_size`` values used by the backlog-aware
-    # scale-down guard. Stage batch sizes do not change over the
-    # pipeline's lifetime, so build once outside the main loop.
+    # Static per-stage ``stage_batch_size`` values consumed by both
+    # the backlog-aware scale-down guard
+    # (``Autoscaler.apply_autoscale_result_if_ready``) and the
+    # autoscaler's ``input_queue_depth`` aggregation
+    # (``Autoscaler.start_autoscale_calculation`` ->
+    # ``_make_problem_state``). Stage batch sizes do not change
+    # over the pipeline's lifetime, so build once outside the main
+    # loop.
     stage_batch_sizes: list[int] = [
         typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
     ]
 
-    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
+    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / effective_autoscale_interval(pipeline_spec))
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
     logger.debug("Starting main loop")
@@ -972,7 +1360,12 @@ def run_pipeline(
             # Handle scaling the actor pools.
             # This should get called on the first loop through.
             if autoscale_rate_limiter.can_call():
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones)
+                autoscaler.start_autoscale_calculation(
+                    pools,
+                    stage_is_dones,
+                    upstream_queue_lens,
+                    stage_batch_sizes,
+                )
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools
@@ -1049,14 +1442,17 @@ def run_pipeline(
                     if not is_last_stage:
                         next_stage_batch_size = pipeline_spec.stages[idx + 1].stage.stage_batch_size  # type: ignore
 
-                    max_queued = max(
-                        int(
-                            pool.num_ready_actors
-                            * pool.slots_per_actor
-                            * pipeline_spec.config.mode_specific.max_queued_multiplier
-                        ),
-                        pipeline_spec.config.mode_specific.max_queued_lower_bound,
-                        next_stage_batch_size,
+                    stage_name = pipeline_spec.stages[idx].name(idx)  # type: ignore
+                    max_queued = compute_max_queued(
+                        num_ready_actors=pool.num_ready_actors,
+                        num_pending_actors=pool.num_pending_actors,
+                        slots_per_actor=pool.slots_per_actor,
+                        max_queued_multiplier=pipeline_spec.config.mode_specific.max_queued_multiplier,
+                        max_queued_lower_bound=pipeline_spec.config.mode_specific.max_queued_lower_bound,
+                        next_stage_batch_size=next_stage_batch_size,
+                        setup_aware_enabled=resolve_setup_aware_max_queued_enabled(pipeline_spec, idx, stage_name),
+                        is_done=stage_is_dones[idx],
+                        stage_name=stage_name,
                     )
 
                     if num_tasks_in_progress + num_tasks_completed >= max_queued:
