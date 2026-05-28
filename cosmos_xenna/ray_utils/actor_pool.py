@@ -53,10 +53,35 @@ _KILL_ACTOR_SURVIVORS: bool = os.getenv("XENNA_KILL_ACTOR_SURVIVORS", "0") == "1
 # node loss, external ray.kill, assertion in a Ray callback, ...). Used by
 # ``_process_completed_task`` to convert what would otherwise be a driver-killing
 # exception into a structured recovery via ``_handle_actor_death``.
+#
+# In the Ray 2.x exception hierarchy these are NOT all subclasses of one root:
+#
+#   RayError
+#     +- RayActorError
+#     |    +- ActorDiedError
+#     |    +- ActorUnavailableError
+#     +- NodeDiedError              <- distinct from RayActorError
+#     +- WorkerCrashedError         <- distinct from RayActorError
+#     +- OutOfMemoryError           <- distinct from RayActorError
+#     +- ObjectLostError            <- intentionally NOT caught (see note below)
+#
+# ``ActorDiedError`` / ``ActorUnavailableError`` are redundant with the
+# ``RayActorError`` parent but listed explicitly for self-documenting recovery
+# behavior. ``NodeDiedError`` and ``WorkerCrashedError`` are NOT subclasses of
+# ``RayActorError`` so they must be listed individually.
+#
+# Intentionally NOT caught: ``RayTaskError`` (user code raised in ``process_data``
+# - those are real bugs that must propagate, not actor deaths to recover from)
+# and ``ObjectLostError`` (its subclass ``ReferenceCountingAssertionError`` fires
+# on plasma/ref-counting bugs that should not silently trigger WG teardown).
+# If we ever need to handle ``OwnerDiedError`` on the metadata ``ray.get``, add
+# that subclass directly rather than the broad ``ObjectLostError`` base.
 _ACTOR_DEATH_ERRORS: tuple[type[BaseException], ...] = (
     ray.exceptions.RayActorError,
     ray.exceptions.ActorDiedError,
     ray.exceptions.ActorUnavailableError,
+    ray.exceptions.NodeDiedError,
+    ray.exceptions.WorkerCrashedError,
     ray.exceptions.OutOfMemoryError,
 )
 
@@ -1699,8 +1724,20 @@ class ActorPool(Generic[T, V]):
         # but ``_handle_actor_death`` already tore down the whole WG on the first
         # one.
         deaths_seen: set[str] = set()
+        # ``successful_task_ids_by_wg`` records, per WG, the set of ``id(task)``
+        # values whose result the primary rank already accepted on this tick.
+        # ``_handle_actor_death`` consults it to skip requeueing tasks that
+        # primary already emitted - preventing silent double-emission when a
+        # sibling rank dies later in the same tick (SPMD post-success race).
+        successful_task_ids_by_wg: dict[str, set[int]] = {}
         for wg, actor, i, is_primary in finished_slots:
-            should_kill_actor = self._process_completed_task(actor, i, is_primary, deaths_seen=deaths_seen)
+            should_kill_actor = self._process_completed_task(
+                actor,
+                i,
+                is_primary,
+                deaths_seen=deaths_seen,
+                successful_task_ids_by_wg=successful_task_ids_by_wg,
+            )
             if should_kill_actor:
                 wgs_to_kill.add(wg.id_)
 
@@ -1833,7 +1870,13 @@ class ActorPool(Generic[T, V]):
                 logger.trace(f"Stolen={stolen}")
             # If we couldn't steal for this receiver, continue to next; nothing else to do
 
-    def _handle_actor_death(self, wg_id: str, exc: BaseException) -> None:
+    def _handle_actor_death(
+        self,
+        wg_id: str,
+        exc: BaseException,
+        *,
+        already_succeeded_task_ids: set[int] | None = None,
+    ) -> None:
         """Recover from an unexpected stage-actor death without killing the driver.
 
         Called from ``_process_completed_task`` when ``ray.get`` on a slot's object ref
@@ -1846,16 +1889,28 @@ class ActorPool(Generic[T, V]):
         SPMD: ``_schedule_task_on_worker_group`` dispatches the same ``Task`` instance
         to every rank actor's slot. Without dedupe via ``id(task)``, an N-rank WG death
         would N x duplicate every in-flight task in the queue.
+
+        ``already_succeeded_task_ids`` is the per-tick set of ``id(task)`` values whose
+        result was already accepted from the primary rank earlier in this same
+        ``_process_completed_tasks`` tick. Those tasks are NOT requeued here, because
+        requeueing would let a new primary on the replacement WG re-emit the same
+        logical result on the next tick - a silent at-least-twice violation.
         """
-        self._num_unexpected_actor_deaths += 1
         wg = self._worker_groups.get(wg_id)
         if wg is None:
+            # No-op: another slot on this WG already entered recovery this tick
+            # and tore down the WG. Do not count this as a fresh death event;
+            # the counter reflects WGs that actually entered recovery, not raw
+            # call count.
             logger.debug(f"_handle_actor_death: worker group {wg_id} already gone; nothing to recover.")
             return
+        self._num_unexpected_actor_deaths += 1
 
         seen_task_ids: set[int] = set()
+        succeeded_ids = already_succeeded_task_ids or set()
         tasks_to_requeue: list[Task] = []
         dropped = 0
+        spmd_post_success_skipped = 0
 
         for actor_id in wg.actors:
             ready_actor = self._ready_actors.get(actor_id)
@@ -1865,12 +1920,23 @@ class ActorPool(Generic[T, V]):
                 if not slot.has_task:
                     continue
                 task = slot.get_task.task
-                if id(task) in seen_task_ids:
+                tid = id(task)
+                if tid in succeeded_ids:
+                    # SPMD post-success dedupe: this logical task's result was
+                    # already emitted from the primary rank earlier this tick
+                    # (the primary's slot succeeded; this sibling slot is just
+                    # the parallel copy that happened to die at the same time).
+                    # Requeueing would let a new primary re-emit on the next
+                    # round - duplicate output for the same input.
+                    spmd_post_success_skipped += 1
+                    slot.clear_task()
+                    continue
+                if tid in seen_task_ids:
                     # SPMD sibling slot pointing at the same Task; clear it so the
                     # downstream ``_try_delete_ready_actor`` reclaim is a no-op for it.
                     slot.clear_task()
                     continue
-                seen_task_ids.add(id(task))
+                seen_task_ids.add(tid)
                 if task.actor_death_retries < _MAX_ACTOR_DEATH_RETRIES:
                     task.actor_death_retries += 1
                     tasks_to_requeue.append(task)
@@ -1887,6 +1953,11 @@ class ActorPool(Generic[T, V]):
             self._task_queue.appendleft(task)
 
         self._num_tasks_dropped_on_actor_death += dropped
+        if spmd_post_success_skipped:
+            logger.info(
+                f"Stage {self._name} WG {wg_id} death: skipped requeue of {spmd_post_success_skipped} "
+                "task(s) already accepted from primary this tick (SPMD sibling died after primary success)."
+            )
 
         # Per-WG consecutive-death tally. Reset to zero in
         # ``_process_completed_task`` on any successful task completion on this WG,
@@ -1932,6 +2003,15 @@ class ActorPool(Generic[T, V]):
         # (step 4 of ``update``) will recreate the worker group on the next
         # tick through the same code path autoscale and
         # ``_maybe_restart_long_running_actor`` use.
+        #
+        # FIXME: ``saved_allocation`` is the original ``WorkerGroupAllocation``
+        # pinned to whichever node ids the autoscaler picked when this WG was
+        # first built. On a true node-loss cause (``NodeDiedError``), the next
+        # ``_adjust_actors`` tick will try to recreate the WG on the same dead
+        # node, which can fail with ``AllocationError`` or stall on actor
+        # spawn. The per-WG consecutive-death cap still bounds the loop, but a
+        # fresh allocator snapshot would re-target the survivor pool sooner.
+        # needs autoscaler / allocator integration.
         self._worker_groups_to_create.append(saved_allocation)
 
     def _process_completed_task(
@@ -1941,6 +2021,7 @@ class ActorPool(Generic[T, V]):
         is_primary: bool,
         *,
         deaths_seen: set[str] | None = None,
+        successful_task_ids_by_wg: dict[str, set[int]] | None = None,
     ) -> bool:
         # Each slot holds a reference to a ray.remote call on StageWorker.process_data.
         # process_data returns a generator, which first produces a TaskResultMetadata,
@@ -1956,6 +2037,11 @@ class ActorPool(Generic[T, V]):
             # deleted the WG. ``finished_slots`` was snapshotted before that ran,
             # so we may still iterate this slot here. Nothing to process.
             return False
+        # Snapshot ``id(task)`` BEFORE the slot is cleared so the SPMD
+        # post-success dedupe in ``_handle_actor_death`` can recognize a
+        # sibling-rank death for the same logical task later in this tick.
+        wg_id = actor.metadata.worker_group_id
+        task_id_for_dedupe = id(slot.get_task.task)
         dynamic_ref = slot.get_task.object_ref
         try:
             # Get the values for the is_null and time_taken refs.
@@ -1964,22 +2050,27 @@ class ActorPool(Generic[T, V]):
             metadata_ref = refs[0]
             metadata: stage_worker.TaskResultMetadata = ray.get(metadata_ref)
         except _ACTOR_DEATH_ERRORS as e:
-            # An unexpected actor death surfaces here as a RayActorError /
-            # ActorDiedError / ActorUnavailableError / OutOfMemoryError on the
-            # slot's generator ref. Recover instead of propagating to the
-            # driver. The ``deaths_seen`` set ensures one recovery per worker
-            # group per tick even if multiple slots on the same WG surface the
-            # same death.
-            wg_id = actor.metadata.worker_group_id
+            # An unexpected actor death surfaces here as one of the exceptions
+            # in ``_ACTOR_DEATH_ERRORS`` on the slot's generator ref. Recover
+            # instead of propagating to the driver. The ``deaths_seen`` set
+            # ensures one recovery per worker group per tick even if multiple
+            # slots on the same WG surface the same death.
             if deaths_seen is None or wg_id not in deaths_seen:
                 if deaths_seen is not None:
                     deaths_seen.add(wg_id)
-                self._handle_actor_death(wg_id, e)
+                # Pass the set of task ids whose result the primary already
+                # accepted from this WG on this tick so the death handler does
+                # not requeue them (would cause silent double-emission - see
+                # ``_handle_actor_death`` docstring).
+                already_succeeded: set[int] | None = None
+                if successful_task_ids_by_wg is not None:
+                    already_succeeded = successful_task_ids_by_wg.get(wg_id)
+                self._handle_actor_death(wg_id, e, already_succeeded_task_ids=already_succeeded)
             return False
         # Successful round-trip proves this WG is still functional, so clear any
         # accumulated consecutive-death tally for it. The cap only fires when a
         # WG dies repeatedly with no forward progress in between.
-        self._consecutive_actor_deaths_by_wg_id.pop(actor.metadata.worker_group_id, None)
+        self._consecutive_actor_deaths_by_wg_id.pop(wg_id, None)
         out_data_refs = refs[1:]
         if len(out_data_refs) != metadata.num_returns:
             raise ValueError(
@@ -2012,6 +2103,11 @@ class ActorPool(Generic[T, V]):
                 self._num_dynamically_spawned_tasks += metadata.num_returns - self._params.stage_batch_size
             # Metrics
             self._update_task_metrics(metadata)
+            # Record the primary-rank success so a sibling-rank death on the
+            # same logical task later in this tick is recognized as a
+            # post-success dedupe target rather than a fresh requeue.
+            if successful_task_ids_by_wg is not None:
+                successful_task_ids_by_wg.setdefault(wg_id, set()).add(task_id_for_dedupe)
         # Mark the slot as empty
         actor.slots[slot_num].clear_task()
         return metadata.failure_info.should_restart_worker

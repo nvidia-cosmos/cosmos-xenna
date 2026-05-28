@@ -109,6 +109,10 @@ def _make_ready_actor(actor_id: str, worker_group_id: str, slots: list[_Slot]) -
     actor.actor_ref = mock.sentinel.actor_ref  # type: ignore[assignment]
     actor.start_time = 0.0
     actor.last_became_idle_time = None
+    # ``rate_estimator.update`` is called inside ``_process_completed_task`` on
+    # the primary-rank success path. Tests that exercise the success path stub
+    # it; tests that only exercise ``_handle_actor_death`` never touch it.
+    actor.rate_estimator = mock.MagicMock()  # type: ignore[assignment]
     return actor
 
 
@@ -137,6 +141,18 @@ def _make_pool() -> ActorPool:
     pool._num_tasks_dropped_on_actor_death = 0
     pool._num_worker_groups_abandoned = 0
     pool._consecutive_actor_deaths_by_wg_id = {}
+
+    # Primary-rank success path state. Only consulted when a test drives
+    # ``_process_completed_task`` with ``is_primary=True`` (e.g. the SPMD
+    # post-success regression tests). Mocked metrics avoid pulling the real
+    # Counter / metric backend into hermetic unit tests.
+    pool._task_result_metadatas = collections.deque()
+    pool._completed_tasks = collections.deque()
+    pool._num_null_tasks = 0
+    pool._num_completed_tasks = 0
+    pool._num_dynamically_spawned_tasks = 0
+    pool._params = mock.MagicMock(stage_batch_size=1)
+    pool._update_task_metrics = mock.MagicMock()  # type: ignore[method-assign]
 
     # ``_delete_worker_group`` requires an allocator + port registry on the real
     # pool. Replace with a recorder so the unit tests stay hermetic; the
@@ -171,11 +187,39 @@ def _install_worker_group(
 
 
 def test_actor_death_errors_includes_expected_ray_exceptions() -> None:
-    """Lock in the exception tuple so a Ray-side rename does not silently regress recovery."""
+    """Lock in the exception tuple so a Ray-side rename does not silently regress recovery.
+
+    The docstring on ``_handle_actor_death`` promises coverage of OOM-kill, node
+    loss, segfault, and external ``ray.kill``. The tuple must include every
+    distinct ``RayError`` subclass needed for those scenarios; some of them
+    (``NodeDiedError``, ``WorkerCrashedError``, ``OutOfMemoryError``) are NOT
+    subclasses of ``RayActorError`` and must be listed individually.
+    """
     assert ray.exceptions.RayActorError in _ACTOR_DEATH_ERRORS
     assert ray.exceptions.ActorDiedError in _ACTOR_DEATH_ERRORS
     assert ray.exceptions.ActorUnavailableError in _ACTOR_DEATH_ERRORS
+    assert ray.exceptions.NodeDiedError in _ACTOR_DEATH_ERRORS
+    assert ray.exceptions.WorkerCrashedError in _ACTOR_DEATH_ERRORS
     assert ray.exceptions.OutOfMemoryError in _ACTOR_DEATH_ERRORS
+
+
+def test_actor_death_subclass_invariants_hold() -> None:
+    """Lock the Ray exception hierarchy assumptions the tuple relies on.
+
+    A future Ray refactor that demotes ``ActorDiedError`` / ``ActorUnavailableError``
+    out of the ``RayActorError`` lineage, or promotes ``NodeDiedError`` /
+    ``WorkerCrashedError`` into it, would silently change recovery coverage.
+    This test makes that regression noisy.
+    """
+    assert issubclass(ray.exceptions.ActorDiedError, ray.exceptions.RayActorError)
+    assert issubclass(ray.exceptions.ActorUnavailableError, ray.exceptions.RayActorError)
+    assert not issubclass(ray.exceptions.NodeDiedError, ray.exceptions.RayActorError)
+    assert not issubclass(ray.exceptions.WorkerCrashedError, ray.exceptions.RayActorError)
+    assert not issubclass(ray.exceptions.OutOfMemoryError, ray.exceptions.RayActorError)
+    # RayTaskError is intentionally NOT in the tuple: it wraps user-code
+    # exceptions raised from inside ``process_data`` and must propagate as a
+    # real bug, not trigger WG recovery.
+    assert ray.exceptions.RayTaskError not in _ACTOR_DEATH_ERRORS
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +412,11 @@ def test_handle_actor_death_unknown_worker_group_is_a_noop() -> None:
     """If the WG is already torn down (e.g. handled this tick by another slot's death),
     the call must short-circuit without touching the queue or the create queue.
 
-    The death counter still increments so we count the event itself."""
+    The death counter is NOT incremented on the no-op path: it counts WGs that
+    actually entered recovery, not raw call count. This keeps the eventual
+    Prometheus counter free of duplicate spikes when ``deaths_seen`` only
+    partially elides re-entry.
+    """
     pool = _make_pool()
 
     pool._handle_actor_death("wg-nonexistent", ray.exceptions.RayActorError("died"))
@@ -376,7 +424,9 @@ def test_handle_actor_death_unknown_worker_group_is_a_noop() -> None:
     assert len(pool._task_queue) == 0
     assert len(pool._worker_groups_to_create) == 0
     pool._delete_worker_group.assert_not_called()  # type: ignore[attr-defined]
-    assert pool._num_unexpected_actor_deaths == 1
+    assert pool._num_unexpected_actor_deaths == 0, (
+        "no-op call (WG already torn down) must NOT advance the death counter"
+    )
     assert pool._num_tasks_dropped_on_actor_death == 0
 
 
@@ -659,3 +709,300 @@ def test_kill_worker_groups_requested_handles_mixed_present_and_absent() -> None
     assert pool._delete_worker_group.call_count == delete_calls_after_death + 1  # type: ignore[attr-defined]
     pool._delete_worker_group.assert_called_with("wg-alive")  # type: ignore[attr-defined]
     assert "wg-alive" not in pool._worker_groups
+
+
+# ---------------------------------------------------------------------------
+# SPMD same-tick race: primary success + sibling death must not double-emit
+# ---------------------------------------------------------------------------
+
+
+def _make_success_metadata() -> TaskResultMetadata:
+    """Canonical primary-rank success metadata used by the same-tick race tests.
+
+    ``should_process_further=False`` lets the test skip the
+    ``_completed_tasks.append(Task(..., actor.metadata.allocation.node))`` path
+    (which would need an ``allocation`` field on ``_StubMetadata``). The SPMD
+    post-success dedupe-recording lives after both branches and still fires
+    here, which is what the tests care about.
+    """
+    return TaskResultMetadata(
+        timing=TimingInfo(),
+        failure_info=FailureInfo(should_process_further=False, should_restart_worker=False),
+        task_data_info=TaskDataInfo(serialized_input_size=0),
+        num_returns=0,
+    )
+
+
+def _make_success_metadata_with_restart() -> TaskResultMetadata:
+    """Primary-rank success metadata that also requests a worker restart.
+
+    Same ``should_process_further=False`` rationale as ``_make_success_metadata``.
+    """
+    return TaskResultMetadata(
+        timing=TimingInfo(),
+        failure_info=FailureInfo(should_process_further=False, should_restart_worker=True),
+        task_data_info=TaskDataInfo(serialized_input_size=0),
+        num_returns=0,
+    )
+
+
+def test_spmd_primary_success_then_sibling_death_does_not_double_emit() -> None:
+    """Regression for the SPMD post-success race.
+
+    ``_schedule_task_on_worker_group`` dispatches the same ``Task`` instance to
+    every rank's slot. If ``ray.wait`` surfaces a primary's success ref AND a
+    sibling rank's death ref in the same ``_process_completed_tasks`` tick, and
+    the primary is processed FIRST:
+
+      1. Primary succeeds -> result appended to the completed queue, primary
+         slot cleared.
+      2. Sibling raises ``ActorDiedError`` -> ``_handle_actor_death`` walks
+         ``wg.actors``; primary's slot is empty (just cleared), sibling's slot
+         still holds the task.
+
+    Without the post-success dedupe, the death handler would requeue the task,
+    a new primary would process it again, and the result would be emitted a
+    second time for the same logical input - a silent at-least-twice violation.
+
+    The fix threads ``successful_task_ids_by_wg`` through ``_process_completed_task``
+    and into ``_handle_actor_death`` so the sibling-death code path recognizes the
+    task as already-emitted and skips the requeue.
+    """
+    pool = _make_pool()
+    shared_task = _make_task()
+    _install_worker_group(
+        pool,
+        "wg-spmd",
+        ["rank-0", "rank-1"],
+        [[_make_slot_with_task(shared_task)], [_make_slot_with_task(shared_task)]],
+    )
+    primary_actor = pool._ready_actors["rank-0"]
+    sibling_actor = pool._ready_actors["rank-1"]
+
+    deaths_seen: set[str] = set()
+    successful_task_ids_by_wg: dict[str, set[int]] = {}
+
+    # Step 1: primary processes successfully. Drives the real
+    # ``_process_completed_task`` so the dedupe-record code path is exercised
+    # end-to-end (not just the dict mutation in isolation).
+    metadata = _make_success_metadata()
+    with mock.patch(
+        "cosmos_xenna.ray_utils.actor_pool.ray.get",
+        side_effect=[[mock.sentinel.metadata_ref], metadata],
+    ):
+        pool._process_completed_task(
+            primary_actor,
+            slot_num=0,
+            is_primary=True,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+
+    assert not primary_actor.slots[0].has_task, "primary success must clear the slot"
+    assert successful_task_ids_by_wg.get("wg-spmd") == {id(shared_task)}, (
+        "primary success must record id(task) so a same-tick sibling death can dedupe"
+    )
+
+    # Step 2: sibling raises ActorDiedError on the same logical task. The death
+    # handler is invoked through ``_process_completed_task`` so the kwarg
+    # threading is exercised end-to-end.
+    with mock.patch(
+        "cosmos_xenna.ray_utils.actor_pool.ray.get",
+        side_effect=ray.exceptions.ActorDiedError(),
+    ):
+        pool._process_completed_task(
+            sibling_actor,
+            slot_num=0,
+            is_primary=False,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+
+    # Death handler ran and tore down the WG, but it MUST NOT have requeued the
+    # task - that would let a new primary re-emit the same logical result.
+    assert "wg-spmd" in deaths_seen
+    assert "wg-spmd" not in pool._worker_groups, "death handler must tear down the dead WG"
+    assert list(pool._task_queue) == [], (
+        "task must not be requeued (primary's result is canonical; requeue would double-emit)"
+    )
+    assert pool._num_tasks_dropped_on_actor_death == 0, "post-success skip is not a drop"
+    assert shared_task.actor_death_retries == 0, "skipped-task retry counter must NOT advance"
+    assert pool._num_unexpected_actor_deaths == 1
+
+
+def test_spmd_sibling_death_then_primary_success_short_circuits() -> None:
+    """The reverse iteration order is already safe via the existing
+    ``if not slot.has_task: return False`` short-circuit at the top of
+    ``_process_completed_task``. This locks that invariant in.
+
+    Order: sibling-death first -> death handler clears every slot on the WG,
+    tears down the WG, and re-schedules. Then primary's success iteration sees
+    its own slot already empty and returns False without calling ``ray.get``.
+    Net effect: task is requeued exactly once by the death handler; primary's
+    successful result is not consulted (it lives in Ray's object store and is
+    GC'd). No duplicate.
+    """
+    pool = _make_pool()
+    shared_task = _make_task()
+    _install_worker_group(
+        pool,
+        "wg-spmd",
+        ["rank-0", "rank-1"],
+        [[_make_slot_with_task(shared_task)], [_make_slot_with_task(shared_task)]],
+    )
+    primary_actor = pool._ready_actors["rank-0"]
+    sibling_actor = pool._ready_actors["rank-1"]
+
+    deaths_seen: set[str] = set()
+    successful_task_ids_by_wg: dict[str, set[int]] = {}
+
+    # Step 1: sibling dies first.
+    with mock.patch(
+        "cosmos_xenna.ray_utils.actor_pool.ray.get",
+        side_effect=ray.exceptions.ActorDiedError(),
+    ):
+        pool._process_completed_task(
+            sibling_actor,
+            slot_num=0,
+            is_primary=False,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+
+    assert "wg-spmd" not in pool._worker_groups
+    # Death handler requeued exactly once and bumped the retry counter.
+    assert list(pool._task_queue) == [shared_task]
+    assert shared_task.actor_death_retries == 1
+    # Primary's slot was cleared by the death handler.
+    assert not primary_actor.slots[0].has_task
+
+    # Step 2: primary's "success" iteration short-circuits. The mock must NOT
+    # be consulted (the slot is already empty) - if it is, the call_count
+    # check will catch it.
+    fake_get = mock.MagicMock()
+    with mock.patch("cosmos_xenna.ray_utils.actor_pool.ray.get", new=fake_get):
+        result = pool._process_completed_task(
+            primary_actor,
+            slot_num=0,
+            is_primary=True,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+
+    assert result is False
+    assert fake_get.call_count == 0, "short-circuit must NOT consult ray.get on an empty slot"
+    # No second requeue, no extra retry bump, no spurious entry in the dedupe map.
+    assert list(pool._task_queue) == [shared_task]
+    assert shared_task.actor_death_retries == 1
+    assert "wg-spmd" not in successful_task_ids_by_wg
+
+
+def test_spmd_mixed_tasks_post_success_dedupe_is_per_task_not_per_wg() -> None:
+    """Post-success dedupe is keyed on ``id(task)``, NOT on WG id.
+
+    Setup: primary succeeded on task A this tick, but sibling slot still holds
+    a DIFFERENT task B (e.g. multiple slots per actor with distinct tasks).
+    When the sibling dies, A must NOT be requeued (primary emitted it) but B
+    MUST be requeued (no result was ever produced for B).
+    """
+    pool = _make_pool()
+    task_a = _make_task("node-a")
+    task_b = _make_task("node-b")
+    _install_worker_group(
+        pool,
+        "wg-mixed",
+        ["rank-0", "rank-1"],
+        [
+            [_make_slot_with_task(task_a)],
+            [_make_slot_with_task(task_a), _make_slot_with_task(task_b)],
+        ],
+    )
+
+    # Primary already succeeded on task_a this tick.
+    already_succeeded = {id(task_a)}
+
+    pool._handle_actor_death("wg-mixed", ray.exceptions.RayActorError(), already_succeeded_task_ids=already_succeeded)
+
+    queued_ids = [id(t) for t in pool._task_queue]
+    assert queued_ids == [id(task_b)], (
+        f"only task_b should be requeued; task_a was already emitted by primary. got={queued_ids}"
+    )
+    assert task_a.actor_death_retries == 0, "skipped (already-emitted) task must NOT advance retry counter"
+    assert task_b.actor_death_retries == 1, "unrelated task must follow the normal requeue path"
+    assert pool._num_tasks_dropped_on_actor_death == 0
+
+
+# ---------------------------------------------------------------------------
+# should_restart_worker=True same-tick race with death recovery
+# ---------------------------------------------------------------------------
+
+
+def test_should_restart_worker_race_with_sibling_death_does_not_double_delete() -> None:
+    """End-to-end same-tick race: primary returns ``should_restart_worker=True``
+    (so the caller plans to call ``_kill_worker_groups_requested({wg_id})``)
+    AND a sibling rank on the same WG raises ``ActorDiedError`` in the same
+    ``_process_completed_tasks`` tick (so ``_handle_actor_death`` has already
+    torn down the WG by the time the helper runs).
+
+    The double-delete guard in ``_kill_worker_groups_requested`` must skip the
+    missing WG instead of raising ``KeyError`` on ``self._worker_groups.pop``.
+    This complements ``test_kill_worker_groups_requested_skips_already_torn_down_wg``
+    (which exercises the helper in isolation) by driving the actual same-tick
+    sequence through ``_process_completed_task``.
+    """
+    pool = _make_pool()
+    shared_task = _make_task()
+    _install_worker_group(
+        pool,
+        "wg-race",
+        ["rank-0", "rank-1"],
+        [[_make_slot_with_task(shared_task)], [_make_slot_with_task(shared_task)]],
+    )
+    primary_actor = pool._ready_actors["rank-0"]
+    sibling_actor = pool._ready_actors["rank-1"]
+
+    deaths_seen: set[str] = set()
+    successful_task_ids_by_wg: dict[str, set[int]] = {}
+    wgs_to_kill: set[str] = set()
+
+    # Step 1: primary succeeds with should_restart_worker=True.
+    metadata = _make_success_metadata_with_restart()
+    with mock.patch(
+        "cosmos_xenna.ray_utils.actor_pool.ray.get",
+        side_effect=[[mock.sentinel.metadata_ref], metadata],
+    ):
+        should_kill = pool._process_completed_task(
+            primary_actor,
+            slot_num=0,
+            is_primary=True,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+    assert should_kill is True, "primary returned should_restart_worker=True"
+    wgs_to_kill.add("wg-race")
+
+    # Step 2: sibling dies; death handler tears down the WG.
+    with mock.patch(
+        "cosmos_xenna.ray_utils.actor_pool.ray.get",
+        side_effect=ray.exceptions.ActorDiedError(),
+    ):
+        pool._process_completed_task(
+            sibling_actor,
+            slot_num=0,
+            is_primary=False,
+            deaths_seen=deaths_seen,
+            successful_task_ids_by_wg=successful_task_ids_by_wg,
+        )
+    assert "wg-race" not in pool._worker_groups, "death handler must have torn down the WG"
+
+    # Step 3: the helper runs with wg-race in wgs_to_kill but the WG is gone.
+    # The guard must skip cleanly instead of raising KeyError on pop.
+    pool._kill_worker_groups_requested(wgs_to_kill)
+
+    # No extra delete beyond what the death handler already did. The death
+    # handler called _delete_worker_group exactly once for wg-race.
+    pool._delete_worker_group.assert_called_once_with("wg-race")  # type: ignore[attr-defined]
+    # And no double-emission of the task: primary's success stands, sibling
+    # death's requeue was suppressed by the post-success dedupe.
+    assert list(pool._task_queue) == []
+    assert shared_task.actor_death_retries == 0

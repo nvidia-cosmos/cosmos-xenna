@@ -108,7 +108,7 @@ def _assert_recovery_outputs(
     ``actor_death_retries`` counter bumped on each death. After enough deaths
     they all hit the per-task cap together. The contract we can guarantee is:
 
-    1. ``run_pipeline`` returned at all (the CVC-860 driver-survival guarantee).
+    1. ``run_pipeline`` returned at all (the driver-survival guarantee).
     2. No spurious values appear in the output.
     3. The poison input itself is always dropped (it crashes the worker every
        time the worker sees it).
