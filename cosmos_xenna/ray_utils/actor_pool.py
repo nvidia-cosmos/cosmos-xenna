@@ -780,10 +780,10 @@ class ActorPool(Generic[T, V]):
 
         Sums ``num_used_slots`` across every ready actor in each
         worker group; pending or unready worker groups appear with
-        zero. Used by the streaming-layer producer to populate the
-        per-worker ``num_used_slots`` saturation signal on
-        ``ProblemWorkerGroupState`` so Phase D scale-down can prefer
-        idle workers over busy ones.
+        zero. The streaming-layer producer forwards this into the
+        per-worker ``num_used_slots`` load signal on
+        ``ProblemWorkerGroupState`` so an autoscaler can prefer idle
+        worker groups over busy ones when scaling a stage down.
 
         Returns:
             Mapping ``{worker_group_id: total_used_slots}``. Worker

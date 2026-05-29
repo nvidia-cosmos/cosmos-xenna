@@ -308,6 +308,10 @@ class TestMakeProblemStateSlotSignals:
             num_used_slots=13,
             num_empty_slots=3,
             num_queued_tasks=21,
+            # The per-worker snapshot must enumerate the same worker
+            # groups the allocator reports; the validator now compares
+            # the two on the public surface (values are irrelevant here).
+            worker_group_used_slots={"active-w0": 0, "active-w1": 0},
         )
 
         state = _make_problem_state([pool], [False], allocator=allocator)
@@ -321,7 +325,7 @@ class TestMakeProblemStateSlotSignals:
         assert stage.input_queue_depth == 21
 
     def test_active_stage_populates_per_worker_used_slots(self) -> None:
-        """Active stages copy per-worker slot signals onto worker snapshots."""
+        """Active stages copy per-worker slot signals onto matching worker snapshots."""
         allocator = _FakeAllocator(
             workers_by_stage={
                 "active": [
@@ -336,7 +340,10 @@ class TestMakeProblemStateSlotSignals:
             num_used_slots=3,
             num_empty_slots=5,
             num_queued_tasks=0,
-            worker_group_used_slots={"active-w0": 3, "stale-w9": 99},
+            # One entry per allocator worker group (the real pool always
+            # enumerates every group); a busy ``active-w0`` and an idle
+            # ``active-w1`` exercise the per-worker value copy.
+            worker_group_used_slots={"active-w0": 3, "active-w1": 0},
         )
 
         state = _make_problem_state([pool], [False], allocator=allocator)
@@ -783,8 +790,17 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
 
         assert self._per_worker_used_slots(state) == {"active-w0": 3, "active-w1": 0}
 
-    def test_worker_missing_from_partial_fake_idle_map_defaults_to_zero(self) -> None:
-        """A duck-typed pool without structural worker IDs can still omit a worker signal."""
+    def test_allocator_worker_absent_from_pool_snapshot_raises(self) -> None:
+        """An allocator worker missing from the pool snapshot raises (allocator-only diff).
+
+        The validator now reads worker-group ids from the public
+        ``worker_group_num_used_slots`` snapshot, so a worker the
+        allocator reports but the pool omits is a genuine divergence:
+        it must NOT be silently defaulted to zero used slots (which
+        would model a stale allocator view as an idle worker). It
+        raises, naming the allocator-only id. Adversarial axis 2
+        (failure path).
+        """
 
         class _PartialMapPool:
             name = "ingest"
@@ -806,9 +822,8 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
             },
         )
 
-        state = _make_problem_state([_PartialMapPool()], [False], allocator=allocator)  # type: ignore[list-item]
-
-        assert self._per_worker_used_slots(state) == {"ingest-w0": 2, "ingest-w1": 0}
+        with pytest.raises(ValueError, match=r"stage 'ingest'.*allocator-only.*ingest-w1"):
+            _make_problem_state([_PartialMapPool()], [False], allocator=allocator)  # type: ignore[list-item]
 
     def test_negative_worker_group_signal_raises_contextual_value_error(self) -> None:
         """A negative per-worker map value names the stage, worker, and field."""
@@ -845,6 +860,32 @@ class TestMakeProblemStatePerWorkerNumUsedSlots:
         )
 
         with pytest.raises(ValueError, match=r"stage 'active'.*allocator-only.*stale-w1"):
+            _make_problem_state([pool], [False], allocator=allocator)
+
+    def test_pool_snapshot_extra_worker_group_raises(self) -> None:
+        """A pool worker group the allocator does not report raises (pool-only diff).
+
+        The mirror of the allocator-only case, exercised through the
+        public ``worker_group_num_used_slots`` surface on a fake pool:
+        a stale entry in the pool snapshot (a worker group the
+        allocator no longer lists) surfaces as a ``pool-only`` mismatch
+        rather than being silently ignored, so the two views cannot
+        drift apart unnoticed. Adversarial axis 3 (the opposite diff
+        direction).
+        """
+        allocator = _FakeAllocator(
+            workers_by_stage={"active": [_worker_group("active", "active-w0")]},
+        )
+        pool = _FakeActorPool(
+            name="active",
+            slots_per_actor=4,
+            num_used_slots=3,
+            num_empty_slots=5,
+            num_queued_tasks=0,
+            worker_group_used_slots={"active-w0": 3, "stale-w9": 0},
+        )
+
+        with pytest.raises(ValueError, match=r"stage 'active'.*pool-only.*stale-w9"):
             _make_problem_state([pool], [False], allocator=allocator)
 
     def test_repeated_calls_read_fresh_per_worker_signals(self) -> None:

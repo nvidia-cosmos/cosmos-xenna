@@ -40,10 +40,10 @@ class RejectReason(enum.StrEnum):
     structured DEBUG log lines without ``.value`` boilerplate.
     Each reason maps to exactly one gate check inside the donor
     pipeline; expanding the enum is the contract for adding a
-    new gate. Placeholder rust reasons (``worker_not_found`` /
+    new gate. Placeholder placement reasons (``worker_not_found`` /
     ``release_failed`` / ``no_placement``) live on
-    ``rust_apc.PlacementProbeResult`` and are surfaced separately
-    in ``placement_reject_reason``.
+    ``data_structures.PlacementProbeResult.reject_reason`` and are
+    surfaced separately in ``placement_reject_reason``.
 
     """
 

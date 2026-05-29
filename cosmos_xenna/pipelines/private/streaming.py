@@ -259,13 +259,19 @@ def _validate_allocator_pool_worker_ids(
     *,
     stage_name: str,
     allocator_worker_ids: set[str],
-    pool: actor_pool.ActorPool[typing.Any, typing.Any],
+    pool_worker_ids: set[str],
 ) -> None:
-    """Ensure production pool and allocator snapshots describe the same worker groups."""
-    pool_worker_groups = getattr(pool, "_worker_groups", None)
-    if not isinstance(pool_worker_groups, dict):
-        return
-    pool_worker_ids = set(pool_worker_groups)
+    """Ensure the allocator and actor pool describe the same worker groups.
+
+    ``pool_worker_ids`` are the keys of the pool's public
+    :meth:`ActorPool.worker_group_num_used_slots` snapshot (one entry
+    per worker group). Comparing against that public surface - rather
+    than reaching into the private ``_worker_groups`` map - keeps the
+    check on the supported API, so any pool that implements the method
+    (including test doubles) is validated and a genuine
+    allocator-vs-pool divergence always raises instead of being
+    silently skipped for pools that lack the private attribute.
+    """
     if allocator_worker_ids == pool_worker_ids:
         return
     allocator_only = sorted(allocator_worker_ids - pool_worker_ids)
@@ -422,7 +428,7 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
         ValueError: The resolved interval is ``<= 0``. The
             saturation-aware path is already protected by
             ``attrs.validators.gt(0.0)`` on
-            ``SaturationAwareGlobalConfig.interval_s``; the
+            ``SaturationAwareConfig.interval_s``; the
             fragmentation-based path's ``autoscale_interval_s``
             has no field-level validator, so this resolver
             enforces the invariant for both paths uniformly.
@@ -432,12 +438,19 @@ def effective_autoscale_interval(pipeline_spec: specs.PipelineSpec) -> float:
         msg = "effective_autoscale_interval requires StreamingSpecificSpec; got mode_specific=None"
         raise RuntimeError(msg)
     kind = mode_specific.scheduler
-    if kind == specs.SchedulerKind.SATURATION_AWARE:
-        interval = mode_specific.materialized_saturation_aware().interval_s
-        source = "mode_specific.saturation_aware.interval_s"
-    else:
-        interval = mode_specific.autoscale_interval_s
-        source = "mode_specific.autoscale_interval_s"
+    # ``match`` + ``assert_never`` (mirroring ``_make_scheduler_algorithm``)
+    # so adding a ``SchedulerKind`` without a cadence source is a mypy
+    # exhaustiveness error rather than a silent fall-through to the
+    # fragmentation-based default.
+    match kind:
+        case specs.SchedulerKind.SATURATION_AWARE:
+            interval = mode_specific.materialized_saturation_aware().interval_s
+            source = "mode_specific.saturation_aware.interval_s"
+        case specs.SchedulerKind.FRAGMENTATION_BASED:
+            interval = mode_specific.autoscale_interval_s
+            source = "mode_specific.autoscale_interval_s"
+        case _:
+            typing.assert_never(kind)
     if interval <= 0:
         msg = (
             f"Autoscale interval must be > 0; got {interval!r} from {source} "
@@ -478,16 +491,19 @@ def _make_scheduler_algorithm(pipeline_spec: specs.PipelineSpec) -> _SchedulerAl
         An object satisfying the ``_SchedulerAlgorithm`` protocol.
 
     Raises:
-        AssertionError: If ``pipeline_spec.config.mode_specific`` is
+        RuntimeError: If ``pipeline_spec.config.mode_specific`` is
             ``None``. ``Autoscaler`` is only used in streaming mode,
             so this is a programmer error (the surrounding
             ``Autoscaler.__init__`` asserts the same precondition).
-        ValueError: If ``mode_specific.scheduler`` holds an unrecognized
-            ``SchedulerKind`` value (defensive against future enum
-            values that have not been wired up yet), or if collected
-            saturation-aware stage overrides violate cluster-wide
-            guardrails (validation runs inside the
-            ``SaturationAwareScheduler`` constructor).
+        ValueError: If collected saturation-aware stage overrides
+            violate cluster-wide guardrails (validation runs inside
+            the ``SaturationAwareScheduler`` constructor).
+
+    Note:
+        An unrecognized ``SchedulerKind`` is rejected at type-check
+        time by ``typing.assert_never`` in the ``match`` below, so a
+        new enum member without a ``case`` is a mypy build error rather
+        than a runtime failure.
 
     """
     mode_specific = pipeline_spec.config.mode_specific
@@ -752,7 +768,7 @@ class Autoscaler:
                 num_empty_slots = 0
                 input_queue_depth = 0
                 num_pending_actors = 0
-                worker_group_idle: dict[str, int] = {}
+                worker_group_used_slots: dict[str, int] = {}
             else:
                 num_used_slots = pool.num_used_slots
                 num_empty_slots = pool.num_empty_slots
@@ -764,7 +780,7 @@ class Autoscaler:
                 upstream_tasks = math.ceil(upstream_samples / stage_batch_size)
                 input_queue_depth = pool.num_queued_tasks + upstream_tasks
                 num_pending_actors = pool.num_pending_actors
-                worker_group_idle = pool.worker_group_num_used_slots()
+                worker_group_used_slots = pool.worker_group_num_used_slots()
                 for field_name, value in (
                     ("num_used_slots", num_used_slots),
                     ("num_empty_slots", num_empty_slots),
@@ -772,7 +788,7 @@ class Autoscaler:
                     ("num_pending_actors", num_pending_actors),
                 ):
                     _validate_non_negative_signal(stage_name=pool.name, field_name=field_name, value=value)
-                for worker_id, used_slots in worker_group_idle.items():
+                for worker_id, used_slots in worker_group_used_slots.items():
                     _validate_non_negative_signal(
                         stage_name=pool.name,
                         worker_id=worker_id,
@@ -782,7 +798,7 @@ class Autoscaler:
                 _validate_allocator_pool_worker_ids(
                     stage_name=pool.name,
                     allocator_worker_ids={w.id for w in workers},
-                    pool=pool,
+                    pool_worker_ids=set(worker_group_used_slots),
                 )
             stages.append(
                 data_structures.ProblemStageState(
@@ -790,7 +806,7 @@ class Autoscaler:
                     [
                         make_problem_worker_state_from_worker_state(
                             w,
-                            num_used_slots=worker_group_idle.get(w.id, 0),
+                            num_used_slots=worker_group_used_slots.get(w.id, 0),
                         )
                         for w in workers
                     ],

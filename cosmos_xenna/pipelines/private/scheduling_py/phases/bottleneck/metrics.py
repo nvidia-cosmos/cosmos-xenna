@@ -90,6 +90,8 @@ def emit_bottleneck_score(
     if not finite_scores:
         return
 
+    if not bottleneck_identity.engaged:
+        return
     if bottleneck_identity.stage_name is None or bottleneck_identity.stage_name not in finite_scores:
         return
 

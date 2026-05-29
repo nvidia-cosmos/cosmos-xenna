@@ -17,6 +17,8 @@
 
 from typing import Self
 
+import attrs
+
 from cosmos_xenna._cosmos_xenna.pipelines.private.scheduling import (  # type: ignore[import-not-found]
     autoscale_plan_context as rust_apc,
 )
@@ -177,12 +179,12 @@ class ProblemStageState:
         input_queue_depth: Number of pre-batch tasks queued upstream of
             this stage at sample time.
         num_pending_actors: Number of actors currently in setup phases
-            (not yet ready to dispatch tasks). The saturation-aware
-            scheduler combines this with the ready-actor count
-            (``len(workers)``) to detect the setup-phase quiescence
-            condition: when at least one actor is pending and zero are
-            ready, the stage is half-initialised and any signal-driven
-            scale decision would amplify the cold-start spike.
+            (not yet ready to dispatch tasks). An autoscaler combines
+            this with the ready-actor count (``len(workers)``) to
+            detect the setup-phase quiescence condition: when at least
+            one actor is pending and zero are ready, the stage is
+            half-initialised and any signal-driven scale decision would
+            amplify the cold-start spike.
 
     """
 
@@ -398,6 +400,19 @@ class Solution:
         return self._r
 
 
+@attrs.frozen
+class PlacementProbeResult:
+    """Typed result of a non-mutating placement probe."""
+
+    feasible: bool
+    reject_reason: str | None
+
+    @classmethod
+    def from_rust(cls, raw: rust_apc.PlacementProbeResult) -> Self:
+        """Wrap a raw Rust ``PlacementProbeResult`` as the Python boundary type."""
+        return cls(feasible=bool(raw.feasible), reject_reason=raw.reject_reason)
+
+
 class AutoscalePlanContext:
     """Per-cycle autoscale planning context.
 
@@ -593,17 +608,26 @@ class AutoscalePlanContext:
         return bool(self._r.remove_workers_atomically(list(removals)))
 
     def cluster_snapshot(self) -> rust_resources.ClusterResources:
-        """Return a clone of the planner's working cluster.
+        """Return a clone of the planner's working cluster (raw Rust type).
 
         Used by allocation-failure diagnostics so emitted snapshots
         reflect the resources the planner actually used during the
         cycle, not the static cluster from the input ``Problem``.
-        Returns the underlying Rust ``ClusterResources`` object;
-        ``emit_allocation_failure`` already accepts both this shape
-        and the Python ``resources.ClusterResources`` wrapper via
-        duck typing. The returned object is a fresh clone, so
-        caller mutations cannot affect planner state. Safe to call
-        after ``into_solution``.
+
+        This is a deliberate, documented exception to the
+        "wrap Rust types at the boundary" rule. The planner's Rust
+        ``ClusterResources`` exposes per-node/per-GPU fragmentation
+        through ``used_pool()`` / ``total_pool()`` accessors, which
+        the Python ``resources.ClusterResources`` value type does NOT
+        model: its ``from_rust`` reads ``used_cpus`` / ``total_cpus``
+        (and per-GPU ``uuid_``) fields that this Rust object does not
+        expose, so wrapping it raises ``AttributeError``. The only
+        consumer, ``emit_allocation_failure``, is purpose-built to
+        read this raw shape via attribute-based duck typing
+        (``_gpu_used_fraction`` / ``_node_cpu_totals``), so wrapping
+        would add no abstraction value and break at runtime. The
+        returned object is a fresh clone, so caller mutations cannot
+        affect planner state. Safe to call after ``into_solution``.
 
         """
         return self._r.cluster_snapshot()
@@ -612,7 +636,7 @@ class AutoscalePlanContext:
         self,
         removals: list[tuple[int, str]],
         add_stage_index: int,
-    ) -> rust_apc.PlacementProbeResult:
+    ) -> PlacementProbeResult:
         """Non-mutating placement probe for a candidate transfer plan.
 
         Asks the planner whether ``try_add_worker(add_stage_index)``
@@ -637,12 +661,14 @@ class AutoscalePlanContext:
             add_stage_index: The stage we want to grow.
 
         Returns:
-            ``PlacementProbeResult`` with ``feasible`` and an
+            A Python ``PlacementProbeResult`` with ``feasible`` and an
             optional ``reject_reason`` placement-only string
             (``worker_not_found``, ``worker_has_no_resources``,
-            ``release_failed: ...``, or ``no_placement``).
-            Scheduler-policy reasons (signal trust, balance, spread)
-            live in Python and are recorded separately.
+            ``release_failed: ...``, or ``no_placement``); the raw Rust
+            probe result is wrapped at this boundary so callers never
+            touch the backend type. Scheduler-policy reasons (signal
+            trust, balance, spread) live in Python and are recorded
+            separately.
 
         Raises:
             IndexError: ``add_stage_index`` or any ``stage_index`` in

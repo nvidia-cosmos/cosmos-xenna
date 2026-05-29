@@ -32,6 +32,8 @@ selects victims among the workers eligible for removal this cycle.
 import math
 from operator import itemgetter
 
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
+
 
 def select_workers_to_remove_oldest_first(
     *,
@@ -52,6 +54,16 @@ def select_workers_to_remove_oldest_first(
     Returns the first ``delete_count`` worker ids in the resulting
     ordering (or ``[]`` if the pool is empty post-filter).
 
+    Raises:
+        SchedulerInvariantError: A candidate worker (present in
+            ``worker_ids`` and not excluded) carries a non-finite or
+            negative ``host_gpu_used_fraction``. That value is
+            corrupted runtime state, so it surfaces as a hard,
+            non-absorbable scheduler-invariant failure (consistent
+            with the rest of the saturation-aware error taxonomy)
+            rather than a bare ``ValueError`` that an outer handler
+            could mistake for a recoverable usage error.
+
     """
     if delete_count <= 0:
         return []
@@ -65,7 +77,7 @@ def select_workers_to_remove_oldest_first(
         if math.isfinite(fraction) and fraction >= 0.0:
             continue
         msg = f"host_gpu_used_fraction for worker {wid!r} must be finite and >= 0, got {fraction!r}"
-        raise ValueError(msg)
+        raise SchedulerInvariantError(msg)
     ranked = sorted(
         (
             (

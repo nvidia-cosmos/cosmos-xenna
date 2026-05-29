@@ -21,6 +21,7 @@ import math
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.scale_down import select_workers_to_remove_oldest_first
+from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
 
 
 class TestSelectWorkersToRemoveOldestFirst:
@@ -376,9 +377,15 @@ class TestConsolidationTiebreakEdgeCases:
         assert sorted(first) == sorted(worker_ids)
 
     @pytest.mark.parametrize("bad_fraction", [-0.1, math.nan, math.inf, -math.inf])
-    def test_invalid_gpu_fraction_raises_value_error(self, bad_fraction: float) -> None:
-        """Direct helper callers cannot feed invalid consolidation fractions into sorting."""
-        with pytest.raises(ValueError, match=r"host_gpu_used_fraction.*worker 'bad'.*finite and >= 0"):
+    def test_invalid_gpu_fraction_raises_scheduler_invariant_error(self, bad_fraction: float) -> None:
+        """A corrupt candidate fraction surfaces as a hard scheduler-invariant failure.
+
+        A non-finite or negative ``host_gpu_used_fraction`` is corrupted
+        runtime state, so the helper raises ``SchedulerInvariantError``
+        (not a bare ``ValueError``) to keep it on the non-absorbable
+        failure path shared with the rest of the saturation-aware scheduler.
+        """
+        with pytest.raises(SchedulerInvariantError, match=r"host_gpu_used_fraction.*worker 'bad'.*finite and >= 0"):
             select_workers_to_remove_oldest_first(
                 worker_ids=["bad"],
                 worker_ages={"bad": 1},
