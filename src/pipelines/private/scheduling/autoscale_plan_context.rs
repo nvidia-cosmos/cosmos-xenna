@@ -1032,6 +1032,28 @@ impl AutoscalePlanContext {
             }
         }
 
+        // Reject a duplicate `(stage_index, worker_id)` before touching the
+        // clone. Each removal triggers a `release_allocation` on the cloned
+        // cluster, and `NodeResources::release_allocation` does a bare
+        // `used_cpus -= ...` / `used_fraction -= ...` with no underflow
+        // guard (resources.rs). Releasing the same worker twice would drive
+        // the clone's accounting negative, making the dry-run see phantom
+        // free capacity and risking a false-positive `feasible: true` for a
+        // placement the live cluster cannot honor. The Python resource-fit
+        // search builds combos via `itertools.combinations` (distinct
+        // elements) and dedups them, so a duplicate cannot arise today --
+        // this is defensive hardening of the FFI boundary that must fail
+        // closed on malformed input rather than silently corrupt its clone.
+        let mut seen_removals: HashSet<(usize, &str)> = HashSet::with_capacity(removals.len());
+        for (stage_index, worker_id) in &removals {
+            if !seen_removals.insert((*stage_index, worker_id.as_str())) {
+                return Ok(PlacementProbeResult {
+                    feasible: false,
+                    reject_reason: Some("duplicate_donor".to_string()),
+                });
+            }
+        }
+
         let receiver_stage_name = self.stages[add_stage_index].name.clone();
         let receiver_shape = self.stages[add_stage_index].worker_shape.clone();
 
@@ -4676,6 +4698,56 @@ mod batch_removal_and_probe_tests {
             .unwrap();
         assert!(!result.feasible);
         assert_eq!(result.reject_reason.as_deref(), Some("worker_not_found"));
+    }
+
+    #[test]
+    fn probe_add_after_removals_duplicate_donor_rejected_without_underflow() {
+        // A `removals` list containing the same (stage_index, worker_id)
+        // twice must fail closed with `duplicate_donor` *before* any
+        // release touches the clone. Releasing the worker twice would
+        // drive the clone's used_cpus below zero (NodeResources release
+        // has no underflow guard) and could report a false-positive
+        // feasible. The single-removal control proves the worker itself
+        // is a valid donor -- only the duplicate entry is rejected.
+        let problem = ds::Problem {
+            cluster_resources: make_empty_cluster(1, 1.0),
+            stages: vec![make_cpu_stage("stage_a")],
+        };
+        let state = ds::ProblemState {
+            stages: vec![make_cpu_stage_state_with_workers("stage_a", 1, "node0")],
+        };
+        let ctx = AutoscalePlanContext::from_problem_state(&problem, &state, None).unwrap();
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        // Control: a single removal of this worker unblocks the placement.
+        let single = ctx
+            .probe_add_after_removals(vec![(0, "stage_a_worker_0".to_string())], 0)
+            .unwrap();
+        assert!(
+            single.feasible,
+            "single removal of the worker is a valid donor"
+        );
+
+        // Duplicate: the same worker twice must be rejected, not double-released.
+        let duplicate = ctx
+            .probe_add_after_removals(
+                vec![
+                    (0, "stage_a_worker_0".to_string()),
+                    (0, "stage_a_worker_0".to_string()),
+                ],
+                0,
+            )
+            .unwrap();
+        assert!(!duplicate.feasible, "duplicate donor must fail closed");
+        assert_eq!(
+            duplicate.reject_reason.as_deref(),
+            Some("duplicate_donor"),
+            "duplicate donor reported via reject_reason",
+        );
+
+        // The probe never mutates planner state, even on the rejected path.
+        assert_eq!(ctx.cluster.nodes["node0"].used_cpus, baseline_used);
+        assert_eq!(ctx.current_workers["stage_a"].len(), 1);
     }
 
     #[test]
