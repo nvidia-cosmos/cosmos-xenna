@@ -2,6 +2,16 @@
 
 ## Latest
 
+## [0.4.3]
+
+### Released
+
+- 2026-05-27
+
+### Fixed
+
+- Catch unexpected actor deaths and recover instead of crashing the driver
+
 ## [0.4.2]
 
 ### Released
