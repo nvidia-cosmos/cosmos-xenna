@@ -120,6 +120,26 @@ def _problem_state_with_one_worker() -> data_structures.ProblemState:
     )
 
 
+def _seed_stuck_counter(scheduler: SaturationAwareScheduler, stage_name: str, value: int) -> None:
+    """Install a prior-cycle stuck-plan baseline via the public ``record`` path.
+
+    The Grow phase only ever writes the stuck-plan counter through
+    :meth:`StuckPlanLedger.record` (the counter dict and its detector
+    advance in lockstep), so tests seed the baseline the same way
+    rather than poking the counter dict directly. ``last_intent=1``
+    mirrors a stuck (positive-intent) cycle; ``threshold_cycles`` /
+    ``pipeline_name`` only feed the detector's structured log and do
+    not affect the seeded counter value.
+    """
+    scheduler.ledgers.stuck_plan.record(
+        stage_name,
+        value,
+        last_intent=1,
+        threshold_cycles=scheduler.config.stuck_plan_detection_cycles,
+        pipeline_name=scheduler.pipeline_name,
+    )
+
+
 class TestEarlyReturnPathsPreserveCounter:
     """The three Grow bail paths leave the bailed stage's counter at its prior value."""
 
@@ -134,7 +154,7 @@ class TestEarlyReturnPathsPreserveCounter:
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler.ledgers.stuck_plan.set("stage", 13)
+        _seed_stuck_counter(scheduler, "stage", 13)
 
         with patch(
             "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
@@ -159,7 +179,7 @@ class TestEarlyReturnPathsPreserveCounter:
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler.ledgers.stuck_plan.set("stage", 13)
+        _seed_stuck_counter(scheduler, "stage", 13)
 
         try_add_calls: list[int] = []
 
@@ -214,7 +234,7 @@ class TestStrictInvariantStillFiresOnIllegalIncrement:
         """
         scheduler = _scheduler()
         ps = _problem_state_with_one_worker()
-        scheduler.ledgers.stuck_plan.set("stage", 13)
+        _seed_stuck_counter(scheduler, "stage", 13)
 
         original_set = GrowServices.set_stuck_plan_counter
 
@@ -244,7 +264,7 @@ class TestFinishedStageExcluded:
         ``SchedulerInvariantError``.
         """
         scheduler = _scheduler()
-        scheduler.ledgers.stuck_plan.set("stage", 13)
+        _seed_stuck_counter(scheduler, "stage", 13)
 
         worker = data_structures.ProblemWorkerGroupState.make(
             "stage-w0",

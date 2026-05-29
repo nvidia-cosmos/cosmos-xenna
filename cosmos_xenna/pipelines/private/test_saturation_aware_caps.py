@@ -586,8 +586,16 @@ class TestPhaseCCapClamp:
         scheduler, _ = make_scheduler([("A", None)], cfg=_make_config(max_workers=4))
         # Seed at cap (4 workers) so the headroom is zero and the cap clamp fires.
         state = make_state([("A", [f"A-w{i}" for i in range(4)], False)])
-        # Seed a prior-stuck history without rigging the cluster.
-        scheduler.ledgers.stuck_plan.set("A", 7)
+        # Seed a prior-stuck history via the public record path (counter and
+        # detector advance in lockstep); threshold_cycles / pipeline_name only
+        # feed the detector's structured log, not the seeded counter value.
+        scheduler.ledgers.stuck_plan.record(
+            "A",
+            7,
+            last_intent=1,
+            threshold_cycles=scheduler.config.stuck_plan_detection_cycles,
+            pipeline_name=scheduler.pipeline_name,
+        )
 
         autoscale_with_intents(scheduler, state, {"A": 5})
 

@@ -75,6 +75,20 @@ scale-down kills warm GPU state.
 
 See [02 — Decisions and growth](02-decisions-and-growth.md).
 
+### Stabilization windows (recommendation consensus)
+
+| Field | Default | Range | When to adjust |
+|---|---|---|---|
+| `stabilization_window_cycles_up` | `1` | `[1, 4]` typical | Grow responsiveness. Higher → slower ramp after a hold. |
+| `stabilization_window_cycles_down` | `40` | `[30, 60]` typical | Shrink patience. Higher → less churn on transient idle; lower → reclaim sooner. |
+
+Cross-field invariant: `stabilization_window_cycles_down >
+stabilization_window_cycles_up` (validated). At default `interval_s=10s`,
+``40`` down cycles ≈ **400s** of consecutive shrink recommendations
+before Phase D can commit a removal.
+
+See [02 — Decisions and growth](02-decisions-and-growth.md).
+
 ### Worker bounds (`min_workers`, `max_workers`)
 
 | Field | Default | When to set |

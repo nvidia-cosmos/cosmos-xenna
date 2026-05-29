@@ -585,7 +585,7 @@ class SaturationAwareStageConfig:
     stabilization_window_cycles_up: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
     # Recommendation history depth for the scale-down direction.
     # Cross-field: must be > stabilization_window_cycles_up for asymmetric stabilization.
-    stabilization_window_cycles_down: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+    stabilization_window_cycles_down: int = attrs.field(default=40, validator=attrs_utils.validate_positive_int)
 
     # Maximum fraction of a stage's current actors that may be deleted in a
     # single cycle. Prevents cliff scale-downs that starve downstream stages.

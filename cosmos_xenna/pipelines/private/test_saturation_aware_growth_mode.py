@@ -33,8 +33,8 @@ from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
 @pytest.fixture
 def cfg() -> SaturationAwareStageConfig:
-    """Default per-stage config; window is 30 cycles by default."""
-    return SaturationAwareStageConfig()
+    """Per-stage config pinning the pre-0.40 shrink stabilization window."""
+    return SaturationAwareStageConfig(stabilization_window_cycles_down=30)
 
 
 class TestAcquiringTransitions:

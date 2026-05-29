@@ -75,6 +75,7 @@ class TestSaturationAwareStageConfigFieldValidators:
         cfg = SaturationAwareStageConfig()
         assert cfg.min_data_points == 5
         assert cfg.saturation_aggressiveness == 0.25
+        assert cfg.stabilization_window_cycles_down == 40
         assert cfg.saturation_threshold is None
         assert cfg.activation_threshold is None
 

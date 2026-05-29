@@ -87,16 +87,6 @@ class SkEwmaStore:
         """Return the current EWMA value for ``stage_name`` (NaN if absent)."""
         return self._values.get(stage_name, math.nan)
 
-    def seed_nan(self, stage_names: Iterable[str]) -> None:
-        """Seed every named stage with NaN; existing values are preserved.
-
-        The Bottleneck phase relies on the seed so the first finite
-        per-stage sample replaces (does not blend with) the cold-start
-        zero.
-        """
-        for name in stage_names:
-            self._values.setdefault(name, math.nan)
-
     def reset_seeded(self, stage_names: Iterable[str]) -> None:
         """Clear every entry and NaN-seed ``stage_names`` in place.
 

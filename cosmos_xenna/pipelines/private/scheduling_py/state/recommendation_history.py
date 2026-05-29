@@ -17,8 +17,8 @@
 
 A scale action fires only when every cycle in the relevant
 direction-window agrees on the same direction. Asymmetric defaults
-(``window_up = 1``, ``window_down = 30``) match Kubernetes HPA's
-``scaleDown.stabilizationWindowSeconds = 300`` while keeping grow
+(``window_up = 1``, ``window_down = 40``) match Kubernetes HPA's
+``scaleDown.stabilizationWindowSeconds = 400`` while keeping grow
 responsive. This module owns the per-stage state value object
 (:class:`RecommendationHistory`); the surrounding record-then-gate
 function (``apply_stabilization_gate``) lives in

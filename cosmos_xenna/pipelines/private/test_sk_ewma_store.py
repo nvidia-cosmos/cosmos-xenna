@@ -25,7 +25,9 @@ class TestSkEwmaStoreUpdate:
 
     def test_first_finite_sample_replaces_nan_seed_without_blending(self) -> None:
         store = SkEwmaStore()
-        store.seed_nan(["a"])
+        # A missed (non-finite) sample NaN-seeds the stage via the public
+        # update path; the next finite sample must replace, not blend.
+        store.update("a", math.nan, alpha=0.5)
         store.update("a", 4.0, alpha=0.5)
         assert store.get("a") == 4.0
 
@@ -53,15 +55,8 @@ class TestSkEwmaStoreUpdate:
         assert math.isnan(store.get("a"))
 
 
-class TestSkEwmaStoreSeedAndView:
-    """``seed_nan`` is idempotent; ``view`` returns a read-only mapping over the live store."""
-
-    def test_seed_nan_does_not_overwrite_existing_value(self) -> None:
-        store = SkEwmaStore()
-        store.set("a", 2.0)
-        store.seed_nan(["a", "b"])
-        assert store.get("a") == 2.0
-        assert math.isnan(store.get("b"))
+class TestSkEwmaStoreView:
+    """``view`` returns a read-only mapping over the live store."""
 
     def test_view_reflects_live_mutation(self) -> None:
         store = SkEwmaStore()

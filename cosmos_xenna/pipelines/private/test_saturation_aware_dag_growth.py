@@ -269,8 +269,16 @@ class TestStuckPlanReset:
             [("A", None)],
             cluster=_cluster(total_cpus_per_node=8),
         )
-        # Manually seed a prior-stuck state without rigging the cluster.
-        scheduler.ledgers.stuck_plan.set("A", 7)
+        # Manually seed a prior-stuck state via the public record path (counter
+        # and detector advance in lockstep); threshold_cycles / pipeline_name
+        # only feed the detector's structured log, not the seeded counter value.
+        scheduler.ledgers.stuck_plan.record(
+            "A",
+            7,
+            last_intent=1,
+            threshold_cycles=scheduler.config.stuck_plan_detection_cycles,
+            pipeline_name=scheduler.pipeline_name,
+        )
         state = _problem_state([("A", 1, 1, False)])
 
         _autoscale_with_intents(scheduler, state, {"A": 2})

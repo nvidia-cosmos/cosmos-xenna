@@ -115,17 +115,6 @@ class StuckPlanLedger:
         """
         return dict(self._counters)
 
-    def set(self, stage_name: str, value: int) -> None:
-        """Overwrite ``stage_name``'s counter without notifying the detector.
-
-        Bypass writer that updates only the counter dict. :meth:`record`
-        is the normal write path and notifies the detector in lockstep;
-        :meth:`set` is intended for callers that need to install a
-        known baseline counter without driving the detector's
-        WARN-to-INFO state machine.
-        """
-        self._counters[stage_name] = value
-
     def reset(self) -> None:
         """Reset the counter dict and the detector state in place.
 

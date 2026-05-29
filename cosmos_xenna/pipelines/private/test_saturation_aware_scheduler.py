@@ -54,7 +54,7 @@ def _config_pinned_aggressiveness(
     stay stable when the production default changes.
     """
     stage_defaults = SaturationAwareStageConfig(saturation_aggressiveness=aggressiveness)
-    return SaturationAwareConfig(stage_defaults=stage_defaults, **config_overrides)
+    return SaturationAwareConfig(stage_defaults=stage_defaults, **config_overrides)  # type: ignore[arg-type]
 
 
 def _cluster() -> resources.ClusterResources:
