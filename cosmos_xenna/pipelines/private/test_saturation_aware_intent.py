@@ -62,6 +62,7 @@ def _no_warmup_grace_config(**overrides: object) -> SaturationAwareConfig:
 
     """
     stage_defaults = SaturationAwareStageConfig(
+        saturation_aggressiveness=0.30,
         worker_warmup_measurement_grace_s=0.0,
         donor_warmup_grace_s=0.0,
         min_data_points=1,
@@ -88,17 +89,30 @@ def _cluster(*, num_nodes: int = 1, total_cpus_per_node: int = 8) -> resources.C
 def _problem_with_stages(
     stage_names: list[str],
     cluster: resources.ClusterResources | None = None,
+    requested_by_stage: dict[str, int] | None = None,
 ) -> data_structures.Problem:
-    """Build a real ``Problem`` with one CPU stage per name. Order preserved."""
+    """Build a real ``Problem`` with one CPU stage per name. Order preserved.
+
+    Args:
+        stage_names: Stage names, in problem order.
+        cluster: Optional cluster; defaults to a single 8-CPU node.
+        requested_by_stage: Optional mapping of stage name to
+            ``requested_num_workers``. Stages named here are *manual*
+            (operator-pinned); stages absent from the mapping stay
+            auto-scaled (``requested_num_workers=None``). Defaults to
+            all-auto so existing callers are unaffected.
+    """
     if cluster is None:
         cluster = _cluster()
+    if requested_by_stage is None:
+        requested_by_stage = {}
     cpu_shape = resources.Resources(cpus=1.0).to_worker_shape(cluster)
     stages = [
         data_structures.ProblemStage(
             name=name,
             stage_batch_size=1,
             worker_shape=cpu_shape,
-            requested_num_workers=None,
+            requested_num_workers=requested_by_stage.get(name),
             over_provision_factor=None,
         )
         for name in stage_names
@@ -208,6 +222,60 @@ class TestColdStartDoesNotCrash:
         scheduler.autoscale(time=0.0, problem_state=ps)
 
         assert scheduler.last_cycle.intent.deltas == {"A": 0}
+
+
+class TestManualStageReceivesNoIntent:
+    """Manual stages (``requested_num_workers`` set) are owned by Phase A; Intent skips them.
+
+    Floor and Shrink already gate on ``requested_num_workers``; Intent
+    is the upstream source of the worker-count delta, so a manual stage
+    must never receive an intent entry -- otherwise Phase C (Grow) would
+    push it above the operator's pin and Phase A would delete the extras
+    next cycle (grow/delete churn). Pins the Intent half of the
+    manual-stage invariant.
+    """
+
+    def test_saturated_manual_stage_gets_no_intent_entry(self) -> None:
+        """A SATURATED_CRITICAL manual stage produces no intent delta at all.
+
+        The signals ``(4 workers, 8 slots, 31 used, 1 empty, queue 5)``
+        are the same as ``test_saturated_critical_signal_grows_on_first_cycle``
+        (which asserts a positive intent for an auto-scaled stage). With
+        the stage pinned via ``requested_num_workers`` the Intent loop
+        must ``continue`` before writing the delta, so the stage is
+        absent from ``intent.deltas``.
+        """
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
+        scheduler.setup(_problem_with_stages(["hot"], requested_by_stage={"hot": 4}))
+        ps = _problem_state_with_signals([("hot", 4, 8, 31, 1, 5, False)])
+
+        scheduler.autoscale(time=0.0, problem_state=ps)
+
+        assert "hot" not in scheduler.last_cycle.intent.deltas
+
+    def test_manual_stage_skipped_but_auto_sibling_still_keyed(self) -> None:
+        """A manual stage is omitted from intent while an auto-scaled sibling is still keyed.
+
+        Guards against an over-broad skip that would drop every stage:
+        only the pinned stage is excluded; the auto-scaled stage keeps
+        its intent entry the same cycle.
+        """
+        scheduler = SaturationAwareScheduler(_no_warmup_grace_config())
+        scheduler.setup(
+            _problem_with_stages(["pinned", "auto"], requested_by_stage={"pinned": 4}),
+        )
+        ps = _problem_state_with_signals(
+            [
+                ("pinned", 4, 8, 31, 1, 5, False),
+                ("auto", 1, 1, 0, 1, 0, False),
+            ]
+        )
+
+        scheduler.autoscale(time=0.0, problem_state=ps)
+
+        deltas = scheduler.last_cycle.intent.deltas
+        assert "pinned" not in deltas
+        assert "auto" in deltas
 
 
 class TestSolutionShapeReflectsIntentAfterPhaseC:

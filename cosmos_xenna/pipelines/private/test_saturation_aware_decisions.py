@@ -22,7 +22,7 @@ future tuning change surfaces as a precise test failure.
 Default per-stage thresholds at the time of writing:
   saturated_critical_streak_min_cycles = 1
   saturated_streak_min_cycles = 2
-  over_provisioned_streak_min_cycles = 30
+  over_provisioned_streak_min_cycles = 10
   aggressive_growth_max_per_cycle = 4
   max_scale_down_fraction_per_cycle = 0.05
 """
@@ -94,15 +94,24 @@ class TestShouldFireActionScaleUp:
 
 
 class TestShouldFireActionScaleDown:
-    """Conservative scale-down threshold (OVER_PROVISIONED = 30 by default)."""
+    """Conservative scale-down threshold (OVER_PROVISIONED = 10 by default)."""
 
     def test_over_provisioned_does_not_fire_below_threshold(self, cfg: SaturationAwareStageConfig) -> None:
-        """OVER_PROVISIONED at streak 29 < min 30 -> hold; protects against premature shrink."""
-        assert should_fire_action(StageState.OVER_PROVISIONED, streak=29, config=cfg) is False
+        """OVER_PROVISIONED at streak 9 < min 10 -> hold; protects against premature shrink."""
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=9, config=cfg) is False
 
     def test_over_provisioned_fires_at_threshold(self, cfg: SaturationAwareStageConfig) -> None:
         """OVER_PROVISIONED at streak == min cycles is the trigger boundary."""
-        assert should_fire_action(StageState.OVER_PROVISIONED, streak=30, config=cfg) is True
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=10, config=cfg) is True
+
+
+class TestShouldFireActionInputValidation:
+    """Defensive validation against corrupted runtime state."""
+
+    def test_negative_streak_is_rejected(self, cfg: SaturationAwareStageConfig) -> None:
+        """Defensive validation -- negative streak indicates corrupted upstream state."""
+        with pytest.raises(ValueError, match=r"streak must be >= 0, got -1 \(state=SATURATED\)"):
+            should_fire_action(StageState.SATURATED, streak=-1, config=cfg)
 
 
 class TestShouldFireActionNormal:

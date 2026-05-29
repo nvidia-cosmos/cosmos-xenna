@@ -78,6 +78,7 @@ def _pipeline_spec(
     per_stage_override: bool | None = None,
     spec_override: bool | None = None,
     omit_mode_specific: bool = False,
+    execution_mode: specs.ExecutionMode = specs.ExecutionMode.STREAMING,
 ) -> specs.PipelineSpec:
     """Build the smallest pipeline spec needed to resolve the per-stage flag."""
     stage = specs.StageSpec(
@@ -111,7 +112,7 @@ def _pipeline_spec(
     return specs.PipelineSpec(
         input_data=[1],
         stages=[stage],
-        config=specs.PipelineConfig(mode_specific=mode_specific),
+        config=specs.PipelineConfig(mode_specific=mode_specific, execution_mode=execution_mode),
     )
 
 
@@ -284,6 +285,22 @@ class TestResolveSetupAwareMaxQueuedEnabled:
         pipeline_spec = _pipeline_spec(
             scheduler=specs.SchedulerKind.SATURATION_AWARE,
             omit_mode_specific=True,
+        )
+
+        enabled = resolve_setup_aware_max_queued_enabled(
+            pipeline_spec,
+            stage_idx=0,
+            stage_name="Stage 00 - _StageForSetupAwareResolver",
+        )
+
+        assert enabled is False
+
+    def test_batch_execution_mode_disables_setup_aware_cap(self) -> None:
+        """Batch pipelines must not materialize saturation-aware config for backpressure."""
+        pipeline_spec = _pipeline_spec(
+            scheduler=specs.SchedulerKind.SATURATION_AWARE,
+            stage_default=True,
+            execution_mode=specs.ExecutionMode.BATCH,
         )
 
         enabled = resolve_setup_aware_max_queued_enabled(

@@ -33,6 +33,8 @@ These tests pin the projection contract:
     every downstream stage observe ``False``.
 """
 
+import pytest
+
 from cosmos_xenna.pipelines.private.scheduling_py.state.stage_topology import (
     StageTopologyContext,
     project_stage_topology,
@@ -152,3 +154,17 @@ class TestProjectStageTopologyEngaged:
             engaged=True,
             is_upstream_of_bottleneck=False,
         )
+
+
+class TestProjectStageTopologyStageIndexBounds:
+    """An engaged projection fails fast on an out-of-range ``stage_index``."""
+
+    def test_out_of_range_stage_index_raises_index_error(self) -> None:
+        """A ``stage_index`` past the stage list raises rather than returning a silent default."""
+        with pytest.raises(IndexError, match=r"stage_index=5 out of range for 3 stage names"):
+            project_stage_topology(
+                stage_index=5,
+                bottleneck_engaged=True,
+                bottleneck_stage_name="B",
+                stage_names=("A", "B", "C"),
+            )

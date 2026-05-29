@@ -43,7 +43,7 @@ Tune scheduler knobs when:
 
 | Field | Default | Range | When to adjust |
 |---|---|---|---|
-| `SaturationAwareStageConfig.saturation_aggressiveness` | `0.30` | `[0.10, 0.60]` | Whole-pipeline knee tuning. |
+| `SaturationAwareStageConfig.saturation_aggressiveness` | `0.25` | `[0.10, 0.60]` | Whole-pipeline knee tuning. |
 
 The single primary knob. It is the Halfin-Whitt `β` in the
 `K / √c` formula that auto-derives `saturation_threshold` per
@@ -64,7 +64,7 @@ See [01 — Signals and classification](01-signals-and-classification.md).
 | Field | Default | Range | When to adjust |
 |---|---|---|---|
 | `saturated_streak_min_cycles` | `2` | `[1, 8]` typical | Burst response. Higher → slower ramp; lower → noisier ramp. |
-| `over_provisioned_streak_min_cycles` | `30` | `[15, 60]` typical | Scale-down patience. Higher → less churn; lower → reclaim resources sooner. |
+| `over_provisioned_streak_min_cycles` | `10` | `[10, 60]` typical | Scale-down patience. Higher → less churn; lower → reclaim (and donate) resources sooner. |
 | `saturated_critical_streak_min_cycles` | `1` | `[1, 4]` | How fast `SATURATED_CRITICAL` fires. Lower means burst response in one cycle. |
 
 Cross-field invariant: `over_provisioned_streak_min_cycles >
@@ -176,7 +176,7 @@ runtime visible.
 | Regime detector enters / exits SUPER_HW every few cycles | Increase `regime_transition_streak_cycles` (default `3` → `5`) | [bottleneck](04-bottleneck-awareness.md) |
 | Cycle p95 exceeds the watchdog WARN line | Profile first; tune `interval_s` only after profiling rules out an algorithmic issue | [safeguards](06-safeguards.md) |
 | Object-store full → autoscaler still tries to grow | Lower `memory_pressure_critical_threshold` (default `0.85`) | [safeguards](06-safeguards.md) |
-| Stage spec override silently ignored | Verify the resolver tier path (`StageSpec.saturation_aware` highest) | [README](README.md), [README](README.md) |
+| Stage spec override silently ignored | Verify the resolver tier path (`StageSpec.saturation_aware` highest) | [README](README.md) |
 | Stuck-plan counter ticks every cycle | Likely cluster-full; check Phase C / donor logs and consider raising the matching stage's `max_workers` | [safeguards](06-safeguards.md) |
 | Pipeline hangs on cold start, no workers placed | Check `floor_stuck_grace_cycles` exhausted → `RuntimeError`; the cluster is genuinely too small to satisfy `min_workers` | [safeguards](06-safeguards.md) |
 

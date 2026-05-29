@@ -466,7 +466,7 @@ class SaturationAwareStageConfig:
     # pinning. Range: [0.10, 0.60]. Tuning guidance lives in
     # ``cosmos-xenna/docs/scheduler/saturation-aware/tuning.md``.
     saturation_aggressiveness: float = attrs.field(
-        default=0.30,
+        default=0.25,
         validator=attrs.validators.and_(attrs.validators.ge(0.10), attrs.validators.le(0.60)),
     )
     # Slots-empty fraction below which a stage is classified SATURATED
@@ -559,7 +559,7 @@ class SaturationAwareStageConfig:
     saturated_critical_streak_min_cycles: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
     # Cycles a stage must remain OVER_PROVISIONED before scale-down is applied.
     # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
-    over_provisioned_streak_min_cycles: int = attrs.field(default=30, validator=attrs_utils.validate_positive_int)
+    over_provisioned_streak_min_cycles: int = attrs.field(default=10, validator=attrs_utils.validate_positive_int)
 
     # When True, HOLD blocks SATURATED grow during post-shrink stabilization.
     # When False, HOLD has no effect and the stage grows whenever the
@@ -942,10 +942,16 @@ class SaturationAwareConfig:
     # Minimum ``receiver_value - donor_cost`` required to commit a donation.
     cross_stage_donor_spread_threshold: float = attrs.field(default=0.5, validator=attrs.validators.ge(0.0))
 
-    # Maximum allowed regression in pipeline throughput estimate
-    # ``1.0 / max_k(D_k)`` before the donor commit gate rejects a plan.
+    # Maximum allowed RELATIVE regression in the pipeline throughput
+    # estimate ``1.0 / max_k(D_k)`` before the donor commit gate rejects a
+    # plan. A FRACTION, not an absolute throughput delta: the gate rejects
+    # when the bottleneck grows ``max_d_after > max_d_before * (1 + tol)``
+    # (the scale-free proxy for ``throughput_after < throughput_before *
+    # (1 - tol)``), so the same percentage loss is caught whether
+    # ``max_k(D_k)`` is small or large. Default 0.02 tolerates a 2%
+    # throughput loss.
     cross_stage_donor_throughput_tolerance: float = attrs.field(
-        default=0.01,
+        default=0.02,
         validator=attrs.validators.ge(0.0),
     )
     # Maximum amount a donor stage's post-plan ``D_k`` may exceed the
@@ -955,7 +961,10 @@ class SaturationAwareConfig:
         validator=attrs.validators.ge(0.0),
     )
     # Maximum allowed regression in ``balance_score = 1 / max(1, heterogeneity_ratio)``
-    # when ``throughput_estimate`` is tied within ``cross_stage_donor_throughput_tolerance``.
+    # when ``throughput_estimate`` is tied -- i.e. the bottleneck ``max_k(D_k)``
+    # moved within the RELATIVE ``cross_stage_donor_throughput_tolerance`` band
+    # (``|max_d_after - max_d_before| <= max_d_before * tol``). Balance is only
+    # the tie-breaker, so this bound applies solely on a throughput tie.
     cross_stage_donor_balance_tolerance: float = attrs.field(
         default=0.05,
         validator=attrs.validators.ge(0.0),

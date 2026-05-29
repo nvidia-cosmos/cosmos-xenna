@@ -351,6 +351,81 @@ class TestComputeStageCeilings:
             _ = scheduler.runner
 
 
+class TestFloorExceedsCeilingWarnsButNotClamped:
+    """Pin floor-wins: a cross-term floor > ceiling is warned, never clamped.
+
+    ``min_workers`` / ``min_workers_per_node`` and ``max_workers`` /
+    ``max_workers_per_node`` mix different terms with the live node
+    count, so ``__attrs_post_init__`` (same-term checks only) cannot
+    catch e.g. ``min_workers=10`` with ``max_workers_per_node=2`` on one
+    node, which yields ``floor=10 > ceiling=2``. The floor is a hard
+    guarantee that wins over the softer ``max_workers`` policy cap:
+    ``FloorCalculator`` returns the raw floor unchanged and emits a
+    once-per-stage WARN. Phase D's ``allowed_by_floor`` bound then holds
+    the stage at / above its floor (the end-to-end consequence is pinned
+    by ``TestPhaseDCapForcedShrink.test_per_node_floor_blocks_shrink_
+    even_when_cap_demands_it``, which fails if the clamp is reintroduced).
+    """
+
+    def test_floor_exceeding_ceiling_is_not_clamped(self, make_scheduler: SchedulerFactory) -> None:
+        """``min_workers=10`` with a per-node ceiling of 2 keeps the floor at 10, not the cap."""
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(min_workers=10, max_workers_per_node=2),
+            num_nodes=1,
+        )
+
+        floors = scheduler.runner.grow_services.floors.compute(num_nodes=1)
+        ceilings = scheduler.runner.grow_services.ceilings.compute(num_nodes=1)
+
+        # raw floor = max(10, 0) = 10; ceiling = min(2 * 1) = 2; floor wins -> 10 (unclamped).
+        assert ceilings == {0: 2}
+        assert floors == {0: 10}
+
+    def test_floor_equal_to_ceiling_is_not_warned(
+        self,
+        make_scheduler: SchedulerFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The ``floor == ceiling`` boundary passes through unchanged and stays silent."""
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(min_workers=2, max_workers=2),
+            num_nodes=1,
+        )
+
+        floors = scheduler.runner.grow_services.floors.compute(num_nodes=1)
+
+        assert floors == {0: 2}
+        warns = [record for record in loguru_caplog.records if "floor exceeds ceiling" in record.message]
+        assert warns == [], "floor == ceiling is well-configured; no WARN expected"
+
+    def test_floor_exceeds_ceiling_warns_once_naming_stage(
+        self,
+        make_scheduler: SchedulerFactory,
+        loguru_caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The misconfig warns exactly once per stage (debounced), naming the stage, floor, and ceiling."""
+        scheduler, _ = make_scheduler(
+            [("A", None)],
+            cfg=_make_config(min_workers=10, max_workers_per_node=2),
+            num_nodes=1,
+        )
+
+        # Compute several times: the WARN must not thrash every cycle.
+        for _ in range(3):
+            scheduler.runner.grow_services.floors.compute(num_nodes=1)
+
+        warns = [record for record in loguru_caplog.records if "floor exceeds ceiling" in record.message]
+        assert len(warns) == 1, f"WARN must be debounced to once per stage, got {len(warns)}"
+        msg = warns[0].message
+        assert "'A'" in msg
+        assert "floor 10" in msg
+        assert "ceiling 2" in msg
+        # Pin the floor-wins semantics: the stage runs above the cap (not clamped down).
+        assert "takes precedence" in msg
+
+
 class TestStageSpecOverrideConstructorContract:
     """Pin the constructor contract for ``stage_spec_overrides``.
 

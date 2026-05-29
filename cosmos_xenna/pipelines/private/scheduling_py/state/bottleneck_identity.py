@@ -22,7 +22,7 @@ Phase C / Phase D, the donor planning context, the post-cycle
 reporter, and the per-stage topology projection
 (:func:`project_stage_topology`). The value object lives in
 ``state/`` because :class:`BottleneckSnapshot` is in ``state/`` and
-mush import this type at construction time; keeping it under
+must import this type at construction time; keeping it under
 ``phases/bottleneck/`` would force an upward import from ``state/``.
 """
 

@@ -151,6 +151,17 @@ class SaturationGrowPhase:
             runtime_stage = problem_state.rust.stages[stage_index]
             if runtime_stage.is_finished:
                 continue
+            # Manual stages are owned by Phase A (Manual); skip them so Grow never
+            # pushes a saturated manual stage above its requested_num_workers pin
+            # (mirrors Floor/Shrink). With the Intent guard this is belt-and-
+            # braces - a manual stage already arrives with intent 0 - but the
+            # explicit skip keeps the invariant local to Grow. The stuck-plan
+            # counter is intentionally left untouched (no set_stuck_plan_counter
+            # call): the post-Phase-D monotonicity check filters unchanged
+            # counters by value-diff, so a skipped manual stage reads as a
+            # no-attempt cycle (same contract as the other Grow early-returns).
+            if problem.rust.stages[stage_index].requested_num_workers is not None:
+                continue
             stage_name = runtime_stage.stage_name
             intent = intent_deltas.get(stage_name, 0)
             if intent <= 0:

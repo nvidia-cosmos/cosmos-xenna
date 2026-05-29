@@ -214,13 +214,13 @@ class TestSaturatedScaleUpPath:
 
 
 class TestOverProvisionedShrinkPath:
-    """OVER_PROVISIONED needs streak >= 30 (default) before shrink fires."""
+    """OVER_PROVISIONED needs streak >= 10 (default) before shrink fires."""
 
     def test_shrink_fires_after_window_and_transitions_mode(self, cfg: SaturationAwareStageConfig) -> None:
-        """30 consecutive OVER_PROVISIONED cycles -> shrink fires -> ACQUIRING flips to TRACKING."""
+        """10 consecutive OVER_PROVISIONED cycles -> shrink fires -> ACQUIRING flips to TRACKING."""
         state = _fresh_state(cfg)
-        # Walk through 29 OVER_PROVISIONED cycles -> no fire yet.
-        for _ in range(29):
+        # Walk through 9 OVER_PROVISIONED cycles -> no fire yet.
+        for _ in range(9):
             delta = _advance_cycle(
                 state,
                 num_used_slots=1,
@@ -230,7 +230,7 @@ class TestOverProvisionedShrinkPath:
                 config=cfg,
             )
             assert delta == 0
-        # 30th cycle: streak hits threshold, shrink fires.
+        # 10th cycle: streak hits threshold, shrink fires.
         delta = _advance_cycle(
             state,
             num_used_slots=1,
@@ -239,7 +239,7 @@ class TestOverProvisionedShrinkPath:
             current_workers=10,
             config=cfg,
         )
-        assert state.classifier.streak == 30
+        assert state.classifier.streak == 10
         # Cold-start fallback (no D_k yet) shrinks by exactly one worker.
         assert delta == -1
         # ACQUIRING + first shrink -> TRACKING.
@@ -419,12 +419,12 @@ class TestFullLifecycleTrace:
 
         On a fresh state, the cold-start EWMA path means the very
         first OVER_PROVISIONED sample is taken at face value (no
-        warmup tax), so 30 consecutive cycles cleanly accumulate the
-        streak and fire on the 30th.
+        warmup tax), so 10 consecutive cycles cleanly accumulate the
+        streak and fire on the 10th.
         """
         state = _fresh_state(cfg)
-        # 29 cycles of OVER_PROVISIONED with streak < 30 -- no shrink yet.
-        for _ in range(29):
+        # 9 cycles of OVER_PROVISIONED with streak < 10 -- no shrink yet.
+        for _ in range(9):
             delta = _advance_cycle(
                 state,
                 num_used_slots=1,
@@ -436,7 +436,7 @@ class TestFullLifecycleTrace:
             assert delta == 0
             assert state.classifier.state is StageState.OVER_PROVISIONED
 
-        # 30th cycle: streak hits threshold, shrink fires, mode flips.
+        # 10th cycle: streak hits threshold, shrink fires, mode flips.
         delta = _advance_cycle(
             state,
             num_used_slots=1,
@@ -445,7 +445,7 @@ class TestFullLifecycleTrace:
             current_workers=10,
             config=cfg,
         )
-        assert state.classifier.streak == 30
+        assert state.classifier.streak == 10
         assert delta == -1
         # ACQUIRING + first shrink -> TRACKING (ceiling discovered).
         assert state.growth.mode is GrowthMode.TRACKING

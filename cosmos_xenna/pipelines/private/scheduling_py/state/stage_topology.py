@@ -91,9 +91,20 @@ def project_stage_topology(
         stage_names: Stable stage-name order (matches
             ``problem.rust.stages``).
 
+    Raises:
+        IndexError: ``stage_index`` is out of range for
+            ``stage_names`` while the bottleneck is engaged. The
+            consumer index must be a valid DAG index this cycle; an
+            out-of-range value signals ``problem`` /
+            ``problem_state`` shape drift and fails fast rather than
+            yielding a meaningless ``is_upstream_of_bottleneck``.
+
     """
     if not bottleneck_engaged or bottleneck_stage_name is None:
         return StageTopologyContext()
+    if not (0 <= stage_index < len(stage_names)):
+        msg = f"project_stage_topology: stage_index={stage_index} out of range for {len(stage_names)} stage names."
+        raise IndexError(msg)
     try:
         bottleneck_index = stage_names.index(bottleneck_stage_name)
     except ValueError:

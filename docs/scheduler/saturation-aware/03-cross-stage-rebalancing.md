@@ -53,10 +53,13 @@ gates:
    `donor_warmup_grace_s`, and must not currently be the
    bottleneck stage.
 2. **Bounded resource-fit search** — `ResourceFitPlanner` enumerates
-   combinations of donor workers whose freed resources satisfy the
-   receiver's shape. The search is bounded by
+   combinations of donor workers. For each combination, the cluster
+   planner is asked: *if I remove these workers, can I place at least
+   one more worker on the receiver?* (`probe_add_after_removals`).
+   The first feasible answer wins (smallest plan size first, same-node
+   before cross-node). The search is bounded by
    `cross_stage_donor_max_plan_size` (workers per plan) and
-   `cross_stage_donor_max_plan_combinations` (plans tried).
+   `cross_stage_donor_max_plan_combinations` (probes tried).
 3. **Throughput-first economic gate** — proposed `D_k` after the
    transaction must improve `1 / max_k D_k`. If the donation
    would make the donor the new bottleneck (`D_donor_after >

@@ -75,7 +75,7 @@ def _config(**overrides: object) -> SaturationAwareConfig:
     """Build a config with permissive defaults for policy filter tests.
 
     ``cross_stage_donor_anti_flap_cycles`` defaults to 30 so that
-    the cluster guardrail dominates the per-stage default of 30
+    the cluster guardrail dominates the per-stage default of 10
     cycles for ``over_provisioned_streak_min_cycles``; the validator
     in ``SaturationAwareConfig`` rejects anything lower.
 

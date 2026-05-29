@@ -29,6 +29,7 @@ and mutates. These tests pin:
 """
 
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from loguru import logger as _loguru_logger
@@ -234,6 +235,25 @@ class TestViewFor:
         cycle, stage_states = _make_cycle(stage_names=["A", "B"])
         with pytest.raises(IndexError, match="out of range"):
             cycle.view_for(5, stage_states)
+
+
+class TestPlannerWorkerCountsByStageIndex:
+    """``planner_worker_counts_by_stage_index`` mirrors its loud-failure sibling."""
+
+    def test_matched_cardinality_returns_index_keyed_counts(self) -> None:
+        """Equal planner / problem_state cardinality returns ``stage_index -> count``."""
+        cycle, _ = _make_cycle(stage_names=["A", "B"])
+        assert cycle.planner_worker_counts_by_stage_index() == {0: 1, 1: 1}
+
+    def test_stage_vector_drift_raises_value_error(self) -> None:
+        """A planner stage-vector count that drifts from problem_state raises ValueError."""
+        cycle, _ = _make_cycle(stage_names=["A", "B"])
+        # Simulate planner drift: the ctx reports three stage vectors while
+        # problem_state still carries two stages.
+        cycle.ctx = MagicMock()
+        cycle.ctx.worker_ids_by_stage.return_value = [["A-w0"], ["B-w0"], ["ghost-w0"]]
+        with pytest.raises(ValueError, match=r"count 3 != problem_state stage count 2"):
+            cycle.planner_worker_counts_by_stage_index()
 
 
 class TestCycleLogger:

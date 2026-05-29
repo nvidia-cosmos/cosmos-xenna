@@ -32,6 +32,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.lifecycle.cycle_finalizer impo
 from cosmos_xenna.pipelines.private.scheduling_py.lifecycle.post_cycle import PostCycleReporter, StuckPlanInvariant
 from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.scheduler.pipeline_model import PipelineModel
+from cosmos_xenna.pipelines.private.scheduling_py.state.allocation_failure_gate import AllocationFailureGate
 from cosmos_xenna.pipelines.private.scheduling_py.state.autoscale_cycle import AutoscaleCycle
 from cosmos_xenna.pipelines.private.scheduling_py.state.ledgers import SchedulerLedgers
 
@@ -170,3 +171,44 @@ class TestSolutionShapeFailureRaisesBeforeWorkerAgesPersist:
                 prev_stuck_plan_counters={},
             )
         assert ledgers.worker_ages == {}
+
+
+class TestDonorFlowAborted:
+    """``PostCycleReporter.donor_flow_aborted`` aggregates the Floor + Grow latches.
+
+    Only the Floor and Grow phases run a ``DonorBackedAddExecutor`` that
+    commits donor removals into the cycle context before the receiver
+    retry, so only their latches can leave the context half-rebalanced.
+    The Manual gate is excluded: ``ManualGrowExecutor`` never removes
+    donors, so a manual abort cannot orphan a removal. ``finalize``
+    reads this property to decide whether to discard the context.
+    """
+
+    @pytest.mark.parametrize(
+        ("manual", "floor", "grow", "expected"),
+        [
+            (False, False, False, False),  # all clear -> no discard
+            (False, True, False, True),  # floor donor abort -> discard
+            (False, False, True, True),  # grow donor abort -> discard
+            (False, True, True, True),  # both donor phases aborted -> discard
+            (True, False, False, False),  # manual-only abort is not a donor half-rebalance
+        ],
+    )
+    def test_aggregates_floor_and_grow_excludes_manual(
+        self,
+        manual: bool,
+        floor: bool,
+        grow: bool,
+        expected: bool,
+    ) -> None:
+        """Floor OR Grow latched -> ``True``; a Manual-only abort stays ``False``."""
+        reporter = PostCycleReporter(
+            pipeline=cast(PipelineModel, MagicMock(spec=PipelineModel)),
+            ledgers=cast(SchedulerLedgers, MagicMock(spec=SchedulerLedgers)),
+            pipeline_name="test-pipe",
+            manual_allocation=AllocationFailureGate(aborted_cycle=manual),
+            floor_allocation=AllocationFailureGate(aborted_cycle=floor),
+            grow_allocation=AllocationFailureGate(aborted_cycle=grow),
+        )
+
+        assert reporter.donor_flow_aborted is expected

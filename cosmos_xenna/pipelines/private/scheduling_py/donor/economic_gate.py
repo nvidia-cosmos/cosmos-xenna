@@ -279,13 +279,24 @@ class SpreadCheck:
 
 @attrs.frozen
 class ThroughputCheck:
-    """Reject when pipeline throughput regresses past tolerance.
+    """Reject when pipeline throughput regresses past a relative tolerance.
 
-    Throughput is ``1 / max_k D_k``. The check fires only when
-    both before / after values are finite (cold-start cycles with
-    NaN ``D_k`` cannot regress, so they always pass). The
-    tolerance is symmetric on the comparison: regressions strictly
-    larger than the tolerance reject; ties (within tolerance) fall
+    Throughput is ``1 / max_k D_k``. To stay scale-free, the check
+    works directly on ``max_k D_k`` instead of its reciprocal: a
+    relative throughput loss ``throughput_after < throughput_before *
+    (1 - tol)`` is equivalent (for the small ``tol`` used here) to the
+    bottleneck growing ``max_d_after > max_d_before * (1 + tol)``. The
+    ``max_D`` form avoids the ``1 / x`` blow-up as ``x -> 0`` and its
+    ``0`` / ``inf`` edges. ``tol`` (``cross_stage_donor_throughput_tolerance``)
+    is therefore a FRACTION (e.g. 0.02 tolerates a 2% throughput loss),
+    not an absolute throughput delta - so the gate stays effective at
+    high ``max_D`` where the old absolute band went inert (tiny
+    ``1 / max_D`` values made the absolute threshold unreachable).
+
+    The check fires only when both ``max_d_before`` / ``max_d_after``
+    are finite (cold-start cycles with NaN ``D_k`` cannot regress, so
+    they always pass). Regressions strictly beyond the relative band
+    reject; a change within the band is a throughput tie and falls
     through to the balance check.
     """
 
@@ -293,10 +304,15 @@ class ThroughputCheck:
 
     def check(self, score: DonorEconomicScore, config: SaturationAwareConfig) -> RejectReason | None:
         """Return ``RejectReason.THROUGHPUT_REGRESSION`` on a finite, beyond-tolerance regression."""
+        # Relative band on ``max_k D_k`` (scale-free): reject when the
+        # post-plan bottleneck grows past ``(1 + tol)`` of the pre-plan
+        # bottleneck. ``_max_finite`` returns NaN when no finite-positive
+        # value exists, so a finite ``max_d_before`` is always > 0 and the
+        # product is well defined whenever the guard passes.
         if (
-            math.isfinite(score.throughput_before)
-            and math.isfinite(score.throughput_after)
-            and score.throughput_after < score.throughput_before - config.cross_stage_donor_throughput_tolerance
+            math.isfinite(score.max_d_before)
+            and math.isfinite(score.max_d_after)
+            and score.max_d_after > score.max_d_before * (1.0 + config.cross_stage_donor_throughput_tolerance)
         ):
             return RejectReason.THROUGHPUT_REGRESSION
         return None
@@ -331,21 +347,29 @@ class DonorFlipCheck:
 class BalanceCheck:
     """Reject on a balance regression when throughput is tied.
 
-    Fires only on a throughput tie (``|after - before|`` <= the
-    throughput tolerance) so balance is strictly a tie-breaker -
-    throughput-improving plans always pass even if balance
-    drops, and only same-throughput-but-worse-balance plans are
-    rejected here. Skipped on cold-start (non-finite balance).
+    Fires only on a throughput tie - ``max_d_after`` within the same
+    relative band the throughput gate uses
+    (``|max_d_after - max_d_before| <= max_d_before * tol``) - so
+    balance is strictly a tie-breaker: throughput-improving plans
+    always pass even if balance drops, and only
+    same-throughput-but-worse-balance plans are rejected here.
+    Skipped on cold-start (non-finite ``max_D`` or balance).
     """
 
     label: ClassVar[str] = "balance"
 
     def check(self, score: DonorEconomicScore, config: SaturationAwareConfig) -> RejectReason | None:
         """Return ``RejectReason.BALANCE_REGRESSION`` when throughput is tied and balance regresses."""
+        # Relative throughput tie: the bottleneck ``max_D`` moved less
+        # than ``tol`` either way (the same scale-free band
+        # ``ThroughputCheck`` uses), so the plan is neither a throughput
+        # regression nor a clear improvement - only then does balance
+        # decide. A finite ``max_d_before`` is > 0 by construction.
         throughput_tied = (
-            math.isfinite(score.throughput_before)
-            and math.isfinite(score.throughput_after)
-            and abs(score.throughput_after - score.throughput_before) <= config.cross_stage_donor_throughput_tolerance
+            math.isfinite(score.max_d_before)
+            and math.isfinite(score.max_d_after)
+            and abs(score.max_d_after - score.max_d_before)
+            <= score.max_d_before * config.cross_stage_donor_throughput_tolerance
         )
         if (
             throughput_tied

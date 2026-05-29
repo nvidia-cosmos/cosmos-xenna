@@ -47,10 +47,10 @@ class TestFormulaCorrectness:
         slots_per_actor: int,
     ) -> None:
         """``0.30 / sqrt(c)`` for c in {1, 2, 4, 8, 16, 32, 64}, post-clamp."""
-        cfg = SaturationAwareStageConfig()
+        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.30)
         resolved = _resolve_auto_thresholds(cfg, slots_per_actor=slots_per_actor)
 
-        expected_raw = 0.30 / math.sqrt(slots_per_actor)
+        expected_raw = cfg.saturation_aggressiveness / math.sqrt(slots_per_actor)
         expected_clamped = max(cfg.auto_threshold_min, min(expected_raw, cfg.auto_threshold_max))
         assert resolved.saturation_threshold == pytest.approx(expected_clamped, rel=0.01)
 
@@ -171,9 +171,9 @@ class TestOverrideHierarchy:
 
     def test_activation_only_override_derives_saturation_from_formula(self) -> None:
         """``activation_threshold = 0.05`` -> saturation = K / sqrt(c) (formula)."""
-        cfg = SaturationAwareStageConfig(activation_threshold=0.05)
+        cfg = SaturationAwareStageConfig(saturation_aggressiveness=0.30, activation_threshold=0.05)
         resolved = _resolve_auto_thresholds(cfg, slots_per_actor=4)
-        assert resolved.saturation_threshold == pytest.approx(0.30 / math.sqrt(4))
+        assert resolved.saturation_threshold == pytest.approx(cfg.saturation_aggressiveness / math.sqrt(4))
         assert resolved.activation_threshold == pytest.approx(0.05)
         assert resolved.saturation_threshold_was_overridden is False
         assert resolved.activation_threshold_was_overridden is True

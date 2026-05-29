@@ -194,6 +194,7 @@ def _scheduler_with_stage(
     """
     cfg = SaturationAwareConfig(
         stage_defaults=SaturationAwareStageConfig(
+            saturation_aggressiveness=0.30,
             setup_phase_quiescence_enabled=quiescence_enabled,
             saturated_streak_min_cycles=saturated_streak_min_cycles,
             over_provisioned_streak_min_cycles=over_provisioned_streak_min_cycles,
@@ -524,6 +525,7 @@ class TestMixedQuiescenceAcrossStages:
         """In a two-stage pipeline, a quiescent stage does not block a non-quiescent one."""
         cfg = SaturationAwareConfig(
             stage_defaults=SaturationAwareStageConfig(
+                saturation_aggressiveness=0.30,
                 setup_phase_quiescence_enabled=True,
                 worker_warmup_measurement_grace_s=0.0,
                 donor_warmup_grace_s=0.0,

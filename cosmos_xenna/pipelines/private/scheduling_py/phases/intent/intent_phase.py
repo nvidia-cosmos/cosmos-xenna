@@ -278,6 +278,15 @@ class IntentPhase:
         for stage_index, runtime_stage in enumerate(problem_state.rust.stages):
             if runtime_stage.is_finished:
                 continue
+            # Manual stages (requested_num_workers set) are owned end-to-end by
+            # Phase A (Manual). Emitting an intent for them lets Phase C (Grow)
+            # push the stage above the operator's pin, which Phase A then deletes
+            # back the next cycle - grow/delete churn that burns warm GPU state.
+            # Mirror the Floor/Shrink guard; the pin lives on the problem stage
+            # (the runtime stage carries only live counters), so look it up by
+            # index.
+            if pipeline.problem.rust.stages[stage_index].requested_num_workers is not None:
+                continue
             stage_name = runtime_stage.stage_name
             stage_state = services.stage_states.get(stage_name)
             if stage_state is None:

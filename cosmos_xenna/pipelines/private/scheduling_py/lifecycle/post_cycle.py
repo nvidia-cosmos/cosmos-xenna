@@ -143,6 +143,25 @@ class PostCycleReporter:
     floor_allocation: AllocationFailureGate
     grow_allocation: AllocationFailureGate
 
+    @property
+    def donor_flow_aborted(self) -> bool:
+        """``True`` when a donor-backed add aborted after committing its removals.
+
+        Only the Floor and Grow phases run a ``DonorBackedAddExecutor``,
+        which commits the donor worker removals into the planner context
+        *before* it retries the receiver add. When that retry is absorbed
+        (the gate's ``aborted_cycle`` latches), the context is left
+        half-rebalanced: donors removed, receiver not added. The Manual
+        gate is intentionally excluded - ``ManualGrowExecutor`` never
+        removes donors, so a manual abort cannot leave the context in
+        that state.
+
+        :class:`CycleFinalizer.finalize` reads this to discard the
+        half-rebalanced context and emit a no-op ``Solution`` instead of
+        draining orphaned donor removals into the live pool.
+        """
+        return self.floor_allocation.aborted_cycle or self.grow_allocation.aborted_cycle
+
     def emit(self, cycle: AutoscaleCycle) -> None:
         """Emit balance gauges + regression check + cycle summary."""
         self._emit_post_cycle_balance_metrics(cycle)

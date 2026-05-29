@@ -54,6 +54,25 @@ from cosmos_xenna.pipelines.private.scheduling_py.state.sk_ewma_store import SkE
 from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import StageRuntimeState
 from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import derive_utilization_target
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
+from cosmos_xenna.utils import python_log as logger
+
+
+def _stage_ceiling(stage_cfg: SaturationAwareStageConfig, num_nodes: int) -> int | None:
+    """Per-stage hard worker ceiling.
+
+    Returns ``min(max_workers, max_workers_per_node * num_nodes)``, or
+    ``None`` when neither cap is configured. Shared by
+    :class:`CeilingCalculator` (the authoritative ceiling) and
+    :class:`FloorCalculator` (which compares its floor against this value
+    to detect a floor > ceiling cross-term misconfiguration) so the two
+    can never diverge on the ceiling formula.
+    """
+    candidates: list[int] = []
+    if stage_cfg.max_workers is not None:
+        candidates.append(stage_cfg.max_workers)
+    if stage_cfg.max_workers_per_node is not None:
+        candidates.append(stage_cfg.max_workers_per_node * num_nodes)
+    return min(candidates) if candidates else None
 
 
 @attrs.frozen
@@ -114,17 +133,56 @@ class FloorCalculator:
     """
 
     pipeline: PipelineModel
+    # Stage names already warned about a floor > ceiling misconfig.
+    # The calculator is reused across cycles, so this debounces the WARN
+    # to once per stage rather than once per autoscale interval.
+    # Excluded from eq / hash / repr: mutable debounce state, not identity.
+    _floor_exceeds_ceiling_warned: set[str] = attrs.field(factory=set, init=False, eq=False, repr=False)
 
     def compute(self, num_nodes: int) -> dict[int, int]:
-        """Return ``{problem_stage_index: target_min}`` for every stage."""
+        """Return ``{problem_stage_index: target_min}`` for every stage.
+
+        Floor-wins policy: the floor (``min_workers`` /
+        ``min_workers_per_node``) is a hard guarantee that takes
+        precedence over the softer ``max_workers`` policy cap. When the
+        raw floor exceeds the per-stage ceiling the floor is returned
+        unchanged (NOT clamped down); Phase D's ``allowed_by_floor``
+        bound then holds the stage at / above its floor even though that
+        leaves it above the ceiling. Exceeding ``max_workers`` does not
+        over-allocate physical GPUs - placement / resource-fit guards
+        physical capacity - so honoring the operator's minimum is the
+        safer default. A once-per-stage WARN flags the cross-term
+        misconfiguration so the operator can fix it.
+        """
         floors: dict[int, int] = {}
         for stage_index, problem_stage in enumerate(self.pipeline.problem.rust.stages):
             stage_cfg = self.pipeline.stage_config(problem_stage.name)
-            floors[stage_index] = max(
+            raw_floor = max(
                 stage_cfg.min_workers if stage_cfg.min_workers is not None else 1,
                 stage_cfg.min_workers_per_node * num_nodes if stage_cfg.min_workers_per_node is not None else 0,
             )
+            ceiling = _stage_ceiling(stage_cfg, num_nodes)
+            if ceiling is not None and raw_floor > ceiling:
+                self._warn_floor_exceeds_ceiling(problem_stage.name, raw_floor, ceiling, num_nodes)
+            floors[stage_index] = raw_floor
         return floors
+
+    def _warn_floor_exceeds_ceiling(self, stage_name: str, raw_floor: int, ceiling: int, num_nodes: int) -> None:
+        """Emit a once-per-stage WARN that the floor exceeds the ceiling.
+
+        Under the floor-wins policy the floor is not clamped; the message
+        tells the operator the stage will run above its cap until the
+        cross-term config is corrected.
+        """
+        if stage_name in self._floor_exceeds_ceiling_warned:
+            return
+        self._floor_exceeds_ceiling_warned.add(stage_name)
+        logger.warning(
+            f"saturation-aware floor exceeds ceiling: stage '{stage_name}' computed floor "
+            f"{raw_floor} > ceiling {ceiling} at num_nodes={num_nodes}; the floor takes precedence "
+            f"so the stage will run above the cap until the config is fixed. Fix min_workers / "
+            f"min_workers_per_node or max_workers / max_workers_per_node so the floor cannot exceed the cap."
+        )
 
 
 @attrs.frozen
@@ -148,16 +206,10 @@ class CeilingCalculator:
 
     def compute(self, num_nodes: int) -> dict[int, int | None]:
         """Return ``{problem_stage_index: ceiling_or_none}`` for every stage."""
-        ceilings: dict[int, int | None] = {}
-        for stage_index, problem_stage in enumerate(self.pipeline.problem.rust.stages):
-            stage_cfg = self.pipeline.stage_config(problem_stage.name)
-            candidates: list[int] = []
-            if stage_cfg.max_workers is not None:
-                candidates.append(stage_cfg.max_workers)
-            if stage_cfg.max_workers_per_node is not None:
-                candidates.append(stage_cfg.max_workers_per_node * num_nodes)
-            ceilings[stage_index] = min(candidates) if candidates else None
-        return ceilings
+        return {
+            stage_index: _stage_ceiling(self.pipeline.stage_config(problem_stage.name), num_nodes)
+            for stage_index, problem_stage in enumerate(self.pipeline.problem.rust.stages)
+        }
 
 
 __all__ = (

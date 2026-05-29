@@ -108,10 +108,15 @@ class BottleneckProtectionLogger:
 
         Args:
             protected: Stages held by bottleneck protection during
-                the just-finished Shrink cycle.
+                the just-finished Shrink cycle. A shallow copy is
+                stored so later caller mutations do not affect
+                ``previous_cycle``.
 
         """
-        self.previous_cycle = protected
+        if protected is None:
+            self.previous_cycle = set()
+        else:
+            self.previous_cycle = protected.copy()
 
 
 __all__ = ["BottleneckProtectionLogger"]

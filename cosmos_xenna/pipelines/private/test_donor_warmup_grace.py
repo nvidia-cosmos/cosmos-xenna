@@ -51,6 +51,7 @@ from loguru import logger as loguru_logger
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.phases.shrink.scale_down import select_workers_to_remove_oldest_first
 from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.warmup.warmup import WarmupTracker
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
@@ -666,3 +667,19 @@ class TestPhaseDShrinkLogWarmupBranch:
         assert "donor warmup grace left 2 removed" in warmup_msg
         assert "deficit=2" in warmup_msg
         assert "warmup_excluded=4" in warmup_msg
+
+
+class TestExcludedIdsCardinalityGuard:
+    """``WarmupTracker.excluded_ids`` rejects a stage-name / worker-rows length mismatch."""
+
+    def test_mismatched_lengths_raise_value_error(self) -> None:
+        """Fewer stage names than worker rows raises a diagnostic ``ValueError``, not ``IndexError``."""
+        tracker = WarmupTracker()
+
+        with pytest.raises(ValueError, match=r"len\(stage_names\)=1 != len\(worker_ids_by_stage\)=2"):
+            tracker.excluded_ids(
+                [["s0-w0"], ["s1-w0"]],
+                ["stage_0"],
+                lambda _name: SaturationAwareStageConfig(),
+                now=0.0,
+            )

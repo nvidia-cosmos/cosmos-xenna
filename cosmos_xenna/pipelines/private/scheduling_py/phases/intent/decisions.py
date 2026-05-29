@@ -59,7 +59,13 @@ def should_fire_action(
     (OVER_PROVISIONED) requires a long sustained signal. NORMAL
     is the no-action zone.
 
+    Raises:
+        ValueError: ``streak`` is negative.
+
     """
+    if streak < 0:
+        msg = f"streak must be >= 0, got {streak} (state={state})"
+        raise ValueError(msg)
     if state == StageState.SATURATED_CRITICAL:
         return streak >= config.saturated_critical_streak_min_cycles
     if state == StageState.SATURATED:

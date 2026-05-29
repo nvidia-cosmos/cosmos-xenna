@@ -92,9 +92,10 @@ def resolve_setup_aware_max_queued_enabled(
     therefore inherits the 3-tier precedence chain (``StageSpec.saturation_aware``
     > ``SaturationAwareConfig.per_stage_overrides`` > ``stage_defaults``).
     Scheduler kinds that do not consume per-stage SA config (see
-    ``SchedulerKind.supports_setup_aware_queue``) return ``False``
+    ``    SchedulerKind.supports_setup_aware_queue``) return ``False``
     unconditionally, as does any caller running without
-    ``StreamingSpecificSpec``. The resolver dispatches via the
+    ``StreamingSpecificSpec`` or outside ``ExecutionMode.STREAMING`` /
+    ``ExecutionMode.SERVING``. The resolver dispatches via the
     capability flag instead of naming a specific ``SchedulerKind``
     member so future scheduler kinds can opt in without editing this
     module.
@@ -108,6 +109,11 @@ def resolve_setup_aware_max_queued_enabled(
     if not isinstance(stage_spec, specs.StageSpec):
         msg = f"expected specs.StageSpec, got {type(stage_spec).__name__}"
         raise TypeError(msg)
+    if pipeline_spec.config.execution_mode not in (
+        specs.ExecutionMode.STREAMING,
+        specs.ExecutionMode.SERVING,
+    ):
+        return False
     # ``materialized_saturation_aware`` lazily constructs the SA config
     # on the saturation-aware branch only; the field defaults to
     # ``None`` so fragmentation-based pipelines never instantiate it.

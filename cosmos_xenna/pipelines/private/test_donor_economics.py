@@ -528,6 +528,119 @@ class TestEconomicGateRejections:
         assert result.reject_reason is RejectReason.BALANCE_REGRESSION
 
 
+class TestThroughputCheckRelativeTolerance:
+    """Throughput gate uses a scale-free RELATIVE band on ``max_k D_k``.
+
+    The gate must catch the same *percentage* throughput regression
+    whether the bottleneck ``max_D`` is small or large. The legacy
+    absolute band (``throughput_after < throughput_before - tol``) went
+    inert at high ``max_D`` because ``1 / max_D`` shrinks toward zero,
+    so the worst regressions (the most severe bottlenecks) slipped
+    through. These tests pin the relative semantics and the
+    high-``max_D`` fix.
+    """
+
+    @staticmethod
+    def _isolated_config(*, throughput_tolerance: float) -> SaturationAwareConfig:
+        """Config that lets ONLY ``ThroughputCheck`` decide the verdict.
+
+        Spread is made scale-independent (``bottleneck_weight=0`` so the
+        D_k values under test do not move spread, ``spread_threshold=0``)
+        and the donor-flip / balance gates are widened out of the way, so
+        an accept / reject is attributable to the throughput band alone.
+        """
+        return _config(
+            cross_stage_donor_throughput_tolerance=throughput_tolerance,
+            cross_stage_donor_spread_threshold=0.0,
+            cross_stage_donor_bottleneck_weight=0.0,
+            cross_stage_donor_donor_flip_tolerance=1.0e9,
+            cross_stage_donor_balance_tolerance=1.0e9,
+        )
+
+    def _evaluate_donor_channel_halving(self, *, s_k: float) -> GateResult:
+        """Donate one of donor A's two channels so its ``D_k`` doubles.
+
+        Donor A holds 2 channels (``D = s_k / 2``); removing one leaves 1
+        (``D = s_k`` -> the new ``max_D``). Receiver B gains a channel and
+        drops. ``max_D`` therefore goes ``s_k / 2 -> s_k`` (a fixed 2x
+        blow-up = a 50% throughput loss) at EVERY ``s_k``, so the only
+        thing that changes with scale is the absolute ``1 / max_D`` size.
+        """
+        plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
+            receiver_stage_index=1,
+        )
+        states = {
+            "A": _state("A", slots_empty_ewma=0.5, streak=60),
+            "B": _state("B", pressure_ewma=2.0, streak=60),
+        }
+        return _evaluate_economic_gate(
+            plan=plan,
+            stage_names=["A", "B"],
+            stage_states=states,
+            receiver_intent=1,
+            d_k_now={"A": s_k / 2.0, "B": s_k / 4.0},
+            effective_capacities={"A": 2, "B": 4},
+            s_k_ewma={"A": s_k, "B": s_k},
+            config=self._isolated_config(throughput_tolerance=0.02),
+            slots_per_worker_by_stage={},
+        )
+
+    @pytest.mark.parametrize("s_k", [4.0, 400.0])
+    def test_relative_regression_rejects_at_any_scale(self, s_k: float) -> None:
+        """A 2x ``max_D`` blow-up rejects whether ``max_D`` is ~2 or ~200.
+
+        Fail-on-unfixed: the legacy absolute band is inert at ``s_k=400``
+        (``throughput`` ~0.0025 vs the 0.02 tolerance, so the reject
+        condition needs ``throughput_after < -0.015``), so the un-fixed
+        gate ACCEPTS the high-scale regression -- exactly the bug this
+        fix closes. The relative band rejects the identical *percentage*
+        loss at both scales.
+        """
+        result = self._evaluate_donor_channel_halving(s_k=s_k)
+
+        assert result.reject_reason is RejectReason.THROUGHPUT_REGRESSION
+
+    def test_within_band_regression_is_tolerated_at_high_scale(self) -> None:
+        """A sub-tolerance regression at high ``max_D`` passes (no over-firing).
+
+        Donor A holds 100 channels at ``D=100`` (the bottleneck);
+        donating one nudges it to ``D ~= 101.01`` (a ~1.01% rise, inside
+        the 2% band), and receiver B only improves, so ``max_D`` moves
+        within the relative band -> throughput tie -> the gate must not
+        reject. Guards against the fix flipping from "inert at high
+        ``max_D``" to "rejects every high-``max_D`` plan".
+        """
+        plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
+            receiver_stage_index=1,
+        )
+        states = {
+            "A": _state("A", slots_empty_ewma=0.5, streak=60),
+            "B": _state("B", pressure_ewma=2.0, streak=60),
+        }
+        # A: 100 channels, S_k=10000 -> D=100. Removing one leaves 99 ->
+        # D=10000/99 ~= 101.01 (~1.01% rise). B: 8 channels, S_k=400 -> D=50,
+        # gains a channel and drops, so A stays the max both before and after.
+        result = _evaluate_economic_gate(
+            plan=plan,
+            stage_names=["A", "B"],
+            stage_states=states,
+            receiver_intent=1,
+            d_k_now={"A": 100.0, "B": 50.0},
+            effective_capacities={"A": 100, "B": 8},
+            s_k_ewma={"A": 10000.0, "B": 400.0},
+            config=self._isolated_config(throughput_tolerance=0.02),
+            slots_per_worker_by_stage={},
+        )
+
+        # Genuine (small) regression, not an improvement...
+        assert result.max_d_after > result.max_d_before
+        # ...but inside the 2% relative band, so throughput tolerates it.
+        assert result.max_d_after <= result.max_d_before * 1.02
+        assert result.reject_reason is None
+
+
 class TestEconomicGateColdStart:
     """Cold-start cycles (empty / NaN ``d_k_now``) skip throughput / balance checks."""
 

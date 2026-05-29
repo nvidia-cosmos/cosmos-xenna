@@ -46,7 +46,7 @@ Three mechanisms gate every per-stage delta:
    for a configurable number of consecutive cycles before any
    action fires. The required streak length is **asymmetric**:
    short to grow (default `saturated_streak_min_cycles = 2`), long
-   to shrink (`over_provisioned_streak_min_cycles = 30`).
+   to shrink (`over_provisioned_streak_min_cycles = 10`).
 
 2. **Stabilization-window consensus** — adjacent recommendation
    cycles must agree on direction. Even if the streak fires, the

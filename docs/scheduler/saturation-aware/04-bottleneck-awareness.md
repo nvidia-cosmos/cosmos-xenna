@@ -229,7 +229,7 @@ the same `BottleneckSnapshot` published by `BottleneckPhase`.
   `maybe_log_bottleneck_engagement` — argmax + heterogeneity gate
   + debounced engagement log.
 - `state/outputs.py::BottleneckSnapshot` — per-cycle output.
-- `state/s_k_ewma_store.py` — per-stage EWMA store with NaN-seed
+- `state/sk_ewma_store.py` — per-stage EWMA store with NaN-seed
   handling.
 - `regime/regime_controller.py::RegimeController` — Halfin-Whitt
   detector and aggressiveness lift.

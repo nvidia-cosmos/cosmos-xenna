@@ -32,6 +32,8 @@ Tests pin each contract in isolation:
   info is supplied.
 * ``max_plan_combinations`` caps probe calls per plan_size.
 * Returns ``None`` when every probe is infeasible up to ``max_plan_size``.
+* A budget-violating pool is bounded by the per-``find`` total-iteration
+  cap, not just the probe cap.
 """
 
 from collections.abc import Mapping
@@ -39,6 +41,7 @@ from collections.abc import Mapping
 import attrs
 import pytest
 
+from cosmos_xenna.pipelines.private.scheduling_py.donor import resource_fit
 from cosmos_xenna.pipelines.private.scheduling_py.donor.resource_fit import ResourceFitPlanner
 from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker
 
@@ -516,4 +519,72 @@ class TestPerStageRemovableBudget:
         assert plan == DonorPlan(
             removals=(DonorWorker(stage_index=0, worker_id="a-w0", age=1),),
             receiver_stage_index=2,
+        )
+
+
+class TestTotalEnumerationCap:
+    """A per-``find`` iteration cap bounds the raw combination walk (Finding m1).
+
+    ``max_plan_combinations`` caps *probes*, but ``evaluations``
+    increments only *after* a combo clears the cheap stage-budget
+    pre-filter (``_combo_violates_stage_budget``). A candidate pool
+    whose combos almost all violate the budget therefore walks the
+    full ``C(n, plan_size)`` enumeration across both passes without the
+    probe cap ever tripping -- the combinatorial blow-up that can
+    monopolise a scheduler cycle. The total-iteration guard
+    (``max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER``) bounds
+    that walk regardless of the pre-filter hit rate. Adversarial
+    axis 5 (performance guardrail).
+    """
+
+    def test_budget_violating_pool_is_bounded_by_iteration_cap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stage-0-only pool with budget 1 makes every 2+ worker combo violate the budget.
+
+        Each multi-worker combination draws both donors from stage 0
+        and is rejected by the budget pre-filter before any probe, so
+        ``evaluations`` never advances and the probe cap never trips.
+        The iteration guard must still cap total combinations examined
+        at ``max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER``;
+        without it the search walks every ``C(20, k)`` for ``k`` in
+        1..4 across both passes (~12k combos).
+        """
+        # Wrap the real budget pre-filter to count every combo that
+        # reaches it -- exactly one call per combo examined -- while
+        # preserving the production reject behaviour.
+        examined = 0
+        original_filter = resource_fit._combo_violates_stage_budget
+
+        def _counting_filter(combo: tuple[DonorWorker, ...], budget: Mapping[int, int]) -> bool:
+            nonlocal examined
+            examined += 1
+            return original_filter(combo, budget)
+
+        monkeypatch.setattr(resource_fit, "_combo_violates_stage_budget", _counting_filter)
+
+        # 20 donors all on stage 0; a removable budget of 1 means any
+        # combo of 2+ workers exceeds the stage-0 budget and is filtered
+        # before a probe. No node info -> a single "" bucket, so Pass 1
+        # and Pass 2 both walk the full per-size enumeration.
+        candidates = _candidates(*((0, f"a-w{i:02d}", i) for i in range(20)))
+        ctx = _ScriptedCtx(predicate=_all_infeasible)
+
+        max_plan_combinations = 8
+        plan = _resource_fit_plan(
+            receiver_stage_index=1,
+            candidates=candidates,
+            worker_nodes={},
+            ctx=ctx,
+            max_plan_size=4,
+            max_plan_combinations=max_plan_combinations,
+            removable_by_stage={0: 1},
+        )
+
+        cap = max_plan_combinations * resource_fit._ITERATION_BUDGET_MULTIPLIER
+        assert plan is None
+        assert examined <= cap, (
+            f"total enumeration must be bounded by the iteration cap {cap}; examined {examined} "
+            f"combos (an unbounded walk over C(20, 1..4) across both passes is ~12k)"
         )

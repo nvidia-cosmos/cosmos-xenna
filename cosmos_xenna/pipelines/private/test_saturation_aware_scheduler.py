@@ -44,6 +44,19 @@ from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import Sta
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
 
 
+def _config_pinned_aggressiveness(
+    aggressiveness: float = 0.30,
+    **config_overrides: object,
+) -> SaturationAwareConfig:
+    """Cluster config with explicit ``stage_defaults.saturation_aggressiveness``.
+
+    Threshold and regime wiring tests pin a fixed beta so assertions
+    stay stable when the production default changes.
+    """
+    stage_defaults = SaturationAwareStageConfig(saturation_aggressiveness=aggressiveness)
+    return SaturationAwareConfig(stage_defaults=stage_defaults, **config_overrides)
+
+
 def _cluster() -> resources.ClusterResources:
     """Single-node CPU cluster sufficient for ProblemStage construction."""
     return resources.ClusterResources(
@@ -1032,7 +1045,7 @@ class TestThresholdResolutionTiming:
 
     def test_setup_does_not_resolve_thresholds(self) -> None:
         """``setup()`` cannot resolve -- ``slots_per_worker`` only arrives in ``autoscale()``."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         assert scheduler.ledgers.stage_states["A"].classifier.resolved_thresholds is None
 
@@ -1046,7 +1059,7 @@ class TestThresholdResolutionTiming:
         A regression that read ``stage_batch_size`` instead would
         produce identical thresholds for both stages.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["small_c", "large_c"]))
         ps = _problem_state([("small_c", 1, 1), ("large_c", 1, 64)])
         scheduler.autoscale(time=0.0, problem_state=ps)
@@ -1069,7 +1082,7 @@ class TestThresholdResolutionTiming:
         is responsible for restarting if they also want
         threshold re-derivation.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         # First cycle: resolve at slots=8.
         scheduler.autoscale(time=0.0, problem_state=_problem_state([("A", 1, 8)]))
@@ -1094,7 +1107,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_no_slot_signals_keeps_state_in_sub_hw(self) -> None:
         """Production cycles without slot signals leave the regime in sub-HW."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         # `_problem_state` does NOT populate num_used_slots / num_empty_slots.
         for _ in range(5):
@@ -1107,7 +1120,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_sustained_busy_signal_transitions_to_super_hw_after_streak(self) -> None:
         """Three consecutive busy cycles commit the regime transition."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         # 4 workers, each carrying 8 slots, 31 used / 1 empty -> idle ~ 0.031.
         # threshold = 1/sqrt(4) = 0.50 -> 0.031 < 0.50 -> super-HW entry signal.
@@ -1118,7 +1131,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_super_hw_transition_relifts_aggressiveness(self) -> None:
         """A transition into super-HW re-resolves thresholds with base + lift."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
@@ -1130,7 +1143,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_non_default_lift_value_is_consumed(self) -> None:
         """The configured lift, not a hardcoded default, drives super-HW resolution."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig(super_halfin_whitt_aggressiveness_lift=0.05))
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness(super_halfin_whitt_aggressiveness_lift=0.05))
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
@@ -1141,7 +1154,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_non_default_transition_streak_is_consumed(self) -> None:
         """The configured streak length, not a hardcoded default, gates transitions."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig(regime_transition_streak_cycles=2))
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness(regime_transition_streak_cycles=2))
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         scheduler.autoscale(time=0.0, problem_state=ps)
@@ -1151,7 +1164,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_oscillation_around_threshold_does_not_flap_regime(self) -> None:
         """Cluster idle oscillating across the boundary holds sub-HW (streak resets)."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         # 4 workers, 8 slots/worker -> 32 total slots; threshold = 1/sqrt(4) = 0.50.
         below = _problem_state_with_slot_signals([("A", 4, 8, 19, 13)])  # idle ~ 0.41 < 0.50
@@ -1163,7 +1176,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_disabled_flag_pins_aggressiveness_at_base(self) -> None:
         """``enable_regime_aware_aggressiveness=False`` skips regime tracking entirely."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig(enable_regime_aware_aggressiveness=False))
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness(enable_regime_aware_aggressiveness=False))
         scheduler.setup(_problem_with_stages(["A"]))
         ps = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(10):
@@ -1176,7 +1189,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_super_hw_exit_re_resolves_with_base_aggressiveness(self) -> None:
         """Transitioning back to sub-HW re-resolves with the base aggressiveness."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         # Enter super-HW.
         busy = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
@@ -1194,7 +1207,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_setup_resets_regime_hysteresis(self) -> None:
         """A reused scheduler starts the next setup at base aggressiveness."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["A"]))
         busy = _problem_state_with_slot_signals([("A", 4, 8, 31, 1)])
         for _ in range(3):
@@ -1210,7 +1223,7 @@ class TestRegimeAwareAggressiveness:
 
     def test_mixed_slot_signal_snapshot_keeps_regime_state_unchanged(self) -> None:
         """One unreported active worker stage makes the cluster signal unavailable."""
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        scheduler = SaturationAwareScheduler(_config_pinned_aggressiveness())
         scheduler.setup(_problem_with_stages(["reported", "missing"]))
         reported_workers = [
             data_structures.ProblemWorkerGroupState.make(
@@ -1264,7 +1277,8 @@ class TestRegimeAwareAggressiveness:
         longer ``7`` and the classifier state was at least
         re-evaluated rather than carried forward verbatim.
         """
-        scheduler = SaturationAwareScheduler(SaturationAwareConfig())
+        config = _config_pinned_aggressiveness()
+        scheduler = SaturationAwareScheduler(config)
         scheduler.setup(_problem_with_stages(["A"]))
         runtime = scheduler.ledgers.stage_states["A"]
         runtime.classifier.state = StageState.SATURATED
@@ -1279,7 +1293,7 @@ class TestRegimeAwareAggressiveness:
         assert runtime.classifier.resolved_thresholds is not None
         assert (
             runtime.classifier.resolved_thresholds.saturation_aggressiveness
-            > SaturationAwareConfig().stage_defaults.saturation_aggressiveness
+            > config.stage_defaults.saturation_aggressiveness
         )
 
 

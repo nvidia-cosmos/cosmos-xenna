@@ -145,6 +145,7 @@ def _scheduler(stage_specs: list[tuple[str, int | None]]) -> SaturationAwareSche
     cfg = SaturationAwareConfig(
         floor_stuck_grace_cycles=0,
         stage_defaults=SaturationAwareStageConfig(
+            saturation_aggressiveness=0.30,
             min_workers=1,
             worker_warmup_measurement_grace_s=0.0,
             donor_warmup_grace_s=0.0,
@@ -342,6 +343,33 @@ class TestMultiStageIndependentGrowth:
 
         assert len(solution.stages[0].new_workers) == 2
         assert len(solution.stages[1].new_workers) == 3
+
+
+class TestManualStageNotGrown:
+    """Phase C (Grow) never grows a manual stage, mirroring the Floor/Shrink guard.
+
+    Intent already suppresses deltas for manual stages, so this injects
+    a positive intent *directly* (bypassing the Intent phase via the
+    ``_compute_intent_deltas`` patch) to prove the Grow guard holds
+    independently - defense-in-depth against a future Intent regression.
+    A manual stage with a (hypothetical) positive intent must not be
+    grown above its ``requested_num_workers`` pin, while an auto-scaled
+    sibling with positive intent still grows the same cycle.
+    """
+
+    def test_manual_stage_with_positive_intent_is_not_grown(self) -> None:
+        """Injected positive intent for a manual stage produces no add; auto sibling grows."""
+        # "manual" pinned to 1 worker; "auto" auto-scaled. 8-CPU cluster,
+        # 2 workers seeded (1 each) -> 6 free CPUs, room for the auto grow.
+        scheduler = _scheduler([("manual", 1), ("auto", None)])
+        state = _problem_state([("manual", 1, 1, False), ("auto", 1, 1, False)])
+
+        solution = _autoscale_with_intents(scheduler, state, {"manual": 5, "auto": 3})
+
+        # Problem order is preserved in ``solution.stages``.
+        assert solution.stages[0].new_workers == [], "manual stage must not be grown above its pin"
+        assert solution.stages[0].deleted_workers == []
+        assert len(solution.stages[1].new_workers) == 3, "auto-scaled sibling still grows its full intent"
 
 
 class TestPhaseCInvariantBoundary:

@@ -166,8 +166,25 @@ class AutoscaleCycle:
             every runtime stage. Mutations do not affect planner
             state.
 
+        Raises:
+            ValueError: The planner's stage-vector count drifted
+                from ``problem_state.rust.stages``; mirrors the
+                loud ``strict=True`` zip failure of
+                ``planner_worker_counts_by_stage_name``.
+
         """
-        return {stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(self.ctx.worker_ids_by_stage())}
+        worker_ids_by_stage = self.ctx.worker_ids_by_stage()
+        num_runtime_stages = len(self.problem_state.rust.stages)
+        if len(worker_ids_by_stage) != num_runtime_stages:
+            msg = (
+                "planner_worker_counts_by_stage_index: planner stage-vector "
+                f"count {len(worker_ids_by_stage)} != problem_state stage "
+                f"count {num_runtime_stages} (pipeline {self.pipeline_name!r}, "
+                f"cycle {self.cycle_counter}). Planner state drifted from "
+                "problem_state; this is a scheduler defect."
+            )
+            raise ValueError(msg)
+        return {stage_index: len(worker_ids) for stage_index, worker_ids in enumerate(worker_ids_by_stage)}
 
     def cycle_logger(self, stage: str = "") -> object:
         """Return a loguru logger pre-bound to cycle/pipeline/stage fields.

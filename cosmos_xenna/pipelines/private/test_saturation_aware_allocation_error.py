@@ -27,7 +27,8 @@ from loguru import logger as loguru_logger
 
 from cosmos_xenna.pipelines.private import data_structures, resources
 from cosmos_xenna.pipelines.private.scheduling_py.cluster import allocation_failures
-from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, DonorWorker
+from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
+from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorAcquireResult, DonorPlan, DonorWorker
 from cosmos_xenna.pipelines.private.scheduling_py.scheduler.errors import SchedulerInvariantError
 from cosmos_xenna.pipelines.private.scheduling_py.scheduler.saturation_aware import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.specs import SaturationAwareConfig, SaturationAwareStageConfig
@@ -354,9 +355,6 @@ class TestDonorRetryInvariant:
         # SaturationPolicy.on_commit so the test does not need a
         # separate record-call assertion - the divergence raises
         # before any cooldown ledger update would run.
-        from cosmos_xenna.pipelines.private.scheduling_py.donor.coordinator import DonorCoordinator
-        from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorAcquireResult
-
         with patch(
             "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
             return_value={"stage": 1},
@@ -382,6 +380,104 @@ class TestDonorRetryInvariant:
         assert fake_counter.calls == [], (
             "SchedulerInvariantError must not increment the absorbed-allocation-failure counter"
         )
+
+
+class TestDonorAbortDiscardsHalfRebalance:
+    """A donor-backed add that aborts post-commit emits a no-op ``Solution`` (Finding M4).
+
+    The donor commit removes warm donor workers from the cycle context
+    *before* retrying the receiver add. When that retry's
+    ``AllocationError`` is absorbed (``skip_cycle_on_allocation_error``),
+    the context is left half-rebalanced - donors removed, receiver not
+    added - which is strictly worse than a no-op: the pipeline loses
+    the warm donor for nothing. The finalizer must discard that context
+    and emit a no-op ``Solution`` so the live pool never observes the
+    orphaned removal, and the not-removed donor must keep its age so the
+    next cycle does not see it as a fresh (preferred) donor and re-raid
+    it. Adversarial axes 2 (failure/recovery) + 8 (partial-failure
+    stability).
+    """
+
+    def test_post_commit_abort_discards_orphaned_removal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A committed donor removal + absorbed receiver retry yields a no-op ``Solution``.
+
+        The patched coordinator commits the donor removal of ``stage-w0``
+        into the live cycle context exactly as the real
+        ``remove_workers_atomically`` would, so the context is genuinely
+        half-rebalanced when the post-commit retry then raises an
+        absorbed ``AllocationError``. Without the discard the emitted
+        ``Solution`` drains that orphaned removal; with it the
+        ``Solution`` is a no-op and ``stage-w0`` survives in the age
+        ledger.
+        """
+        fake_counter = _FakeCounter()
+        monkeypatch.setattr(allocation_failures, "_ALLOCATION_FAILURES_COUNTER", fake_counter)
+
+        scheduler = _scheduler()
+        ps = _problem_state_with_one_worker()
+
+        # 1st ``try_add_worker`` (direct add) returns None (no headroom,
+        # so the executor falls through to the donor path); the 2nd
+        # (post-commit receiver retry) raises ``AllocationError``, which
+        # the gate absorbs -> ``aborted_cycle`` latches -> the executor
+        # returns ``AllocationAborted``.
+        try_add_call_count = 0
+
+        def _try_add(*_args: object, **_kwargs: object) -> data_structures.ProblemWorkerGroupState | None:
+            nonlocal try_add_call_count
+            try_add_call_count += 1
+            if try_add_call_count == 1:
+                return None
+            raise resources.AllocationError("post-commit receiver retry fails")
+
+        donor_plan = DonorPlan(
+            removals=(DonorWorker(stage_index=0, worker_id="stage-w0", age=0),),
+            receiver_stage_index=0,
+        )
+
+        def _acquire_and_commit(
+            *,
+            ctx: data_structures.AutoscalePlanContext,
+            **_kwargs: object,
+        ) -> DonorAcquireResult:
+            # Commit the donor removal into the live cycle context just as
+            # the real coordinator's ``commit_donor_plan`` would, so the
+            # context is genuinely half-rebalanced when the retry fails.
+            assert ctx.remove_workers_atomically([(0, "stage-w0")]), "donor removal must stage"
+            return DonorAcquireResult(
+                plan=donor_plan,
+                attempted_plan=donor_plan,
+                reject_reason=None,
+                placement_reject_reason="",
+                gate_result=None,
+            )
+
+        with (
+            patch(
+                "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+                return_value={"stage": 1},
+            ),
+            patch(
+                "cosmos_xenna.pipelines.private.data_structures.AutoscalePlanContext.try_add_worker",
+                side_effect=_try_add,
+            ),
+            patch.object(DonorCoordinator, "acquire", side_effect=_acquire_and_commit),
+        ):
+            solution = scheduler.autoscale(time=0.0, problem_state=ps)
+
+        # Atomic outcome: neither the orphaned donor removal nor the
+        # failed receiver add survives into the emitted Solution.
+        assert len(solution.stages) == 1
+        assert solution.stages[0].deleted_workers == [], "the half-rebalanced removal must be discarded"
+        assert solution.stages[0].new_workers == [], "the failed receiver add must not appear"
+        # The not-removed donor keeps its age entry so the next cycle does
+        # not treat it as a fresh age-0 (preferred) donor and re-raid it.
+        assert "stage-w0" in scheduler.ledgers.worker_ages
+        # The absorbed retry still logged + counted the placement failure.
+        assert fake_counter.calls == [{"stage": "stage", "pipeline": "test-pipe"}]
 
 
 class TestAllocationFailureLogIsInjectionSafe:

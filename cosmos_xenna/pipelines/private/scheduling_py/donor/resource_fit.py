@@ -18,11 +18,20 @@
 ``ResourceFitPlanner`` enumerates same-node-first then cross-node
 worker combinations against a candidate pool, probing each combo
 through ``ctx.probe_add_after_removals`` and returning the first
-feasible ``DonorPlan``. The search is bounded by
-``max_plan_size`` (combo width) and ``max_plan_combinations``
-(probe budget) so a pathological cluster cannot stall the
-scheduler. Per-stage donor budgets prevent any single combo from
-dropping a donor stage below its own floor.
+feasible ``DonorPlan``. The search is bounded on three axes so a
+pathological cluster cannot stall the scheduler:
+
+* ``max_plan_size`` - combo width (donors per plan).
+* ``max_plan_combinations`` - per-plan-size *probe* budget (the
+  expensive ``probe_add_after_removals`` FFI calls).
+* ``max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER`` - the
+  per-``find`` *enumeration* budget. The probe budget only counts
+  combos that clear the cheap stage-budget pre-filter, so it cannot
+  bound the raw ``itertools.combinations`` walk when most combos
+  fail that filter; this third cap does.
+
+Per-stage donor budgets prevent any single combo from dropping a
+donor stage below its own floor.
 """
 
 import itertools
@@ -35,6 +44,22 @@ from cosmos_xenna.pipelines.private.scheduling_py.donor.types import DonorPlan, 
 
 if TYPE_CHECKING:
     from cosmos_xenna.pipelines.private.data_structures import AutoscalePlanContext
+
+
+# Multiplier converting the per-plan-size *probe* budget
+# (``max_plan_combinations``) into a per-``find`` *enumeration*
+# budget. ``max_plan_combinations`` only counts combos that clear the
+# cheap stage-budget pre-filter (``evaluations`` increments *after*
+# the filter), so a pool whose combos mostly violate the budget would
+# otherwise walk the full ``C(n, plan_size)`` space across both passes
+# without the probe cap ever tripping. Bounding total combinations
+# examined at ``max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER``
+# keeps the enumeration finite regardless of the pre-filter hit rate.
+# 64 leaves a wide margin over a healthy search - which examines at
+# most a few multiples of ``max_plan_combinations`` across all plan
+# sizes - so the cap only fires on pathological pools, never on
+# legitimate ones.
+_ITERATION_BUDGET_MULTIPLIER = 64
 
 
 @attrs.frozen
@@ -69,6 +94,14 @@ class ResourceFitPlanner:
         combo from pulling a stage below its own floor. Tiebreak:
         ``(age ASC, worker_id ASC, stage_index ASC)``.
 
+        Returns ``None`` early if total combinations examined exceed
+        ``max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER`` - a
+        safety bound on the raw enumeration that the probe budget
+        cannot provide (it only counts combos clearing the cheap
+        stage-budget pre-filter). A pool needing more than that many
+        combinations to surface a feasible plan is itself pathological;
+        abandoning the search is preferable to stalling the cycle.
+
         """
         if not candidates:
             return None
@@ -98,6 +131,19 @@ class ResourceFitPlanner:
             else:
                 bucket.append(worker)
 
+        # Per-``find`` total-enumeration guard. ``evaluations`` (reset
+        # per plan_size, below) caps *probes* but increments only after
+        # a combo clears the cheap stage-budget pre-filter, so it cannot
+        # bound the raw ``itertools.combinations`` walk when most combos
+        # fail that filter. ``iterations`` counts *every* combo examined
+        # - budget-rejected and dedup-skipped included - across all
+        # plan sizes and both passes; the search returns ``None`` once
+        # it exceeds ``max_iterations`` so a pathological candidate pool
+        # cannot monopolise a scheduler cycle while the probe budget
+        # still limits FFI cost as before.
+        max_iterations = self.max_plan_combinations * _ITERATION_BUDGET_MULTIPLIER
+        iterations = 0
+
         for plan_size in range(1, self.max_plan_size + 1):
             evaluations = 0
             # Dedup key uses the full planner identity
@@ -114,6 +160,9 @@ class ResourceFitPlanner:
                 for combo in itertools.combinations(same_node, plan_size):
                     if evaluations >= self.max_plan_combinations:
                         break
+                    iterations += 1
+                    if iterations > max_iterations:
+                        return None
                     if _combo_violates_stage_budget(combo, removable_by_stage):
                         continue
                     combo_key = tuple((w.stage_index, w.worker_id) for w in combo)
@@ -137,6 +186,9 @@ class ResourceFitPlanner:
             for combo in itertools.combinations(sorted_candidates, plan_size):
                 if evaluations >= self.max_plan_combinations:
                     break
+                iterations += 1
+                if iterations > max_iterations:
+                    return None
                 if _combo_violates_stage_budget(combo, removable_by_stage):
                     continue
                 combo_key = tuple((w.stage_index, w.worker_id) for w in combo)

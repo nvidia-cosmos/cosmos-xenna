@@ -185,7 +185,22 @@ class WarmupTracker:
         warmup-protected donors is worse than killing a young
         donor.
 
+        Raises:
+            ValueError: ``stage_names`` and ``worker_ids_by_stage``
+                have mismatched lengths; both must share the
+                canonical stage order.
+
         """
+        if len(stage_names) != len(worker_ids_by_stage):
+            msg = (
+                "WarmupTracker.excluded_ids requires stage_names and "
+                "worker_ids_by_stage to share the canonical stage order, but "
+                f"got len(stage_names)={len(stage_names)} != "
+                f"len(worker_ids_by_stage)={len(worker_ids_by_stage)}. This is "
+                "a scheduler defect; report it with the autoscale cycle's "
+                "problem_state."
+            )
+            raise ValueError(msg)
         excluded: set[str] = set()
         for stage_index, worker_ids in enumerate(worker_ids_by_stage):
             stage_name = stage_names[stage_index]

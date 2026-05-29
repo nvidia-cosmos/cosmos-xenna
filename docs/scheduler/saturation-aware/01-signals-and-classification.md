@@ -82,13 +82,13 @@ backs the `1 / sqrt(c)` scaling.
    ┌─────────────────────────────────────────────────────────┐
    │  threshold = K / sqrt(slots_per_worker)                 │
    │                                                         │
-   │     slots=1   →  K / 1.0   = 0.30  (lots of headroom    │
+   │     slots=1   →  K / 1.0   = 0.25  (lots of headroom    │
    │                                     before "saturated") │
-   │     slots=4   →  K / 2.0   = 0.15                       │
-   │     slots=16  →  K / 4.0   = 0.075                      │
-   │     slots=32  →  K / 5.66  = 0.053  (saturates faster)  │
+   │     slots=4   →  K / 2.0   = 0.125                      │
+   │     slots=16  →  K / 4.0   = 0.0625                     │
+   │     slots=32  →  K / 5.66  = 0.044  (saturates faster)  │
    │                                                         │
-   │  K = saturation_aggressiveness (default 0.30)           │
+   │  K = saturation_aggressiveness (default 0.25)           │
    └─────────────────────────────────────────────────────────┘
 ```
 

@@ -604,10 +604,15 @@ class SaturationAwareScheduler:
         assert self._finalizer is not None
         preflight = self._preflight.build(time=time, problem_state=problem_state)
         self._runner.run(preflight.cycle)
+        # A donor-backed add (Floor / Grow) that aborts after committing
+        # its removals leaves the cycle context half-rebalanced; the
+        # finalizer discards it and emits a no-op Solution instead of
+        # draining orphaned removals into the live pool.
         solution = self._finalizer.finalize(
             cycle=preflight.cycle,
             problem_state=problem_state,
             prev_stuck_plan_counters=preflight.prev_stuck_plan_counters,
+            donor_cycle_aborted=self._post_cycle_reporter.donor_flow_aborted,
         )
         self._last_cycle = preflight.cycle
         return solution

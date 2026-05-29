@@ -259,14 +259,16 @@ class TestDagPriorityGrowOrderUnderSimultaneousSaturation:
             f"DAG-priority order must grow downstream stage 'C' under simultaneous "
             f"saturation; got per-cycle C adds {c_adds}, A adds {a_adds}"
         )
-        # Upstream 'A' must not be grown ahead of downstream 'C' on any
-        # cycle where the cluster headroom is exhausted. The cycle-by-cycle
-        # check is sufficient: if both have an add on the same cycle the
-        # headroom guarantee is fine, but on a tight cycle only C should
-        # carry an add.
+        # Upstream 'A' must not grow alone on any cycle: DAG priority
+        # allocates headroom to downstream stages first, so an add on
+        # 'A' without a concurrent add on 'C' would violate ordering.
         per_cycle_pairs = list(zip(a_adds, c_adds, strict=True))
-        # Sanity: at least one cycle landed an add on C.
-        assert any(c > 0 for _a, c in per_cycle_pairs)
+        for cycle_idx, (a, c) in enumerate(per_cycle_pairs):
+            assert not (a > 0 and c == 0), (
+                f"DAG-priority: upstream 'A' must not grow alone on cycle "
+                f"{cycle_idx}; got A adds={a}, C adds={c} "
+                f"(per-cycle pairs {per_cycle_pairs})"
+            )
 
 
 class TestDonorCascadeReleasesUpstreamForDownstream:
@@ -465,6 +467,114 @@ class TestMixedManualAutoFinishedLongRunningStability:
                 f"auto stage at index {stage_index} must not shrink on a steady NORMAL "
                 f"signal across 20 cycles, got per-cycle deletes {deletes}"
             )
+
+
+class TestSaturatedManualStageHoldsAtPin:
+    """A SATURATED manual stage holds at its pin -- no grow/delete churn, no donor raid.
+
+    End-to-end guard for the manual-stage invariant: Phase A owns
+    ``requested_num_workers`` stages, so Intent must not emit a delta for
+    them (root cause) and Grow must not act on one (defense in depth).
+    Two failure modes are pinned: (1) per-cycle grow/delete churn that
+    burns warm GPU state on a roomy cluster, and (2) the cross-stage
+    donor raiding auto-scaled stages to feed a pinned receiver on a full
+    cluster.
+    """
+
+    def test_saturated_manual_stage_does_not_grow_while_auto_sibling_does(self) -> None:
+        """Roomy cluster: a saturated manual stage holds at its pin; the auto sibling grows.
+
+        Exercises the real Intent -> Grow path (no injected intent). The
+        manual stage ``M`` is fed at exactly its pin (2 workers) under a
+        SATURATED_CRITICAL signal every cycle; pre-fix Intent emits a
+        positive delta and Grow pushes it above the pin. Post-fix Intent
+        skips it, so ``M`` never grows and is never deleted, while the
+        auto-scaled ``A`` still grows under the same signal.
+        """
+        scheduler = _build_scheduler(
+            [("M", 2), ("A", None)],
+            cluster=_cluster(num_nodes=1, total_cpus_per_node=64),
+        )
+
+        def state_factory(_cycle: int) -> data_structures.ProblemState:
+            return data_structures.ProblemState(
+                [
+                    _saturated("M", num_workers=2),
+                    _saturated("A", num_workers=1),
+                ]
+            )
+
+        solutions = _run_cycles(scheduler, state_factory, num_cycles=4)
+
+        m_adds = _new_workers_per_stage(solutions, stage_index=0)
+        m_deletes = _deleted_workers_per_stage(solutions, stage_index=0)
+        a_adds = _new_workers_per_stage(solutions, stage_index=1)
+        assert all(n == 0 for n in m_adds), f"manual stage 'M' must never grow above its pin, got {m_adds}"
+        assert all(n == 0 for n in m_deletes), f"manual stage 'M' at its pin must not be churned, got {m_deletes}"
+        assert sum(a_adds) >= 1, f"auto-scaled 'A' must still grow under the same signal, got {a_adds}"
+
+    def test_saturated_manual_receiver_does_not_raid_auto_donor_on_full_cluster(self) -> None:
+        """Full cluster: a pinned receiver must not trigger the donor to raid an auto stage.
+
+        Mirrors ``TestDonorCascadeReleasesUpstreamForDownstream`` but
+        makes the receiver a *manual* stage. With the cluster at cap the
+        only way to grow the receiver is to reclaim a worker from the
+        OVER_PROVISIONED auto donor ``A``. Pre-fix Grow processes the
+        pinned receiver and the donor raids ``A``; post-fix Grow skips
+        the manual receiver, so ``A`` keeps its worker and the receiver
+        holds. Intent is injected (as in the cascade test) to isolate the
+        Grow donor-fallback path deterministically.
+        """
+        # 3 CPUs, 1-CPU shapes -> 3 workers fit; seed 2 'A' + 1 'M' = at cap.
+        scheduler = _build_scheduler(
+            [("A", None), ("M", 1)],
+            cluster=_cluster(num_nodes=1, total_cpus_per_node=3),
+            over_provisioned_streak_min_cycles=2,
+        )
+        # Pre-seed classifier state so the donor filter accepts 'A' and
+        # treats 'M' as a saturated receiver immediately (mirrors the
+        # cascade test); the property under test is the donor raid, not
+        # the classifier ramp.
+        scheduler.ledgers.stage_states["A"] = StageRuntimeState(
+            stage_name="A",
+            classifier=ClassifierState(state=StageState.OVER_PROVISIONED, streak=10),
+            growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
+        )
+        scheduler.ledgers.stage_states["M"] = StageRuntimeState(
+            stage_name="M",
+            classifier=ClassifierState(state=StageState.SATURATED, streak=10),
+            growth=GrowthState(mode=GrowthMode.TRACKING, streak=10),
+        )
+
+        ps = data_structures.ProblemState(
+            [
+                _stage_state(name="A", num_workers=2, num_used_slots=2, num_empty_slots=14, input_queue_depth=0),
+                _stage_state(name="M", num_workers=1, num_used_slots=8, num_empty_slots=0, input_queue_depth=5),
+            ]
+        )
+
+        # Inject intent for the pinned receiver to isolate the Grow
+        # donor-fallback path; the injection bypasses the Intent guard so
+        # this asserts the Grow guard specifically.
+        def _inject(_services: object, _cycle: object, **_kwargs: object) -> dict[str, int]:
+            return {"M": 1}
+
+        with patch(
+            "cosmos_xenna.pipelines.private.scheduling_py.phases.intent.intent_phase.IntentPhase._compute_intent_deltas",
+            side_effect=_inject,
+        ):
+            solution = scheduler.autoscale(time=0.0, problem_state=ps)
+
+        a_solution = solution.stages[0]
+        m_solution = solution.stages[1]
+        assert a_solution.deleted_workers == [], (
+            f"auto donor 'A' must not be raided to feed a pinned receiver; got "
+            f"{len(a_solution.deleted_workers)} deletes"
+        )
+        assert m_solution.new_workers == [], (
+            f"manual receiver 'M' must not be grown via the donor path; got {len(m_solution.new_workers)} adds"
+        )
+        assert m_solution.deleted_workers == [], "manual receiver 'M' at its pin must not be deleted"
 
 
 class TestBottleneckShiftEngagementMarkerFollowsSaturatedStage:
