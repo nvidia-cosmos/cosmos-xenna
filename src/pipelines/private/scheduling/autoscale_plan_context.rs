@@ -878,7 +878,23 @@ impl AutoscalePlanContext {
         // path callers reserve for routine missing-worker retries.
         // Mirrors the contract of the single-worker `try_remove_worker`
         // path, which already distinguishes these two failure modes.
+        let mut seen_removals: HashSet<(usize, &str)> = HashSet::with_capacity(removals.len());
         for (stage_index, worker_id) in &removals {
+            // Reject a duplicate `(stage_index, worker_id)` up front, mirroring
+            // the `probe_add_after_removals` guard. The owning commit loop below
+            // removes each worker from its planner map and releases its
+            // resources; a repeated tuple would find the worker already gone on
+            // the second pass and surface as a hard `disappeared mid-batch`
+            // PyRuntimeError plus a full rollback, instead of the graceful
+            // `Ok(false)` fall-back the caller reserves for an unsatisfiable
+            // plan. The Python resource-fit search builds combos via
+            // `itertools.combinations` (distinct elements) and dedups by planner
+            // identity, so a duplicate cannot arise today -- this is defensive
+            // FFI-boundary hardening that fails closed via the same `Ok(false)`
+            // path the missing-worker cases use.
+            if !seen_removals.insert((*stage_index, worker_id.as_str())) {
+                return Ok(false);
+            }
             if *stage_index >= self.stages.len() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                     "AutoscalePlanContext.remove_workers_atomically: stage_index {} out of \
@@ -4444,6 +4460,54 @@ mod batch_removal_and_probe_tests {
         assert!(
             ctx.pending_removes["stage_a"].is_empty(),
             "no pending removes staged when batch is rejected",
+        );
+    }
+
+    #[test]
+    fn remove_workers_atomically_duplicate_worker_returns_false_without_mutation() {
+        // A `removals` list containing the same (stage_index, worker_id)
+        // twice must fail closed via the Ok(false) fall-back BEFORE the
+        // owning commit loop runs. Without the up-front dedup the first
+        // commit removes the worker and the second pass finds it gone,
+        // surfacing a hard `disappeared mid-batch` PyRuntimeError plus a
+        // rollback instead of the graceful Ok(false) the caller expects
+        // for an unsatisfiable plan. No state mutates on the rejected path.
+        let (mut ctx, ids) = ctx_with_cpu_workers(2);
+        let baseline_used = ctx.cluster.nodes["node0"].used_cpus;
+
+        let result = ctx
+            .remove_workers_atomically(vec![(0, ids[0].clone()), (0, ids[0].clone())])
+            .unwrap();
+
+        assert!(
+            !result,
+            "duplicate (stage_index, worker_id) returns Ok(false)"
+        );
+        assert_eq!(
+            ctx.cluster.nodes["node0"].used_cpus, baseline_used,
+            "no release runs when the batch is rejected for a duplicate",
+        );
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            2,
+            "current_workers untouched on the duplicate-rejection path",
+        );
+        assert!(
+            ctx.pending_removes["stage_a"].is_empty(),
+            "no pending removes staged when the batch is rejected",
+        );
+
+        // Control: the same worker is a valid removal target on its own,
+        // proving the rejection above was due to the duplicate entry, not
+        // an invalid worker.
+        let single = ctx
+            .remove_workers_atomically(vec![(0, ids[0].clone())])
+            .unwrap();
+        assert!(single, "single removal of the same worker commits");
+        assert_eq!(
+            ctx.current_workers["stage_a"].len(),
+            1,
+            "one worker removed by the control single-removal",
         );
     }
 

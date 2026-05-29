@@ -26,10 +26,29 @@ See ``docs/scheduler/saturation-aware/`` for the algorithm.
 """
 
 from collections.abc import Mapping
+from types import MappingProxyType
 
 import attrs
 
 from cosmos_xenna.pipelines.private.scheduling_py.state.bottleneck_identity import BottleneckIdentity
+
+# Read-only converters for the snapshot mapping fields. ``@attrs.frozen``
+# freezes the attribute binding but not the contents of a plain ``dict``,
+# so each mapping is copied (isolating the snapshot from later mutation of
+# the caller's source dict) and wrapped in a ``MappingProxyType`` that
+# rejects in-place writes. Two concretely-typed converters are used rather
+# than one generic helper because the attrs/mypy plugin cannot bind a free
+# ``TypeVar`` on a converter, which would reject every construction site.
+
+
+def _read_only_float_map(mapping: Mapping[str, float]) -> Mapping[str, float]:
+    """Return a read-only, copied view of a ``str -> float`` mapping."""
+    return MappingProxyType(dict(mapping))
+
+
+def _read_only_int_map(mapping: Mapping[str, int]) -> Mapping[str, int]:
+    """Return a read-only, copied view of a ``str -> int`` mapping."""
+    return MappingProxyType(dict(mapping))
 
 
 @attrs.frozen
@@ -46,12 +65,16 @@ class BottleneckSnapshot:
         balance_score_start: Cluster balance score at cycle start;
             ``math.nan`` on cold start.
 
+    The three mapping fields are wrapped in a read-only
+    ``MappingProxyType`` view at construction so a downstream phase
+    cannot mutate this cycle's snapshot contents in place.
+
     """
 
     identity: BottleneckIdentity
-    d_k_now: Mapping[str, float]
-    effective_capacities: Mapping[str, int]
-    channels_per_worker_group: Mapping[str, int]
+    d_k_now: Mapping[str, float] = attrs.field(converter=_read_only_float_map)
+    effective_capacities: Mapping[str, int] = attrs.field(converter=_read_only_int_map)
+    channels_per_worker_group: Mapping[str, int] = attrs.field(converter=_read_only_int_map)
     balance_score_start: float
 
 
@@ -66,7 +89,9 @@ class IntentPlan:
     Attributes:
         deltas: ``stage_name -> signed delta`` mapping for every
             non-manual stage participating in the current cycle.
+            Wrapped in a read-only ``MappingProxyType`` view at
+            construction so consumers cannot mutate the plan in place.
 
     """
 
-    deltas: Mapping[str, int]
+    deltas: Mapping[str, int] = attrs.field(converter=_read_only_int_map)

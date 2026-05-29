@@ -88,7 +88,26 @@ class StuckPlanLedger:
             pipeline_name: Pipeline tag for the detector's structured
                 log and Prometheus labels.
 
+        Raises:
+            ValueError: If ``value`` is negative. The per-stage stuck
+                counter is monotonic -- the Grow phase only ever resets
+                it to ``0`` or advances it by ``+1`` -- so a negative
+                value signals a Grow-phase accounting defect. Rejecting
+                it at the single write path stops a negative counter
+                from being stored or forwarded to the detector's
+                structured log / Prometheus metrics; the downstream
+                post-cycle monotonicity invariant would otherwise raise
+                ``SchedulerInvariantError`` a phase later, further from
+                the offending caller.
+
         """
+        if value < 0:
+            msg = (
+                f"StuckPlanLedger.record: refusing to write negative stuck-cycle counter "
+                f"{value} for stage {stage_name!r} (pipeline {pipeline_name!r}); the per-stage "
+                f"counter is monotonic and must never go below zero."
+            )
+            raise ValueError(msg)
         self._counters[stage_name] = value
         self.detector.update(
             stage_name=stage_name,

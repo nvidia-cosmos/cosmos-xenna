@@ -467,9 +467,13 @@ Detects pathological stages whose intent stays non-zero but never
 satisfied for `stuck_plan_detection_cycles` cycles (typically because
 the cluster is full and donor fallback is exhausted). Lower the
 detection threshold to trip the operator alert sooner.
-`skip_cycle_on_allocation_error` controls whether the Phase C
-allocation-failure absorb path skips the rest of the cycle or
-re-raises.
+`skip_cycle_on_allocation_error` is a cluster-wide switch governing
+the allocation-failure absorb-vs-re-raise behavior on every
+worker-add path — the manual grow path (Phase A), floor enforcement
+(Phase B), and saturation grow (Phase C) — not Phase C alone. When
+`True`, an absorbed `AllocationError` skips the rest of the cycle and
+the next cycle re-evaluates against any freed capacity; when `False`,
+it re-raises so the failure surfaces immediately.
 
 - `specs.py` fields:
   `SaturationAwareConfig.stuck_plan_detection_cycles`,
