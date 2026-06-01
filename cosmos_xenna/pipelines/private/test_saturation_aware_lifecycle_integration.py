@@ -163,6 +163,9 @@ def _build_scheduler(
             min_data_points=min_data_points,
             saturated_streak_min_cycles=saturated_streak_min_cycles,
             over_provisioned_streak_min_cycles=over_provisioned_streak_min_cycles,
+            # Bind the self-shrink gate to the same streak so Phase D fires
+            # at over_provisioned_streak_min_cycles (the helper's contract).
+            over_provisioned_shrink_streak_min_cycles=over_provisioned_streak_min_cycles,
             stabilization_window_cycles_up=stabilization_window_cycles_up,
             stabilization_window_cycles_down=stabilization_window_cycles_down,
             setup_phase_quiescence_enabled=quiescence_enabled,

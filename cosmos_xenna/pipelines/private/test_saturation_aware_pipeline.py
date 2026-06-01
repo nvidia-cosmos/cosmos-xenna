@@ -34,6 +34,7 @@ the ``_advance_cycle`` helper, which models the scheduler executing
 exactly the recommendation.
 """
 
+import attrs
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.phases.intent.stage_decision_pipeline import StageDecisionPipeline
@@ -44,6 +45,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.state.stage_runtime import (
     StageRuntimeState,
     StageState,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.state.stage_topology import StageTopologyContext
 from cosmos_xenna.pipelines.private.scheduling_py.thresholds.auto_thresholds import _resolve_auto_thresholds
 from cosmos_xenna.pipelines.private.specs import SaturationAwareStageConfig
 
@@ -214,10 +216,12 @@ class TestSaturatedScaleUpPath:
 
 
 class TestOverProvisionedShrinkPath:
-    """OVER_PROVISIONED needs streak >= 10 (default) before shrink fires."""
+    """Proactive self-shrink needs streak >= over_provisioned_shrink_streak_min_cycles before it fires."""
 
     def test_shrink_fires_after_window_and_transitions_mode(self, cfg: SaturationAwareStageConfig) -> None:
-        """10 consecutive OVER_PROVISIONED cycles -> shrink fires -> ACQUIRING flips to TRACKING."""
+        """10 consecutive OVER_PROVISIONED cycles -> self-shrink fires -> ACQUIRING flips to TRACKING."""
+        # Self-shrink keys on its own gate (default 100); pin it to 10 to keep the window short.
+        cfg = attrs.evolve(cfg, over_provisioned_shrink_streak_min_cycles=10)
         state = _fresh_state(cfg)
         # Walk through 9 OVER_PROVISIONED cycles -> no fire yet.
         for _ in range(9):
@@ -422,8 +426,10 @@ class TestFullLifecycleTrace:
         warmup tax), so 10 consecutive cycles cleanly accumulate the
         streak and fire on the 10th.
         """
+        # Self-shrink keys on its own gate (default 100); pin it to 10 to keep the window short.
+        cfg = attrs.evolve(cfg, over_provisioned_shrink_streak_min_cycles=10)
         state = _fresh_state(cfg)
-        # 9 cycles of OVER_PROVISIONED with streak < 10 -- no shrink yet.
+        # 9 cycles of OVER_PROVISIONED with streak < 10 (shrink gate) -> no shrink yet.
         for _ in range(9):
             delta = _advance_cycle(
                 state,
@@ -480,3 +486,48 @@ class TestColdStartZeroActorsDoesNotResetGrowthMode:
         assert delta == 0
         assert state.growth.mode is GrowthMode.TRACKING
         assert state.growth.streak == 1
+
+
+class TestBottleneckPromotionThroughPipeline:
+    """The pipeline forwards ``topology.is_bottleneck`` into the classifier.
+
+    Drives the masked-bottleneck regime (slot-pinned ratio + drained
+    queue -> low pressure) and pins that an engaged bottleneck is held
+    SATURATED while the identical signal without the marker demotes to
+    NORMAL. SATURATED keeps the stage growable; NORMAL freezes it.
+    """
+
+    def test_engaged_bottleneck_held_saturated(self, cfg: SaturationAwareStageConfig) -> None:
+        """is_bottleneck=True holds the masked-bottleneck signal SATURATED past the fire-gate streak."""
+        state = _fresh_state(cfg)
+        pipeline = StageDecisionPipeline()
+        # slots_empty_ratio = 2/20 = 0.10 (slot-pinned, below saturation 0.15);
+        # drained queue -> low pressure -> would demote without the override.
+        for _ in range(cfg.saturated_streak_min_cycles + 1):
+            pipeline.compute_recommendation(
+                stage_state=state,
+                num_used_slots=18,
+                num_empty_slots=2,
+                input_queue_depth=0,
+                current_workers=2,
+                config=cfg,
+                topology=StageTopologyContext(engaged=True, is_bottleneck=True),
+            )
+        assert state.classifier.state is StageState.SATURATED
+        assert state.classifier.streak >= cfg.saturated_streak_min_cycles
+
+    def test_non_bottleneck_demotes_to_normal(self, cfg: SaturationAwareStageConfig) -> None:
+        """The identical signal without the bottleneck marker demotes to NORMAL."""
+        state = _fresh_state(cfg)
+        pipeline = StageDecisionPipeline()
+        for _ in range(cfg.saturated_streak_min_cycles + 1):
+            pipeline.compute_recommendation(
+                stage_state=state,
+                num_used_slots=18,
+                num_empty_slots=2,
+                input_queue_depth=0,
+                current_workers=2,
+                config=cfg,
+                topology=StageTopologyContext(),
+            )
+        assert state.classifier.state is StageState.NORMAL

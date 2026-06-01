@@ -322,7 +322,12 @@ def _cfg(
     saturated_streak_min: int = 2,
     over_provisioned_streak_min: int = 30,
 ) -> SaturationAwareStageConfig:
-    """Stage config with explicit thresholds and stabilization windows."""
+    """Stage config with explicit thresholds and stabilization windows.
+
+    Binds the self-shrink gate to ``over_provisioned_streak_min`` so these
+    stabilization-window tests fire Phase D at that streak; the self-shrink
+    gate (not the donor-maturity gate) drives proactive shrink.
+    """
     return SaturationAwareStageConfig(
         saturation_threshold=0.15,
         activation_threshold=0.05,
@@ -330,6 +335,7 @@ def _cfg(
         stabilization_window_cycles_down=window_down,
         saturated_streak_min_cycles=saturated_streak_min,
         over_provisioned_streak_min_cycles=over_provisioned_streak_min,
+        over_provisioned_shrink_streak_min_cycles=over_provisioned_streak_min,
     )
 
 
