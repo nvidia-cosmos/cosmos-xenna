@@ -23,7 +23,7 @@ Default per-stage thresholds at the time of writing:
   saturated_critical_streak_min_cycles = 1
   saturated_streak_min_cycles = 2
   over_provisioned_streak_min_cycles = 10
-  aggressive_growth_max_per_cycle = 4
+  aggressive_growth_max_per_cycle = 32
   max_scale_down_fraction_per_cycle = 0.05
 """
 
@@ -138,7 +138,7 @@ class TestComputeDeltaCapacityDrivenGrow:
         assert result == 3
 
     def test_grow_clamped_by_aggressive_growth_max_per_cycle(self, cfg: SaturationAwareStageConfig) -> None:
-        """current=4, target=100 -> shortfall 96, clamped to aggressive_growth_max_per_cycle (4)."""
+        """current=4, target=100 -> shortfall 96, clamped to aggressive_growth_max_per_cycle (32)."""
         result = compute_delta(
             StageState.SATURATED_CRITICAL,
             GrowthMode.ACQUIRING,

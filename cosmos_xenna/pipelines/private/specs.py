@@ -568,7 +568,7 @@ class SaturationAwareStageConfig:
     # Hard cap on the per-cycle additions any growth decision may produce.
     # Bounds the blast radius when the capacity target jumps far above
     # the current worker count (e.g. on a sudden burst of upstream load).
-    aggressive_growth_max_per_cycle: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
+    aggressive_growth_max_per_cycle: int = attrs.field(default=32, validator=attrs_utils.validate_positive_int)
 
     # Weight on the NEW sample in the EWMA recursion:
     #   smoothed = level * new + (1 - level) * prior

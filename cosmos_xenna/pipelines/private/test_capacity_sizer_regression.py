@@ -64,7 +64,7 @@ class TestStarvedCaptioningStageGrowsToCapacity:
         self,
         cfg: SaturationAwareStageConfig,
     ) -> None:
-        """current=1, target=51 -> shortfall 50, capped by aggressive_growth_max_per_cycle (4)."""
+        """current=1, target=51 -> shortfall 50, capped by aggressive_growth_max_per_cycle (32)."""
         delta = compute_delta(
             StageState.SATURATED_CRITICAL,
             GrowthMode.ACQUIRING,
