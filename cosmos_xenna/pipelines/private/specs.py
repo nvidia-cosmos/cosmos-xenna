@@ -574,10 +574,10 @@ class SaturationAwareStageConfig:
     #   smoothed = level * new + (1 - level) * prior
     # Higher values are more responsive (less smoothing);
     # lower values smooth more heavily.
-    # Default 0.20 gives ~3-cycle half-life.
+    # Default 0.35 gives ~1.6-cycle half-life.
     # 0.0 is rejected (would freeze the smoothed value forever).
     slots_empty_ratio_smoothing_level: float = attrs.field(
-        default=0.20,
+        default=0.35,
         validator=attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0)),
     )
 
@@ -608,7 +608,8 @@ class SaturationAwareStageConfig:
     # ready snapshot, its slot samples are excluded from per-stage averages
     # until this many seconds elapse. This keeps freshly-ready actors from
     # biasing the EWMA while the dispatcher is still filling their queues.
-    worker_warmup_measurement_grace_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
+    # Default 30.0.
+    worker_warmup_measurement_grace_s: float = attrs.field(default=30.0, validator=attrs.validators.ge(0.0))
     # Donor warmup grace: after a worker first appears in the ready
     # snapshot, it is excluded from Phase D and saturation-donor victim
     # pools until this many seconds elapse.

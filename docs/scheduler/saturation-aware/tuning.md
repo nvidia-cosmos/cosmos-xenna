@@ -106,7 +106,7 @@ cycle. `max_workers` clamps Phase C grow. See
 
 | Field | Default | When to adjust |
 |---|---|---|
-| `worker_warmup_measurement_grace_s` | `60.0 s` | Increase when a stage's actor `setup()` is consistently slow (large model load, lengthy initialisation). |
+| `worker_warmup_measurement_grace_s` | `30.0 s` | Increase when a stage's actor `setup()` is consistently slow (large model load, lengthy initialisation). Decrease toward `20 s` for a known bottleneck whose first worker saturates within ~1 min, so the first scale-up is not delayed by the exclusion window. |
 | `donor_warmup_grace_s` | `180.0 s` | Same trigger; donor grace must `>= worker_warmup_measurement_grace_s` (cross-field validator). |
 
 Workers younger than these windows are excluded from EWMA

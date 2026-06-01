@@ -63,7 +63,7 @@ Three facts drive every design decision below.
    same downstream queue.
 
 2. **Warm GPU state is expensive.** A wrong scale-down costs a
-   `worker_warmup_measurement_grace_s` window (60 s default) of
+   `worker_warmup_measurement_grace_s` window (30 s default) of
    throughput while the replacement actor reloads its model.
    Decisions must err on the side of keeping warm capacity warm.
 
