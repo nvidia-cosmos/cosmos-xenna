@@ -19,9 +19,10 @@ Slot-pin gate selects the candidate zone from the smoothed
 slots-empty ratio; the smoothed backlog-time pressure then
 demotes the candidate when it disagrees with the queue evidence
 (SATURATED / SATURATED_CRITICAL require matching pressure;
-OVER_PROVISIONED demotes to NORMAL when pressure is high). Drained
-queue + idle slots resolves to OVER_PROVISIONED under the same
-demotion gate. See
+OVER_PROVISIONED demotes to NORMAL when pressure is high). An
+engaged pipeline bottleneck overrides the low-pressure SATURATED
+demotion and holds SATURATED. Drained queue + idle slots resolves
+to OVER_PROVISIONED under the same demotion gate. See
 ``docs/scheduler/saturation-aware/`` for the algorithm.
 """
 
@@ -39,6 +40,7 @@ def classify(
     activation_threshold: float,
     config: SaturationAwareStageConfig,
     pressure_ewma: float | None = None,
+    is_bottleneck: bool = False,
 ) -> StageState:
     """Classify a stage's current cycle.
 
@@ -74,6 +76,8 @@ def classify(
         saturation_boundary *= 1.0 + config.saturation_deadband_pct
     if slots_empty_ratio_ewma < saturation_boundary:
         if pressure_ewma is None or pressure_ewma > config.pressure_saturation_threshold:
+            return StageState.SATURATED
+        if is_bottleneck:
             return StageState.SATURATED
         return StageState.NORMAL
 

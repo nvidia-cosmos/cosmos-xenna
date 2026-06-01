@@ -1054,6 +1054,7 @@ class TestConfigWiringMetaCoverage:
         "saturated_streak_min_cycles",
         "saturated_critical_streak_min_cycles",
         "over_provisioned_streak_min_cycles",
+        "over_provisioned_shrink_streak_min_cycles",
         "aggressive_growth_max_per_cycle",
         "slots_empty_ratio_smoothing_level",
         "stabilization_window_cycles_up",

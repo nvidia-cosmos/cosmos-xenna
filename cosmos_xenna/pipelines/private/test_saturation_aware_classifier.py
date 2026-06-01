@@ -457,6 +457,72 @@ class TestPressureNormalThresholdStrictness:
         assert result is StageState.NORMAL
 
 
+class TestBottleneckSaturationProtection:
+    """``is_bottleneck`` holds SATURATED on the low-pressure slot-pinned branch.
+
+    The engaged bottleneck is slot-pinned but its queue pressure is
+    capped by downstream backpressure; without the override it would
+    demote to NORMAL and never grow. The override is scoped to the
+    slot-pinned branch only.
+    """
+
+    def test_low_pressure_bottleneck_holds_saturated(self, cfg: SaturationAwareStageConfig) -> None:
+        """Slot-pinned + low pressure + is_bottleneck -> SATURATED (not demoted)."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=0.10,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=cfg.pressure_saturation_threshold,
+            is_bottleneck=True,
+        )
+        assert result is StageState.SATURATED
+
+    def test_low_pressure_non_bottleneck_demotes_to_normal(self, cfg: SaturationAwareStageConfig) -> None:
+        """Identical slot-pinned + low-pressure inputs without the override -> NORMAL (baseline)."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=0.10,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=cfg.pressure_saturation_threshold,
+            is_bottleneck=False,
+        )
+        assert result is StageState.NORMAL
+
+    def test_override_does_not_alter_critical_gate(self, cfg: SaturationAwareStageConfig) -> None:
+        """The CRITICAL slot-pin gate is unaffected by is_bottleneck."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=0.0,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=None,
+            is_bottleneck=True,
+        )
+        assert result is StageState.SATURATED_CRITICAL
+
+    def test_override_does_not_promote_idle_bottleneck(self, cfg: SaturationAwareStageConfig) -> None:
+        """An idle (over-provisioned-zone) bottleneck is not forced to SATURATED."""
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=cfg.over_provisioned_threshold + 0.1,
+            prev_state=StageState.NORMAL,
+            pressure_ewma=cfg.pressure_normal_threshold,
+            is_bottleneck=True,
+        )
+        assert result is StageState.OVER_PROVISIONED
+
+    def test_override_does_not_extend_saturation_deadband(self, cfg: SaturationAwareStageConfig) -> None:
+        """Above the saturation deadband the slot-pin branch is not taken, so the override does not apply."""
+        ratio_above_deadband = cfg.saturation_threshold * (1.0 + cfg.saturation_deadband_pct) + 1e-6
+        result = _classify(
+            cfg,
+            slots_empty_ratio_ewma=ratio_above_deadband,
+            prev_state=StageState.SATURATED,
+            pressure_ewma=cfg.pressure_saturation_threshold,
+            is_bottleneck=True,
+        )
+        assert result is StageState.NORMAL
+
+
 class TestPressureColdStartFallback:
     """``pressure_ewma=None`` preserves slot-only behaviour for the cycle."""
 

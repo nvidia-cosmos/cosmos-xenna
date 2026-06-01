@@ -139,7 +139,7 @@ def compute_heterogeneity_ratio(
     logger.info(
         f"high cluster heterogeneity (ratio={ratio:.1f} for "
         f"{state.streak_cycles} cycles); consider raising "
-        f"over_provisioned_streak_min_cycles for stage "
+        f"over_provisioned_shrink_streak_min_cycles for stage "
         f"{bottleneck_name!r} (bottleneck D={bottleneck_score:.1f}s) "
         f"to give it more recovery margin"
     )

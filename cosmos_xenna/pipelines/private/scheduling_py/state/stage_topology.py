@@ -36,7 +36,7 @@ import attrs
 class StageTopologyContext:
     """Per-stage projection of the cycle's bottleneck topology.
 
-    Two booleans capture everything a consumer (the per-stage
+    Three booleans capture everything a consumer (the per-stage
     decision pipeline, the structured DEBUG / INFO log lines) needs
     to know about how the current stage relates to the cluster-wide
     bottleneck this cycle. The value object is constructed at the
@@ -52,11 +52,16 @@ class StageTopologyContext:
             engaged bottleneck stage. Always ``False`` when
             ``engaged`` is ``False``, and always ``False`` for the
             bottleneck stage itself.
+        is_bottleneck: ``True`` when the owning stage is itself the
+            engaged bottleneck. Always ``False`` when ``engaged`` is
+            ``False``; mutually exclusive with
+            ``is_upstream_of_bottleneck``.
 
     """
 
     engaged: bool = False
     is_upstream_of_bottleneck: bool = False
+    is_bottleneck: bool = False
 
 
 def project_stage_topology(
@@ -77,10 +82,12 @@ def project_stage_topology(
     - ``bottleneck_stage_name`` is not in ``stage_names`` (stale
       identity after a stage-list change between cycles).
 
-    Otherwise returns ``StageTopologyContext(engaged=True,
-    is_upstream_of_bottleneck=stage_index <
-    bottleneck_index)``. The bottleneck stage itself observes
-    ``is_upstream_of_bottleneck=False`` because ``<`` is strict.
+    Otherwise returns an engaged context with
+    ``is_upstream_of_bottleneck=stage_index < bottleneck_index`` and
+    ``is_bottleneck=stage_index == bottleneck_index``. The two
+    relational flags are mutually exclusive: the bottleneck stage
+    observes ``is_upstream_of_bottleneck=False`` (``<`` is strict)
+    and ``is_bottleneck=True``.
 
     Args:
         stage_index: DAG index of the consumer stage.
@@ -112,6 +119,7 @@ def project_stage_topology(
     return StageTopologyContext(
         engaged=True,
         is_upstream_of_bottleneck=stage_index < bottleneck_index,
+        is_bottleneck=stage_index == bottleneck_index,
     )
 
 

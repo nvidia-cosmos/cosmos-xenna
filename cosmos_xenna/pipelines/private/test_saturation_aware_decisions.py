@@ -22,7 +22,8 @@ future tuning change surfaces as a precise test failure.
 Default per-stage thresholds at the time of writing:
   saturated_critical_streak_min_cycles = 1
   saturated_streak_min_cycles = 2
-  over_provisioned_streak_min_cycles = 10
+  over_provisioned_streak_min_cycles = 10            (donor maturity)
+  over_provisioned_shrink_streak_min_cycles = 100    (proactive self-shrink)
   aggressive_growth_max_per_cycle = 32
   max_scale_down_fraction_per_cycle = 0.05
 """
@@ -94,15 +95,25 @@ class TestShouldFireActionScaleUp:
 
 
 class TestShouldFireActionScaleDown:
-    """Conservative scale-down threshold (OVER_PROVISIONED = 10 by default)."""
+    """Conservative self-shrink threshold (OVER_PROVISIONED = 100 by default)."""
 
     def test_over_provisioned_does_not_fire_below_threshold(self, cfg: SaturationAwareStageConfig) -> None:
-        """OVER_PROVISIONED at streak 9 < min 10 -> hold; protects against premature shrink."""
-        assert should_fire_action(StageState.OVER_PROVISIONED, streak=9, config=cfg) is False
+        """OVER_PROVISIONED at streak 99 < self-shrink min 100 -> hold; protects against premature shrink."""
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=99, config=cfg) is False
 
     def test_over_provisioned_fires_at_threshold(self, cfg: SaturationAwareStageConfig) -> None:
-        """OVER_PROVISIONED at streak == min cycles is the trigger boundary."""
-        assert should_fire_action(StageState.OVER_PROVISIONED, streak=10, config=cfg) is True
+        """OVER_PROVISIONED at streak == self-shrink min cycles is the trigger boundary."""
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=100, config=cfg) is True
+
+    def test_self_shrink_keys_on_shrink_field_not_donor_maturity(self) -> None:
+        """Proactive self-shrink reads over_provisioned_shrink_streak_min_cycles, not the donor gate."""
+        cfg = SaturationAwareStageConfig(
+            over_provisioned_streak_min_cycles=10,
+            over_provisioned_shrink_streak_min_cycles=50,
+        )
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=10, config=cfg) is False
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=49, config=cfg) is False
+        assert should_fire_action(StageState.OVER_PROVISIONED, streak=50, config=cfg) is True
 
 
 class TestShouldFireActionInputValidation:

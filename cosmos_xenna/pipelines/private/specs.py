@@ -557,9 +557,16 @@ class SaturationAwareStageConfig:
     saturated_streak_min_cycles: int = attrs.field(default=2, validator=attrs_utils.validate_positive_int)
     # Cycles in SATURATED_CRITICAL before burst delta is applied.
     saturated_critical_streak_min_cycles: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
-    # Cycles a stage must remain OVER_PROVISIONED before scale-down is applied.
-    # Cross-field: must dominate saturated_streak_min_cycles for asymmetric stabilization.
+    # Cycles OVER_PROVISIONED before the stage is eligible as a cross-stage
+    # donor (donor-maturity gate; read by donor.policy and anti-flap only).
+    # Cross-field: must dominate saturated_streak_min_cycles.
     over_provisioned_streak_min_cycles: int = attrs.field(default=10, validator=attrs_utils.validate_positive_int)
+    # Cycles OVER_PROVISIONED before the stage shrinks its own workers
+    # (self-shrink gate; read by decisions.should_fire_action). Larger than
+    # the donor gate: donation reclaims toward the bottleneck first.
+    over_provisioned_shrink_streak_min_cycles: int = attrs.field(
+        default=100, validator=attrs_utils.validate_positive_int
+    )
 
     # When True, HOLD blocks SATURATED grow during post-shrink stabilization.
     # When False, HOLD has no effect and the stage grows whenever the
@@ -774,12 +781,33 @@ class SaturationAwareStageConfig:
             )
             raise ValueError(msg)
 
-        # Streak ordering - shrink streak must dominate growth streak.
+        # Streak ordering - donor-maturity streak must dominate growth streak.
         if self.over_provisioned_streak_min_cycles <= self.saturated_streak_min_cycles:
             msg = (
                 f"over_provisioned_streak_min_cycles ({self.over_provisioned_streak_min_cycles}) must be "
                 f"strictly > saturated_streak_min_cycles ({self.saturated_streak_min_cycles}) "
                 f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # Self-shrink streak must also dominate the growth streak (same
+        # asymmetric-stabilization rationale as the donor-maturity gate).
+        if self.over_provisioned_shrink_streak_min_cycles <= self.saturated_streak_min_cycles:
+            msg = (
+                f"over_provisioned_shrink_streak_min_cycles ({self.over_provisioned_shrink_streak_min_cycles}) "
+                f"must be strictly > saturated_streak_min_cycles ({self.saturated_streak_min_cycles}) "
+                f"(asymmetric stabilization)"
+            )
+            raise ValueError(msg)
+
+        # A stage must reach donor-candidate maturity before it is allowed
+        # to self-shrink: donation is the primary reclamation path, proactive
+        # self-shrink is the slow safety net that fires strictly later.
+        if self.over_provisioned_shrink_streak_min_cycles < self.over_provisioned_streak_min_cycles:
+            msg = (
+                f"over_provisioned_shrink_streak_min_cycles ({self.over_provisioned_shrink_streak_min_cycles}) "
+                f"must be >= over_provisioned_streak_min_cycles ({self.over_provisioned_streak_min_cycles}) "
+                f"so a stage becomes a cross-stage donor candidate before it self-shrinks"
             )
             raise ValueError(msg)
 
@@ -1069,8 +1097,9 @@ class SaturationAwareConfig:
     # Ratio of ``max(D_k) / min(D_k)`` (Forced-Flow service demand)
     # above which the cluster is considered heterogeneous enough that
     # the dominant bottleneck stage may benefit from a longer
-    # ``over_provisioned_streak_min_cycles`` to absorb measurement
-    # noise. Default 5.0 -- a homogeneous pipeline has a ratio of 1.0,
+    # ``over_provisioned_shrink_streak_min_cycles`` to absorb
+    # measurement noise before self-shrinking. Default 5.0; a
+    # homogeneous pipeline has a ratio of 1.0,
     # so the threshold must be strictly greater than 1.0. Values
     # between 3.0 and 10.0 are typical: lower values fire the tuning
     # log on mildly skewed pipelines (CPU prep + GPU caption);
@@ -1191,12 +1220,14 @@ class SaturationAwareConfig:
                 config they must dominate.
         """
         all_stage_configs = [self.stage_defaults, *self.per_stage_overrides.values(), *spec_overrides]
-        longest_shrink_streak = max(cfg.over_provisioned_streak_min_cycles for cfg in all_stage_configs)
-        if self.cross_stage_donor_anti_flap_cycles < longest_shrink_streak:
+        # Anti-flap governs donation, so it must dominate the donor-maturity
+        # gate (over_provisioned_streak_min_cycles), not the self-shrink gate.
+        longest_donor_maturity_streak = max(cfg.over_provisioned_streak_min_cycles for cfg in all_stage_configs)
+        if self.cross_stage_donor_anti_flap_cycles < longest_donor_maturity_streak:
             msg = (
                 f"cross_stage_donor_anti_flap_cycles ({self.cross_stage_donor_anti_flap_cycles}) must be "
                 f">= the longest over_provisioned_streak_min_cycles across all stage configs "
-                f"({longest_shrink_streak}); otherwise the anti-flap safeguard is weaker than the "
+                f"({longest_donor_maturity_streak}); otherwise the anti-flap safeguard is weaker than the "
                 f"streak it must dominate."
             )
             raise ValueError(msg)

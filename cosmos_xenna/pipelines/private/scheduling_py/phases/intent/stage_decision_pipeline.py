@@ -306,6 +306,7 @@ class ClassifierTransitionLogger:
         should_fire: bool,
         delta: int,
         topology: StageTopologyContext,
+        promoted: bool = False,
     ) -> None:
         """Emit DEBUG trace; emit INFO if the classifier state changed."""
         logger.debug(
@@ -317,7 +318,9 @@ class ClassifierTransitionLogger:
             f"new_state={new_classifier_state.name} "
             f"streak={stage_state.classifier.streak} "
             f"bottleneck_engaged={topology.engaged} "
+            f"is_bottleneck={topology.is_bottleneck} "
             f"upstream_of_bottleneck={topology.is_upstream_of_bottleneck} "
+            f"promoted={promoted} "
             f"should_fire={should_fire} "
             f"delta={delta}"
         )
@@ -327,8 +330,9 @@ class ClassifierTransitionLogger:
                 f"{prev_classifier_state.name} -> {new_classifier_state.name} "
                 f"(pressure_ewma={pressure_ewma:.3f}, slots_empty_ratio_ewma={classifier_input:.3f}, "
                 f"queue={input_queue_depth}, streak={stage_state.classifier.streak}, "
-                f"bottleneck_engaged={topology.engaged}, "
-                f"upstream_of_bottleneck={topology.is_upstream_of_bottleneck}, delta={delta})"
+                f"bottleneck_engaged={topology.engaged}, is_bottleneck={topology.is_bottleneck}, "
+                f"upstream_of_bottleneck={topology.is_upstream_of_bottleneck}, "
+                f"promoted={promoted}, delta={delta})"
             )
 
 
@@ -491,7 +495,24 @@ class StageDecisionPipeline:
             saturation_threshold=stage_state.classifier.resolved_thresholds.saturation_threshold,
             activation_threshold=stage_state.classifier.resolved_thresholds.activation_threshold,
             config=config,
+            is_bottleneck=topology.is_bottleneck,
         )
+        # Promotion detection for the structured log: re-run classify
+        # without the override. promoted is True only when the override
+        # flipped the verdict (NORMAL to SATURATED). At most one stage per
+        # cycle is the engaged bottleneck, so the extra call is negligible.
+        promoted = False
+        if topology.is_bottleneck and new_classifier_state == StageState.SATURATED:
+            baseline_state = classify(
+                slots_empty_ratio_ewma=classifier_input,
+                pressure_ewma=pressure_ewma,
+                prev_state=prev_classifier_state,
+                saturation_threshold=stage_state.classifier.resolved_thresholds.saturation_threshold,
+                activation_threshold=stage_state.classifier.resolved_thresholds.activation_threshold,
+                config=config,
+                is_bottleneck=False,
+            )
+            promoted = baseline_state == StageState.NORMAL
         stage_state.classifier.streak = update_streak(
             stage_state.classifier.state,
             stage_state.classifier.streak,
@@ -526,6 +547,7 @@ class StageDecisionPipeline:
             should_fire=outcome.should_fire,
             delta=delta,
             topology=topology,
+            promoted=promoted,
         )
 
         stage_state.growth.prev_workers = current_workers

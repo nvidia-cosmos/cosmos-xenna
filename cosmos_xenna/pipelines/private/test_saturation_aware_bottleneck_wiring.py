@@ -18,9 +18,9 @@
 The intent phase projects the cycle-wide
 :class:`BottleneckIdentity` into a per-stage
 :class:`StageTopologyContext` (``engaged`` +
-``is_upstream_of_bottleneck`` booleans) at the call site of
-:meth:`StageDecisionPipeline.compute_recommendation`. No per-stage
-mirror is stored on the runtime state.
+``is_upstream_of_bottleneck`` + ``is_bottleneck`` booleans) at the
+call site of :meth:`StageDecisionPipeline.compute_recommendation`.
+No per-stage mirror is stored on the runtime state.
 
 These tests pin the projection contract:
 
@@ -29,8 +29,9 @@ These tests pin the projection contract:
   * Stale identity (bottleneck name no longer in the stage list)
     also collapses to the default.
   * Engaged identity makes every strictly-upstream stage observe
-    ``is_upstream_of_bottleneck=True``; the bottleneck itself and
-    every downstream stage observe ``False``.
+    ``is_upstream_of_bottleneck=True``; the bottleneck observes
+    ``is_bottleneck=True``; downstream stages observe ``False`` for
+    both relational flags.
 """
 
 import pytest
@@ -86,7 +87,7 @@ class TestProjectStageTopologyEngaged:
     """An engaged identity partitions the pipeline into upstream / not-upstream."""
 
     def test_upstream_stage_observes_is_upstream_true(self) -> None:
-        """A stage with strictly smaller DAG index than the bottleneck is upstream."""
+        """A stage with strictly smaller DAG index than the bottleneck is upstream, not the bottleneck."""
         topology = project_stage_topology(
             stage_index=0,
             bottleneck_engaged=True,
@@ -97,10 +98,11 @@ class TestProjectStageTopologyEngaged:
         assert topology == StageTopologyContext(
             engaged=True,
             is_upstream_of_bottleneck=True,
+            is_bottleneck=False,
         )
 
-    def test_bottleneck_stage_itself_is_not_upstream(self) -> None:
-        """The bottleneck stage observes ``is_upstream_of_bottleneck=False``."""
+    def test_bottleneck_stage_observes_is_bottleneck_true(self) -> None:
+        """The bottleneck stage observes ``is_bottleneck=True`` and ``is_upstream_of_bottleneck=False``."""
         topology = project_stage_topology(
             stage_index=2,
             bottleneck_engaged=True,
@@ -111,10 +113,11 @@ class TestProjectStageTopologyEngaged:
         assert topology == StageTopologyContext(
             engaged=True,
             is_upstream_of_bottleneck=False,
+            is_bottleneck=True,
         )
 
-    def test_downstream_stage_is_not_upstream(self) -> None:
-        """A stage with strictly larger DAG index than the bottleneck is not upstream."""
+    def test_downstream_stage_is_neither_upstream_nor_bottleneck(self) -> None:
+        """A stage with strictly larger DAG index than the bottleneck is neither upstream nor the bottleneck."""
         topology = project_stage_topology(
             stage_index=3,
             bottleneck_engaged=True,
@@ -125,6 +128,7 @@ class TestProjectStageTopologyEngaged:
         assert topology == StageTopologyContext(
             engaged=True,
             is_upstream_of_bottleneck=False,
+            is_bottleneck=False,
         )
 
     def test_first_stage_is_upstream_when_second_stage_is_bottleneck(self) -> None:

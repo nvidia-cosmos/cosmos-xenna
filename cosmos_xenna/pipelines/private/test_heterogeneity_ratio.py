@@ -254,7 +254,7 @@ class TestComputeHeterogeneityRatio:
         assert len(info_logs) == 1, f"expected exactly one INFO log line, got {[r.message for r in info_logs]}"
         pattern = re.compile(
             r"high cluster heterogeneity \(ratio=\d+\.\d+ for \d+ cycles\); "
-            r"consider raising over_provisioned_streak_min_cycles for stage "
+            r"consider raising over_provisioned_shrink_streak_min_cycles for stage "
             r".+? \(bottleneck D=\d+\.\d+s\) to give it more recovery margin"
         )
         assert pattern.fullmatch(info_logs[0].message), (

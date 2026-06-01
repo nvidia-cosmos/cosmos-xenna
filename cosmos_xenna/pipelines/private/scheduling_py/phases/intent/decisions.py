@@ -54,10 +54,9 @@ def should_fire_action(
 ) -> bool:
     """Return whether a sustained state has reached its action threshold.
 
-    Asymmetric thresholds: scale-up (SATURATED,
-    SATURATED_CRITICAL) fires after few cycles; scale-down
-    (OVER_PROVISIONED) requires a long sustained signal. NORMAL
-    is the no-action zone.
+    Asymmetric thresholds: scale-up (SATURATED, SATURATED_CRITICAL)
+    fires after few cycles; proactive self-shrink (OVER_PROVISIONED)
+    waits over_provisioned_shrink_streak_min_cycles. NORMAL is the no-action zone.
 
     Raises:
         ValueError: ``streak`` is negative.
@@ -71,7 +70,7 @@ def should_fire_action(
     if state == StageState.SATURATED:
         return streak >= config.saturated_streak_min_cycles
     if state == StageState.OVER_PROVISIONED:
-        return streak >= config.over_provisioned_streak_min_cycles
+        return streak >= config.over_provisioned_shrink_streak_min_cycles
     return False
 
 

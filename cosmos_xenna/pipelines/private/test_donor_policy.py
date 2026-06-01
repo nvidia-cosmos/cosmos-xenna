@@ -258,6 +258,24 @@ class TestSaturationPolicyEligibilityFilters:
         result = policy.filter_eligible_donors(context, _receiver(1, "B"))
         assert 0 not in result
 
+    def test_donor_maturity_gate_independent_of_self_shrink_streak(self) -> None:
+        """Donor eligibility keys on over_provisioned_streak_min_cycles, not the longer self-shrink gate."""
+        stage_cfg = SaturationAwareStageConfig(
+            over_provisioned_streak_min_cycles=10,
+            over_provisioned_shrink_streak_min_cycles=100,
+        )
+        states = {
+            "A": _state("A", classifier_streak=10),  # mature donor, far below the self-shrink gate
+            "B": _state("B"),
+            "C": _state("C"),
+        }
+        context = _make_context(
+            stage_states=states,
+            stage_configs={"A": stage_cfg, "B": stage_cfg, "C": stage_cfg},
+        )
+        policy = _saturation_policy()
+        assert 0 in policy.filter_eligible_donors(context, _receiver(1, "B"))
+
     def test_hold_growth_mode_excluded(self) -> None:
         policy = _saturation_policy()
         states = {

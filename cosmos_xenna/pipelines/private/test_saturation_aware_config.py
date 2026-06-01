@@ -182,11 +182,28 @@ class TestSaturationAwareStageConfigCrossFieldValidators:
             )
 
     def test_over_provisioned_streak_not_dominating_saturated_streak_is_rejected(self) -> None:
-        """Asymmetric stabilization requires the shrink streak to dominate the growth streak."""
+        """Asymmetric stabilization requires the donor-maturity streak to dominate the growth streak."""
         with pytest.raises(ValueError, match="strictly > saturated_streak_min_cycles"):
             SaturationAwareStageConfig(
                 saturated_streak_min_cycles=5,
                 over_provisioned_streak_min_cycles=5,
+            )
+
+    def test_self_shrink_streak_not_dominating_saturated_streak_is_rejected(self) -> None:
+        """The self-shrink streak must also dominate the growth streak."""
+        with pytest.raises(ValueError, match=r"over_provisioned_shrink_streak_min_cycles.*strictly > saturated"):
+            SaturationAwareStageConfig(
+                saturated_streak_min_cycles=2,
+                over_provisioned_shrink_streak_min_cycles=2,
+            )
+
+    def test_self_shrink_streak_below_donor_maturity_is_rejected(self) -> None:
+        """A stage must reach donor-candidate maturity before it is allowed to self-shrink."""
+        with pytest.raises(ValueError, match=r"over_provisioned_shrink_streak_min_cycles.*>= over_provisioned_streak"):
+            SaturationAwareStageConfig(
+                saturated_streak_min_cycles=2,
+                over_provisioned_streak_min_cycles=50,
+                over_provisioned_shrink_streak_min_cycles=10,
             )
 
     def test_stabilization_window_down_not_dominating_up_is_rejected(self) -> None:
