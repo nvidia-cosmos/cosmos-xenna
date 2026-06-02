@@ -37,6 +37,8 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -283,6 +285,57 @@ def _required_workers_for_stage(
     return max(Autoscaler.MIN_WORKERS_PER_STAGE, workers_for_inflight, workers_for_backlog)
 
 
+class _SchedulerAlgorithm(typing.Protocol):
+    """Per-cycle autoscaling algorithm consumed by :class:`Autoscaler`.
+
+    Both the Rust-backed ``FragmentationBasedAutoscaler`` and the pure-Python
+    ``SaturationAwareScheduler`` satisfy this surface.
+    """
+
+    def setup(self, problem: data_structures.Problem) -> None: ...
+
+    def update_with_measurements(self, time: float, measurements: data_structures.Measurements) -> None: ...
+
+    def autoscale(self, time: float, problem_state: data_structures.ProblemState) -> data_structures.Solution: ...
+
+
+def _effective_autoscale_interval_s(mode_specific: specs.StreamingSpecificSpec) -> float:
+    """Return the decision cadence in seconds for the selected scheduler."""
+    if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
+        return SaturationAwareConfig.resolve(mode_specific.saturation_aware).interval_s
+    return mode_specific.autoscale_interval_s
+
+
+def _make_scheduler_algorithm(
+    pipeline_spec: specs.PipelineSpec,
+    cluster_resources: resources.ClusterResources,
+    mode_specific: specs.StreamingSpecificSpec,
+) -> _SchedulerAlgorithm:
+    """Build and set up the autoscaling algorithm selected by ``mode_specific``.
+
+    ``FRAGMENTATION_BASED`` (default) returns the Rust solver; ``SATURATION_AWARE``
+    returns the pure-Python backlog-aware scheduler.
+    """
+    problem = _make_problem_from_pipeline_spec(pipeline_spec, cluster_resources)
+    algorithm: _SchedulerAlgorithm
+    if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
+        config = SaturationAwareConfig.resolve(mode_specific.saturation_aware)
+        stages = [typing.cast(specs.StageSpec, stage) for stage in pipeline_spec.stages]
+        algorithm = SaturationAwareScheduler(
+            config=config,
+            stage_names=tuple(stage.name(index) for index, stage in enumerate(stages)),
+            stage_batch_sizes=tuple(stage.stage.stage_batch_size for stage in stages),
+            stage_is_gpu=tuple(stage.stage.required_resources.gpus > 0 for stage in stages),
+        )
+    else:
+        algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
+            mode_specific.autoscale_speed_estimation_window_duration_s,
+            mode_specific.autoscale_speed_estimation_min_data_points,
+        )
+    algorithm.setup(problem)
+    return algorithm
+
+
 class Autoscaler:
     """Manages the autoscaling of pipeline stages in a streaming execution mode.
 
@@ -382,11 +435,9 @@ class Autoscaler:
         assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
-            mode_specific.autoscale_speed_estimation_window_duration_s,
-            mode_specific.autoscale_speed_estimation_min_data_points,
+        self._algorithm: _SchedulerAlgorithm = _make_scheduler_algorithm(
+            pipeline_spec, cluster_resources, mode_specific
         )
-        self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
@@ -448,7 +499,9 @@ class Autoscaler:
             )
         return data_structures.ProblemState(stages)
 
-    def start_autoscale_calculation(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
+    def start_autoscale_calculation(
+        self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool], upstream_queue_lens: list[int]
+    ) -> None:
         """Starts a new autoscaling calculation in a background thread.
 
         If a calculation is already in progress, this method does nothing.
@@ -456,6 +509,8 @@ class Autoscaler:
         Args:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths, used by
+                backlog-aware schedulers as the current per-stage queue depth.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
@@ -463,6 +518,8 @@ class Autoscaler:
             return
 
         self._autoscale_start_time = time.time()
+        if isinstance(self._algorithm, SaturationAwareScheduler):
+            self._algorithm.set_queue_snapshot(upstream_queue_lens)
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
@@ -921,7 +978,9 @@ def run_pipeline(
         typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
     ]
 
-    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
+    autoscale_rate_limiter = timing.RateLimitChecker(
+        1.0 / _effective_autoscale_interval_s(pipeline_spec.config.mode_specific)
+    )
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
     logger.debug("Starting main loop")
@@ -972,7 +1031,7 @@ def run_pipeline(
             # Handle scaling the actor pools.
             # This should get called on the first loop through.
             if autoscale_rate_limiter.can_call():
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones)
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones, upstream_queue_lens)
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools

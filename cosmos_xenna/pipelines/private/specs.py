@@ -28,6 +28,9 @@ import attrs
 from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.pipelines.private.continuous_wrapped_stage import ContinuousWrappedStage
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import (
+    SaturationAwareConfig as SaturationAwareConfig,
+)
 from cosmos_xenna.ray_utils import runtime_envs, stage
 from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface
 from cosmos_xenna.utils import approx, attrs_utils
@@ -65,6 +68,17 @@ class ExecutionMode(enum.Enum):
     # serving scenarios where requests arrive dynamically via an input source queue and results are
     # pushed to output a sink queue. Workers remain active indefinitely waiting for new requests.
     SERVING = 2
+
+
+class SchedulerKind(enum.StrEnum):
+    """Streaming-mode autoscaler selection.
+
+    ``FRAGMENTATION_BASED`` is the Rust-backed production default;
+    ``SATURATION_AWARE`` is the pure-Python backlog-aware scheduler.
+    """
+
+    FRAGMENTATION_BASED = "fragmentation_based"
+    SATURATION_AWARE = "saturation_aware"
 
 
 class Stage(abc.ABC, Generic[T, V]):
@@ -421,6 +435,13 @@ class StreamingSpecificSpec:
     # still applies). End-of-stage teardown bypasses the grace via the
     # ``stages_is_dones`` flag so final drain is never delayed.
     scale_down_grace_after_ready_s: float = 60.0
+    # Streaming-mode autoscaler selection. ``FRAGMENTATION_BASED`` (default) uses the
+    # Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python backlog-aware
+    # scheduler. Ignored in BATCH execution mode.
+    scheduler: SchedulerKind = SchedulerKind.FRAGMENTATION_BASED
+    # Tunables for the saturation-aware scheduler; consulted only when
+    # ``scheduler`` is ``SATURATION_AWARE``. ``None`` uses the defaults.
+    saturation_aware: SaturationAwareConfig | None = None
 
 
 @attrs.define
