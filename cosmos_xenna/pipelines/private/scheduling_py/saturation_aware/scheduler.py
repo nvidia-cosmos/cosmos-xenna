@@ -57,6 +57,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import 
     compute_floors,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.grace import WarmupGrace
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import ColdStartRampPolicy, StageRampInput
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.sizing import BacklogDemandPolicy, StageSnapshot
 from cosmos_xenna.utils import python_log as logger
 
@@ -75,19 +76,22 @@ class SaturationAwareScheduler:
         config: Operator tunables (cadence, catch-up cap, headroom, smoothing).
         stage_names: Canonical per-stage names in pipeline order.
         stage_batch_sizes: Per-stage input items consumed per batch.
-        stage_is_gpu: Whether each stage holds GPU workers (slower release).
+        stage_gpu_fractions: Per-worker GPU shape per stage (0.0 for CPU stages).
+            Drives the cold-start ramp (fractional-GPU stages only) and the
+            floor's slower release for GPU stages.
     """
 
     config: SaturationAwareConfig
     stage_names: tuple[str, ...]
     stage_batch_sizes: tuple[int, ...]
-    stage_is_gpu: tuple[bool, ...]
+    stage_gpu_fractions: tuple[float, ...]
     _estimator: PipelineRateEstimator = attrs.field(init=False)
     _floor_params: FloorParams = attrs.field(init=False)
     _floor_state: FloorState = attrs.field(init=False)
     _grace: WarmupGrace = attrs.field(init=False, factory=WarmupGrace)
     _worker_id_factory: WorkerIdFactory = attrs.field(init=False, factory=WorkerIdFactory)
     _demand: BacklogDemandPolicy = attrs.field(init=False)
+    _ramp: ColdStartRampPolicy = attrs.field(init=False)
     _problem: data_structures.Problem | None = attrs.field(init=False, default=None)
     _queue_snapshot: tuple[float, ...] = attrs.field(init=False, factory=tuple)
     _pending_measurements: queue.Queue[data_structures.Measurements] = attrs.field(init=False, factory=queue.Queue)
@@ -108,6 +112,7 @@ class SaturationAwareScheduler:
         )
         self._floor_state = FloorState.initial(len(self.stage_names))
         self._demand = BacklogDemandPolicy(config)
+        self._ramp = ColdStartRampPolicy(config)
 
     def setup(self, problem: data_structures.Problem) -> None:
         """Record the static problem; the solver needs it each cycle."""
@@ -156,6 +161,7 @@ class SaturationAwareScheduler:
         solution = run_fragmentation_autoscaler(
             self._problem, problem_state, Estimates(estimates), _OVERALLOCATION_TARGET, self._worker_id_factory
         )
+        self._apply_cold_start_ramp(solution, workers)
         floors = self._floors(workers, speeds, returns)
         self._protect(solution, workers, floors, time)
         return solution
@@ -189,6 +195,49 @@ class SaturationAwareScheduler:
             multipliers.append(result.multiplier)
         return estimates, speeds, returns, multipliers
 
+    def _apply_cold_start_ramp(self, solution: data_structures.Solution, workers: Sequence[int]) -> None:
+        """Trim cold-start over-spawn of not-yet-trusted fractional-GPU stages.
+
+        Caps each such stage's new-worker additions so the solver cannot fill
+        the cluster with sub-GPU workers before any throughput is measured,
+        which would fragment GPUs and starve whole-GPU stages. Mutates the
+        solution's ``new_workers`` in place via the native setters, logging each
+        stage it trims.
+        """
+        stages = list(solution.rust.stages)
+        changed = False
+        for index, stage in enumerate(stages):
+            new_workers = list(stage.new_workers)
+            if not new_workers:
+                continue
+            name = self.stage_names[index]
+            current = workers[index]
+            deleted = len(stage.deleted_workers)
+            samples = self._estimator.sample_count(name)
+            decision = self._ramp.decide(
+                StageRampInput(
+                    name=name,
+                    current_workers=current,
+                    deleted_count=deleted,
+                    proposed_post=current + len(new_workers) - deleted,
+                    sample_count=samples,
+                    gpu_fraction=self.stage_gpu_fractions[index],
+                )
+            )
+            if decision.keep_new is None or decision.keep_new >= len(new_workers):
+                continue
+            stage.new_workers = new_workers[: decision.keep_new]
+            changed = True
+            logger.info(
+                f"saturation-aware cold-start ramp: stage '{name}' capped new_workers "
+                f"{len(new_workers)} -> {decision.keep_new} (reason={decision.reason}, "
+                f"current={current}, cap_post={decision.cap}, "
+                f"samples={samples}/{self.config.speed_estimation_min_data_points}, "
+                f"gpu_fraction={self.stage_gpu_fractions[index]})"
+            )
+        if changed:
+            solution.rust.stages = stages
+
     def _floors(self, workers: Sequence[int], speeds: Sequence[float], returns: Sequence[float]) -> tuple[int, ...]:
         """Compute the per-stage scale-down floors."""
         queue_depths = self._queue_for_cycle(len(workers))
@@ -200,7 +249,7 @@ class SaturationAwareScheduler:
             chain=tuple(chain_values),
             stock_src=tuple(stock),
             batch_sizes=self.stage_batch_sizes,
-            is_gpu=self.stage_is_gpu,
+            is_gpu=tuple(fraction > 0.0 for fraction in self.stage_gpu_fractions),
         )
         result = compute_floors(inputs, self._floor_state, self._floor_params)
         self._floor_state = result.state

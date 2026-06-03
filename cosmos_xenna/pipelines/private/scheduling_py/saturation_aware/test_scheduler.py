@@ -20,6 +20,7 @@ through the native fragmentation solver. The pure control-law math lives in
 the chain/floor/grace/estimator unit tests.
 """
 
+import uuid
 from typing import cast
 
 import pytest
@@ -58,6 +59,40 @@ class _CpuStage(v1.Stage):
         return task
 
 
+class _GpuStage(v1.Stage):
+    """Minimal GPU pipeline stage with a configurable per-worker GPU fraction."""
+
+    def __init__(self, gpus: float) -> None:
+        self._gpus = gpus
+
+    @property
+    def stage_batch_size(self) -> int:
+        return 1
+
+    @property
+    def required_resources(self) -> v1.Resources:
+        return v1.Resources(cpus=1.0, gpus=self._gpus)
+
+    def setup(self, worker_metadata: object) -> None:
+        pass
+
+    def process_data(self, task: list[float]) -> list[float]:
+        return task
+
+
+def _gpu_cluster(num_gpus: int) -> resources.ClusterResources:
+    return resources.ClusterResources(
+        nodes={
+            "n0": resources.NodeResources(
+                used_cpus=0,
+                total_cpus=64,
+                gpus=[resources.GpuResources(index=i, uuid_=uuid.uuid4(), used_fraction=0.0) for i in range(num_gpus)],
+                name="n0",
+            )
+        }
+    )
+
+
 def _build(
     cpus_per_stage: list[float], *, num_cpus: int
 ) -> tuple[v1.PipelineSpec, resources.ClusterResources, data_structures.Problem]:
@@ -78,12 +113,12 @@ def _scheduler(spec: v1.PipelineSpec, config: SaturationAwareConfig | None = Non
     stages = cast(list[StageSpec], spec.stages)
     names = tuple(stage_spec.name(index) for index, stage_spec in enumerate(stages))
     batch_sizes = tuple(stage_spec.stage.stage_batch_size for stage_spec in stages)
-    is_gpu = tuple(stage_spec.stage.required_resources.gpus > 0 for stage_spec in stages)
+    gpu_fractions = tuple(float(stage_spec.stage.required_resources.gpus) for stage_spec in stages)
     return SaturationAwareScheduler(
         config=config or SaturationAwareConfig(),
         stage_names=names,
         stage_batch_sizes=batch_sizes,
-        stage_is_gpu=is_gpu,
+        stage_gpu_fractions=gpu_fractions,
     )
 
 
@@ -122,6 +157,21 @@ def test_cold_start_sizes_every_stage_and_deletes_nothing() -> None:
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert all(len(stage.new_workers) >= 1 for stage in solution.stages)
     assert all(len(stage.deleted_workers) == 0 for stage in solution.stages)
+
+
+def test_cold_start_ramp_caps_fractional_gpu_stage() -> None:
+    """A fractional-GPU stage with no measurements is held to a single new worker.
+
+    Without the ramp the solver fills the idle cluster with sub-GPU workers
+    (the fragmentation bug). The ramp caps the cold stage at one worker.
+    """
+    spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_GpuStage(0.25))])
+    cluster = _gpu_cluster(4)
+    problem = streaming._make_problem_from_pipeline_spec(spec, cluster)
+    scheduler = _scheduler(spec)
+    scheduler.setup(problem)
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages[0].new_workers) == 1
 
 
 def test_autoscale_before_setup_raises() -> None:

@@ -325,7 +325,7 @@ def _make_scheduler_algorithm(
             config=config,
             stage_names=tuple(stage.name(index) for index, stage in enumerate(stages)),
             stage_batch_sizes=tuple(stage.stage.stage_batch_size for stage in stages),
-            stage_is_gpu=tuple(stage.stage.required_resources.gpus > 0 for stage in stages),
+            stage_gpu_fractions=tuple(float(stage.stage.required_resources.gpus) for stage in stages),
         )
     else:
         algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
