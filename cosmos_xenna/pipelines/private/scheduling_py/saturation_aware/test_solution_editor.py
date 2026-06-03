@@ -37,7 +37,17 @@ class _FakeStage:
 
 class _FakeRust:
     def __init__(self, stages: list[_FakeStage]) -> None:
-        self.stages = stages
+        self._stages = stages
+        self.write_count = 0
+
+    @property
+    def stages(self) -> list[_FakeStage]:
+        return self._stages
+
+    @stages.setter
+    def stages(self, value: list[_FakeStage]) -> None:
+        self._stages = value
+        self.write_count += 1
 
 
 class _FakeSolution:
@@ -92,3 +102,12 @@ def test_commit_without_changes_does_not_rewrite_stage_list(make_editor: EditorF
     original = solution.rust.stages
     editor.commit()
     assert solution.rust.stages is original
+    assert solution.rust.write_count == 0
+
+
+def test_commit_is_idempotent_after_a_change(make_editor: EditorFactory) -> None:
+    editor, solution = make_editor([_FakeStage(["a", "b"], [])])
+    editor.trim_new_workers(0, 1)
+    editor.commit()
+    editor.commit()
+    assert solution.rust.write_count == 1

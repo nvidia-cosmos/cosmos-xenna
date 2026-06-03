@@ -90,6 +90,7 @@ class SolutionEditor:
         return True
 
     def commit(self) -> None:
-        """Write the edit buffer back to the native solution if it changed."""
+        """Write the edit buffer back to the native solution once, if it changed."""
         if self._changed:
             self._solution.rust.stages = self._stages
+            self._changed = False
