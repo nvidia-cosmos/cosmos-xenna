@@ -203,3 +203,15 @@ def test_active_stock_blocks_release_that_queue_only_stock_would_trigger() -> No
 
     assert _caption_floor_after_two_cycles((queue_only[0], queue_only[1]), params) == 1
     assert _caption_floor_after_two_cycles((active[0], active[1]), params) == 15
+
+
+def test_scale_down_floor_policy_carries_state_across_cycles() -> None:
+    """The stateful policy holds for the confirm window, then releases to MIN.
+
+    Verifies the release streak accumulates inside the policy across calls, so
+    the scheduler no longer threads ``FloorState`` by hand.
+    """
+    policy = floor.ScaleDownFloorPolicy.create(2, _params())
+    inputs = _inputs(upstream_workers=10, caption_workers=15, stock=_EMPTY_STOCK)
+    assert policy.plan(inputs)[1] == 15
+    assert policy.plan(inputs)[1] == 1

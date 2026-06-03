@@ -20,18 +20,18 @@ through the native fragmentation solver. The pure control-law math lives in
 the chain/floor/activity/estimator unit tests.
 """
 
-import concurrent.futures
 import uuid
-from typing import Any, cast
-from unittest.mock import MagicMock
+from typing import cast
 
 import pytest
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
+from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
 
 
@@ -113,14 +113,9 @@ def _build(
 
 def _scheduler(spec: v1.PipelineSpec, config: SaturationAwareConfig | None = None) -> SaturationAwareScheduler:
     stages = cast(list[StageSpec], spec.stages)
-    names = tuple(stage_spec.name(index) for index, stage_spec in enumerate(stages))
-    batch_sizes = tuple(stage_spec.stage.stage_batch_size for stage_spec in stages)
-    gpu_fractions = tuple(float(stage_spec.stage.required_resources.gpus) for stage_spec in stages)
     return SaturationAwareScheduler(
         config=config or SaturationAwareConfig(),
-        stage_names=names,
-        stage_batch_sizes=batch_sizes,
-        stage_gpu_fractions=gpu_fractions,
+        shape=PipelineShape.from_stage_specs(stages),
     )
 
 
@@ -150,27 +145,6 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
             for duration in durations
         ],
     )
-
-
-class _NoopExecutor:
-    """Executor stub that records submissions without running them."""
-
-    def __init__(self) -> None:
-        self.submitted: tuple[object, ...] | None = None
-
-    def submit(self, *args: object) -> concurrent.futures.Future[object]:
-        self.submitted = args
-        return concurrent.futures.Future()
-
-
-def _pool_for_activity(name: str, *, queued_tasks: int, used_slots: int, batch_size: int) -> MagicMock:
-    pool = MagicMock(name=f"pool-{name}")
-    pool.name = name
-    pool.slots_per_actor = 1
-    pool.num_queued_tasks = queued_tasks
-    pool.num_used_slots = used_slots
-    pool.stage_batch_size = batch_size
-    return pool
 
 
 def test_cold_start_sizes_every_stage_and_deletes_nothing() -> None:
@@ -275,91 +249,21 @@ def test_all_queued_measurement_batches_are_drained_on_next_autoscale() -> None:
     assert new_counts[1] > new_counts[0]
 
 
-def test_active_stock_holds_floor_when_queue_only_stock_is_empty() -> None:
-    scheduler = SaturationAwareScheduler(
-        config=SaturationAwareConfig(scale_down_release_cycles=3),
-        stage_names=("upstream", "caption"),
-        stage_batch_sizes=(1, 1),
-        stage_gpu_fractions=(0.0, 1.0),
-    )
-    scheduler.set_queue_snapshot([0.0, 0.0])
-    scheduler.set_activity_snapshot(
-        queue_depths=[0.0, 0.0],
-        pool_queued_tasks=[15, 0],
-        inflight_slots=[0, 0],
-        batch_sizes=[1, 1],
-    )
-
-    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
-
-    assert result.floors[1] == 15
-    assert result.queued_stock == (0.0, 0.0)
-    assert result.active_stock == (15.0, 15.0)
-    assert result.active_depths == (15.0, 0.0)
-
-
-def test_missing_activity_snapshot_falls_back_to_queue_depths() -> None:
-    scheduler = SaturationAwareScheduler(
-        config=SaturationAwareConfig(scale_down_release_cycles=3),
-        stage_names=("upstream", "caption"),
-        stage_batch_sizes=(1, 1),
-        stage_gpu_fractions=(0.0, 1.0),
-    )
-    scheduler.set_queue_snapshot([15.0, 0.0])
-
-    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
-
-    assert result.floors[1] == 15
-    assert result.queued_stock == result.active_stock
-    assert result.active_depths == (15.0, 0.0)
-
-
-def test_queue_snapshot_refresh_clears_stale_activity_snapshot() -> None:
-    scheduler = SaturationAwareScheduler(
-        config=SaturationAwareConfig(scale_down_release_cycles=3),
-        stage_names=("upstream", "caption"),
-        stage_batch_sizes=(1, 1),
-        stage_gpu_fractions=(0.0, 1.0),
-    )
-    scheduler.set_queue_snapshot([0.0, 0.0])
-    scheduler.set_activity_snapshot(
-        queue_depths=[0.0, 0.0],
-        pool_queued_tasks=[15, 0],
-        inflight_slots=[0, 0],
-        batch_sizes=[1, 1],
-    )
-    scheduler.set_queue_snapshot([2.0, 0.0])
-
-    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
-
-    assert result.active_depths == (2.0, 0.0)
-    assert result.active_stock == result.queued_stock
-
-
-def test_streaming_passes_pool_counters_into_saturation_activity_snapshot() -> None:
-    spec, cluster, _ = _build([1.0, 1.0], num_cpus=16)
+def test_observe_runtime_rejects_stage_count_mismatch() -> None:
+    spec, _, _ = _build([1.0, 1.0], num_cpus=16)
     scheduler = _scheduler(spec)
-    executor = _NoopExecutor()
-    autoscaler = cast(Any, object.__new__(streaming.Autoscaler))
-    autoscaler._autoscale_future = None
-    autoscaler._autoscale_start_time = 0.0
-    autoscaler._algorithm = scheduler
-    autoscaler._executor = executor
-    autoscaler._allocator = MagicMock()
-    autoscaler._allocator.get_workers_in_stage.return_value = []
-    autoscaler._verbosity_level = 0
+    with pytest.raises(ValueError, match="expected 2"):
+        scheduler.observe_runtime(
+            RuntimeSignals(queue_depths=(0.0,), pool_queued_tasks=(0,), inflight_slots=(0,), batch_sizes=(1,))
+        )
 
-    pools = [
-        _pool_for_activity("stage-0", queued_tasks=2, used_slots=3, batch_size=4),
-        _pool_for_activity("stage-1", queued_tasks=5, used_slots=7, batch_size=8),
-    ]
 
-    autoscaler.start_autoscale_calculation(
-        pools=pools,
-        stages_is_dones=[False, False],
-        upstream_queue_lens=[11, 13],
+def test_autoscale_consumes_runtime_signals_without_error() -> None:
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
+    scheduler = _scheduler(spec)
+    scheduler.setup(problem)
+    scheduler.observe_runtime(
+        RuntimeSignals(queue_depths=(5.0, 0.0), pool_queued_tasks=(0, 0), inflight_slots=(0, 0), batch_sizes=(1, 1))
     )
-
-    assert scheduler._activity_snapshot is not None
-    assert scheduler._activity_snapshot.active_depths() == (31.0, 109.0)
-    assert executor.submitted is not None
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages) == 2

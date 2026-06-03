@@ -37,8 +37,10 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
+from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -321,12 +323,7 @@ def _make_scheduler_algorithm(
     if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
         config = SaturationAwareConfig.resolve(mode_specific.saturation_aware)
         stages = [typing.cast(specs.StageSpec, stage) for stage in pipeline_spec.stages]
-        algorithm = SaturationAwareScheduler(
-            config=config,
-            stage_names=tuple(stage.name(index) for index, stage in enumerate(stages)),
-            stage_batch_sizes=tuple(stage.stage.stage_batch_size for stage in stages),
-            stage_gpu_fractions=tuple(float(stage.stage.required_resources.gpus) for stage in stages),
-        )
+        algorithm = SaturationAwareScheduler(config=config, shape=PipelineShape.from_stage_specs(stages))
     else:
         algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
             mode_specific.autoscale_speed_estimation_window_duration_s,
@@ -499,6 +496,23 @@ class Autoscaler:
             )
         return data_structures.ProblemState(stages)
 
+    def _offer_runtime_signals(self, pools: list[actor_pool.ActorPool], upstream_queue_lens: list[int]) -> None:
+        """Deliver this cycle's per-stage runtime signals to a capability-aware scheduler.
+
+        Builds the scheduler-agnostic ``RuntimeSignals`` from pool counters and
+        routes them via :func:`runtime_signals.deliver`, a no-op for schedulers
+        that do not consume runtime signals (such as the fragmentation solver).
+        """
+        runtime_signals.deliver(
+            self._algorithm,
+            runtime_signals.RuntimeSignals(
+                queue_depths=tuple(float(depth) for depth in upstream_queue_lens),
+                pool_queued_tasks=tuple(pool.num_queued_tasks for pool in pools),
+                inflight_slots=tuple(pool.num_used_slots for pool in pools),
+                batch_sizes=tuple(pool.stage_batch_size for pool in pools),
+            ),
+        )
+
     def start_autoscale_calculation(
         self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool], upstream_queue_lens: list[int]
     ) -> None:
@@ -518,14 +532,7 @@ class Autoscaler:
             return
 
         self._autoscale_start_time = time.time()
-        if isinstance(self._algorithm, SaturationAwareScheduler):
-            self._algorithm.set_queue_snapshot(upstream_queue_lens)
-            self._algorithm.set_activity_snapshot(
-                queue_depths=upstream_queue_lens,
-                pool_queued_tasks=[pool.num_queued_tasks for pool in pools],
-                inflight_slots=[pool.num_used_slots for pool in pools],
-                batch_sizes=[pool.stage_batch_size for pool in pools],
-            )
+        self._offer_runtime_signals(pools, upstream_queue_lens)
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 

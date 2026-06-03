@@ -182,3 +182,30 @@ def _source_capacities(workers: Sequence[int], speed: Sequence[float], chain: Se
         worker_count * speed_k / factor if factor > 0.0 else 0.0
         for worker_count, speed_k, factor in zip(workers, speed, chain, strict=True)
     ]
+
+
+@attrs.define
+class ScaleDownFloorPolicy:
+    """Owns the scale-down floor's cross-cycle state and release tuning.
+
+    Wraps the pure :func:`compute_floors` so the smoothed sustainable arrival
+    and release streaks persist inside the policy across cycles, rather than
+    being threaded through the scheduler.
+
+    Attributes:
+        params: Smoothing and release tuning.
+    """
+
+    params: FloorParams
+    _state: FloorState
+
+    @classmethod
+    def create(cls, num_stages: int, params: FloorParams) -> Self:
+        """Build a policy with empty state for ``num_stages`` stages."""
+        return cls(params=params, state=FloorState.initial(num_stages))
+
+    def plan(self, inputs: FloorInputs) -> tuple[int, ...]:
+        """Return this cycle's per-stage floors and advance the internal state."""
+        result = compute_floors(inputs, self._state, self.params)
+        self._state = result.state
+        return result.floors

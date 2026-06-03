@@ -21,13 +21,14 @@ fragmentation-scheduler code; it is selected per run via ``SchedulerKind``.
 
 ::
 
-    config --> estimator --> sizing --> chain --> activity --> floor
-    (knobs)    (speed +      (demand    (chain    (active      (scale-
-               num_returns)   multiplier factors)  pipeline     down
-                              m)                    stock)       floor)
+    estimator --> sizing  --> chain  --> activity --> floor
+    (speed +      (demand    (fan-out  (active      (scale-
+     num_returns)  multiplier factors)  stock)       down floor)
 
-``scheduler`` composes these around the shared solver each cycle. Only
-``config`` is import-cheap (no native extension); the others are imported
-by ``scheduler`` and the streaming seam, which already depend on the
+``scheduler`` composes these around the read-only solver each cycle, using
+``shape`` for the static per-stage layout and ``solution_editor`` to apply its
+overrides to the returned ``Solution``. Per-cycle runtime signals arrive through
+the scheduler-agnostic ``scheduling_py.runtime_signals`` seam. ``config`` and
+``shape`` are native-free; ``solution_editor`` and ``scheduler`` depend on the
 native solver.
 """
