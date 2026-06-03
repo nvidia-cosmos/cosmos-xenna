@@ -19,9 +19,11 @@ Bounds how fast any not-yet-trusted stage may grow while the fragmentation
 solver is still sizing it from placeholder throughput. With no completed sample
 a stage is capped at one worker; while warming, allowed growth scales with
 sample confidence; once the speed estimate is trusted, the stage is uncapped
-and the solver decides. A stage that produces no sample within a full
-speed-estimation window is treated as a confirmed slow-starter and is uncapped
-so all its workers spawn and warm up in parallel rather than one at a time.
+and the solver decides. A stage that still has work waiting but produces no
+sample within a full speed-estimation window is treated as a confirmed
+slow-starter and is uncapped so all its workers spawn and warm up in parallel
+rather than one at a time. Pure and native-extension-free, so it is
+unit-testable without the solver.
 """
 
 import enum
@@ -65,6 +67,9 @@ class StageRampInput:
         stage_age_s: Seconds since the scheduler first saw this stage. Lets a
             stage that has produced no sample within a full speed-estimation
             window be released to the solver as a confirmed slow-starter.
+        has_pending_work: Whether the stage has work waiting (queued, pool-queued,
+            or in-flight). Gates the slow-starter release so a stage merely
+            starved of input is not over-spawned from placeholder throughput.
     """
 
     current_workers: int
@@ -72,6 +77,7 @@ class StageRampInput:
     proposed_post: int
     sample_count: int
     stage_age_s: float
+    has_pending_work: bool
 
 
 @attrs.frozen
@@ -108,8 +114,8 @@ class ColdStartRampPolicy:
         """Return the cold-start cap and trim count for one stage.
 
         No completed sample caps the stage at one worker until a full
-        speed-estimation window has elapsed with no sample, after which the
-        stage is treated as a slow-starter and uncapped; while warming, the
+        speed-estimation window has elapsed with work still waiting, after which
+        the stage is treated as a slow-starter and uncapped; while warming, the
         allowed growth is ``ceil(confidence * solver_growth)`` (at least one);
         trusted stages are uncapped.
         """
@@ -117,15 +123,19 @@ class ColdStartRampPolicy:
         if stage.sample_count >= min_data_points:
             return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
         if stage.sample_count == 0:
-            if stage.stage_age_s >= self.config.speed_estimation_window_s:
-                # A full estimation window has passed with no completed task:
-                # this is a slow-warmup stage (its first result lands long
-                # after the window). Trust the solver so every worker spawns
-                # now.
+            window_elapsed = stage.stage_age_s >= self.config.speed_estimation_window_s
+            if window_elapsed and stage.has_pending_work:
+                # A full estimation window has passed with no completed task yet
+                # work is still waiting: this is a slow-warmup stage (its first
+                # result lands long after the window). Trust the solver so every
+                # worker spawns now and their models load in parallel. The
+                # pending-work gate keeps a stage merely starved of input capped,
+                # so the solver cannot over-spawn it from placeholder throughput.
                 return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
-            # No completed task yet, but still within the warmup window: hold at
-            # a single worker so a 0-sample stage cannot creep upward cycle
-            # after cycle while it could still produce its first sample.
+            # No completed task yet (still within the warmup window, or no work
+            # waiting): hold at a single worker so a 0-sample stage cannot creep
+            # upward cycle after cycle while it could still produce its first
+            # sample.
             cap = 1
             reason = RampReason.COLD
         else:

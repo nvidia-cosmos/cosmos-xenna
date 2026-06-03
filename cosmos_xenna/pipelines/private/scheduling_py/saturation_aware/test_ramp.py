@@ -40,6 +40,7 @@ def make_input() -> RampInputFactory:
         proposed_post: int = 10,
         sample_count: int = 0,
         stage_age_s: float = 0.0,
+        has_pending_work: bool = False,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
@@ -47,6 +48,7 @@ def make_input() -> RampInputFactory:
             proposed_post=proposed_post,
             sample_count=sample_count,
             stage_age_s=stage_age_s,
+            has_pending_work=has_pending_work,
         )
 
     return _make_input
@@ -82,15 +84,25 @@ def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> Non
     assert decision.reason is RampReason.COLD
 
 
-def test_no_sample_after_window_trusts_solver(make_input: RampInputFactory) -> None:
-    """A stage with no sample after a full estimation window is released to the solver."""
+def test_no_sample_after_window_with_pending_work_trusts_solver(make_input: RampInputFactory) -> None:
+    """A stage with work waiting but no sample after a full window is released to the solver."""
     config = SaturationAwareConfig()
     decision = ColdStartRampPolicy(config).decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s)
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=True)
     )
     assert decision.cap is None
     assert decision.keep_new is None
     assert decision.reason is RampReason.SLOW_START
+
+
+def test_no_sample_after_window_without_pending_work_stays_cold(make_input: RampInputFactory) -> None:
+    """A starved stage (no work waiting) stays capped past the window, never over-spawned."""
+    config = SaturationAwareConfig()
+    decision = ColdStartRampPolicy(config).decide(
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=False)
+    )
+    assert decision.cap == 1
+    assert decision.reason is RampReason.COLD
 
 
 def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -> None:

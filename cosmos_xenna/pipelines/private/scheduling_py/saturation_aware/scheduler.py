@@ -273,6 +273,8 @@ class SaturationAwareScheduler:
         min_data_points = self.config.speed_estimation_min_data_points
         first_decision_time = self._first_decision_time if self._first_decision_time is not None else now
         stage_age_s = now - first_decision_time
+        num_stages = len(workers)
+        active_depths = self._active_depths_for_cycle(num_stages, self._queue_for_cycle(num_stages))
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             if stage.is_manual:
@@ -292,6 +294,7 @@ class SaturationAwareScheduler:
                     proposed_post=current + frag_new - deleted,
                     sample_count=samples,
                     stage_age_s=stage_age_s,
+                    has_pending_work=active_depths[index] > 0.0,
                 )
             )
             summaries.append(

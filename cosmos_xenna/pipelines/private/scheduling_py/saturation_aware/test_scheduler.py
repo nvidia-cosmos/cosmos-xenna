@@ -197,24 +197,45 @@ def test_cold_start_ramp_caps_cpu_stage() -> None:
     assert len(solution.stages[0].new_workers) == 1
 
 
-def test_no_sample_after_window_releases_stage_to_solver() -> None:
-    """A stage with no measurements after a full estimation window spawns past one worker.
+def _runtime_signals(queue_depth: float) -> RuntimeSignals:
+    """Single-stage runtime signals with the given upstream queue depth."""
+    return RuntimeSignals(queue_depths=(queue_depth,), pool_queued_tasks=(0,), inflight_slots=(0,), batch_sizes=(1,))
+
+
+def test_no_sample_after_window_with_pending_work_releases_stage_to_solver() -> None:
+    """A stage with work waiting but no measurements after a full window spawns past one worker.
 
     The first decision anchors the warmup clock and caps the cold stage at one
-    worker; a later decision past ``speed_estimation_window_s`` with still no
-    measurements treats it as a slow-starter and trusts the solver.
+    worker; a later decision past ``speed_estimation_window_s`` with work still
+    queued but no measurements treats it as a slow-starter and trusts the solver.
     """
     spec, cluster, problem = _build([1.0], num_cpus=16)
     config = SaturationAwareConfig()
     scheduler = _scheduler(spec, cluster, config)
     scheduler.setup(problem)
     t0 = 100.0
+    scheduler.observe_runtime(_runtime_signals(queue_depth=5.0))
     cold = scheduler.autoscale(t0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert len(cold.stages[0].new_workers) == 1
     later = scheduler.autoscale(
         t0 + config.speed_estimation_window_s + 1.0, _state(spec, allocator.WorkerAllocator.make(cluster))
     )
     assert len(later.stages[0].new_workers) > 1
+
+
+def test_no_sample_after_window_without_pending_work_stays_capped() -> None:
+    """A starved stage (no work waiting) stays at one worker past the window, never over-spawned."""
+    spec, cluster, problem = _build([1.0], num_cpus=16)
+    config = SaturationAwareConfig()
+    scheduler = _scheduler(spec, cluster, config)
+    scheduler.setup(problem)
+    t0 = 100.0
+    scheduler.observe_runtime(_runtime_signals(queue_depth=0.0))
+    scheduler.autoscale(t0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    later = scheduler.autoscale(
+        t0 + config.speed_estimation_window_s + 1.0, _state(spec, allocator.WorkerAllocator.make(cluster))
+    )
+    assert len(later.stages[0].new_workers) == 1
 
 
 def test_autoscale_before_setup_raises() -> None:
