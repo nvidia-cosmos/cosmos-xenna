@@ -17,9 +17,9 @@
 
 Mirrors the fragmentation solver's ``num_input_samples_per_sample``: the
 cumulative fan-out from the source to each stage. Converting per-stage
-queue depths by these factors expresses all pending work in common
+depths by these factors expresses queued or active work in common
 source-item units, so a stage can see the whole upstream stock that will
-fan out to it (not only its own immediate input queue).
+fan out to it (not only its own immediate input depth).
 """
 
 from collections.abc import Sequence
@@ -66,13 +66,13 @@ def chain_factors(num_returns_per_batch: Sequence[float], stage_batch_sizes: Seq
 def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> list[float]:
     """Return per-stage at-or-upstream pending stock, in source-item units.
 
-    ``stock[k] = sum over u <= k of Q[u] / k[u]``, where ``Q[u]`` is the
-    stage-``u`` input queue depth (in stage-``u`` input samples) and
+    ``stock[k] = sum over u <= k of D[u] / k[u]``, where ``D[u]`` is the
+    stage-``u`` depth (queued or active, in stage-``u`` input samples) and
     ``k[u]`` the chain factor. A non-positive ``k[u]`` (a fully dropping
     upstream stage) contributes nothing, since no work flows past it.
 
     Args:
-        queue_depths: Per-stage input queue depths, in stage-input samples.
+        queue_depths: Per-stage depths, in stage-input samples.
         chain: Per-stage chain factors from :func:`chain_factors`.
 
     Returns:

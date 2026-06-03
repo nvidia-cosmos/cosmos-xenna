@@ -21,10 +21,10 @@ fragmentation-scheduler code; it is selected per run via ``SchedulerKind``.
 
 ::
 
-    config --> estimator --> sizing --> chain --> floor --> grace
-    (knobs)    (speed +      (demand    (chain    (scale-   (warmup
-               num_returns)   multiplier factors)  down      delete
-                              m)                    floor)    protect)
+    config --> estimator --> sizing --> chain --> activity --> floor
+    (knobs)    (speed +      (demand    (chain    (active      (scale-
+               num_returns)   multiplier factors)  pipeline     down
+                              m)                    stock)       floor)
 
 ``scheduler`` composes these around the shared solver each cycle. Only
 ``config`` is import-cheap (no native extension); the others are imported

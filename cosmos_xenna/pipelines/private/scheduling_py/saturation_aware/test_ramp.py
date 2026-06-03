@@ -27,24 +27,20 @@ type RampInputFactory = Callable[..., StageRampInput]
 
 @pytest.fixture
 def make_input() -> RampInputFactory:
-    """Return a factory for ramp inputs defaulting to a cold fractional-GPU stage."""
+    """Return a factory for ramp inputs defaulting to a cold untrusted stage."""
 
     def _make_input(
         *,
-        name: str = "s",
         current_workers: int = 0,
         deleted_count: int = 0,
         proposed_post: int = 10,
         sample_count: int = 0,
-        gpu_fraction: float = 0.25,
     ) -> StageRampInput:
         return StageRampInput(
-            name=name,
             current_workers=current_workers,
             deleted_count=deleted_count,
             proposed_post=proposed_post,
             sample_count=sample_count,
-            gpu_fraction=gpu_fraction,
         )
 
     return _make_input
@@ -56,7 +52,7 @@ def _policy() -> ColdStartRampPolicy:
 
 
 def test_cold_start_with_no_samples_caps_at_one(make_input: RampInputFactory) -> None:
-    """A fractional-GPU stage with no completed sample is capped at one worker."""
+    """Any stage with no completed sample is capped at one worker."""
     decision = _policy().decide(make_input(sample_count=0, current_workers=0, proposed_post=11))
     assert decision.cap == 1
     assert decision.keep_new == 1
@@ -100,17 +96,10 @@ def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
     assert decision.reason == "uncapped"
 
 
-def test_whole_gpu_stage_is_exempt(make_input: RampInputFactory) -> None:
-    """A whole-GPU stage is never capped, even with no samples."""
-    decision = _policy().decide(make_input(sample_count=0, gpu_fraction=1.0, proposed_post=10))
-    assert decision.cap is None
-    assert decision.reason == "uncapped"
-
-
-def test_cpu_stage_is_exempt(make_input: RampInputFactory) -> None:
-    """A CPU stage (zero GPU fraction) is never capped."""
-    decision = _policy().decide(make_input(sample_count=0, gpu_fraction=0.0, proposed_post=10))
-    assert decision.cap is None
+def test_ramp_input_does_not_carry_resource_shape(make_input: RampInputFactory) -> None:
+    """The pure ramp policy depends on measurement confidence, not resource shape."""
+    ramp_input = make_input()
+    assert not hasattr(ramp_input, "gpu_fraction")
 
 
 def test_proposal_within_cap_is_not_trimmed(make_input: RampInputFactory) -> None:

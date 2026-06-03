@@ -887,6 +887,11 @@ class ActorPool(Generic[T, V]):
         return self._slots_per_actor
 
     @property
+    def stage_batch_size(self) -> int:
+        """Return the number of input samples each scheduled task consumes."""
+        return self._params.stage_batch_size
+
+    @property
     def task_extra_data(self) -> collections.deque[stage_worker.TaskResultMetadata]:
         return self._task_result_metadatas
 

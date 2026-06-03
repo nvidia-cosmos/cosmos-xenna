@@ -15,14 +15,12 @@
 
 """Cold-start worker ramp for the saturation-aware scheduler.
 
-Bounds how fast a not-yet-trusted fractional-GPU stage may grow so the
-fragmentation solver cannot fill the cluster with sub-GPU workers before any
-throughput is measured (which fragments GPUs and starves whole-GPU stages).
-With no completed sample a fractional-GPU stage is capped at one worker; while
-warming, the allowed growth scales with sample confidence; once the speed
-estimate is trusted, or the stage is not fractional-GPU, it is uncapped and the
-solver decides. Pure and native-extension-free, so it is unit-testable without
-the solver.
+Bounds how fast any not-yet-trusted stage may grow while the fragmentation
+solver is still sizing it from placeholder throughput. With no completed sample
+a stage is capped at one worker; while warming, allowed growth scales with
+sample confidence; once the speed estimate is trusted, the stage is uncapped
+and the solver decides. Pure and native-extension-free, so it is unit-testable
+without the solver.
 """
 
 import math
@@ -37,22 +35,17 @@ class StageRampInput:
     """One stage's inputs to the cold-start ramp.
 
     Attributes:
-        name: Stage name (for logging).
         current_workers: Live pre-solve worker count.
         deleted_count: Workers the solver proposes to delete this cycle.
         proposed_post: Post-solve worker count the solver proposes
             (``current_workers + new - deleted``).
         sample_count: Measured throughput samples observed for this stage.
-        gpu_fraction: Per-worker GPU shape; the ramp acts only on fractional-GPU
-            stages (``0 < gpu_fraction < 1``).
     """
 
-    name: str
     current_workers: int
     deleted_count: int
     proposed_post: int
     sample_count: int
-    gpu_fraction: float
 
 
 @attrs.frozen
@@ -61,7 +54,7 @@ class RampDecision:
 
     Attributes:
         cap: Maximum post-solve worker count this cycle, or ``None`` when the
-            stage is exempt or trusted (uncapped).
+            stage is trusted (uncapped).
         keep_new: How many of the solver's proposed new workers to keep, or
             ``None`` when none are trimmed (keep all).
         reason: Short tag for logs (``cold``, ``warming``, or ``uncapped``).
@@ -72,9 +65,9 @@ class RampDecision:
     reason: str
 
 
-@attrs.define
+@attrs.frozen
 class ColdStartRampPolicy:
-    """Evidence-scaled cold-start cap for not-yet-trusted fractional-GPU stages.
+    """Evidence-scaled cold-start cap for not-yet-trusted stages.
 
     Allowed growth interpolates from one worker (no evidence) to the solver's
     full proposal (trusted), scaled by sample confidence.
@@ -90,11 +83,10 @@ class ColdStartRampPolicy:
 
         No completed sample caps the stage at one worker; while warming, the
         allowed growth is ``ceil(confidence * solver_growth)`` (at least one);
-        trusted or non-fractional-GPU stages are uncapped.
+        trusted stages are uncapped.
         """
-        trusted = stage.sample_count >= self.config.speed_estimation_min_data_points
-        fractional_gpu = 0.0 < stage.gpu_fraction < 1.0
-        if trusted or not fractional_gpu:
+        min_data_points = self.config.speed_estimation_min_data_points
+        if stage.sample_count >= min_data_points:
             return RampDecision(cap=None, keep_new=None, reason="uncapped")
         if stage.sample_count == 0:
             # No completed task means no evidence: hold at a single worker so a
@@ -102,7 +94,7 @@ class ColdStartRampPolicy:
             cap = 1
             reason = "cold"
         else:
-            confidence = stage.sample_count / self.config.speed_estimation_min_data_points
+            confidence = stage.sample_count / min_data_points
             solver_growth = max(0, stage.proposed_post - stage.current_workers)
             cap = stage.current_workers + max(1, math.ceil(confidence * solver_growth))
             reason = "warming"

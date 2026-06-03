@@ -20,7 +20,7 @@ extension, so ``specs`` and ``cosmos_curator`` can import them without
 building the Rust solver.
 """
 
-from typing import Self
+from typing import Self, cast
 
 import attrs
 
@@ -52,21 +52,18 @@ class SaturationAwareConfig:
             ``alpha_down = 1 / scale_down_release_cycles`` (larger means
             the floor decays slower, so an expensive stage is held
             longer through a transient upstream lull).
-        scale_down_grace_after_ready_s: Window after a worker is first
-            observed before it may be deleted, in seconds.
     """
 
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
     max_backlog_boost: float = attrs.field(default=8.0, validator=attrs.validators.ge(1.0))
     burst_headroom: float = attrs.field(default=0.10, validator=_UNIT_INTERVAL)
     backlog_smoothing: float | None = attrs.field(
-        default=0.4,
+        default=cast(float | None, 0.4),
         validator=attrs.validators.optional(_OPEN_UNIT_INTERVAL),
     )
     speed_estimation_window_s: float = attrs.field(default=60.0, validator=attrs.validators.gt(0.0))
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
-    scale_down_grace_after_ready_s: float = attrs.field(default=60.0, validator=attrs.validators.ge(0.0))
 
     @classmethod
     def resolve(cls, config: Self | None) -> Self:

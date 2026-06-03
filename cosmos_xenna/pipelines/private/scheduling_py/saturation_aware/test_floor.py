@@ -15,7 +15,7 @@
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import floor
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import chain, floor
 
 # A two-stage "clip-extract (CPU) -> caption (GPU)" pipeline, 1 video -> 8 clips.
 # chain = [1, 8]; caption speed 0.5 clips/s/worker; upstream speed 0.1 videos/s/worker.
@@ -48,6 +48,18 @@ def _inputs(*, upstream_workers: int, caption_workers: int, stock: tuple[float, 
         batch_sizes=_BATCH,
         is_gpu=_IS_GPU,
     )
+
+
+def _caption_floor_after_two_cycles(stock: tuple[float, float], params: floor.FloorParams) -> int:
+    """Run the floor two cycles at fixed workers and return caption's floor.
+
+    Two cycles is exactly ``release_confirm_cycles`` for ``_params()``, so a
+    persistently low stock releases on the second cycle.
+    """
+    state = floor.FloorState.initial(2)
+    first = floor.compute_floors(_inputs(upstream_workers=10, caption_workers=15, stock=stock), state, params)
+    second = floor.compute_floors(_inputs(upstream_workers=10, caption_workers=15, stock=stock), first.state, params)
+    return second.floors[1]
 
 
 def test_asymmetric_ewma_initializes_to_first_sample() -> None:
@@ -173,3 +185,21 @@ def test_gpu_stage_releases_slower_than_cpu_stage() -> None:
     cpu_result = floor.compute_floors(cpu_inputs, high, params)
     # Slower decay -> GPU floor stays >= CPU floor after the same single drop cycle.
     assert gpu_result.floors[1] >= cpu_result.floors[1]
+
+
+def test_active_stock_blocks_release_that_queue_only_stock_would_trigger() -> None:
+    """In-flight upstream work must keep caption warm when local queues are empty.
+
+    Reproduction of the caption scale-down oscillation: at the bad moment both
+    inter-stage queues read empty, so a queue-only stock (depths ``[0, 0]``)
+    releases caption to MIN after the confirm window. An *active* stock that also
+    counts clip-extraction's in-flight + pool-queued videos (10 used slots + 5
+    pool-queued = 15 stage-0 input samples, depths ``[15, 0]``) keeps the release
+    gate shut, so caption holds at 15.
+    """
+    params = _params()  # release_confirm_cycles = 2
+    queue_only = chain.whole_chain_stock([0.0, 0.0], _CHAIN)
+    active = chain.whole_chain_stock([15.0, 0.0], _CHAIN)
+
+    assert _caption_floor_after_two_cycles((queue_only[0], queue_only[1]), params) == 1
+    assert _caption_floor_after_two_cycles((active[0], active[1]), params) == 15

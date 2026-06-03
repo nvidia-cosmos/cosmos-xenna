@@ -17,11 +17,13 @@
 
 These exercise the wiring (sizing -> solve -> protect -> mutate-and-return)
 through the native fragmentation solver. The pure control-law math lives in
-the chain/floor/grace/estimator unit tests.
+the chain/floor/activity/estimator unit tests.
 """
 
+import concurrent.futures
 import uuid
-from typing import cast
+from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -150,6 +152,27 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
     )
 
 
+class _NoopExecutor:
+    """Executor stub that records submissions without running them."""
+
+    def __init__(self) -> None:
+        self.submitted: tuple[object, ...] | None = None
+
+    def submit(self, *args: object) -> concurrent.futures.Future[object]:
+        self.submitted = args
+        return concurrent.futures.Future()
+
+
+def _pool_for_activity(name: str, *, queued_tasks: int, used_slots: int, batch_size: int) -> MagicMock:
+    pool = MagicMock(name=f"pool-{name}")
+    pool.name = name
+    pool.slots_per_actor = 1
+    pool.num_queued_tasks = queued_tasks
+    pool.num_used_slots = used_slots
+    pool.stage_batch_size = batch_size
+    return pool
+
+
 def test_cold_start_sizes_every_stage_and_deletes_nothing() -> None:
     spec, cluster, problem = _build([0.25, 1.0], num_cpus=16)
     scheduler = _scheduler(spec)
@@ -168,6 +191,26 @@ def test_cold_start_ramp_caps_fractional_gpu_stage() -> None:
     spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_GpuStage(0.25))])
     cluster = _gpu_cluster(4)
     problem = streaming._make_problem_from_pipeline_spec(spec, cluster)
+    scheduler = _scheduler(spec)
+    scheduler.setup(problem)
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages[0].new_workers) == 1
+
+
+def test_cold_start_ramp_caps_whole_gpu_stage() -> None:
+    """A whole-GPU stage with no measurements is held to a single new worker."""
+    spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_GpuStage(1.0))])
+    cluster = _gpu_cluster(4)
+    problem = streaming._make_problem_from_pipeline_spec(spec, cluster)
+    scheduler = _scheduler(spec)
+    scheduler.setup(problem)
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages[0].new_workers) == 1
+
+
+def test_cold_start_ramp_caps_cpu_stage() -> None:
+    """A CPU stage with no measurements is held to a single new worker."""
+    spec, cluster, problem = _build([1.0], num_cpus=16)
     scheduler = _scheduler(spec)
     scheduler.setup(problem)
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
@@ -230,3 +273,93 @@ def test_all_queued_measurement_batches_are_drained_on_next_autoscale() -> None:
     solution = scheduler.autoscale(now, _state(spec, allocator.WorkerAllocator.make(cluster)))
     new_counts = [len(stage.new_workers) for stage in solution.stages]
     assert new_counts[1] > new_counts[0]
+
+
+def test_active_stock_holds_floor_when_queue_only_stock_is_empty() -> None:
+    scheduler = SaturationAwareScheduler(
+        config=SaturationAwareConfig(scale_down_release_cycles=3),
+        stage_names=("upstream", "caption"),
+        stage_batch_sizes=(1, 1),
+        stage_gpu_fractions=(0.0, 1.0),
+    )
+    scheduler.set_queue_snapshot([0.0, 0.0])
+    scheduler.set_activity_snapshot(
+        queue_depths=[0.0, 0.0],
+        pool_queued_tasks=[15, 0],
+        inflight_slots=[0, 0],
+        batch_sizes=[1, 1],
+    )
+
+    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
+
+    assert result.floors[1] == 15
+    assert result.queued_stock == (0.0, 0.0)
+    assert result.active_stock == (15.0, 15.0)
+    assert result.active_depths == (15.0, 0.0)
+
+
+def test_missing_activity_snapshot_falls_back_to_queue_depths() -> None:
+    scheduler = SaturationAwareScheduler(
+        config=SaturationAwareConfig(scale_down_release_cycles=3),
+        stage_names=("upstream", "caption"),
+        stage_batch_sizes=(1, 1),
+        stage_gpu_fractions=(0.0, 1.0),
+    )
+    scheduler.set_queue_snapshot([15.0, 0.0])
+
+    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
+
+    assert result.floors[1] == 15
+    assert result.queued_stock == result.active_stock
+    assert result.active_depths == (15.0, 0.0)
+
+
+def test_queue_snapshot_refresh_clears_stale_activity_snapshot() -> None:
+    scheduler = SaturationAwareScheduler(
+        config=SaturationAwareConfig(scale_down_release_cycles=3),
+        stage_names=("upstream", "caption"),
+        stage_batch_sizes=(1, 1),
+        stage_gpu_fractions=(0.0, 1.0),
+    )
+    scheduler.set_queue_snapshot([0.0, 0.0])
+    scheduler.set_activity_snapshot(
+        queue_depths=[0.0, 0.0],
+        pool_queued_tasks=[15, 0],
+        inflight_slots=[0, 0],
+        batch_sizes=[1, 1],
+    )
+    scheduler.set_queue_snapshot([2.0, 0.0])
+
+    result = scheduler._floors(workers=[10, 15], speeds=[0.1, 0.5], returns=[8.0, 1.0])
+
+    assert result.active_depths == (2.0, 0.0)
+    assert result.active_stock == result.queued_stock
+
+
+def test_streaming_passes_pool_counters_into_saturation_activity_snapshot() -> None:
+    spec, cluster, _ = _build([1.0, 1.0], num_cpus=16)
+    scheduler = _scheduler(spec)
+    executor = _NoopExecutor()
+    autoscaler = cast(Any, object.__new__(streaming.Autoscaler))
+    autoscaler._autoscale_future = None
+    autoscaler._autoscale_start_time = 0.0
+    autoscaler._algorithm = scheduler
+    autoscaler._executor = executor
+    autoscaler._allocator = MagicMock()
+    autoscaler._allocator.get_workers_in_stage.return_value = []
+    autoscaler._verbosity_level = 0
+
+    pools = [
+        _pool_for_activity("stage-0", queued_tasks=2, used_slots=3, batch_size=4),
+        _pool_for_activity("stage-1", queued_tasks=5, used_slots=7, batch_size=8),
+    ]
+
+    autoscaler.start_autoscale_calculation(
+        pools=pools,
+        stages_is_dones=[False, False],
+        upstream_queue_lens=[11, 13],
+    )
+
+    assert scheduler._activity_snapshot is not None
+    assert scheduler._activity_snapshot.active_depths() == (31.0, 109.0)
+    assert executor.submitted is not None

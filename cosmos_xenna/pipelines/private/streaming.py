@@ -520,6 +520,12 @@ class Autoscaler:
         self._autoscale_start_time = time.time()
         if isinstance(self._algorithm, SaturationAwareScheduler):
             self._algorithm.set_queue_snapshot(upstream_queue_lens)
+            self._algorithm.set_activity_snapshot(
+                queue_depths=upstream_queue_lens,
+                pool_queued_tasks=[pool.num_queued_tasks for pool in pools],
+                inflight_slots=[pool.num_used_slots for pool in pools],
+                batch_sizes=[pool.stage_batch_size for pool in pools],
+            )
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
