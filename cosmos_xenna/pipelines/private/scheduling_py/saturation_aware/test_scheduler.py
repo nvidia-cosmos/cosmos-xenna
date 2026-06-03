@@ -30,6 +30,7 @@ from cosmos_xenna.pipelines.private import allocator, data_structures, resources
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
@@ -111,11 +112,16 @@ def _build(
     return spec, cluster, problem
 
 
-def _scheduler(spec: v1.PipelineSpec, config: SaturationAwareConfig | None = None) -> SaturationAwareScheduler:
+def _scheduler(
+    spec: v1.PipelineSpec,
+    cluster: resources.ClusterResources,
+    config: SaturationAwareConfig | None = None,
+) -> SaturationAwareScheduler:
     stages = cast(list[StageSpec], spec.stages)
     return SaturationAwareScheduler(
         config=config or SaturationAwareConfig(),
         shape=PipelineShape.from_stage_specs(stages),
+        solver_template=SolverProblemTemplate.from_stage_specs(stages, cluster),
     )
 
 
@@ -149,7 +155,7 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
 
 def test_cold_start_sizes_every_stage_and_deletes_nothing() -> None:
     spec, cluster, problem = _build([0.25, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     scheduler.setup(problem)
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert all(len(stage.new_workers) >= 1 for stage in solution.stages)
@@ -165,7 +171,7 @@ def test_cold_start_ramp_caps_fractional_gpu_stage() -> None:
     spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_GpuStage(0.25))])
     cluster = _gpu_cluster(4)
     problem = streaming._make_problem_from_pipeline_spec(spec, cluster)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     scheduler.setup(problem)
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert len(solution.stages[0].new_workers) == 1
@@ -176,7 +182,7 @@ def test_cold_start_ramp_caps_whole_gpu_stage() -> None:
     spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_GpuStage(1.0))])
     cluster = _gpu_cluster(4)
     problem = streaming._make_problem_from_pipeline_spec(spec, cluster)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     scheduler.setup(problem)
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert len(solution.stages[0].new_workers) == 1
@@ -185,22 +191,42 @@ def test_cold_start_ramp_caps_whole_gpu_stage() -> None:
 def test_cold_start_ramp_caps_cpu_stage() -> None:
     """A CPU stage with no measurements is held to a single new worker."""
     spec, cluster, problem = _build([1.0], num_cpus=16)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     scheduler.setup(problem)
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert len(solution.stages[0].new_workers) == 1
 
 
+def test_no_sample_after_window_releases_stage_to_solver() -> None:
+    """A stage with no measurements after a full estimation window spawns past one worker.
+
+    The first decision anchors the warmup clock and caps the cold stage at one
+    worker; a later decision past ``speed_estimation_window_s`` with still no
+    measurements treats it as a slow-starter and trusts the solver.
+    """
+    spec, cluster, problem = _build([1.0], num_cpus=16)
+    config = SaturationAwareConfig()
+    scheduler = _scheduler(spec, cluster, config)
+    scheduler.setup(problem)
+    t0 = 100.0
+    cold = scheduler.autoscale(t0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(cold.stages[0].new_workers) == 1
+    later = scheduler.autoscale(
+        t0 + config.speed_estimation_window_s + 1.0, _state(spec, allocator.WorkerAllocator.make(cluster))
+    )
+    assert len(later.stages[0].new_workers) > 1
+
+
 def test_autoscale_before_setup_raises() -> None:
     spec, cluster, _ = _build([0.25], num_cpus=8)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     with pytest.raises(RuntimeError):
         scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
 
 
 def test_backlog_deflation_grows_the_slower_stage() -> None:
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
     scheduler.setup(problem)
     now = 100.0
     scheduler.update_with_measurements(now, _measurements(now, [0.1, 5.0]))
@@ -239,7 +265,7 @@ def test_all_queued_measurement_batches_are_drained_on_next_autoscale() -> None:
     # min_data_points=2 means a single un-drained batch leaves the estimator below
     # threshold (speed None -> no deflation); deflation here proves both batches applied.
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec, SaturationAwareConfig(speed_estimation_min_data_points=2))
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=2))
     scheduler.setup(problem)
     now = 100.0
     scheduler.update_with_measurements(now, _measurements(now, [0.1, 5.0]))
@@ -250,8 +276,8 @@ def test_all_queued_measurement_batches_are_drained_on_next_autoscale() -> None:
 
 
 def test_observe_runtime_rejects_stage_count_mismatch() -> None:
-    spec, _, _ = _build([1.0, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec)
+    spec, cluster, _ = _build([1.0, 1.0], num_cpus=16)
+    scheduler = _scheduler(spec, cluster)
     with pytest.raises(ValueError, match="expected 2"):
         scheduler.observe_runtime(
             RuntimeSignals(queue_depths=(0.0,), pool_queued_tasks=(0,), inflight_slots=(0,), batch_sizes=(1,))
@@ -260,10 +286,52 @@ def test_observe_runtime_rejects_stage_count_mismatch() -> None:
 
 def test_autoscale_consumes_runtime_signals_without_error() -> None:
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec)
+    scheduler = _scheduler(spec, cluster)
     scheduler.setup(problem)
     scheduler.observe_runtime(
         RuntimeSignals(queue_depths=(5.0, 0.0), pool_queued_tasks=(0, 0), inflight_slots=(0, 0), batch_sizes=(1, 1))
     )
     solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert len(solution.stages) == 2
+
+
+def _cpu_cluster(num_cpus: int) -> resources.ClusterResources:
+    return resources.ClusterResources(
+        nodes={"n0": resources.NodeResources(used_cpus=0, total_cpus=num_cpus, gpus=[], name="n0")}
+    )
+
+
+def test_pinned_stage_skips_ramp_while_autoscaled_stage_is_capped() -> None:
+    """A pinned stage reaches its requested count at cold start; an autoscaled peer is still ramp-capped to one."""
+    spec = v1.PipelineSpec(
+        input_data=range(100),
+        stages=[
+            v1.StageSpec(_CpuStage(1.0, 1.0), num_workers=4),
+            v1.StageSpec(_CpuStage(1.0, 1.0)),
+        ],
+    )
+    cluster = _cpu_cluster(16)
+    scheduler = _scheduler(spec, cluster)
+    scheduler.setup(streaming._make_problem_from_pipeline_spec(spec, cluster))
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages[0].new_workers) == 4
+    assert len(solution.stages[1].new_workers) == 1
+
+
+def test_pinned_stage_over_capacity_holds_at_current_without_raising() -> None:
+    """A pinned count that cannot fit holds at the current size instead of aborting the solve."""
+    spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_CpuStage(1.0, 1.0), num_workers=4)])
+    cluster = _cpu_cluster(2)
+    scheduler = _scheduler(spec, cluster)
+    scheduler.setup(streaming._make_problem_from_pipeline_spec(spec, cluster))
+    solution = scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert len(solution.stages[0].new_workers) == 0
+
+
+def test_solve_reraises_when_nothing_can_be_relaxed() -> None:
+    """With no pinned stages to hold back, a genuinely infeasible solve propagates."""
+    spec, cluster, problem = _build([1.0, 1.0, 1.0], num_cpus=2)
+    scheduler = _scheduler(spec, cluster)
+    scheduler.setup(problem)
+    with pytest.raises(RuntimeError):
+        scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))

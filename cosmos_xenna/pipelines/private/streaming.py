@@ -39,6 +39,7 @@ from cosmos_xenna.pipelines.private import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
@@ -192,18 +193,12 @@ def _make_problem_from_pipeline_spec(
     num_nodes = len(cluster_resources.nodes)
     for idx, stage in enumerate(pipeline_spec.stages):
         assert isinstance(stage, specs.StageSpec)
-        if stage.num_workers is not None:
-            num_workers = stage.num_workers
-        elif stage.num_workers_per_node is not None:
-            num_workers = math.ceil(stage.num_workers_per_node * num_nodes)
-        else:
-            num_workers = None
         out_stages.append(
             data_structures.ProblemStage(
                 stage.name(idx),
                 stage.stage.stage_batch_size,
                 stage.stage.required_resources.to_worker_shape(cluster_resources),
-                requested_num_workers=num_workers,
+                requested_num_workers=stage.resolved_num_workers(num_nodes),
                 over_provision_factor=stage.over_provision_factor,
             )
         )
@@ -323,7 +318,11 @@ def _make_scheduler_algorithm(
     if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
         config = SaturationAwareConfig.resolve(mode_specific.saturation_aware)
         stages = [typing.cast(specs.StageSpec, stage) for stage in pipeline_spec.stages]
-        algorithm = SaturationAwareScheduler(config=config, shape=PipelineShape.from_stage_specs(stages))
+        algorithm = SaturationAwareScheduler(
+            config=config,
+            shape=PipelineShape.from_stage_specs(stages),
+            solver_template=SolverProblemTemplate.from_stage_specs(stages, cluster_resources),
+        )
     else:
         algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
             mode_specific.autoscale_speed_estimation_window_duration_s,
@@ -540,7 +539,6 @@ class Autoscaler:
         self,
         pools: list[actor_pool.ActorPool],
         upstream_queue_lens: list[int],
-        stage_batch_sizes: list[int],
         stages_is_dones: list[bool],
     ) -> None:
         """Apply a completed autoscaling result, clamping unsafe deletions.
@@ -586,9 +584,6 @@ class Autoscaler:
                 pulled into ``pools[i]`` (the pipeline's input queue for
                 stage ``0``, or ``queues[i - 1]`` for downstream stages).
                 Must have the same length as ``pools``.
-            stage_batch_sizes: Per-stage declared ``stage_batch_size`` values
-                (each must be ``>= 1``). Must have the same length as
-                ``pools``.
             stages_is_dones: Per-stage completion flags. ``True`` means the
                 stage has finished consuming all upstream work and is being
                 torn down by the main loop; the guard skips clamping for
@@ -596,24 +591,19 @@ class Autoscaler:
                 the same length as ``pools``.
 
         Raises:
-            ValueError: If ``upstream_queue_lens``, ``stage_batch_sizes``,
-                ``stages_is_dones``, or ``autoscale_result.stages`` has a
-                length different from ``pools``. These are caller-side or
-                planner-side contract violations, not runtime conditions.
+            ValueError: If ``upstream_queue_lens``, ``stages_is_dones``, or
+                ``autoscale_result.stages`` has a length different from
+                ``pools``. These are caller-side or planner-side contract
+                violations, not runtime conditions.
 
         """
         if self._autoscale_future is None or not self._autoscale_future.done():
             return
 
-        if (
-            len(upstream_queue_lens) != len(pools)
-            or len(stage_batch_sizes) != len(pools)
-            or len(stages_is_dones) != len(pools)
-        ):
+        if len(upstream_queue_lens) != len(pools) or len(stages_is_dones) != len(pools):
             raise ValueError(
                 f"Guard inputs have mismatched lengths: pools={len(pools)}, "
                 f"upstream_queue_lens={len(upstream_queue_lens)}, "
-                f"stage_batch_sizes={len(stage_batch_sizes)}, "
                 f"stages_is_dones={len(stages_is_dones)}"
             )
 
@@ -654,13 +644,14 @@ class Autoscaler:
                 # Unit normalization: ``upstream_queue_lens[idx]`` is sample-
                 # denominated (``Queue.__len__`` counts individual ObjectRefs),
                 # but ``pool.num_queued_tasks`` returns pre-batched Tasks.
-                # Multiply the pool count by ``stage_batch_sizes[idx]`` so the
+                # Multiply the pool count by ``pool.stage_batch_size`` so the
                 # combined ``backlog_samples`` value passed to the helper is
                 # uniformly in samples.
-                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued * stage_batch_sizes[idx]
+                stage_batch_size = pool.stage_batch_size
+                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued * stage_batch_size
                 required_workers = _required_workers_for_stage(
                     slots_per_actor=pre_slots_per_actor,
-                    stage_batch_size=stage_batch_sizes[idx],
+                    stage_batch_size=stage_batch_size,
                     inflight_slots=pre_inflight_slots,
                     backlog_samples=backlog_samples,
                 )
@@ -673,7 +664,7 @@ class Autoscaler:
                         f"proposed_delete={proposed_delete_count}, allowed_delete={allowed_delete_count}, "
                         f"upstream_q={upstream_queue_lens[idx]}, pool_q={pre_pool_queued}, "
                         f"inflight_slots={pre_inflight_slots}, slots_per_actor={pre_slots_per_actor}, "
-                        f"stage_batch_size={stage_batch_sizes[idx]}"
+                        f"stage_batch_size={stage_batch_size}"
                     )
                 deletions = deletions[:allowed_delete_count]
 
@@ -984,13 +975,6 @@ def run_pipeline(
     # Create a vector used to track whether a stages are finished or not.
     stage_is_dones = [False for _ in pools]
 
-    # Static per-stage ``stage_batch_size`` values used by the backlog-aware
-    # scale-down guard. Stage batch sizes do not change over the
-    # pipeline's lifetime, so build once outside the main loop.
-    stage_batch_sizes: list[int] = [
-        typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
-    ]
-
     autoscale_rate_limiter = timing.RateLimitChecker(
         1.0 / _effective_autoscale_interval_s(pipeline_spec.config.mode_specific)
     )
@@ -1026,7 +1010,7 @@ def run_pipeline(
             upstream_queue_lens: list[int] = [
                 len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(len(pools))
             ]
-            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_batch_sizes, stage_is_dones)
+            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_is_dones)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need

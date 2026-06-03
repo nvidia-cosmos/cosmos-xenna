@@ -59,7 +59,12 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import 
     FloorParams,
     ScaleDownFloorPolicy,
 )
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import ColdStartRampPolicy, StageRampInput
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import (
+    ColdStartRampPolicy,
+    RampReason,
+    StageRampInput,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.sizing import (
     BacklogDemandPolicy,
@@ -83,16 +88,21 @@ class SaturationAwareScheduler:
     Attributes:
         config: Operator tunables (cadence, catch-up cap, headroom, smoothing).
         shape: Static per-stage pipeline shape (names, batch sizes, GPU flags).
+        solver_template: Rebuilds the solver problem with per-stage request
+            overrides, used to hold pinned stages at their current size when
+            the cluster cannot grow them to their target.
     """
 
     config: SaturationAwareConfig
     shape: PipelineShape
+    solver_template: SolverProblemTemplate
     _estimator: PipelineRateEstimator = attrs.field(init=False)
     _floor: ScaleDownFloorPolicy = attrs.field(init=False)
     _worker_id_factory: WorkerIdFactory = attrs.field(init=False, factory=WorkerIdFactory)
     _demand: BacklogDemandPolicy = attrs.field(init=False)
     _ramp: ColdStartRampPolicy = attrs.field(init=False)
     _problem: data_structures.Problem | None = attrs.field(init=False, default=None)
+    _first_decision_time: float | None = attrs.field(init=False, default=None)
     _queue_snapshot: tuple[float, ...] = attrs.field(init=False, factory=tuple)
     _activity_snapshot: PipelineActivitySnapshot | None = attrs.field(init=False, default=None)
     _pending_measurements: queue.Queue[data_structures.Measurements] = attrs.field(init=False, factory=queue.Queue)
@@ -168,6 +178,12 @@ class SaturationAwareScheduler:
         """
         if self._problem is None:
             raise RuntimeError("setup() must be called before autoscale()")
+        if self._first_decision_time is None:
+            # Anchor every stage's warmup clock to the first decision. The
+            # pipeline shape is static, so all stages exist from this cycle;
+            # the cold-start ramp uses the elapsed time to release a stage that
+            # has produced no sample within a full speed-estimation window.
+            self._first_decision_time = time
         self._drain_pending_measurements()
         workers = [stage.num_workers() for stage in problem_state.rust.stages]
 
@@ -180,14 +196,47 @@ class SaturationAwareScheduler:
             )
         )
         estimates = [Estimate(sizing.effective_speed, sizing.num_returns) for sizing in sizings]
-        solution = run_fragmentation_autoscaler(
-            self._problem, problem_state, Estimates(estimates), _OVERALLOCATION_TARGET, self._worker_id_factory
-        )
+        solution = self._solve(problem_state, Estimates(estimates), workers)
         editor = SolutionEditor(solution)
-        self._apply_cold_start_ramp(editor, workers)
+        self._apply_cold_start_ramp(editor, workers, time)
         self._apply_scale_down_floor(editor, workers, sizings)
         editor.commit()
         return solution
+
+    def _solve(
+        self,
+        problem_state: data_structures.ProblemState,
+        estimates: Estimates,
+        workers: Sequence[int],
+    ) -> data_structures.Solution:
+        """Solve placement, retrying once with pinned stages held at current size.
+
+        A pinned stage's count is a hard solver constraint enforced before any
+        donor borrowing, so a saturated cluster makes the full target infeasible
+        and the solver raises. Holding every pinned stage at its current count is
+        always feasible (it asks the solver to add nothing for those stages) and
+        lets later cycles grow toward the target as resources free.
+        """
+        assert self._problem is not None
+        try:
+            return run_fragmentation_autoscaler(
+                self._problem, problem_state, estimates, _OVERALLOCATION_TARGET, self._worker_id_factory
+            )
+        except RuntimeError as exc:
+            overrides = {stage.name: workers[index] for index, stage in enumerate(self.shape.stages) if stage.is_manual}
+            if not overrides:
+                raise
+            logger.warning(
+                f"saturation-aware solve infeasible ({exc}); holding pinned stages "
+                f"at current size and retrying: {overrides}"
+            )
+            return run_fragmentation_autoscaler(
+                self.solver_template.build(overrides),
+                problem_state,
+                estimates,
+                _OVERALLOCATION_TARGET,
+                self._worker_id_factory,
+            )
 
     def _size_stages(self, now: float, workers: Sequence[int]) -> list[DemandResult]:
         """Size each stage from its snapshot via the backlog demand policy.
@@ -211,17 +260,25 @@ class SaturationAwareScheduler:
             results.append(self._demand.size(snapshot))
         return results
 
-    def _apply_cold_start_ramp(self, editor: SolutionEditor, workers: Sequence[int]) -> None:
+    def _apply_cold_start_ramp(self, editor: SolutionEditor, workers: Sequence[int], now: float) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
 
         Caps each untrusted stage's new-worker additions so the solver cannot
         make large commitments while it is still sizing the stage from
-        placeholder throughput. Logs a per-cycle DEBUG summary of every grown
-        stage and an INFO line for each stage it actually trims.
+        placeholder throughput. A stage that has produced no sample within a
+        full speed-estimation window is released to the solver (slow-starter).
+        Logs a per-cycle DEBUG summary of every grown stage and an INFO line for
+        each stage it trims or releases as a slow-starter.
         """
         min_data_points = self.config.speed_estimation_min_data_points
+        first_decision_time = self._first_decision_time if self._first_decision_time is not None else now
+        stage_age_s = now - first_decision_time
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
+            if stage.is_manual:
+                # Operator pinned this count; the evidence ramp has nothing to
+                # ramp toward, so leave the solver's proposal for it intact.
+                continue
             frag_new = editor.proposed_new_workers(index)
             if frag_new == 0:
                 continue
@@ -234,12 +291,24 @@ class SaturationAwareScheduler:
                     deleted_count=deleted,
                     proposed_post=current + frag_new - deleted,
                     sample_count=samples,
+                    stage_age_s=stage_age_s,
                 )
             )
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu}"
             )
+            if decision.reason is RampReason.SLOW_START:
+                # No sample within the warmup window: the ramp is trusting the
+                # solver rather than trimming. Surface it at INFO so the cause
+                # of the (intentional) large spawn is traceable.
+                logger.info(
+                    f"saturation-aware cold-start ramp: stage='{stage.name}' reason={decision.reason} "
+                    f"current={current} frag_new={frag_new} "
+                    f"stage_age_s={stage_age_s:.1f} window_s={self.config.speed_estimation_window_s:.1f} "
+                    f"samples={samples}/{min_data_points} is_gpu={stage.is_gpu} "
+                    f"(no sample within window; trusting solver)"
+                )
             if decision.keep_new is None or decision.keep_new >= frag_new:
                 continue
             if not editor.trim_new_workers(index, decision.keep_new):

@@ -20,7 +20,11 @@ from collections.abc import Callable
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import ColdStartRampPolicy, StageRampInput
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import (
+    ColdStartRampPolicy,
+    RampReason,
+    StageRampInput,
+)
 
 type RampInputFactory = Callable[..., StageRampInput]
 
@@ -35,12 +39,14 @@ def make_input() -> RampInputFactory:
         deleted_count: int = 0,
         proposed_post: int = 10,
         sample_count: int = 0,
+        stage_age_s: float = 0.0,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
             deleted_count=deleted_count,
             proposed_post=proposed_post,
             sample_count=sample_count,
+            stage_age_s=stage_age_s,
         )
 
     return _make_input
@@ -56,7 +62,7 @@ def test_cold_start_with_no_samples_caps_at_one(make_input: RampInputFactory) ->
     decision = _policy().decide(make_input(sample_count=0, current_workers=0, proposed_post=11))
     assert decision.cap == 1
     assert decision.keep_new == 1
-    assert decision.reason == "cold"
+    assert decision.reason is RampReason.COLD
 
 
 def test_no_samples_running_stage_trims_all_new_workers(make_input: RampInputFactory) -> None:
@@ -66,12 +72,33 @@ def test_no_samples_running_stage_trims_all_new_workers(make_input: RampInputFac
     assert decision.keep_new == 0
 
 
+def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> None:
+    """A 0-sample stage is held at one worker until a full estimation window elapses."""
+    config = SaturationAwareConfig()
+    decision = ColdStartRampPolicy(config).decide(
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s - 1.0)
+    )
+    assert decision.cap == 1
+    assert decision.reason is RampReason.COLD
+
+
+def test_no_sample_after_window_trusts_solver(make_input: RampInputFactory) -> None:
+    """A stage with no sample after a full estimation window is released to the solver."""
+    config = SaturationAwareConfig()
+    decision = ColdStartRampPolicy(config).decide(
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s)
+    )
+    assert decision.cap is None
+    assert decision.keep_new is None
+    assert decision.reason is RampReason.SLOW_START
+
+
 def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -> None:
     """One sample of five unlocks ceil(0.2 * solver_growth) workers."""
     decision = _policy().decide(make_input(sample_count=1, current_workers=1, proposed_post=11))
     assert decision.cap == 3
     assert decision.keep_new == 2
-    assert decision.reason == "warming"
+    assert decision.reason is RampReason.WARMING
 
 
 def test_warming_more_evidence_allows_larger_step(make_input: RampInputFactory) -> None:
@@ -93,7 +120,7 @@ def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
     decision = _policy().decide(make_input(sample_count=5, current_workers=1, proposed_post=11))
     assert decision.cap is None
     assert decision.keep_new is None
-    assert decision.reason == "uncapped"
+    assert decision.reason is RampReason.UNCAPPED
 
 
 def test_ramp_input_does_not_carry_resource_shape(make_input: RampInputFactory) -> None:

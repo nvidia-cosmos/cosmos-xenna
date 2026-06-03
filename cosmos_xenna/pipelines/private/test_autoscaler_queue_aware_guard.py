@@ -43,6 +43,7 @@ def _make_mock_pool(
     num_used_slots: int,
     slots_per_actor: int,
     num_queued_tasks: int,
+    stage_batch_size: int = 1,
 ) -> MagicMock:
     """Build a lightweight mock ActorPool exposing only what the guard reads."""
     pool = MagicMock(name=f"pool-{name}")
@@ -51,6 +52,7 @@ def _make_mock_pool(
     pool.num_used_slots = num_used_slots
     pool.slots_per_actor = slots_per_actor
     pool.num_queued_tasks = num_queued_tasks
+    pool.stage_batch_size = stage_batch_size
     return pool
 
 
@@ -198,7 +200,6 @@ def test_blocks_deletions_when_backlog_exists() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -221,7 +222,6 @@ def test_allows_deletions_when_no_backlog_no_inflight() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -253,7 +253,6 @@ def test_enforces_min_workers_floor_on_drain_tail() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -276,7 +275,6 @@ def test_preserves_workers_for_inflight_only() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -299,7 +297,6 @@ def test_preserves_workers_for_upstream_backlog() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[20],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -321,7 +318,6 @@ def test_does_not_amplify_rust_proposal() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -346,6 +342,7 @@ def test_pool_queue_units_are_tasks_not_samples_under_batch_gt_one() -> None:
         num_used_slots=0,
         slots_per_actor=1,
         num_queued_tasks=4,
+        stage_batch_size=4,
     )
     solution = _make_solution([_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(9)])])
     autoscaler = _make_autoscaler_with_solution(solution)
@@ -353,7 +350,6 @@ def test_pool_queue_units_are_tasks_not_samples_under_batch_gt_one() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[4],
         stages_is_dones=[False],
     )
 
@@ -375,6 +371,7 @@ def test_mixed_upstream_samples_and_pool_tasks_with_batch_gt_one() -> None:
         num_used_slots=0,
         slots_per_actor=2,
         num_queued_tasks=3,
+        stage_batch_size=4,
     )
     solution = _make_solution([_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(7)])])
     autoscaler = _make_autoscaler_with_solution(solution)
@@ -382,7 +379,6 @@ def test_mixed_upstream_samples_and_pool_tasks_with_batch_gt_one() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[4],
-        stage_batch_sizes=[4],
         stages_is_dones=[False],
     )
 
@@ -404,7 +400,6 @@ def test_first_stage_uses_input_queue_length() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[5],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -440,7 +435,6 @@ def test_non_first_stage_uses_its_own_upstream_queue_entry() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool0, pool1],
         upstream_queue_lens=[0, 5],
-        stage_batch_sizes=[1, 1],
         stages_is_dones=[False, False],
     )
 
@@ -489,7 +483,6 @@ def test_logs_clamping_at_info_level(loguru_caplog: pytest.LogCaptureFixture) ->
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -587,6 +580,7 @@ def test_guard_flag_governs_deletion_clamping(
         num_used_slots=inflight_slots,
         slots_per_actor=slots_per_actor,
         num_queued_tasks=queued_tasks,
+        stage_batch_size=stage_batch_size,
     )
     solution = _make_solution(
         [_make_solution_stage(deleted_workers=[_make_deleted_worker(f"w{i}") for i in range(proposed_deletions)])]
@@ -596,7 +590,6 @@ def test_guard_flag_governs_deletion_clamping(
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[upstream_q],
-        stage_batch_sizes=[stage_batch_size],
         stages_is_dones=[False],
     )
 
@@ -628,7 +621,6 @@ def test_no_future_does_nothing() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[False],
     )
 
@@ -657,7 +649,6 @@ def test_finished_stage_bypasses_floor_to_release_workers() -> None:
     autoscaler.apply_autoscale_result_if_ready(
         pools=[pool],
         upstream_queue_lens=[0],
-        stage_batch_sizes=[1],
         stages_is_dones=[True],
     )
 
@@ -675,6 +666,5 @@ def test_raises_on_mismatched_solution_stage_count() -> None:
         autoscaler.apply_autoscale_result_if_ready(
             pools=[pool],
             upstream_queue_lens=[0],
-            stage_batch_sizes=[1],
             stages_is_dones=[False],
         )

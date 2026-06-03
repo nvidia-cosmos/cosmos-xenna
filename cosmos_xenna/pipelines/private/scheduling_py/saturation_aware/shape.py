@@ -21,6 +21,7 @@ tuples (names, batch sizes, GPU flags) indexed in lockstep.
 """
 
 from collections.abc import Sequence
+from typing import Self
 
 import attrs
 
@@ -36,11 +37,15 @@ class StageShape:
         name: Canonical stage name (estimator and floor-state key).
         batch_size: Input items consumed per processed batch.
         is_gpu: Whether the stage's workers hold GPU resources.
+        is_manual: Whether the operator pinned the worker count
+            (``num_workers`` / ``num_workers_per_node``); pinned stages are
+            exempt from the cold-start ramp.
     """
 
     name: str
     batch_size: int = attrs.field(validator=attrs_utils.validate_positive_int)
     is_gpu: bool
+    is_manual: bool
 
 
 @attrs.frozen
@@ -54,7 +59,7 @@ class PipelineShape:
     stages: tuple[StageShape, ...]
 
     @classmethod
-    def from_stage_specs(cls, stage_specs: Sequence[specs.StageSpec]) -> "PipelineShape":
+    def from_stage_specs(cls, stage_specs: Sequence[specs.StageSpec]) -> Self:
         """Build the shape from ordered pipeline stage specs.
 
         Args:
@@ -69,6 +74,7 @@ class PipelineShape:
                     name=spec.name(index),
                     batch_size=spec.stage.stage_batch_size,
                     is_gpu=float(spec.stage.required_resources.gpus) > 0.0,
+                    is_manual=spec.num_workers is not None or spec.num_workers_per_node is not None,
                 )
                 for index, spec in enumerate(stage_specs)
             )

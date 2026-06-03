@@ -202,7 +202,7 @@ class ScaleDownFloorPolicy:
     @classmethod
     def create(cls, num_stages: int, params: FloorParams) -> Self:
         """Build a policy with empty state for ``num_stages`` stages."""
-        return cls(params=params, state=FloorState.initial(num_stages))
+        return cls(params, FloorState.initial(num_stages))
 
     def plan(self, inputs: FloorInputs) -> tuple[int, ...]:
         """Return this cycle's per-stage floors and advance the internal state."""

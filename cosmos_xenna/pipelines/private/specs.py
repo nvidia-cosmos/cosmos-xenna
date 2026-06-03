@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import copy
 import enum
+import math
 import multiprocessing
 import typing
 from typing import Any, Generic, Optional, Sequence
@@ -354,6 +355,22 @@ class StageSpec(typing.Generic[T, V]):
             return str(type(self.stage).__name__)
         else:
             return f"Stage {index:02d} - {type(self.stage).__name__}"
+
+    def resolved_num_workers(self, num_nodes: int) -> int | None:
+        """Return the pinned worker count, or None when the stage autoscales.
+
+        Args:
+            num_nodes: Cluster node count, used to expand a per-node count.
+
+        Returns:
+            ``num_workers`` if set; else ``ceil(num_workers_per_node * num_nodes)``;
+            else ``None``.
+        """
+        if self.num_workers is not None:
+            return self.num_workers
+        if self.num_workers_per_node is not None:
+            return math.ceil(self.num_workers_per_node * num_nodes)
+        return None
 
     def validate(self, cluster_resources: resources.ClusterResources) -> None:
         if self.num_workers is not None and self.num_workers_per_node is not None:
