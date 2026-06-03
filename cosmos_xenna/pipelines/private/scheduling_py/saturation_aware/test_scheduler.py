@@ -20,10 +20,13 @@ through the native fragmentation solver. The pure control-law math lives in
 the chain/floor/activity/estimator unit tests.
 """
 
+import logging
 import uuid
+from collections.abc import Iterator
 from typing import cast
 
 import pytest
+from loguru import logger as loguru_logger
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
@@ -356,3 +359,29 @@ def test_solve_reraises_when_nothing_can_be_relaxed() -> None:
     scheduler.setup(problem)
     with pytest.raises(RuntimeError):
         scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+
+
+@pytest.fixture
+def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Bridge loguru records into pytest's stdlib ``caplog`` fixture."""
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").log(msg.record["level"].no, msg.record["message"]),
+        level=0,
+        format="{message}",
+    )
+    caplog.set_level(logging.DEBUG, logger="loguru")
+    try:
+        yield caplog
+    finally:
+        loguru_logger.remove(handler_id)
+XX
+
+def test_pinned_stage_held_at_zero_escalates_to_error(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """A pinned stage that cannot place even one worker at cold start is logged at ERROR (not running)."""
+    spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_CpuStage(1.0, 1.0), num_workers=4)])
+    cluster = _cpu_cluster(2)
+    scheduler = _scheduler(spec, cluster)
+    scheduler.setup(streaming._make_problem_from_pipeline_spec(spec, cluster))
+    scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    errors = [record.getMessage() for record in loguru_caplog.records if record.levelno == logging.ERROR]
+    assert any("cannot place a worker" in message for message in errors)

@@ -213,9 +213,16 @@ class SaturationAwareScheduler:
 
         A pinned stage's count is a hard solver constraint enforced before any
         donor borrowing, so a saturated cluster makes the full target infeasible
-        and the solver raises. Holding every pinned stage at its current count is
-        always feasible (it asks the solver to add nothing for those stages) and
-        lets later cycles grow toward the target as resources free.
+        and the solver raises. Holding every pinned stage at its current count
+        satisfies that Phase-1 constraint, letting later cycles grow toward the
+        target as resources free. A pinned stage held at zero workers is logged
+        at ERROR (it will not run this cycle); a held stage that still has
+        workers is merely degraded.
+
+        Raises:
+            RuntimeError: If there are no pinned stages to relax, or if the
+                retry is still infeasible (for example a non-pinned stage cannot
+                place its mandatory first worker).
         """
         assert self._problem is not None
         try:
@@ -226,6 +233,12 @@ class SaturationAwareScheduler:
             overrides = {stage.name: workers[index] for index, stage in enumerate(self.shape.stages) if stage.is_manual}
             if not overrides:
                 raise
+            stalled = sorted(name for name, held in overrides.items() if held < _MIN_WORKERS)
+            if stalled:
+                logger.error(
+                    f"saturation-aware: pinned stage(s) {stalled} cannot place a worker on the current cluster "
+                    f"and will not run this cycle; reduce the pinned count or free cluster resources"
+                )
             logger.warning(
                 f"saturation-aware solve infeasible ({exc}); holding pinned stages "
                 f"at current size and retrying: {overrides}"
@@ -265,10 +278,10 @@ class SaturationAwareScheduler:
 
         Caps each untrusted stage's new-worker additions so the solver cannot
         make large commitments while it is still sizing the stage from
-        placeholder throughput. A stage that has produced no sample within a
-        full speed-estimation window is released to the solver (slow-starter).
-        Logs a per-cycle DEBUG summary of every grown stage and an INFO line for
-        each stage it trims or releases as a slow-starter.
+        placeholder throughput. A stage that has work waiting but produces no
+        sample within a full speed-estimation window is released to the solver
+        (slow-starter). Logs a per-cycle DEBUG summary of every grown stage and
+        an INFO line for each stage it trims or releases as a slow-starter.
         """
         min_data_points = self.config.speed_estimation_min_data_points
         first_decision_time = self._first_decision_time if self._first_decision_time is not None else now
@@ -287,6 +300,7 @@ class SaturationAwareScheduler:
             current = workers[index]
             deleted = editor.proposed_deletes(index)
             samples = self._estimator.sample_count(stage.name)
+            has_pending_work = active_depths[index] > 0.0
             decision = self._ramp.decide(
                 StageRampInput(
                     current_workers=current,
@@ -294,7 +308,7 @@ class SaturationAwareScheduler:
                     proposed_post=current + frag_new - deleted,
                     sample_count=samples,
                     stage_age_s=stage_age_s,
-                    has_pending_work=active_depths[index] > 0.0,
+                    has_pending_work=has_pending_work,
                 )
             )
             summaries.append(
@@ -302,15 +316,17 @@ class SaturationAwareScheduler:
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu}"
             )
             if decision.reason is RampReason.SLOW_START:
-                # No sample within the warmup window: the ramp is trusting the
-                # solver rather than trimming. Surface it at INFO so the cause
-                # of the (intentional) large spawn is traceable.
+                # No sample within the warmup window but work is still waiting:
+                # the ramp is trusting the solver to spawn all workers rather
+                # than trimming. Surface it at INFO so the cause of the
+                # (intentional) large spawn is traceable.
                 logger.info(
                     f"saturation-aware cold-start ramp: stage='{stage.name}' reason={decision.reason} "
                     f"current={current} frag_new={frag_new} "
                     f"stage_age_s={stage_age_s:.1f} window_s={self.config.speed_estimation_window_s:.1f} "
-                    f"samples={samples}/{min_data_points} is_gpu={stage.is_gpu} "
-                    f"(no sample within window; trusting solver)"
+                    f"samples={samples}/{min_data_points} has_pending_work={has_pending_work} "
+                    f"active_depth={active_depths[index]:.2f} is_gpu={stage.is_gpu} "
+                    f"(no sample within window and work waiting; trusting solver)"
                 )
             if decision.keep_new is None or decision.keep_new >= frag_new:
                 continue
