@@ -95,11 +95,12 @@ class BacklogDemandPolicy:
         recorded; the previous multiplier is recorded only on the measured path
         so the first measured cycle is unsmoothed (init-to-first).
         """
-        num_returns = (
-            snapshot.num_returns
-            if (snapshot.num_returns is not None and snapshot.num_returns > 0.0)
-            else float(snapshot.batch_size)
-        )
+        if snapshot.num_returns is None:
+            num_returns = float(snapshot.batch_size)
+        elif snapshot.num_returns < 0.0:
+            raise ValueError(f"num_returns for stage '{snapshot.name}' must be >= 0, got {snapshot.num_returns}")
+        else:
+            num_returns = snapshot.num_returns
         speed = snapshot.speed
         if speed is None or speed <= 0.0:
             result = DemandResult(

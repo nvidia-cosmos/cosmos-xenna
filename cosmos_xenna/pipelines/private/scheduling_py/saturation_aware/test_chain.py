@@ -48,6 +48,11 @@ def test_non_positive_batch_size_raises() -> None:
         chain.chain_factors([1.0, 1.0], [1, 0])
 
 
+def test_negative_num_returns_raises() -> None:
+    with pytest.raises(ValueError, match=r"num_returns_per_batch\[1\] must be >= 0, got -1.0"):
+        chain.chain_factors([1.0, -1.0], [1, 1])
+
+
 def test_downstream_stage_sees_upstream_stock_in_source_units() -> None:
     """A starved caption stage still sees upstream backlog: 1000 videos -> 1000 source units."""
     factors = chain.chain_factors([8.0, 1.0], [1, 1])
@@ -70,3 +75,8 @@ def test_zero_fan_out_upstream_contributes_no_downstream_stock() -> None:
     """A fully dropping upstream (k=0 downstream) adds no stock past it."""
     factors = chain.chain_factors([0.0, 1.0], [1, 1])  # k = [1, 0]
     assert chain.whole_chain_stock([5.0, 7.0], factors) == [5.0, 5.0]
+
+
+def test_negative_queue_depth_does_not_reduce_stock() -> None:
+    """Transient negative queue readings are clamped before stock accumulation."""
+    assert chain.whole_chain_stock([4.0, -4.0], [1.0, 2.0]) == [4.0, 4.0]

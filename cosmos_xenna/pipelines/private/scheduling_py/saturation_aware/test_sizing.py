@@ -106,6 +106,18 @@ def test_num_returns_falls_back_to_batch_size_when_unmeasured(make_snapshot: Sna
     assert result.num_returns == 4.0
 
 
+def test_zero_num_returns_is_passed_through(make_snapshot: SnapshotFactory) -> None:
+    """A measured zero fan-out is valid and represents a fully dropping stage."""
+    result = BacklogDemandPolicy(SaturationAwareConfig()).size(make_snapshot(num_returns=0.0, batch_size=4))
+    assert result.num_returns == 0.0
+
+
+def test_negative_num_returns_raises(make_snapshot: SnapshotFactory) -> None:
+    """A negative measured fan-out is invalid and must not fall back to batch size."""
+    with pytest.raises(ValueError, match=r"num_returns for stage 's' must be >= 0, got -1.0"):
+        BacklogDemandPolicy(SaturationAwareConfig()).size(make_snapshot(num_returns=-1.0, batch_size=4))
+
+
 def test_measured_num_returns_is_passed_through(make_snapshot: SnapshotFactory) -> None:
     """A measured fan-out is used verbatim."""
     result = BacklogDemandPolicy(SaturationAwareConfig()).size(make_snapshot(num_returns=8.0))

@@ -41,12 +41,15 @@ def chain_factors(num_returns_per_batch: Sequence[float], stage_batch_sizes: Seq
 
     Raises:
         ValueError: If the two sequences differ in length or a batch size
-            is not positive.
+            is not positive, or a per-batch return count is negative.
     """
     if len(num_returns_per_batch) != len(stage_batch_sizes):
         raise ValueError(
             f"length mismatch: num_returns={len(num_returns_per_batch)} batch_sizes={len(stage_batch_sizes)}"
         )
+    for i, num_returns in enumerate(num_returns_per_batch):
+        if num_returns < 0.0:
+            raise ValueError(f"num_returns_per_batch[{i}] must be >= 0, got {num_returns}")
     factors: list[float] = []
     acc = 1.0
     for i, batch in enumerate(stage_batch_sizes):
@@ -83,7 +86,8 @@ def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> 
     stock: list[float] = []
     running = 0.0
     for queue_depth, factor in zip(queue_depths, chain, strict=True):
+        non_negative_depth = max(queue_depth, 0.0)
         if factor > 0.0:
-            running += queue_depth / factor
+            running += non_negative_depth / factor
         stock.append(running)
     return stock

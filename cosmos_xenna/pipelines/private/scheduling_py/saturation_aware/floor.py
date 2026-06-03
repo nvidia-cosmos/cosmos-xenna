@@ -163,7 +163,7 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
 
         threshold = inputs.batch_sizes[k] / inputs.chain[k] if inputs.chain[k] > 0.0 else 0.0
         streak = 0 if inputs.stock_src[k] > threshold else prev.release_streak[k] + 1
-        releasing = streak >= params.release_confirm_cycles
+        releasing = inputs.stock_src[k] <= threshold and streak >= params.release_confirm_cycles
 
         floor = params.min_workers if releasing else max(params.min_workers, min(w_sustain, inputs.workers[k]))
         floors.append(floor)

@@ -123,6 +123,24 @@ def test_drain_releases_to_min_after_confirm_with_hysteresis() -> None:
     assert result2.floors[1] == 1
 
 
+def test_release_requires_low_stock_even_when_confirmation_is_zero() -> None:
+    """A zero confirmation count must not release while upstream stock is present."""
+    params = floor.FloorParams(
+        alpha_up=0.6,
+        alpha_down_cpu=1.0 / 6.0,
+        alpha_down_gpu=1.0 / 18.0,
+        release_confirm_cycles=0,
+        min_workers=1,
+    )
+    result = floor.compute_floors(
+        _inputs(upstream_workers=10, caption_workers=15, stock=_DEEP_STOCK),
+        floor.FloorState.initial(2),
+        params,
+    )
+    assert result.floors[1] == 15
+    assert result.state.release_streak[1] == 0
+
+
 def test_cold_start_without_speed_estimate_floors_at_min() -> None:
     """Before the speed estimate warms up, the floor cannot size and defaults to MIN."""
     inputs = floor.FloorInputs(
