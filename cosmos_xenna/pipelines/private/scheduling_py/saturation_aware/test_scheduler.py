@@ -15,26 +15,30 @@
 
 """Integration tests for SaturationAwareScheduler against the real solver.
 
-These exercise the wiring (sizing -> solve -> protect -> mutate-and-return)
-through the native fragmentation solver. The pure control-law math lives in
-the chain/floor/activity/estimator unit tests.
+These exercise the wiring (capacity -> demand -> solve -> ramp -> floor ->
+mutate-and-return) through the native fragmentation solver. The pure control-law
+math lives in the capacity/chain/floor/sizing/estimator unit tests.
 """
 
+import logging
 import uuid
+from collections.abc import Iterator
 from typing import cast
+from unittest import mock
 
 import pytest
+from loguru import logger as loguru_logger
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityModel
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import FloorDecision, FloorPlan
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import ScaleDownFloorPolicy
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.solution_editor import SolutionEditor
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
 
 
@@ -247,7 +251,15 @@ def test_autoscale_before_setup_raises() -> None:
         scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
 
 
-def test_backlog_deflation_grows_the_slower_stage() -> None:
+def test_bottleneck_stage_grows_more_than_fast_upstream() -> None:
+    """The slower (bottleneck) stage receives more workers than its fast upstream.
+
+    At cold start the harness reports zero live workers, so the capacity model
+    sees no bottleneck and demand deflates both stages by the same unit
+    multiplier. This therefore asserts the *solver's* speed-balancing: handed the
+    real per-worker speeds (stage 1 is 50x slower), FRAG allocates more workers
+    to the slow stage to equalize throughput.
+    """
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
     scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
     scheduler.setup(problem)
@@ -282,6 +294,38 @@ def test_saturation_aware_uses_its_own_interval() -> None:
         saturation_aware=SaturationAwareConfig(interval_s=7.0),
     )
     assert streaming._effective_autoscale_interval_s(mode) == 7.0
+
+
+def test_upstream_queue_lens_reads_input_then_prior_stage_queues() -> None:
+    """Stage 0 reads the pipeline input queue; each later stage reads its upstream output queue."""
+    input_queue = streaming.Queue()
+    input_queue.by_node_id[None].extend([object(), object(), object()])  # 3 source items
+    stage0_out = streaming.Queue()
+    stage0_out.by_node_id[None].append(object())  # 1 item waiting to feed stage 1
+    queues = [stage0_out, streaming.Queue()]
+    # idx 0 -> len(input_queue) == 3; idx 1 -> len(queues[0]) == 1.
+    assert streaming._upstream_queue_lens(input_queue, queues, 2) == [3, 1]
+
+
+def _streaming_autoscaler(
+    spec: v1.PipelineSpec, cluster: resources.ClusterResources, scheduler: SchedulerKind
+) -> streaming.Autoscaler:
+    spec.config.mode_specific = StreamingSpecificSpec(scheduler=scheduler)
+    return streaming.Autoscaler(allocator.WorkerAllocator.make(cluster), spec, cluster)
+
+
+def test_autoscaler_uses_runtime_signals_for_saturation_aware() -> None:
+    """The saturation-aware scheduler is runtime-aware, so its submission is deferred post-transfer."""
+    spec, cluster, _ = _build([1.0], num_cpus=16)
+    with _streaming_autoscaler(spec, cluster, SchedulerKind.SATURATION_AWARE) as autoscaler:
+        assert autoscaler.uses_runtime_signals is True
+
+
+def test_fragmentation_autoscaler_does_not_use_runtime_signals() -> None:
+    """The fragmentation solver ignores runtime signals, so it keeps the early submission point."""
+    spec, cluster, _ = _build([1.0], num_cpus=16)
+    with _streaming_autoscaler(spec, cluster, SchedulerKind.FRAGMENTATION_BASED) as autoscaler:
+        assert autoscaler.uses_runtime_signals is False
 
 
 def test_all_queued_measurement_batches_are_drained_on_next_autoscale() -> None:
@@ -351,6 +395,44 @@ def test_pinned_stage_over_capacity_holds_at_current_without_raising() -> None:
     assert len(solution.stages[0].new_workers) == 0
 
 
+@pytest.fixture
+def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Bridge loguru records into pytest's stdlib-based ``caplog`` fixture.
+
+    ``cosmos_xenna.utils.python_log`` routes logging through loguru, which does
+    not propagate to the stdlib ``logging`` module, so ``caplog`` is otherwise
+    blind to ``logger.error(...)`` calls. The bridge re-emits every loguru record
+    through a stdlib logger named ``"loguru"`` and tears the sink down at the end.
+    """
+    handler_id = loguru_logger.add(
+        lambda msg: logging.getLogger("loguru").log(msg.record["level"].no, msg.record["message"]),
+        level=0,
+        format="{message}",
+    )
+    caplog.set_level(logging.DEBUG, logger="loguru")
+    try:
+        yield caplog
+    finally:
+        loguru_logger.remove(handler_id)
+
+
+def test_pinned_stage_held_at_zero_escalates_to_error(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """A pinned stage that cannot place even one worker is escalated to ERROR.
+
+    The operator pinned a count the saturated cluster cannot host, so the
+    infeasible solve retries with the stage held at its current zero workers.
+    Holding a pinned stage at zero means it will not run this cycle, so the
+    scheduler must surface an ERROR the operator can act on, not a silent retry.
+    """
+    spec = v1.PipelineSpec(input_data=range(100), stages=[v1.StageSpec(_CpuStage(1.0, 1.0), num_workers=4)])
+    cluster = _cpu_cluster(2)
+    scheduler = _scheduler(spec, cluster)
+    scheduler.setup(streaming._make_problem_from_pipeline_spec(spec, cluster))
+    scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    errors = [record.getMessage() for record in loguru_caplog.records if record.levelno == logging.ERROR]
+    assert any("cannot place a worker" in message for message in errors), errors
+
+
 def test_solve_reraises_when_nothing_can_be_relaxed() -> None:
     """With no pinned stages to hold back, a genuinely infeasible solve propagates."""
     spec, cluster, problem = _build([1.0, 1.0, 1.0], num_cpus=2)
@@ -361,159 +443,53 @@ def test_solve_reraises_when_nothing_can_be_relaxed() -> None:
 
 
 def test_gpu_stage_uses_slower_release_alpha_than_cpu() -> None:
-    """GPU stages decay their floor four times slower than CPU stages.
+    """GPU stages decay their sustainable rate four times slower than CPU stages.
 
     The slower GPU ratchet keeps an expensive warmup stage warm while a
     transient upstream bottleneck clears, instead of tearing it down and
-    paying the cold-start cost again when work resumes.
+    paying the cold-start cost again when work resumes. The release alphas now
+    live on the capacity model, which owns the throughput smoothing.
     """
     spec, cluster, _ = _build([1.0, 1.0], num_cpus=16)
-    params = _scheduler(spec, cluster)._floor.params
+    params = _scheduler(spec, cluster)._capacity.params
     assert params.alpha_down_gpu < params.alpha_down_cpu
     assert params.alpha_down_gpu == pytest.approx(params.alpha_down_cpu / 4.0)
 
 
-class _GrowthStage:
-    """Duck-typed ``solution.rust.stages`` entry: new + deleted worker ids."""
+def test_trusted_speed_is_none_below_threshold_then_measured() -> None:
+    """A stage's measured speed is withheld until it clears the estimator trust threshold.
 
-    def __init__(self, new: int, deleted: int) -> None:
-        self.new_workers = [f"n{i}" for i in range(new)]
-        self.deleted_workers = [f"d{i}" for i in range(deleted)]
-
-
-class _GrowthRust:
-    def __init__(self, stages: list[_GrowthStage]) -> None:
-        self._stages = stages
-
-    @property
-    def stages(self) -> list[_GrowthStage]:
-        return self._stages
-
-    @stages.setter
-    def stages(self, value: list[_GrowthStage]) -> None:
-        self._stages = value
+    Mirrors the cold-start ramp's trust gate so a single noisy early sample
+    cannot set the bottleneck identity or rate before the stage is believed.
+    """
+    spec, cluster, _ = _build([1.0], num_cpus=16)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=3))
+    name = scheduler.shape.stages[0].name
+    now = 100.0
+    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
+    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
+    assert scheduler._trusted_speed(name, now) is None  # 2 samples < threshold (3)
+    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
+    assert scheduler._trusted_speed(name, now) is not None  # 3 samples >= threshold
 
 
-class _GrowthSolution:
-    def __init__(self, stages: list[_GrowthStage]) -> None:
-        self.rust = _GrowthRust(stages)
+def test_capacity_and_floor_advance_once_per_autoscale() -> None:
+    """The capacity model and the floor each evaluate exactly once per autoscale.
 
-
-def _editor_over(stage_counts: list[tuple[int, int]]) -> SolutionEditor:
-    """Build a SolutionEditor over a fake solution with ``(new, deleted)`` per stage."""
-    stages = [_GrowthStage(new, deleted) for new, deleted in stage_counts]
-    return SolutionEditor(cast(data_structures.Solution, _GrowthSolution(stages)))
-
-
-def _decision(*, w_sustain: int, cap_src: float) -> FloorDecision:
-    """A FloorDecision carrying only the fields the growth cap reads."""
-    return FloorDecision(floor=1, cap_src=cap_src, a_raw=0.0, a_ewma=0.0, w_sustain=w_sustain)
-
-
-def _growth_scheduler() -> SaturationAwareScheduler:
-    """Three autoscaled CPU stages (source, middle, sink); none operator-pinned."""
-    spec, cluster, _ = _build([0.25, 0.25, 0.25], num_cpus=64)
-    return _scheduler(spec, cluster)
-
-
-def _last_stage_bottleneck_plan() -> FloorPlan:
-    """Plan whose global bottleneck is the sink; the middle stage is over-fed."""
-    return FloorPlan(
-        decisions=(
-            _decision(w_sustain=1, cap_src=100.0),
-            _decision(w_sustain=8, cap_src=5.0),
-            _decision(w_sustain=5, cap_src=2.0),
-        ),
-        bottleneck_stage=2,
-    )
-
-
-def test_growth_cap_trims_overfed_non_bottleneck_stage_to_sustainable() -> None:
-    """A non-bottleneck stage's new workers are trimmed so post == w_sustain."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(0, 0), (20, 0), (0, 0)])
-    scheduler._apply_growth_cap(editor, (5, 5, 5), _last_stage_bottleneck_plan())
-    # keep_new = w_sustain(8) - workers(5) + deletes(0) = 3 -> post = 5 + 3 = 8.
-    assert editor.proposed_new_workers(1) == 3
-
-
-def test_growth_cap_allows_growth_within_the_band() -> None:
-    """Growth that stays at or below w_sustain is left untouched."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(0, 0), (2, 0), (0, 0)])
-    scheduler._apply_growth_cap(editor, (5, 5, 5), _last_stage_bottleneck_plan())
-    # keep_new = 8 - 5 = 3 >= frag_new(2) -> no trim.
-    assert editor.proposed_new_workers(1) == 2
-
-
-def test_growth_cap_exempts_source_stage() -> None:
-    """The source (index 0) grows freely; its w_sustain is a placeholder, not a ceiling."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(20, 0), (0, 0), (0, 0)])
-    scheduler._apply_growth_cap(editor, (5, 5, 5), _last_stage_bottleneck_plan())
-    # Without the index==0 guard, keep_new = max(0, 1 - 5) = 0 would delete all 20.
-    assert editor.proposed_new_workers(0) == 20
-
-
-def test_growth_cap_exempts_the_bottleneck_stage() -> None:
-    """The global bottleneck grows freely (it is what everyone else is sized to)."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(0, 0), (20, 0), (0, 0)])
-    plan = FloorPlan(
-        decisions=(
-            _decision(w_sustain=1, cap_src=100.0),
-            _decision(w_sustain=8, cap_src=5.0),
-            _decision(w_sustain=5, cap_src=2.0),
-        ),
-        bottleneck_stage=1,
-    )
-    scheduler._apply_growth_cap(editor, (5, 5, 5), plan)
-    assert editor.proposed_new_workers(1) == 20
-
-
-def test_growth_cap_exempts_operator_pinned_stage() -> None:
-    """An operator-pinned stage grows freely; the operator owns its count."""
-    spec = v1.PipelineSpec(
-        input_data=range(100),
-        stages=[
-            v1.StageSpec(_CpuStage(0.25, 1.0)),
-            v1.StageSpec(_CpuStage(0.25, 1.0), num_workers=4),
-            v1.StageSpec(_CpuStage(0.25, 1.0)),
-        ],
-    )
-    scheduler = _scheduler(spec, _cpu_cluster(64))
-    editor = _editor_over([(0, 0), (20, 0), (0, 0)])
-    scheduler._apply_growth_cap(editor, (5, 5, 5), _last_stage_bottleneck_plan())
-    assert editor.proposed_new_workers(1) == 20
-
-
-def test_growth_cap_exempts_cold_stage() -> None:
-    """A cold stage (cap_src == 0) is governed by the ramp, not the growth cap."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(0, 0), (20, 0), (0, 0)])
-    plan = FloorPlan(
-        decisions=(
-            _decision(w_sustain=1, cap_src=100.0),
-            _decision(w_sustain=8, cap_src=0.0),
-            _decision(w_sustain=5, cap_src=2.0),
-        ),
-        bottleneck_stage=2,
-    )
-    scheduler._apply_growth_cap(editor, (5, 5, 5), plan)
-    assert editor.proposed_new_workers(1) == 20
-
-
-def test_growth_cap_is_inert_when_no_stage_is_measured() -> None:
-    """With no measured bottleneck (-1), the cap does nothing for any stage."""
-    scheduler = _growth_scheduler()
-    editor = _editor_over([(20, 0), (20, 0), (20, 0)])
-    plan = FloorPlan(
-        decisions=(
-            _decision(w_sustain=1, cap_src=0.0),
-            _decision(w_sustain=1, cap_src=0.0),
-            _decision(w_sustain=1, cap_src=0.0),
-        ),
-        bottleneck_stage=-1,
-    )
-    scheduler._apply_growth_cap(editor, (5, 5, 5), plan)
-    assert [editor.proposed_new_workers(i) for i in range(3)] == [20, 20, 20]
+    Both own cross-cycle state (the capacity EWMA and sticky bottleneck identity,
+    the floor release streaks). Evaluating either twice in one cycle would advance
+    that state twice -- double-decaying the EWMA or double-counting a release
+    streak -- so pin each to a single evaluation per ``autoscale``.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler.setup(problem)
+    now = 100.0
+    scheduler.update_with_measurements(now, _measurements(now, [0.1, 5.0]))
+    capacity_spy = mock.Mock(wraps=scheduler._capacity)
+    floor_spy = mock.Mock(wraps=scheduler._floor)
+    scheduler._capacity = cast(CapacityModel, capacity_spy)
+    scheduler._floor = cast(ScaleDownFloorPolicy, floor_spy)
+    scheduler.autoscale(now, _state(spec, allocator.WorkerAllocator.make(cluster)))
+    assert capacity_spy.plan.call_count == 1
+    assert floor_spy.plan.call_count == 1

@@ -20,14 +20,13 @@ extension, so ``specs`` and ``cosmos_curator`` can import them without
 building the Rust solver.
 """
 
-from typing import Self, cast
+from typing import Self
 
 import attrs
 
 from cosmos_xenna.utils import attrs_utils
 
 _UNIT_INTERVAL = attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))
-_OPEN_UNIT_INTERVAL = attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0))
 
 
 @attrs.frozen
@@ -37,30 +36,25 @@ class SaturationAwareConfig:
     Every field has a working default; a normal run touches none of them.
 
     Attributes:
-        interval_s: Measure-and-decide cadence and backlog catch-up
-            horizon, in seconds.
-        max_backlog_boost: Primary knob; the most a stage may request
-            relative to its feed-matched size.
-        burst_headroom: Spare-capacity fraction kept on every active
-            stage; the demand-multiplier floor is ``1 + burst_headroom``.
-        backlog_smoothing: EWMA alpha for the demand multiplier; ``None``
-            (or ``1.0``) disables smoothing.
+        interval_s: Measure-and-decide cadence, in seconds. It sets how
+            often the scheduler re-measures throughput and re-plans
+            capacity targets; it is not a backlog catch-up horizon.
+        capacity_headroom: Spare-capacity fraction added on top of the
+            bottleneck rate when computing a stage's useful growth target
+            ``w_target`` (the bounded source-rate read-ahead). It is a
+            target headroom, not a demand-multiplier floor.
         speed_estimation_window_s: Throughput-estimator window.
         speed_estimation_min_data_points: Samples retained even when
-            older than the window.
-        scale_down_release_cycles: Scale-down floor release speed;
+            older than the window; also the trust threshold below which a
+            stage is treated as cold/unmeasured for capacity and demand.
+        scale_down_release_cycles: Scale-down release speed;
             ``alpha_down = 1 / scale_down_release_cycles`` (larger means
-            the floor decays slower, so an expensive stage is held
-            longer through a transient upstream lull).
+            the smoothed sustainable rate decays slower, so an expensive
+            stage is held longer through a transient upstream lull).
     """
 
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
-    max_backlog_boost: float = attrs.field(default=8.0, validator=attrs.validators.ge(1.0))
-    burst_headroom: float = attrs.field(default=0.10, validator=_UNIT_INTERVAL)
-    backlog_smoothing: float | None = attrs.field(
-        default=cast(float | None, 0.4),
-        validator=attrs.validators.optional(_OPEN_UNIT_INTERVAL),
-    )
+    capacity_headroom: float = attrs.field(default=0.10, validator=_UNIT_INTERVAL)
     speed_estimation_window_s: float = attrs.field(default=60.0, validator=attrs.validators.gt(0.0))
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)

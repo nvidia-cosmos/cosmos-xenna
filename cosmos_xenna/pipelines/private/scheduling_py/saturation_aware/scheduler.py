@@ -13,27 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Saturation-aware scheduler: backlog-biased sizing over the fragmentation solver.
+"""Saturation-aware scheduler: capacity-target sizing over the fragmentation solver.
 
-Each cycle the scheduler deflates per-stage speed estimates by a backlog
-demand multiplier so the shared fragmentation solver grows backed-up stages,
-then post-processes the solution it returns to protect transiently-starved
-expensive stages. It edits no fragmentation-scheduler code: the solver is
-called read-only and the returned ``Solution`` is mutated through a
+Each cycle the scheduler builds one pipeline throughput / capacity model
+(``capacity.py``) and uses it to drive both growth and shrink. Demand sizing
+(``sizing.py``) deflates a stage's speed estimate only enough to grow it toward
+its capacity target ``w_target``, so the shared fragmentation solver is never
+handed an inflated ask; the returned solution is then post-processed to ramp
+cold stages and to clamp deletes to each stage's capacity hold target
+``w_sustain``. It edits no fragmentation-scheduler code: the solver is called
+read-only and the returned ``Solution`` is mutated through a
 :class:`SolutionEditor`.
 
 ::
 
-    size  -->  solve  -->  ramp  -->  floor  -->  commit
-    (deflate   (FRAG,      (cap      (clamp      (write the
-     speed/m)   read-only)  cold)     deletes)    edited Solution)
+    snapshot --> capacity --> demand --> solve --> ramp --> floor --> commit
+    (trusted    (cap_src,    (mult to   (FRAG,    (cap      (clamp     (write
+     speed)      rates,       w_target)  read-     cold)     deletes    edited
+                 targets)                only)               to         Solution)
+                                                             w_sustain)
 
 The driver thread only enqueues inputs: ``update_with_measurements`` queues a
 measurement batch and ``observe_runtime`` publishes the per-stage runtime
 signals (queue depth for growth; pool-queued and in-flight work for the
 release gate). ``autoscale`` runs on a single executor thread and owns all
-estimator and floor state mutation, so that state is never shared across
-threads.
+estimator, capacity, and floor state mutation, so that state is never shared
+across threads.
 """
 
 import math
@@ -52,6 +57,12 @@ from cosmos_xenna.pipelines.private.autoscaling_algorithms import (
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import chain
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.activity import PipelineActivitySnapshot
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import (
+    CapacityInputs,
+    CapacityModel,
+    CapacityParams,
+    CapacityPlan,
+)
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.estimator import PipelineRateEstimator
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import (
@@ -68,9 +79,9 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.sizing import (
-    BacklogDemandPolicy,
+    CapacityDemandPolicy,
     DemandResult,
-    StageSnapshot,
+    StageDemandSnapshot,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.solution_editor import SolutionEditor
 from cosmos_xenna.utils import python_log as logger
@@ -80,14 +91,20 @@ _GPU_RELEASE_SLOWDOWN = 4.0
 _RELEASE_CONFIRM_DIVISOR = 3
 _MIN_WORKERS = 1
 _OVERALLOCATION_TARGET = 1.0
+# Bottleneck hysteresis: a challenger must be >=15% slower than the incumbent
+# for 2 consecutive cycles before it takes over, so a one-cycle cap_src dip
+# (for example a transient floor cut) cannot flap the pipeline target rate.
+_HYSTERESIS_MARGIN = 0.15
+_SWITCH_CONFIRM = 2
 
 
 @attrs.define
 class SaturationAwareScheduler:
-    """Backlog-biased autoscaler built on the read-only fragmentation solver.
+    """Capacity-target autoscaler built on the read-only fragmentation solver.
 
     Attributes:
-        config: Operator tunables (cadence, catch-up cap, headroom, smoothing).
+        config: Operator tunables (cadence, capacity headroom, estimator
+            window, scale-down release cycles).
         shape: Static per-stage pipeline shape (names, batch sizes, GPU flags).
         solver_template: Rebuilds the solver problem with per-stage request
             overrides, used to hold pinned stages at their current size when
@@ -98,9 +115,10 @@ class SaturationAwareScheduler:
     shape: PipelineShape
     solver_template: SolverProblemTemplate
     _estimator: PipelineRateEstimator = attrs.field(init=False)
+    _capacity: CapacityModel = attrs.field(init=False)
     _floor: ScaleDownFloorPolicy = attrs.field(init=False)
     _worker_id_factory: WorkerIdFactory = attrs.field(init=False, factory=WorkerIdFactory)
-    _demand: BacklogDemandPolicy = attrs.field(init=False)
+    _demand: CapacityDemandPolicy = attrs.field(init=False)
     _ramp: ColdStartRampPolicy = attrs.field(init=False)
     _problem: data_structures.Problem | None = attrs.field(init=False, default=None)
     _first_decision_time: float | None = attrs.field(init=False, default=None)
@@ -109,21 +127,32 @@ class SaturationAwareScheduler:
     _pending_measurements: queue.Queue[data_structures.Measurements] = attrs.field(init=False, factory=queue.Queue)
 
     def __attrs_post_init__(self) -> None:
-        """Derive the estimator, demand, ramp, and floor policies from the config."""
+        """Derive the estimator, capacity, demand, ramp, and floor policies from the config."""
         config = self.config
         self._estimator = PipelineRateEstimator(
             config.speed_estimation_window_s, config.speed_estimation_min_data_points
         )
         cycles = config.scale_down_release_cycles
-        floor_params = FloorParams(
-            alpha_up=_ALPHA_UP,
-            alpha_down_cpu=1.0 / cycles,
-            alpha_down_gpu=1.0 / (cycles * _GPU_RELEASE_SLOWDOWN),
-            release_confirm_cycles=max(1, math.ceil(cycles / _RELEASE_CONFIRM_DIVISOR)),
-            min_workers=_MIN_WORKERS,
+        self._capacity = CapacityModel.create(
+            self.shape.num_stages,
+            CapacityParams(
+                alpha_up=_ALPHA_UP,
+                alpha_down_cpu=1.0 / cycles,
+                alpha_down_gpu=1.0 / (cycles * _GPU_RELEASE_SLOWDOWN),
+                capacity_headroom=config.capacity_headroom,
+                hysteresis_margin=_HYSTERESIS_MARGIN,
+                switch_confirm=_SWITCH_CONFIRM,
+                min_workers=_MIN_WORKERS,
+            ),
         )
-        self._floor = ScaleDownFloorPolicy.create(self.shape.num_stages, floor_params)
-        self._demand = BacklogDemandPolicy(config)
+        self._floor = ScaleDownFloorPolicy.create(
+            self.shape.num_stages,
+            FloorParams(
+                release_confirm_cycles=max(1, math.ceil(cycles / _RELEASE_CONFIRM_DIVISOR)),
+                min_workers=_MIN_WORKERS,
+            ),
+        )
+        self._demand = CapacityDemandPolicy()
         self._ramp = ColdStartRampPolicy(config)
 
     def setup(self, problem: data_structures.Problem) -> None:
@@ -164,7 +193,7 @@ class SaturationAwareScheduler:
         )
 
     def autoscale(self, time: float, problem_state: data_structures.ProblemState) -> data_structures.Solution:
-        """Size to backlog, solve placement via FRAG, then protect starved stages.
+        """Model capacity, size to target, solve via FRAG, ramp, then floor.
 
         Args:
             time: Decision timestamp, in seconds.
@@ -188,20 +217,43 @@ class SaturationAwareScheduler:
         self._drain_pending_measurements()
         workers = [stage.num_workers() for stage in problem_state.rust.stages]
 
-        sizings = self._size_stages(time, workers)
-        logger.debug(
-            "saturation-aware demand: "
-            + ", ".join(
-                f"{stage.name}={sizing.multiplier:.2f}"
-                for stage, sizing in zip(self.shape.stages, sizings, strict=True)
+        # One throughput model per cycle, shared by growth and the floor.
+        snapshots = self._demand_snapshots(time, workers)
+        returns = [self._demand.resolve_num_returns(snapshot) for snapshot in snapshots]
+        batch_sizes = tuple(stage.batch_size for stage in self.shape.stages)
+        chain_values = chain.chain_factors(returns, batch_sizes)
+        queue_depths = self._queue_for_cycle(len(workers))
+        active_depths = self._active_depths_for_cycle(len(workers), queue_depths)
+        queued_stock = chain.whole_chain_stock(queue_depths, chain_values)
+        active_stock = chain.whole_chain_stock(active_depths, chain_values)
+        capacity = self._capacity.plan(
+            CapacityInputs(
+                workers=tuple(workers),
+                # A cold / untrusted stage reports 0.0 so it is excluded from
+                # the bottleneck and the cold-start ramp keeps owning it.
+                speed=tuple(max(0.0, snapshot.speed or 0.0) for snapshot in snapshots),
+                chain=tuple(chain_values),
+                is_gpu=tuple(stage.is_gpu for stage in self.shape.stages),
             )
         )
+
+        # Grow toward w_target only when real whole-chain stock is waiting.
+        sizings = [
+            self._demand.size(
+                snapshots[index],
+                capacity.stages[index],
+                active_stock[index] > self._stock_threshold(index, chain_values),
+            )
+            for index in range(len(workers))
+        ]
         estimates = [Estimate(sizing.effective_speed, sizing.num_returns) for sizing in sizings]
         solution = self._solve(problem_state, Estimates(estimates), workers)
         editor = SolutionEditor(solution)
         self._apply_cold_start_ramp(editor, workers, time)
-        plan = self._apply_scale_down_floor(editor, workers, sizings)
-        self._apply_growth_cap(editor, workers, plan)
+        floor_plan = self._apply_scale_down_floor(
+            editor, workers, capacity, active_stock, active_depths, chain_values, batch_sizes
+        )
+        self._log_decision_snapshot(workers, sizings, capacity, floor_plan, queued_stock, active_stock)
         editor.commit()
         return solution
 
@@ -253,27 +305,45 @@ class SaturationAwareScheduler:
                 self._worker_id_factory,
             )
 
-    def _size_stages(self, now: float, workers: Sequence[int]) -> list[DemandResult]:
-        """Size each stage from its snapshot via the backlog demand policy.
+    def _demand_snapshots(self, now: float, workers: Sequence[int]) -> list[StageDemandSnapshot]:
+        """Build one demand snapshot per stage from the estimator.
 
-        Returns one :class:`DemandResult` per stage carrying the deflated solver
-        speed, fan-out, the measured speed for the floor, and the demand
-        multiplier (for logging).
+        The per-worker speed is gated through :meth:`_trusted_speed` so a stage
+        with too few samples reports ``None`` (cold) and is excluded from both
+        the bottleneck and demand growth until it is trusted.
         """
-        queue_depths = self._queue_for_cycle(len(workers))
-        results: list[DemandResult] = []
-        for index, stage in enumerate(self.shape.stages):
-            snapshot = StageSnapshot(
+        return [
+            StageDemandSnapshot(
                 name=stage.name,
                 workers=workers[index],
-                queue_depth=queue_depths[index],
-                speed=self._estimator.speed(stage.name, now),
+                speed=self._trusted_speed(stage.name, now),
                 num_returns=self._estimator.num_returns(stage.name),
                 batch_size=stage.batch_size,
-                sample_count=self._estimator.sample_count(stage.name),
             )
-            results.append(self._demand.size(snapshot))
-        return results
+            for index, stage in enumerate(self.shape.stages)
+        ]
+
+    def _trusted_speed(self, name: str, now: float) -> float | None:
+        """Return the measured speed once trusted, else ``None``.
+
+        Mirrors the cold-start ramp's trust threshold
+        (``speed_estimation_min_data_points``) so a single noisy early sample
+        cannot set the bottleneck identity or rate before the stage has
+        enough samples to be believed.
+        """
+        if self._estimator.sample_count(name) < self.config.speed_estimation_min_data_points:
+            return None
+        return self._estimator.speed(name, now)
+
+    def _stock_threshold(self, index: int, chain_values: Sequence[float]) -> float:
+        """Return the source-unit stock above which stage ``index`` has real work.
+
+        One batch's worth of source items (``batch_size / chain``); below it the
+        stage's whole-chain stock is treated as drained, matching the floor's
+        release threshold so growth and release agree on "has work".
+        """
+        factor = chain_values[index]
+        return self.shape.stages[index].batch_size / factor if factor > 0.0 else 0.0
 
     def _apply_cold_start_ramp(self, editor: SolutionEditor, workers: Sequence[int], now: float) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
@@ -350,41 +420,41 @@ class SaturationAwareScheduler:
             logger.debug("saturation-aware ramp: " + " | ".join(summaries))
 
     def _apply_scale_down_floor(
-        self, editor: SolutionEditor, workers: Sequence[int], sizings: Sequence[DemandResult]
+        self,
+        editor: SolutionEditor,
+        workers: Sequence[int],
+        capacity: CapacityPlan,
+        active_stock: Sequence[float],
+        active_depths: Sequence[float],
+        chain_values: Sequence[float],
+        batch_sizes: Sequence[int],
     ) -> FloorPlan:
-        """Cap each stage's delete set to its pipeline-aware scale-down floor.
+        """Clamp each stage's delete set to its capacity hold floor.
 
-        The release gate is driven by active stock (queued backlog plus upstream
+        Feeds the capacity plan's per-stage ``w_sustain`` to the release gate,
+        which is driven by active stock (queued backlog plus upstream
         pool-queued and in-flight work) so a downstream stage is not released
         while upstream work is still in flight. Trims the solver's deletes so the
-        post-delete worker count stays at or above the floor, logging each stage
-        it overrides alongside the signals (speed, capacity, sustainable arrival,
-        and the global bottleneck) that justified it.
+        post-delete worker count stays at or above the floor, logging each
+        overridden stage alongside the capacity signals (speed, cap_src,
+        sustainable arrival, the bottleneck ladder) that justified it.
 
         Returns:
-            The cycle's :class:`FloorPlan`, reused by the growth cap so the
-            floor's smoothing state advances exactly once per cycle.
+            The cycle's :class:`FloorPlan`, reused by the decision snapshot.
         """
-        num_stages = len(workers)
-        speeds = [sizing.measured_speed_for_floor for sizing in sizings]
-        returns = [sizing.num_returns for sizing in sizings]
-        batch_sizes = tuple(stage.batch_size for stage in self.shape.stages)
-        queue_depths = self._queue_for_cycle(num_stages)
-        active_depths = self._active_depths_for_cycle(num_stages, queue_depths)
-        chain_values = chain.chain_factors(returns, batch_sizes)
-        queued_stock = chain.whole_chain_stock(queue_depths, chain_values)
-        active_stock = chain.whole_chain_stock(active_depths, chain_values)
         plan = self._floor.plan(
             FloorInputs(
                 workers=tuple(workers),
-                speed=tuple(speeds),
                 chain=tuple(chain_values),
                 stock_src=tuple(active_stock),
-                batch_sizes=batch_sizes,
-                is_gpu=tuple(stage.is_gpu for stage in self.shape.stages),
+                active_depths=tuple(active_depths),
+                batch_sizes=tuple(batch_sizes),
+                w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
             )
         )
-        bottleneck_name = self.shape.stages[plan.bottleneck_stage].name if plan.bottleneck_stage >= 0 else "none"
+        bottleneck_name = (
+            self.shape.stages[capacity.bottleneck_stage].name if capacity.bottleneck_stage >= 0 else "none"
+        )
         for index in range(editor.stage_count):
             frag_delete = editor.proposed_deletes(index)
             if frag_delete == 0:
@@ -395,6 +465,7 @@ class SaturationAwareScheduler:
             if not editor.cap_deletes(index, max_deletes):
                 continue
             sat_delete = editor.proposed_deletes(index)
+            cap = capacity.stages[index]
             frag_post = workers[index] + new_count - frag_delete
             sat_post = workers[index] + new_count - sat_delete
             logger.info(
@@ -403,49 +474,56 @@ class SaturationAwareScheduler:
                 f"frag_delete={frag_delete} frag_post={frag_post} "
                 f"sat_delete={sat_delete} sat_post={sat_post} "
                 f"floor_protected={frag_delete - sat_delete} floor_target={decision.floor} max_deletes={max_deletes} "
-                f"speed={speeds[index]:.4f} cap_src={decision.cap_src:.3f} a_raw={decision.a_raw:.2f} "
-                f"a_ewma={decision.a_ewma:.2f} w_sustain={decision.w_sustain} bottleneck='{bottleneck_name}' "
-                f"queued_stock={queued_stock[index]:.2f} "
-                f"active_stock={active_stock[index]:.2f} "
-                f"active_depth={active_depths[index]:.2f}"
+                f"releasing={decision.releasing} speed={cap.speed:.4f} cap_src={cap.cap_src:.3f} "
+                f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} w_sustain={cap.w_sustain} w_target={cap.w_target} "
+                f"bottleneck_rate={capacity.bottleneck_rate:.3f} "
+                f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
+                f"bottleneck='{bottleneck_name}' "
+                f"active_stock={active_stock[index]:.2f} active_depth={active_depths[index]:.2f}"
             )
         return plan
 
-    def _apply_growth_cap(self, editor: SolutionEditor, workers: Sequence[int], plan: FloorPlan) -> None:
-        """Cap each non-bottleneck stage's growth at the bottleneck-matched size.
+    def _log_decision_snapshot(
+        self,
+        workers: Sequence[int],
+        sizings: Sequence[DemandResult],
+        capacity: CapacityPlan,
+        floor_plan: FloorPlan,
+        queued_stock: Sequence[float],
+        active_stock: Sequence[float],
+    ) -> None:
+        """Emit one per-cycle DEBUG line capturing every stage's decision signals.
 
-        The floor frees an over-fed stage (lower bound); this ceiling stops the
-        local demand multiplier from immediately re-growing it past what the
-        global bottleneck can absorb (upper bound ``w_sustain``). The source,
-        the bottleneck, operator-pinned, and cold stages grow freely, so the cap
-        is inert until the pipeline is measured.
+        Folds the capacity model (cap_src, bottleneck and next-bottleneck
+        rates, bottleneck stage, w_sustain / w_target), the demand multiplier,
+        the floor decision, the queued and active whole-chain stock, and
+        in-flight slot utilization into one record so a scheduler cycle is
+        debuggable from logs alone.
         """
-        if plan.bottleneck_stage < 0:
-            return
-        bottleneck_name = self.shape.stages[plan.bottleneck_stage].name
-        for index in range(editor.stage_count):
-            stage = self.shape.stages[index]
-            decision = plan.decisions[index]
-            # index 0 is the source (w_sustain is a placeholder there); the
-            # bottleneck must grow; the operator owns pinned counts; a cold or
-            # zero-worker stage (cap_src == 0) is governed by the cold-start ramp.
-            if index == 0 or index == plan.bottleneck_stage or stage.is_manual or decision.cap_src <= 0.0:
-                continue
-            frag_new = editor.proposed_new_workers(index)
-            if frag_new == 0:
-                continue
-            # post = workers - deletes + keep_new; solve for post == w_sustain.
-            # proposed_deletes reflects the floor-capped deletes (the floor ran first).
-            keep_new = max(0, decision.w_sustain - workers[index] + editor.proposed_deletes(index))
-            if not editor.trim_new_workers(index, keep_new):
-                continue
-            cap_post = workers[index] + keep_new - editor.proposed_deletes(index)
-            logger.info(
-                f"saturation-aware growth cap: stage='{stage.name}' "
-                f"current={workers[index]} frag_new={frag_new} keep_new={keep_new} "
-                f"trimmed={frag_new - keep_new} cap_post={cap_post} "
-                f"w_sustain={decision.w_sustain} cap_src={decision.cap_src:.3f} bottleneck='{bottleneck_name}'"
+        snapshot = self._activity_snapshot
+        has_activity = snapshot is not None and len(snapshot.stages) == len(workers)
+        bottleneck_name = (
+            self.shape.stages[capacity.bottleneck_stage].name if capacity.bottleneck_stage >= 0 else "none"
+        )
+        groups: list[str] = []
+        for index, stage in enumerate(self.shape.stages):
+            cap = capacity.stages[index]
+            decision = floor_plan.decisions[index]
+            inflight = snapshot.stages[index].inflight_slots if has_activity else 0
+            pool_queued = snapshot.stages[index].pool_queued_tasks if has_activity else 0
+            utilization = inflight / max(workers[index], 1)
+            groups.append(
+                f"{stage.name}[w={workers[index]} cap_src={cap.cap_src:.2f} "
+                f"w_sustain={cap.w_sustain} w_target={cap.w_target} mult={sizings[index].multiplier:.2f} "
+                f"floor={decision.floor} releasing={decision.releasing} "
+                f"q_stock={queued_stock[index]:.1f} a_stock={active_stock[index]:.1f} "
+                f"inflight={inflight} pool_q={pool_queued} util={utilization:.2f}]"
             )
+        logger.debug(
+            f"saturation-aware decision: bottleneck_rate={capacity.bottleneck_rate:.3f} "
+            f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
+            f"bottleneck='{bottleneck_name}' | " + " | ".join(groups)
+        )
 
     def _queue_for_cycle(self, num_stages: int) -> tuple[float, ...]:
         """Return the queue snapshot if it matches the stage count, else zeros."""

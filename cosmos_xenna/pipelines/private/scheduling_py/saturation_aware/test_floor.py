@@ -13,275 +13,177 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+"""Focused unit tests for the scale-down release gate (native-extension-free).
+
+The throughput math (cap_src, bottleneck, w_sustain) now lives in
+``capacity.py`` and is tested in ``test_capacity.py``; these tests cover only
+the floor's release gate, which consumes a supplied ``w_sustain`` and decides
+how far the solver may shrink each stage.
+"""
 
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import chain, floor
 
 # A two-stage "clip-extract (CPU) -> caption (GPU)" pipeline, 1 video -> 8 clips.
-# chain = [1, 8]; caption speed 0.5 clips/s/worker; upstream speed 0.1 videos/s/worker.
-# So caption's sustainable arrival A = 8 * (w0 * 0.1) = 0.8 * w0 clips/s.
 _CHAIN = (1.0, 8.0)
 _BATCH = (1, 1)
-_IS_GPU = (False, True)
-_CAPTION_SPEED = 0.5
-_UP_SPEED = 0.1
 _DEEP_STOCK = (5000.0, 5000.0)  # plenty of upstream work, in source units
 _EMPTY_STOCK = (0.0, 0.0)
 
 
-def _params() -> floor.FloorParams:
-    return floor.FloorParams(
-        alpha_up=0.6,
-        alpha_down_cpu=1.0 / 6.0,
-        alpha_down_gpu=1.0 / 18.0,
-        release_confirm_cycles=2,
-        min_workers=1,
-    )
+def _params(release_confirm_cycles: int = 2) -> floor.FloorParams:
+    return floor.FloorParams(release_confirm_cycles=release_confirm_cycles, min_workers=1)
 
 
-def _inputs(*, upstream_workers: int, caption_workers: int, stock: tuple[float, float]) -> floor.FloorInputs:
+def _inputs(
+    *,
+    workers: tuple[int, int],
+    w_sustain: tuple[int, int],
+    stock: tuple[float, float],
+    active: tuple[float, float] = (0.0, 0.0),
+    chain_factors: tuple[float, float] = _CHAIN,
+) -> floor.FloorInputs:
+    # active_depths only affects the zero-fanout (chain <= 0) release branch.
+    # _CHAIN is all-positive, so positive-chain tests are unaffected by it.
     return floor.FloorInputs(
-        workers=(upstream_workers, caption_workers),
-        speed=(_UP_SPEED, _CAPTION_SPEED),
-        chain=_CHAIN,
+        workers=workers,
+        chain=chain_factors,
         stock_src=stock,
+        active_depths=active,
         batch_sizes=_BATCH,
-        is_gpu=_IS_GPU,
-    )
-
-
-def _bottleneck_inputs() -> floor.FloorInputs:
-    """Three-stage pipeline whose global bottleneck is the last (GPU) stage.
-
-    cap_src = [10*10, 60*1, 7*0.4] = [100, 60, 2.8], so the bottleneck is the
-    last stage at 2.8 source items/s and the over-fed middle stage is floored
-    down to it.
-    """
-    return floor.FloorInputs(
-        workers=(10, 60, 7),
-        speed=(10.0, 1.0, 0.4),
-        chain=(1.0, 1.0, 1.0),
-        stock_src=(5000.0, 5000.0, 5000.0),
-        batch_sizes=(1, 1, 1),
-        is_gpu=(False, False, True),
+        w_sustain=w_sustain,
     )
 
 
 def _caption_floor_after_two_cycles(stock: tuple[float, float], params: floor.FloorParams) -> int:
-    """Run the floor two cycles at fixed workers and return caption's floor.
+    """Run the floor two cycles at fixed inputs and return caption's floor.
 
     Two cycles is exactly ``release_confirm_cycles`` for ``_params()``, so a
     persistently low stock releases on the second cycle.
     """
     state = floor.FloorState.initial(2)
-    first = floor.compute_floors(_inputs(upstream_workers=10, caption_workers=15, stock=stock), state, params)
-    second = floor.compute_floors(_inputs(upstream_workers=10, caption_workers=15, stock=stock), first.state, params)
-    return second.floors[1]
+    args = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=stock)
+    first = floor.compute_floors(args, state, params)
+    second = floor.compute_floors(args, first.state, params)
+    return second.plan.floors[1]
 
 
-def test_asymmetric_ewma_initializes_to_first_sample() -> None:
-    assert floor.asymmetric_ewma(None, 8.0, 0.6, 0.1) == 8.0
-
-
-def test_asymmetric_ewma_is_fast_up_slow_down() -> None:
-    up = floor.asymmetric_ewma(2.0, 10.0, 0.6, 0.1)
-    down = floor.asymmetric_ewma(10.0, 2.0, 0.6, 0.1)
-    # Rising moves most of the way (alpha_up); falling barely moves (alpha_down).
-    assert up == pytest.approx(0.6 * 10.0 + 0.4 * 2.0)
-    assert down == pytest.approx(0.1 * 2.0 + 0.9 * 10.0)
-    assert (up - 2.0) > (10.0 - down)  # up step larger than down step
-
-
-def test_stage_zero_floor_is_always_min() -> None:
-    """The source stage has no upstream, so it is never upstream-starved."""
+def test_holds_clamps_deletes_to_w_sustain() -> None:
+    """While stock is present the floor clamps deletes to ``min(w_sustain, workers)``."""
     result = floor.compute_floors(
-        _inputs(upstream_workers=10, caption_workers=15, stock=_DEEP_STOCK),
+        _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_DEEP_STOCK),
         floor.FloorState.initial(2),
         _params(),
     )
-    assert result.floors[0] == 1
-
-
-def test_transient_lull_holds_expensive_stage_warm() -> None:
-    """Upstream capacity is intact (w*s high) and work is queued, so caption is held at 15."""
-    result = floor.compute_floors(
-        _inputs(upstream_workers=10, caption_workers=15, stock=_DEEP_STOCK),
-        floor.FloorState.initial(2),
-        _params(),
-    )
-    # cap_src = [1.0, 0.9375]; the global bottleneck is caption itself (0.9375).
-    # A = 8 * 0.9375 = 7.5; w_sustain = ceil(7.5/0.5) = 15; floor = min(15, 15) = 15.
-    assert result.floors[1] == 15
-
-
-def test_persistent_bottleneck_shrinks_to_sustainable_size() -> None:
-    """When upstream is genuinely slow, caption shrinks to the size its feed justifies (= borrow)."""
-    converged = floor.FloorState(a_ewma=(None, 2.4), release_streak=(0, 0))
-    result = floor.compute_floors(
-        _inputs(upstream_workers=3, caption_workers=15, stock=_DEEP_STOCK),
-        converged,
-        _params(),
-    )
-    # A = 8 * (3 * 0.1) = 2.4; w_sustain = ceil(2.4/0.5) = 5; floor = min(5, 15) = 5.
-    assert result.floors[1] == 5
-
-
-def test_global_bottleneck_frees_overfed_upstream_stage() -> None:
-    """A stage fed faster than the global bottleneck is floored down to it."""
-    result = floor.compute_floors(_bottleneck_inputs(), floor.FloorState.initial(3), _params())
-    # Stage 1: a_raw = 1 * 2.8 = 2.8; w_sustain = ceil(2.8/1.0) = 3; floor = min(3, 60) = 3.
-    assert result.bottleneck_stage == 2
-    assert result.floors[1] == 3
-
-
-def test_global_bottleneck_stage_holds_itself() -> None:
-    """The bottleneck's own capacity bounds the floor, so it is not shrunk."""
-    result = floor.compute_floors(_bottleneck_inputs(), floor.FloorState.initial(3), _params())
-    # Stage 2 (bottleneck): a_raw = 1 * 2.8 = 2.8; w_sustain = ceil(2.8/0.4) = 7; floor = min(7, 7) = 7.
-    assert result.floors[2] == 7
-
-
-def test_cold_stage_is_excluded_from_the_global_bottleneck() -> None:
-    """A stage with no speed estimate neither becomes nor drags the bottleneck."""
-    inputs = floor.FloorInputs(
-        workers=(10, 60, 7),
-        speed=(10.0, 0.0, 0.4),  # middle stage not yet measured
-        chain=(1.0, 1.0, 1.0),
-        stock_src=(5000.0, 5000.0, 5000.0),
-        batch_sizes=(1, 1, 1),
-        is_gpu=(False, False, True),
-    )
-    result = floor.compute_floors(inputs, floor.FloorState.initial(3), _params())
-    # cap_src = [100, 0, 2.8]; the cold stage is skipped -> bottleneck = 2.8 at stage 2.
-    assert result.bottleneck_stage == 2
-    assert result.floors[1] == 1
-
-
-def test_all_cold_pipeline_floors_at_min_with_no_bottleneck() -> None:
-    """With no measured stage, the floor cannot size and reports no bottleneck."""
-    inputs = floor.FloorInputs(
-        workers=(10, 60, 7),
-        speed=(0.0, 0.0, 0.0),
-        chain=(1.0, 1.0, 1.0),
-        stock_src=(5000.0, 5000.0, 5000.0),
-        batch_sizes=(1, 1, 1),
-        is_gpu=(False, False, True),
-    )
-    result = floor.compute_floors(inputs, floor.FloorState.initial(3), _params())
-    assert result.bottleneck_stage == -1
-    assert result.floors == (1, 1, 1)
-
-
-def test_single_cycle_bottleneck_dip_does_not_collapse_floor() -> None:
-    """A one-cycle bottleneck drop decays the floor slowly, not all at once."""
-    # Stage 1 converged at the higher arrival it saw before the dip (a_ewma=8.0).
-    converged = floor.FloorState(a_ewma=(None, 8.0, None), release_streak=(0, 0, 0))
-    result = floor.compute_floors(_bottleneck_inputs(), converged, _params())
-    # a_raw drops to 2.8 but CPU slow-down holds a_ewma ~7.13 -> w_sustain = 8,
-    # well above the fully-decayed sustainable size (3).
-    assert result.floors[1] > 3
+    # w_sustain 5 < workers 15 -> the solver may shrink caption down to 5, no further.
+    assert result.plan.floors[1] == 5
 
 
 def test_floor_never_exceeds_current_workers() -> None:
     """The floor is a shrink-veto, never a grow command."""
-    # Seed a high prior arrival: the slow GPU decay keeps w_sustain above the
-    # current workers this cycle. (Once a_ewma settles the clamp is a no-op,
-    # because a stage's own capacity bounds the global bottleneck.)
-    converged = floor.FloorState(a_ewma=(None, 9.0), release_streak=(0, 0))
     result = floor.compute_floors(
-        _inputs(upstream_workers=10, caption_workers=10, stock=_DEEP_STOCK),
-        converged,
+        _inputs(workers=(10, 10), w_sustain=(1, 18), stock=_DEEP_STOCK),
+        floor.FloorState.initial(2),
         _params(),
     )
-    # a_raw = 8 * 0.625 = 5.0; slow GPU decay holds a_ewma ~8.78 -> w_sustain = 18;
-    # only 10 workers exist -> floor = min(18, 10) = 10, not 18.
-    assert result.floors[1] == 10
+    # w_sustain 18 > workers 10 -> floor = min(18, 10) = 10, not 18.
+    assert result.plan.floors[1] == 10
 
 
-def test_drain_releases_to_min_after_confirm_with_hysteresis() -> None:
-    """With queues empty, the floor holds for release_confirm cycles, then releases to MIN."""
-    params = _params()
-    state = floor.FloorState.initial(2)
-
-    # Cycle 1: queues just went empty; hysteresis keeps the stage held (capacity still high).
-    result1 = floor.compute_floors(_inputs(upstream_workers=10, caption_workers=15, stock=_EMPTY_STOCK), state, params)
-    assert result1.floors[1] == 15
-
-    # Cycle 2: still empty -> release_confirm reached -> released to MIN.
-    result2 = floor.compute_floors(
-        _inputs(upstream_workers=10, caption_workers=15, stock=_EMPTY_STOCK), result1.state, params
+def test_source_stage_is_clamped_like_any_other() -> None:
+    """There is no source special case: stage 0 holds at ``min(w_sustain, workers)`` too."""
+    result = floor.compute_floors(
+        _inputs(workers=(10, 15), w_sustain=(4, 5), stock=_DEEP_STOCK),
+        floor.FloorState.initial(2),
+        _params(),
     )
-    assert result2.floors[1] == 1
+    assert result.plan.floors[0] == 4
+
+
+def test_drain_releases_to_min_after_confirm() -> None:
+    """With stock drained, the floor holds for the confirm window, then releases to MIN."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    args = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_EMPTY_STOCK)
+
+    first = floor.compute_floors(args, state, params)
+    assert first.plan.floors[1] == 5  # cycle 1: still held at the sustain clamp (streak 1 < 2)
+
+    second = floor.compute_floors(args, first.state, params)
+    assert second.plan.floors[1] == 1  # cycle 2: confirm reached -> released to MIN
 
 
 def test_release_requires_low_stock_even_when_confirmation_is_zero() -> None:
     """A zero confirmation count must not release while upstream stock is present."""
-    params = floor.FloorParams(
-        alpha_up=0.6,
-        alpha_down_cpu=1.0 / 6.0,
-        alpha_down_gpu=1.0 / 18.0,
-        release_confirm_cycles=0,
-        min_workers=1,
-    )
+    params = _params(release_confirm_cycles=0)
     result = floor.compute_floors(
-        _inputs(upstream_workers=10, caption_workers=15, stock=_DEEP_STOCK),
+        _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_DEEP_STOCK),
         floor.FloorState.initial(2),
         params,
     )
-    assert result.floors[1] == 15
+    assert result.plan.floors[1] == 5
     assert result.state.release_streak[1] == 0
-
-
-def test_cold_start_without_speed_estimate_floors_at_min() -> None:
-    """Before the speed estimate warms up, the floor cannot size and defaults to MIN."""
-    inputs = floor.FloorInputs(
-        workers=(10, 15),
-        speed=(0.1, 0.0),  # caption speed not yet estimated
-        chain=_CHAIN,
-        stock_src=_DEEP_STOCK,
-        batch_sizes=_BATCH,
-        is_gpu=_IS_GPU,
-    )
-    result = floor.compute_floors(inputs, floor.FloorState.initial(2), _params())
-    assert result.floors[1] == 1
-
-
-def test_gpu_stage_releases_slower_than_cpu_stage() -> None:
-    """A GPU stage uses the slower alpha_down, so its floor decays less per cycle on a capacity drop."""
-    params = _params()
-    high = floor.FloorState(a_ewma=(None, 8.0), release_streak=(0, 0))
-    dropped = _inputs(upstream_workers=3, caption_workers=15, stock=_DEEP_STOCK)  # A drops 8 -> 2.4
-
-    gpu_result = floor.compute_floors(dropped, high, params)
-    cpu_inputs = floor.FloorInputs(
-        workers=dropped.workers,
-        speed=dropped.speed,
-        chain=dropped.chain,
-        stock_src=dropped.stock_src,
-        batch_sizes=dropped.batch_sizes,
-        is_gpu=(False, False),
-    )
-    cpu_result = floor.compute_floors(cpu_inputs, high, params)
-    # Slower decay -> GPU floor stays >= CPU floor after the same single drop cycle.
-    assert gpu_result.floors[1] >= cpu_result.floors[1]
 
 
 def test_active_stock_blocks_release_that_queue_only_stock_would_trigger() -> None:
     """In-flight upstream work must keep caption warm when local queues are empty.
 
-    Reproduction of the caption scale-down oscillation: at the bad moment both
-    inter-stage queues read empty, so a queue-only stock (depths ``[0, 0]``)
-    releases caption to MIN after the confirm window. An *active* stock that also
-    counts clip-extraction's in-flight + pool-queued videos (10 used slots + 5
-    pool-queued = 15 stage-0 input samples, depths ``[15, 0]``) keeps the release
-    gate shut, so caption holds at 15.
+    At the bad moment both inter-stage queues read empty, so a queue-only stock
+    (depths ``[0, 0]``) releases caption to MIN after the confirm window. An
+    active stock that also counts clip-extraction's in-flight + pool-queued
+    videos (depths ``[15, 0]``) keeps the release gate shut, so caption holds.
     """
-    params = _params()  # release_confirm_cycles = 2
+    params = _params(release_confirm_cycles=2)
     queue_only = chain.whole_chain_stock([0.0, 0.0], _CHAIN)
     active = chain.whole_chain_stock([15.0, 0.0], _CHAIN)
 
     assert _caption_floor_after_two_cycles((queue_only[0], queue_only[1]), params) == 1
     assert _caption_floor_after_two_cycles((active[0], active[1]), params) == 15
+
+
+def _zero_fanout_inputs(active_caption_depth: float) -> floor.FloorInputs:
+    """A drop stage (chain[1] == 0): no source-normalized stock reaches stage 1."""
+    return floor.FloorInputs(
+        workers=(10, 15),
+        chain=(1.0, 0.0),
+        stock_src=(0.0, 0.0),
+        active_depths=(0.0, active_caption_depth),
+        batch_sizes=_BATCH,
+        w_sustain=(1, 14),
+    )
+
+
+def test_zero_fanout_stage_holds_floor_while_local_work_remains() -> None:
+    """A drop stage (chain == 0) is not released while it still owns admitted work.
+
+    whole_chain_stock() cannot express a zero-fanout stage's own depth in source
+    units, so stock_src reads 0 even with work in flight. Gating release on
+    active_depths keeps the release streak at 0 (no premature release to MIN).
+    """
+    params = _params(release_confirm_cycles=2)
+    busy = _zero_fanout_inputs(active_caption_depth=5.0)
+
+    first = floor.compute_floors(busy, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(busy, first.state, params)
+
+    # Held branch: floor = min(w_sustain 14, workers 15) = 14.
+    assert first.plan.floors[1] == 14
+    assert first.state.release_streak[1] == 0
+    assert second.state.release_streak[1] == 0
+    assert second.plan.floors[1] > params.min_workers
+
+
+def test_zero_fanout_stage_releases_once_local_work_drains() -> None:
+    """Once a drop stage's local work is gone, the normal low-stock release resumes."""
+    params = _params(release_confirm_cycles=2)
+    drained = _zero_fanout_inputs(active_caption_depth=0.0)
+
+    first = floor.compute_floors(drained, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(drained, first.state, params)
+
+    # Cycle 1: streak reaches 1 (< confirm=2); still held at the sustain clamp.
+    assert first.state.release_streak[1] == 1
+    # Cycle 2: streak reaches the confirm window -> released to MIN.
+    assert second.plan.floors[1] == params.min_workers
 
 
 def test_scale_down_floor_policy_carries_state_across_cycles() -> None:
@@ -290,7 +192,7 @@ def test_scale_down_floor_policy_carries_state_across_cycles() -> None:
     Verifies the release streak accumulates inside the policy across calls, so
     the scheduler no longer threads ``FloorState`` by hand.
     """
-    policy = floor.ScaleDownFloorPolicy.create(2, _params())
-    inputs = _inputs(upstream_workers=10, caption_workers=15, stock=_EMPTY_STOCK)
-    assert policy.plan(inputs).floors[1] == 15
-    assert policy.plan(inputs).floors[1] == 1
+    policy = floor.ScaleDownFloorPolicy.create(2, _params(release_confirm_cycles=2))
+    args = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_EMPTY_STOCK)
+    assert policy.plan(args).floors[1] == 5
+    assert policy.plan(args).floors[1] == 1

@@ -452,6 +452,19 @@ class Autoscaler:
         """Exits the context manager, shutting down the executor."""
         self._executor.shutdown(wait=True)
 
+    @property
+    def uses_runtime_signals(self) -> bool:
+        """Whether the selected scheduler consumes per-cycle runtime signals.
+
+        Runtime-aware schedulers (for example ``SATURATION_AWARE``) read the
+        per-stage queue/pool/in-flight snapshot published at submission time, so
+        the streaming loop defers their autoscale submission until after
+        completed tasks have been transferred downstream (a phase-consistent
+        snapshot). The fragmentation solver ignores runtime signals, so it keeps
+        the earlier submission point and is unaffected by the deferral.
+        """
+        return isinstance(self._algorithm, runtime_signals.RuntimeAware)
+
     def add_measurements(
         self,
         task_metadata_per_pool: list[list[stage_worker.TaskResultMetadata]],
@@ -929,6 +942,28 @@ class Queue:
         return all_refs
 
 
+def _upstream_queue_lens(input_queue: Queue, queues: list[Queue], num_pools: int) -> list[int]:
+    """Return each stage's upstream queue length, in input samples.
+
+    Stage 0 draws from the pipeline ``input_queue``; every downstream stage
+    ``idx`` draws from ``queues[idx - 1]`` (its immediate upstream stage's output
+    queue). The streaming loop computes this twice per cycle: once as the
+    pre-dispatch snapshot a completed autoscale result is applied against, and
+    again (after completed tasks are transferred downstream) as the
+    post-transfer snapshot a runtime-aware scheduler reasons about when its next
+    calculation is submitted.
+
+    Args:
+        input_queue: The pipeline's source-input queue (feeds stage 0).
+        queues: Per-stage output queues; ``queues[idx - 1]`` feeds stage ``idx``.
+        num_pools: Number of stages/pools to report a length for.
+
+    Returns:
+        A length-``num_pools`` list of per-stage upstream queue lengths.
+    """
+    return [len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(num_pools)]
+
+
 def run_pipeline(
     pipeline_spec: specs.PipelineSpec,
     cluster_resources: resources.ClusterResources,
@@ -1007,10 +1042,10 @@ def run_pipeline(
             # per-stage upstream queue lengths used by the backlog-aware
             # scale-down guard: stage 0 draws from the pipeline
             # input queue; every other stage draws from ``queues[idx - 1]``.
-            upstream_queue_lens: list[int] = [
-                len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(len(pools))
-            ]
-            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_is_dones)
+            # This pre-dispatch snapshot is the state a previously-computed
+            # autoscale result is applied against.
+            apply_queue_lens = _upstream_queue_lens(input_queue, queues, len(pools))
+            autoscaler.apply_autoscale_result_if_ready(pools, apply_queue_lens, stage_is_dones)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
@@ -1025,10 +1060,21 @@ def run_pipeline(
                     pool.update()
             new_stats.pool_update_end = time.time()
 
-            # Handle scaling the actor pools.
-            # This should get called on the first loop through.
-            if autoscale_rate_limiter.can_call():
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones, upstream_queue_lens)
+            # Handle scaling the actor pools. ``can_call()`` advances the
+            # rate-limiter clock as a side effect, so evaluate it once per loop
+            # and reuse the result for whichever submission path runs below.
+            can_submit_autoscale = autoscale_rate_limiter.can_call()
+
+            # The fragmentation solver (default) ignores runtime signals, so it
+            # submits here, on the same early loop phase as before, using the
+            # pre-dispatch queue snapshot. Runtime-aware schedulers
+            # (SATURATION_AWARE) defer submission until after completed tasks are
+            # transferred downstream (see below), so the RuntimeSignals they read
+            # describe the post-transfer pipeline state instead of a stale one.
+            # The deferred path's submission cost is reflected in the add-tasks
+            # timing phase rather than here.
+            if can_submit_autoscale and not autoscaler.uses_runtime_signals:
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones, apply_queue_lens)
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools
@@ -1142,6 +1188,19 @@ def run_pipeline(
                             task = maybe_task
                         logger.trace(f"Stage {idx} adding task: {task}")
                         pool.add_task(task)  # type: ignore
+
+            # Runtime-aware schedulers (SATURATION_AWARE) submit here, after the
+            # reverse stage loop above has transferred completed tasks downstream
+            # and dispatched ready work. Recomputing the upstream queue lengths
+            # now makes the published RuntimeSignals (queue depths plus the
+            # pool's pool-queued and in-flight counters) describe the
+            # post-transfer state the new solve reasons about, instead of a stale
+            # top-of-loop snapshot. ``stage_is_dones`` is still this iteration's
+            # value (the done check below has not run yet), matching the default
+            # path above.
+            if can_submit_autoscale and autoscaler.uses_runtime_signals:
+                submit_queue_lens = _upstream_queue_lens(input_queue, queues, len(pools))
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones, submit_queue_lens)
 
             new_stats.add_tasks_end = time.time()
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
