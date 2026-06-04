@@ -19,10 +19,11 @@ from collections.abc import Callable
 
 import pytest
 
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import StageCapacity
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityPlan, StageCapacity
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.sizing import (
-    CapacityDemandPolicy,
     StageDemandSnapshot,
+    size_pipeline,
+    size_stage,
 )
 
 type SnapshotFactory = Callable[..., StageDemandSnapshot]
@@ -58,14 +59,21 @@ def _capacity(*, w_target: int, w_sustain: int = 1, speed: float = 2.0) -> Stage
 
 def test_cold_start_without_speed_uses_solver_default(make_snapshot: SnapshotFactory) -> None:
     """No measured speed yields the solver default speed and a unit multiplier."""
-    result = CapacityDemandPolicy().size(make_snapshot(speed=None), _capacity(w_target=10), has_stock=True)
+    result = size_stage(make_snapshot(speed=None), _capacity(w_target=10), has_stock=True)
     assert result.effective_speed == 1.0
     assert result.multiplier == 1.0
 
 
 def test_non_positive_speed_is_treated_as_cold_start(make_snapshot: SnapshotFactory) -> None:
     """A zero speed is unestimated, so it falls back to the cold-start path."""
-    result = CapacityDemandPolicy().size(make_snapshot(speed=0.0), _capacity(w_target=10), has_stock=True)
+    result = size_stage(make_snapshot(speed=0.0), _capacity(w_target=10), has_stock=True)
+    assert result.effective_speed == 1.0
+    assert result.multiplier == 1.0
+
+
+def test_negative_speed_is_treated_as_cold_start(make_snapshot: SnapshotFactory) -> None:
+    """A negative speed is an invalid estimate, so it falls back to the cold-start path."""
+    result = size_stage(make_snapshot(speed=-1.0), _capacity(w_target=10), has_stock=True)
     assert result.effective_speed == 1.0
     assert result.multiplier == 1.0
 
@@ -77,56 +85,72 @@ def test_at_or_above_target_does_not_grow_even_with_stock(make_snapshot: Snapsho
     current size, so the multiplier stays 1.0 and the solver is never handed an
     inflated ask that could over-grow it.
     """
-    result = CapacityDemandPolicy().size(make_snapshot(workers=4, speed=2.0), _capacity(w_target=4), has_stock=True)
+    result = size_stage(make_snapshot(workers=4, speed=2.0), _capacity(w_target=4), has_stock=True)
     assert result.multiplier == 1.0
     assert result.effective_speed == pytest.approx(2.0)
 
 
 def test_below_target_with_stock_grows_toward_target(make_snapshot: SnapshotFactory) -> None:
     """A below-target stage with real stock deflates speed by ``w_target / workers``."""
-    result = CapacityDemandPolicy().size(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_stock=True)
+    result = size_stage(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_stock=True)
     assert result.multiplier == pytest.approx(3.0)
     assert result.effective_speed == pytest.approx(2.0 / 3.0)
 
 
 def test_below_target_without_stock_does_not_grow(make_snapshot: SnapshotFactory) -> None:
     """Without whole-chain stock the stage holds at a unit multiplier even below target."""
-    result = CapacityDemandPolicy().size(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_stock=False)
+    result = size_stage(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_stock=False)
     assert result.multiplier == 1.0
     assert result.effective_speed == pytest.approx(2.0)
 
 
 def test_zero_workers_below_target_uses_one_as_divisor(make_snapshot: SnapshotFactory) -> None:
     """A stage with no current workers divides by one, not zero."""
-    result = CapacityDemandPolicy().size(make_snapshot(workers=0, speed=2.0), _capacity(w_target=3), has_stock=True)
+    result = size_stage(make_snapshot(workers=0, speed=2.0), _capacity(w_target=3), has_stock=True)
     assert result.multiplier == pytest.approx(3.0)
 
 
 def test_num_returns_falls_back_to_batch_size_when_unmeasured(make_snapshot: SnapshotFactory) -> None:
     """Without a measured fan-out, the batch size seeds the chain factor."""
-    result = CapacityDemandPolicy().size(
-        make_snapshot(num_returns=None, batch_size=4), _capacity(w_target=1), has_stock=False
-    )
+    result = size_stage(make_snapshot(num_returns=None, batch_size=4), _capacity(w_target=1), has_stock=False)
     assert result.num_returns == 4.0
 
 
 def test_zero_num_returns_is_passed_through(make_snapshot: SnapshotFactory) -> None:
     """A measured zero fan-out is valid and represents a fully dropping stage."""
-    result = CapacityDemandPolicy().size(
-        make_snapshot(num_returns=0.0, batch_size=4), _capacity(w_target=1), has_stock=False
-    )
+    result = size_stage(make_snapshot(num_returns=0.0, batch_size=4), _capacity(w_target=1), has_stock=False)
     assert result.num_returns == 0.0
 
 
 def test_negative_num_returns_raises(make_snapshot: SnapshotFactory) -> None:
     """A negative measured fan-out is invalid and must not fall back to batch size."""
     with pytest.raises(ValueError, match=r"num_returns for stage 's' must be >= 0, got -1.0"):
-        CapacityDemandPolicy().size(
-            make_snapshot(num_returns=-1.0, batch_size=4), _capacity(w_target=1), has_stock=False
-        )
+        size_stage(make_snapshot(num_returns=-1.0, batch_size=4), _capacity(w_target=1), has_stock=False)
 
 
 def test_measured_num_returns_is_passed_through(make_snapshot: SnapshotFactory) -> None:
     """A measured fan-out is used verbatim."""
-    result = CapacityDemandPolicy().size(make_snapshot(num_returns=8.0), _capacity(w_target=1), has_stock=False)
+    result = size_stage(make_snapshot(num_returns=8.0), _capacity(w_target=1), has_stock=False)
     assert result.num_returns == 8.0
+
+
+def test_size_pipeline_pairs_each_stage_with_its_capacity_and_stock(make_snapshot: SnapshotFactory) -> None:
+    """``size_pipeline`` applies growth only to the below-target stage with stock.
+
+    Stage 0 is below target with stock (grows), stage 1 is below target without
+    stock (holds). The per-index ``has_stock`` predicate must select the right
+    stage, proving the function pairs snapshots, capacities, and the gate by
+    index.
+    """
+    snapshots = [make_snapshot(workers=2, speed=2.0), make_snapshot(workers=2, speed=2.0)]
+    capacity = CapacityPlan(
+        stages=(_capacity(w_target=6), _capacity(w_target=6)),
+        bottleneck_stage=0,
+        bottleneck_rate=1.0,
+        next_bottleneck_rate=1.0,
+    )
+
+    results = size_pipeline(snapshots, capacity, has_stock=lambda index: index == 0)
+
+    assert results[0].multiplier == pytest.approx(3.0)
+    assert results[1].multiplier == 1.0

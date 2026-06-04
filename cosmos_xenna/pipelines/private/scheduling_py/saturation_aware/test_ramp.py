@@ -20,11 +20,7 @@ from collections.abc import Callable
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import (
-    ColdStartRampPolicy,
-    RampReason,
-    StageRampInput,
-)
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import RampReason, StageRampInput, decide
 
 type RampInputFactory = Callable[..., StageRampInput]
 
@@ -54,14 +50,14 @@ def make_input() -> RampInputFactory:
     return _make_input
 
 
-def _policy() -> ColdStartRampPolicy:
-    """Build a policy with the default trust threshold of 5 samples."""
-    return ColdStartRampPolicy(SaturationAwareConfig())
+def _config() -> SaturationAwareConfig:
+    """Build a config with the default trust threshold of 5 samples."""
+    return SaturationAwareConfig()
 
 
 def test_cold_start_with_no_samples_caps_at_one(make_input: RampInputFactory) -> None:
     """Any stage with no completed sample is capped at one worker."""
-    decision = _policy().decide(make_input(sample_count=0, current_workers=0, proposed_post=11))
+    decision = decide(make_input(sample_count=0, current_workers=0, proposed_post=11), _config())
     assert decision.cap == 1
     assert decision.keep_new == 1
     assert decision.reason is RampReason.COLD
@@ -69,7 +65,7 @@ def test_cold_start_with_no_samples_caps_at_one(make_input: RampInputFactory) ->
 
 def test_no_samples_running_stage_trims_all_new_workers(make_input: RampInputFactory) -> None:
     """With one worker already up but no sample yet, no further workers are added."""
-    decision = _policy().decide(make_input(sample_count=0, current_workers=1, proposed_post=11))
+    decision = decide(make_input(sample_count=0, current_workers=1, proposed_post=11), _config())
     assert decision.cap == 1
     assert decision.keep_new == 0
 
@@ -77,9 +73,7 @@ def test_no_samples_running_stage_trims_all_new_workers(make_input: RampInputFac
 def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> None:
     """A 0-sample stage is held at one worker until a full estimation window elapses."""
     config = SaturationAwareConfig()
-    decision = ColdStartRampPolicy(config).decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s - 1.0)
-    )
+    decision = decide(make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s - 1.0), config)
     assert decision.cap == 1
     assert decision.reason is RampReason.COLD
 
@@ -87,8 +81,8 @@ def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> Non
 def test_no_sample_after_window_with_pending_work_trusts_solver(make_input: RampInputFactory) -> None:
     """A stage with work waiting but no sample after a full window is released to the solver."""
     config = SaturationAwareConfig()
-    decision = ColdStartRampPolicy(config).decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=True)
+    decision = decide(
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=True), config
     )
     assert decision.cap is None
     assert decision.keep_new is None
@@ -98,8 +92,8 @@ def test_no_sample_after_window_with_pending_work_trusts_solver(make_input: Ramp
 def test_no_sample_after_window_without_pending_work_stays_cold(make_input: RampInputFactory) -> None:
     """A starved stage (no work waiting) stays capped past the window, never over-spawned."""
     config = SaturationAwareConfig()
-    decision = ColdStartRampPolicy(config).decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=False)
+    decision = decide(
+        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=False), config
     )
     assert decision.cap == 1
     assert decision.reason is RampReason.COLD
@@ -107,7 +101,7 @@ def test_no_sample_after_window_without_pending_work_stays_cold(make_input: Ramp
 
 def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -> None:
     """One sample of five unlocks ceil(0.2 * solver_growth) workers."""
-    decision = _policy().decide(make_input(sample_count=1, current_workers=1, proposed_post=11))
+    decision = decide(make_input(sample_count=1, current_workers=1, proposed_post=11), _config())
     assert decision.cap == 3
     assert decision.keep_new == 2
     assert decision.reason is RampReason.WARMING
@@ -115,21 +109,21 @@ def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -
 
 def test_warming_more_evidence_allows_larger_step(make_input: RampInputFactory) -> None:
     """More samples unlock a larger fraction of the solver's requested growth."""
-    decision = _policy().decide(make_input(sample_count=4, current_workers=1, proposed_post=11))
+    decision = decide(make_input(sample_count=4, current_workers=1, proposed_post=11), _config())
     assert decision.cap == 9
     assert decision.keep_new == 8
 
 
 def test_warming_allows_at_least_one_more_worker(make_input: RampInputFactory) -> None:
     """A warming stage may always grow by at least one worker."""
-    decision = _policy().decide(make_input(sample_count=1, current_workers=1, proposed_post=2))
+    decision = decide(make_input(sample_count=1, current_workers=1, proposed_post=2), _config())
     assert decision.cap == 2
     assert decision.keep_new is None
 
 
 def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
     """Once samples reach the trust threshold the stage is uncapped."""
-    decision = _policy().decide(make_input(sample_count=5, current_workers=1, proposed_post=11))
+    decision = decide(make_input(sample_count=5, current_workers=1, proposed_post=11), _config())
     assert decision.cap is None
     assert decision.keep_new is None
     assert decision.reason is RampReason.UNCAPPED
@@ -143,12 +137,12 @@ def test_ramp_input_does_not_carry_resource_shape(make_input: RampInputFactory) 
 
 def test_proposal_within_cap_is_not_trimmed(make_input: RampInputFactory) -> None:
     """A solver proposal already at or below the cap keeps all its new workers."""
-    decision = _policy().decide(make_input(sample_count=0, current_workers=0, proposed_post=1))
+    decision = decide(make_input(sample_count=0, current_workers=0, proposed_post=1), _config())
     assert decision.cap == 1
     assert decision.keep_new is None
 
 
 def test_shrink_is_never_turned_into_growth(make_input: RampInputFactory) -> None:
     """A solver-proposed shrink is left untouched; the ramp never adds workers."""
-    decision = _policy().decide(make_input(sample_count=1, current_workers=5, deleted_count=2, proposed_post=3))
+    decision = decide(make_input(sample_count=1, current_workers=5, deleted_count=2, proposed_post=3), _config())
     assert decision.keep_new is None

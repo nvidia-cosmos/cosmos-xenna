@@ -63,6 +63,28 @@ def chain_factors(num_returns_per_batch: Sequence[float], stage_batch_sizes: Seq
     return factors
 
 
+def source_stock_threshold(batch_size: int, chain_factor: float) -> float:
+    """Return one batch worth of source-item stock for a stage.
+
+    A stage is considered to have real work when its whole-chain at-or-upstream
+    stock (in source-item units) exceeds one batch's worth of source items,
+    ``batch_size / chain_factor``. A non-positive ``chain_factor`` (a fully
+    dropping upstream stage, whose admitted work cannot be expressed in source
+    units) collapses the threshold to ``0.0``. This is the single source of
+    truth shared by the growth gate and the scale-down release gate, so both
+    agree on the "has work" boundary.
+
+    Args:
+        batch_size: Stage input items consumed per batch (``> 0`` in practice).
+        chain_factor: Stage's cumulative fan-out from :func:`chain_factors`.
+
+    Returns:
+        The source-unit stock above which the stage has at least one batch of
+        work, or ``0.0`` when ``chain_factor`` is non-positive.
+    """
+    return batch_size / chain_factor if chain_factor > 0.0 else 0.0
+
+
 def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> list[float]:
     """Return per-stage at-or-upstream pending stock, in source-item units.
 

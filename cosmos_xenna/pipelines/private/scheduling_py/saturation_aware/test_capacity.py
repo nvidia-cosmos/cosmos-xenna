@@ -222,7 +222,7 @@ def test_source_grows_toward_next_bottleneck_when_it_is_the_bottleneck() -> None
 
 
 def test_hold_window_can_have_next_rate_below_bottleneck_rate() -> None:
-    """While holding the incumbent, a transiently slower challenger makes T1 < T0."""
+    """While holding the incumbent, a transiently slower challenger makes next_bottleneck_rate < bottleneck_rate."""
     params = _params(hysteresis_margin=0.15, switch_confirm=2)
     state = capacity.CapacityState(a_ewma=(None, None, None), bottleneck=0, bottleneck_streak=0)
     decisive = _inputs(workers=(10, 8, 20), speed=(1.0, 1.0, 1.0))

@@ -37,6 +37,8 @@ from typing import Self
 
 import attrs
 
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import chain
+
 
 @attrs.frozen
 class FloorParams:
@@ -178,7 +180,7 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             streak = 0
             releasing = False
         else:
-            threshold = inputs.batch_sizes[k] / inputs.chain[k] if inputs.chain[k] > 0.0 else 0.0
+            threshold = chain.source_stock_threshold(inputs.batch_sizes[k], inputs.chain[k])
             streak = 0 if inputs.stock_src[k] > threshold else prev.release_streak[k] + 1
             releasing = inputs.stock_src[k] <= threshold and streak >= params.release_confirm_cycles
 

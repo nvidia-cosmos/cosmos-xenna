@@ -97,53 +97,50 @@ class RampDecision:
     reason: RampReason
 
 
-@attrs.frozen
-class ColdStartRampPolicy:
-    """Evidence-scaled cold-start cap for not-yet-trusted stages.
+def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision:
+    """Return the cold-start cap and trim count for one stage.
 
-    Allowed growth interpolates from one worker (no evidence) to the solver's
-    full proposal (trusted), scaled by sample confidence.
+    Evidence-scaled cold-start cap for not-yet-trusted stages: allowed growth
+    interpolates from one worker (no evidence) to the solver's full proposal
+    (trusted), scaled by sample confidence. No completed sample caps the stage
+    at one worker until a full speed-estimation window has elapsed with work
+    still waiting, after which the stage is treated as a slow-starter and
+    uncapped; while warming, the allowed growth is
+    ``ceil(confidence * solver_growth)`` (at least one); trusted stages are
+    uncapped.
 
-    Attributes:
-        config: Operator tunables (provides the trust threshold).
+    Args:
+        stage: One stage's pre-solve counts, sample count, age, and work flag.
+        config: Operator tunables (provides the trust threshold and window).
+
+    Returns:
+        The cold-start :class:`RampDecision` (cap, trim count, and reason tag).
     """
-
-    config: SaturationAwareConfig
-
-    def decide(self, stage: StageRampInput) -> RampDecision:
-        """Return the cold-start cap and trim count for one stage.
-
-        No completed sample caps the stage at one worker until a full
-        speed-estimation window has elapsed with work still waiting, after which
-        the stage is treated as a slow-starter and uncapped; while warming, the
-        allowed growth is ``ceil(confidence * solver_growth)`` (at least one);
-        trusted stages are uncapped.
-        """
-        min_data_points = self.config.speed_estimation_min_data_points
-        if stage.sample_count >= min_data_points:
-            return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
-        if stage.sample_count == 0:
-            window_elapsed = stage.stage_age_s >= self.config.speed_estimation_window_s
-            if window_elapsed and stage.has_pending_work:
-                # A full estimation window has passed with no completed task yet
-                # work is still waiting: this is a slow-warmup stage (its first
-                # result lands long after the window). Trust the solver so every
-                # worker spawns now and their models load in parallel. The
-                # pending-work gate keeps a stage merely starved of input capped,
-                # so the solver cannot over-spawn it from placeholder throughput.
-                return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
-            # No completed task yet (still within the warmup window, or no work
-            # waiting): hold at a single worker so a 0-sample stage cannot creep
-            # upward cycle after cycle while it could still produce its first
-            # sample.
-            cap = 1
-            reason = RampReason.COLD
-        else:
-            confidence = stage.sample_count / min_data_points
-            solver_growth = max(0, stage.proposed_post - stage.current_workers)
-            cap = stage.current_workers + max(1, math.ceil(confidence * solver_growth))
-            reason = RampReason.WARMING
-        if stage.proposed_post <= cap:
-            return RampDecision(cap=cap, keep_new=None, reason=reason)
-        keep_new = max(0, cap - (stage.current_workers - stage.deleted_count))
-        return RampDecision(cap=cap, keep_new=keep_new, reason=reason)
+    min_data_points = config.speed_estimation_min_data_points
+    if stage.sample_count >= min_data_points:
+        return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
+    if stage.sample_count == 0:
+        window_elapsed = stage.stage_age_s >= config.speed_estimation_window_s
+        if window_elapsed and stage.has_pending_work:
+            # A full estimation window has passed with no completed task yet
+            # work is still waiting: this is a slow-warmup stage (its first
+            # result lands long after the window). Trust the solver so every
+            # worker spawns now and their models load in parallel. The
+            # pending-work gate keeps a stage merely starved of input capped,
+            # so the solver cannot over-spawn it from placeholder throughput.
+            return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
+        # No completed task yet (still within the warmup window, or no work
+        # waiting): hold at a single worker so a 0-sample stage cannot creep
+        # upward cycle after cycle while it could still produce its first
+        # sample.
+        cap = 1
+        reason = RampReason.COLD
+    else:
+        confidence = stage.sample_count / min_data_points
+        solver_growth = max(0, stage.proposed_post - stage.current_workers)
+        cap = stage.current_workers + max(1, math.ceil(confidence * solver_growth))
+        reason = RampReason.WARMING
+    if stage.proposed_post <= cap:
+        return RampDecision(cap=cap, keep_new=None, reason=reason)
+    keep_new = max(0, cap - (stage.current_workers - stage.deleted_count))
+    return RampDecision(cap=cap, keep_new=keep_new, reason=reason)

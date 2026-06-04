@@ -33,21 +33,7 @@ fact this module derives two per-stage worker targets that the grow
 Bottleneck identity is sticky (hysteresis) so a one-cycle ``cap_src`` dip from
 a floor cut cannot drag every stage's target down. The smoothed arrival rate
 ``a_ewma`` and the bottleneck identity persist across cycles inside
-:class:`CapacityModel`::
-
-    cap_src[k] = workers[k]*speed[k]/chain[k]
-       |
-       v
-    bottleneck_rate = sticky min(cap_src)
-    next_bottleneck_rate = second-min(cap_src)
-       |
-       v
-    w_sustain = ceil(chain*bottleneck_rate/speed) (hold)
-    w_target  = ceil(chain*target_rate/speed)     (grow)
-       where target_rate = max(next_bottleneck_rate, bottleneck_rate*(1+headroom))
-                               for the bottleneck stage,
-                           bottleneck_rate*(1+headroom)
-                               for every other stage
+:class:`CapacityModel`.
 """
 
 import math

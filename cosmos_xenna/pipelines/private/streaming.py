@@ -39,9 +39,7 @@ from cosmos_xenna.pipelines.private import (
 )
 from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -317,12 +315,7 @@ def _make_scheduler_algorithm(
     algorithm: _SchedulerAlgorithm
     if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
         config = SaturationAwareConfig.resolve(mode_specific.saturation_aware)
-        stages = [typing.cast(specs.StageSpec, stage) for stage in pipeline_spec.stages]
-        algorithm = SaturationAwareScheduler(
-            config=config,
-            shape=PipelineShape.from_stage_specs(stages),
-            solver_template=SolverProblemTemplate.from_stage_specs(stages, cluster_resources),
-        )
+        algorithm = SaturationAwareScheduler.from_pipeline_spec(pipeline_spec, cluster_resources, config)
     else:
         algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
             mode_specific.autoscale_speed_estimation_window_duration_s,

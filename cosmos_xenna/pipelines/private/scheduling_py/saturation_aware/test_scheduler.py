@@ -159,6 +159,59 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
     )
 
 
+def _stage_names(spec: v1.PipelineSpec) -> list[str]:
+    """Return the per-stage names in pipeline order."""
+    return [stage_spec.name(index) for index, stage_spec in enumerate(cast(list[StageSpec], spec.stages))]
+
+
+def _backlog(num_stages: int, queue_depth: float) -> RuntimeSignals:
+    """Uniform runtime signals: every stage has ``queue_depth`` source items waiting."""
+    return RuntimeSignals(
+        queue_depths=(queue_depth,) * num_stages,
+        pool_queued_tasks=(0,) * num_stages,
+        inflight_slots=(0,) * num_stages,
+        batch_sizes=(1,) * num_stages,
+    )
+
+
+def _apply_to_allocator(
+    spec: v1.PipelineSpec,
+    worker_allocator: allocator.WorkerAllocator,
+    solution: data_structures.Solution,
+) -> None:
+    """Commit one autoscale ``Solution`` to the allocator for a multi-cycle simulation.
+
+    The default ``_state`` harness rebuilds from a fresh allocator each call, so
+    current workers are always zero and only the cold-start growth path is ever
+    exercised. Persisting the solution lets a test drive the real cross-cycle
+    control law (capacity EWMA, sticky bottleneck, floor release streaks) and the
+    delete path.
+
+    Mirrors the streaming layer's apply order: deleted workers are released
+    first so a rebalancing cycle never transiently over-allocates a full
+    cluster, then new workers are placed. A post-floor solution can exceed
+    cluster capacity for a single tick; additions that do not fit raise
+    ``allocator.AllocationError`` and are deferred to the next cycle, exactly as
+    ``streaming`` defers unplaceable additions.
+    """
+    names = _stage_names(spec)
+    for stage_solution in solution.stages:
+        for worker in stage_solution.deleted_workers:
+            worker_allocator.remove_worker(worker.id)
+    for index, stage_solution in enumerate(solution.stages):
+        name = names[index]
+        for worker in stage_solution.new_workers:
+            try:
+                worker_allocator.add_worker(worker.to_worker_group(name))
+            except allocator.AllocationError:
+                break  # cluster full this tick; the next autoscale re-proposes
+
+
+def _worker_counts(spec: v1.PipelineSpec, worker_allocator: allocator.WorkerAllocator) -> list[int]:
+    """Return the current per-stage worker counts held by the allocator."""
+    return [len(worker_allocator.get_workers_in_stage(name)) for name in _stage_names(spec)]
+
+
 def test_cold_start_sizes_every_stage_and_deletes_nothing() -> None:
     spec, cluster, problem = _build([0.25, 1.0], num_cpus=16)
     scheduler = _scheduler(spec, cluster)
@@ -493,3 +546,73 @@ def test_capacity_and_floor_advance_once_per_autoscale() -> None:
     scheduler.autoscale(now, _state(spec, allocator.WorkerAllocator.make(cluster)))
     assert capacity_spy.plan.call_count == 1
     assert floor_spy.plan.call_count == 1
+
+
+def test_warm_pipeline_converges_to_a_stable_split() -> None:
+    """A warmed pipeline reaches a steady worker split and then stops churning.
+
+    The slower stage is the bottleneck and must win more workers; once the
+    cluster-balanced split is reached, replaying identical cycles must add and
+    delete nothing. Any cross-cycle state that double-advances (re-decaying the
+    EWMA, double-counting a release streak) would re-open churn here.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    now = 100.0
+    churn_per_cycle: list[int] = []
+    for _ in range(4):
+        scheduler.update_with_measurements(now, _measurements(now, [0.1, 0.5]))  # stage 1 is 5x slower
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        solution = scheduler.autoscale(now, _state(spec, worker_allocator))
+        churn_per_cycle.append(sum(len(s.new_workers) + len(s.deleted_workers) for s in solution.stages))
+        _apply_to_allocator(spec, worker_allocator, solution)
+        now += 10.0
+
+    fast, slow = _worker_counts(spec, worker_allocator)
+    assert slow > fast  # the bottleneck stage wins more workers
+    assert churn_per_cycle[0] > 0  # cold start grows the pipeline
+    assert churn_per_cycle[-1] == 0  # converged: no flapping once the split is reached
+
+
+def test_bottleneck_shift_scales_down_now_fast_stage_gradually() -> None:
+    """When the bottleneck moves, the over-provisioned stage drains gradually.
+
+    This is the only path that drives deletes end-to-end. Warm stage 0 as the
+    bottleneck, then flip the measured speeds so stage 1 becomes the bottleneck.
+    The solver now wants stage 0's workers for stage 1; the scale-down floor
+    releases stage 0 a bounded amount per cycle -- never to zero and never in a
+    single jump -- exercising the floor delete-cap and the ramp/floor editor
+    composition.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    now = 100.0
+
+    # Warm-up: stage 0 is the slow bottleneck and wins the cluster. Run several
+    # cycles so the capacity EWMA and the sticky bottleneck identity settle.
+    for _ in range(5):
+        scheduler.update_with_measurements(now, _measurements(now, [0.5, 0.1]))
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        _apply_to_allocator(spec, worker_allocator, scheduler.autoscale(now, _state(spec, worker_allocator)))
+        now += 10.0
+    warm = _worker_counts(spec, worker_allocator)
+    assert warm[0] > warm[1]  # stage 0 dominates while it is the bottleneck
+
+    # Flip the bottleneck so stage 1 is now slowest; stage 0 must shed workers.
+    stage0_over_time: list[int] = []
+    for _ in range(8):
+        scheduler.update_with_measurements(now, _measurements(now, [0.1, 0.5]))
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        _apply_to_allocator(spec, worker_allocator, scheduler.autoscale(now, _state(spec, worker_allocator)))
+        stage0_over_time.append(_worker_counts(spec, worker_allocator)[0])
+        now += 10.0
+
+    assert stage0_over_time[-1] < warm[0]  # net scale-down: stage 0 ends below its bottleneck peak
+    assert min(stage0_over_time) >= 1  # the floor (min_workers) is never breached
+    assert any(
+        1 < count < warm[0] for count in stage0_over_time
+    )  # gradual: bounded per-cycle release, no one-shot collapse
