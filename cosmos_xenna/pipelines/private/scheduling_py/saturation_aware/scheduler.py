@@ -88,6 +88,7 @@ _OVERALLOCATION_TARGET = 1.0
 # (for example a transient floor cut) cannot flap the pipeline target rate.
 _HYSTERESIS_MARGIN = 0.15
 _SWITCH_CONFIRM = 2
+_FEEDER_BOOST_MAX_MULTIPLIER = 2.0
 
 
 @attrs.frozen
@@ -108,7 +109,12 @@ class _Cycle:
         batch_sizes: Per-stage input items consumed per batch.
         chain_factors: Per-stage cumulative fan-out from the source.
         is_gpu: Per-stage GPU flag (drives the capacity release alpha).
+        is_manual: Per-stage manual pin flag (blocks feeder-pressure boosts).
+        local_depths: Per-stage input queue depth, in stage-input samples.
+        local_pending_depths: Per-stage queue plus pool-queued depth, excluding
+            in-flight work, in stage-input samples.
         active_depths: Per-stage active work depth (queued, pool, in-flight).
+        ready_workers: Per-stage workers not holding an in-flight slot.
         queued_stock: Per-stage queued whole-chain stock, in source units.
         active_stock: Per-stage active whole-chain stock, in source units.
         activity_snapshot: Raw runtime snapshot for this cycle, or ``None`` when
@@ -122,7 +128,11 @@ class _Cycle:
     batch_sizes: tuple[int, ...]
     chain_factors: tuple[float, ...]
     is_gpu: tuple[bool, ...]
+    is_manual: tuple[bool, ...]
+    local_depths: tuple[float, ...]
+    local_pending_depths: tuple[float, ...]
     active_depths: tuple[float, ...]
+    ready_workers: tuple[int, ...]
     queued_stock: tuple[float, ...]
     active_stock: tuple[float, ...]
     activity_snapshot: PipelineActivitySnapshot | None
@@ -136,6 +146,10 @@ class _Cycle:
         threshold = chain.source_stock_threshold(self.batch_sizes[index], self.chain_factors[index])
         return self.active_stock[index] > threshold
 
+    def has_local_input(self, index: int) -> bool:
+        """Return whether local pending input can use another worker."""
+        return self.local_pending_depths[index] > float(self.batch_sizes[index])
+
     def capacity_inputs(self) -> CapacityInputs:
         """Return the capacity model's inputs for this cycle.
 
@@ -147,6 +161,12 @@ class _Cycle:
             speed=tuple(max(0.0, snapshot.speed or 0.0) for snapshot in self.demand_snapshots),
             chain=self.chain_factors,
             is_gpu=self.is_gpu,
+            is_manual=self.is_manual,
+            local_qin=self.local_depths,
+            local_pending_depth=self.local_pending_depths,
+            local_input_threshold=tuple(float(batch_size) for batch_size in self.batch_sizes),
+            active_depth=self.active_depths,
+            ready_workers=self.ready_workers,
         )
 
     def floor_inputs(self, capacity: CapacityPlan) -> FloorInputs:
@@ -162,6 +182,7 @@ class _Cycle:
             active_depths=self.active_depths,
             batch_sizes=self.batch_sizes,
             w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
+            is_gpu=self.is_gpu,
         )
 
 
@@ -210,6 +231,9 @@ class SaturationAwareScheduler:
                 capacity_headroom=config.capacity_headroom,
                 hysteresis_margin=_HYSTERESIS_MARGIN,
                 switch_confirm=_SWITCH_CONFIRM,
+                feeder_pressure_confirm=_SWITCH_CONFIRM,
+                feeder_arrival_horizon_s=config.interval_s,
+                feeder_boost_max_multiplier=_FEEDER_BOOST_MAX_MULTIPLIER,
                 min_workers=_MIN_WORKERS,
             ),
         )
@@ -316,14 +340,17 @@ class SaturationAwareScheduler:
 
         cycle = self._build_cycle(time, problem_state)
         capacity = self._capacity.plan(cycle.capacity_inputs())
-        sizings = sizing.size_pipeline(cycle.demand_snapshots, capacity, cycle.has_work)
+        sizings = sizing.size_pipeline(cycle.demand_snapshots, capacity, cycle.has_local_input)
         estimates = Estimates([Estimate(result.effective_speed, result.num_returns) for result in sizings])
 
         solution = self._solve(problem, problem_state, estimates, cycle.workers)
+        frag_new, frag_delete = self._solution_counts(solution)
         self._apply_cold_start_ramp(solution, cycle)
+        sat_new, _ = self._solution_counts(solution)
         floor_plan = self._apply_scale_down_floor(solution, cycle, capacity)
+        _, sat_delete = self._solution_counts(solution)
 
-        self._log_decision_snapshot(cycle, sizings, capacity, floor_plan)
+        self._log_decision_snapshot(cycle, sizings, capacity, floor_plan, frag_new, frag_delete, sat_new, sat_delete)
         return solution
 
     def _build_cycle(self, time: float, problem_state: data_structures.ProblemState) -> _Cycle:
@@ -361,11 +388,19 @@ class SaturationAwareScheduler:
             # Growth reads input queue depth; release reads the whole active
             # snapshot (queued plus pool-queued plus in-flight).
             queue_depths: tuple[float, ...] = tuple(stage.queue_depth_samples for stage in runtime.stages)
+            local_pending_depths: tuple[float, ...] = tuple(
+                stage.queue_depth_samples + stage.pool_queued_tasks * stage.batch_size for stage in runtime.stages
+            )
             active_depths: tuple[float, ...] = runtime.active_depths()
+            ready_workers: tuple[int, ...] = tuple(
+                max(workers[index] - stage.inflight_slots, 0) for index, stage in enumerate(runtime.stages)
+            )
         else:
             # No runtime signal observed yet: treat every depth as drained.
             queue_depths = (0.0,) * num_stages
+            local_pending_depths = (0.0,) * num_stages
             active_depths = (0.0,) * num_stages
+            ready_workers = workers
         return _Cycle(
             time=time,
             stage_age_s=time - self._first_decision_time,
@@ -374,10 +409,22 @@ class SaturationAwareScheduler:
             batch_sizes=batch_sizes,
             chain_factors=chain_factors,
             is_gpu=tuple(stage.is_gpu for stage in self.shape.stages),
+            is_manual=tuple(stage.is_manual for stage in self.shape.stages),
+            local_depths=queue_depths,
+            local_pending_depths=local_pending_depths,
             active_depths=active_depths,
+            ready_workers=ready_workers,
             queued_stock=tuple(chain.whole_chain_stock(queue_depths, chain_factors)),
             active_stock=tuple(chain.whole_chain_stock(active_depths, chain_factors)),
             activity_snapshot=runtime,
+        )
+
+    def _solution_counts(self, solution: data_structures.Solution) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return proposed new-worker and delete counts from a solution."""
+        editor = SolutionEditor(solution)
+        return (
+            tuple(editor.proposed_new_workers(index) for index in range(editor.stage_count)),
+            tuple(editor.proposed_deletes(index) for index in range(editor.stage_count)),
         )
 
     def _solve(
@@ -610,10 +657,12 @@ class SaturationAwareScheduler:
                 f"frag_delete={frag_delete} frag_post={frag_post} "
                 f"sat_delete={sat_delete} sat_post={sat_post} "
                 f"floor_protected={frag_delete - sat_delete} floor_target={decision.floor} max_deletes={max_deletes} "
-                f"releasing={decision.releasing} speed={cap.speed:.4f} cap_src={cap.cap_src:.3f} "
+                f"releasing={decision.releasing} churn_guarded={decision.churn_guarded} "
+                f"speed={cap.speed:.4f} cap_src={cap.cap_src:.3f} "
                 f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} w_sustain={cap.w_sustain} w_target={cap.w_target} "
                 f"bottleneck_rate={capacity.bottleneck_rate:.3f} "
                 f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
+                f"bottleneck_streak={capacity.bottleneck_streak} "
                 f"bottleneck='{bottleneck_name}' "
                 f"active_stock={cycle.active_stock[index]:.2f} active_depth={cycle.active_depths[index]:.2f}"
             )
@@ -626,6 +675,10 @@ class SaturationAwareScheduler:
         sizings: Sequence[sizing.StageSizingResult],
         capacity: CapacityPlan,
         floor_plan: FloorPlan,
+        frag_new: Sequence[int],
+        frag_delete: Sequence[int],
+        sat_new: Sequence[int],
+        sat_delete: Sequence[int],
     ) -> None:
         """Emit one per-cycle DEBUG line summarizing every stage's decision signals.
 
@@ -649,17 +702,40 @@ class SaturationAwareScheduler:
                 inflight = 0
                 pool_queued = 0
             utilization = inflight / max(cycle.workers[index], 1)
+            if cap.starved_warm or cap.feeder_boost > 0 or cap.feeder_reason:
+                feeder_name = self.shape.stages[cap.binding_feeder].name if cap.binding_feeder >= 0 else "none"
+                downstreams = tuple(self.shape.stages[item].name for item in cap.feeder_downstreams)
+                logger.debug(
+                    f"saturation-aware feeder-pressure: stage='{stage.name}' reason='{cap.feeder_reason}' "
+                    f"starved_warm={cap.starved_warm} suppress_growth={cap.suppress_growth} "
+                    f"local_qin={cycle.local_depths[index]:.2f} "
+                    f"local_pending={cycle.local_pending_depths[index]:.2f} "
+                    f"local_threshold={float(cycle.batch_sizes[index]):.2f} "
+                    f"workers={cycle.workers[index]} ready={cycle.ready_workers[index]} "
+                    f"w_sustain={cap.w_sustain} active_depth={cycle.active_depths[index]:.2f} "
+                    f"binding_feeder='{feeder_name}' path_delay_s={cap.feeder_path_delay_s:.2f} "
+                    f"required_workers={cap.feeder_required_workers} boost_cap={cap.feeder_boost_cap} "
+                    f"feeder_boost={cap.feeder_boost} downstreams={downstreams} aggregation='max'"
+                )
             groups.append(
-                f"{stage.name}[w={cycle.workers[index]} cap_src={cap.cap_src:.2f} "
+                f"{stage.name}[w={cycle.workers[index]} frag_new={frag_new[index]} sat_new={sat_new[index]} "
+                f"frag_del={frag_delete[index]} sat_del={sat_delete[index]} cap_src={cap.cap_src:.2f} "
                 f"w_sustain={cap.w_sustain} w_target={cap.w_target} mult={sizings[index].multiplier:.2f} "
-                f"floor={decision.floor} releasing={decision.releasing} "
+                f"starved={cap.starved_warm} suppress={cap.suppress_growth} "
+                f"feeder_boost={cap.feeder_boost} feeder_reason='{cap.feeder_reason}' "
+                f"floor={decision.floor} churn_guarded={decision.churn_guarded} releasing={decision.releasing} "
+                f"local_qin={cycle.local_depths[index]:.1f} local_pending={cycle.local_pending_depths[index]:.1f} "
+                f"ready={cycle.ready_workers[index]} "
                 f"q_stock={cycle.queued_stock[index]:.1f} a_stock={cycle.active_stock[index]:.1f} "
-                f"inflight={inflight} pool_q={pool_queued} util={utilization:.2f}]"
+                f"active_depth={cycle.active_depths[index]:.1f} inflight={inflight} pool_q={pool_queued} "
+                f"util={utilization:.2f}]"
             )
         logger.debug(
             f"saturation-aware decision: bottleneck_rate={capacity.bottleneck_rate:.3f} "
             f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
-            f"bottleneck='{bottleneck_name}' | " + " | ".join(groups)
+            f"bottleneck='{bottleneck_name}' bottleneck_streak={capacity.bottleneck_streak} "
+            f"bottleneck_candidate={capacity.bottleneck_candidate} "
+            f"bottleneck_candidate_rate={capacity.bottleneck_candidate_rate:.3f} | " + " | ".join(groups)
         )
 
     def _drain_pending_measurements(self) -> None:

@@ -36,11 +36,26 @@ a floor cut cannot drag every stage's target down. The smoothed arrival rate
 :class:`CapacityModel`.
 """
 
+import enum
 import math
 from collections.abc import Sequence
 from typing import Self
 
 import attrs
+
+
+class FeederReason(enum.StrEnum):
+    """Feeder-pressure reason values emitted in scheduler logs."""
+
+    BOOSTED = "boosted"
+    PENDING_CONFIRM = "pending-confirm"
+    NO_BOOST_IMMINENT_ARRIVAL = "no-boost-imminent-arrival"
+    NO_BOOST_GLOBAL_BOTTLENECK = "no-boost-global-bottleneck"
+    NO_BOOST_MANUAL_FEEDER = "no-boost-manual-feeder"
+    NO_BOOST_INVALID_SUPPLY = "no-boost-invalid-supply"
+    CLEARED_LOCAL_INPUT = "cleared-local-input"
+    CLEARED_NOT_WARM = "cleared-not-warm"
+    CLEARED_NO_DELAY = "cleared-no-delay"
 
 
 @attrs.frozen
@@ -60,6 +75,12 @@ class CapacityParams:
             to take over.
         switch_confirm: Consecutive eligible cycles before the bottleneck
             identity switches to the challenger.
+        feeder_pressure_confirm: Consecutive starved-warm cycles before a
+            downstream stage may boost its binding feeder.
+        feeder_arrival_horizon_s: Delay threshold below which upstream arrivals
+            are considered imminent and no feeder boost is needed.
+        feeder_boost_max_multiplier: Maximum feeder-pressure target multiplier
+            relative to the normal capacity target.
         min_workers: Floor a stage's targets never fall below while active.
     """
 
@@ -69,6 +90,9 @@ class CapacityParams:
     capacity_headroom: float
     hysteresis_margin: float
     switch_confirm: int
+    feeder_pressure_confirm: int = 2
+    feeder_arrival_horizon_s: float = 10.0
+    feeder_boost_max_multiplier: float = 2.0
     min_workers: int = 1
 
 
@@ -83,16 +107,24 @@ class CapacityState:
             stage is measured yet.
         bottleneck_streak: Consecutive cycles a margin-clearing challenger
             has beaten the incumbent (resets on any hold).
+        feeder_pressure_streak: Consecutive delayed starved-warm cycles per
+            downstream stage.
     """
 
     a_ewma: tuple[float | None, ...]
     bottleneck: int
     bottleneck_streak: int
+    feeder_pressure_streak: tuple[int, ...]
 
     @classmethod
     def initial(cls, num_stages: int) -> Self:
         """Return empty state for a pipeline with ``num_stages`` stages."""
-        return cls(a_ewma=(None,) * num_stages, bottleneck=-1, bottleneck_streak=0)
+        return cls(
+            a_ewma=(None,) * num_stages,
+            bottleneck=-1,
+            bottleneck_streak=0,
+            feeder_pressure_streak=(0,) * num_stages,
+        )
 
 
 @attrs.frozen
@@ -107,12 +139,28 @@ class CapacityInputs:
         chain: Chain factors from :func:`chain.chain_factors`.
         is_gpu: Whether each stage holds GPU workers (selects the slower
             release alpha).
+        is_manual: Whether each stage has an operator-pinned worker count.
+        local_qin: Inter-stage input queue depth per stage, in stage-input
+            samples.
+        local_pending_depth: Local pending work per stage, excluding in-flight
+            work, in stage-input samples.
+        local_input_threshold: Per-stage local-input threshold, in stage-input
+            samples.
+        active_depth: Local active work per stage, including in-flight work, in
+            stage-input samples.
+        ready_workers: Workers not currently holding in-flight slots.
     """
 
     workers: tuple[int, ...]
     speed: tuple[float, ...]
     chain: tuple[float, ...]
     is_gpu: tuple[bool, ...]
+    is_manual: tuple[bool, ...]
+    local_qin: tuple[float, ...]
+    local_pending_depth: tuple[float, ...]
+    local_input_threshold: tuple[float, ...]
+    active_depth: tuple[float, ...]
+    ready_workers: tuple[int, ...]
 
 
 @attrs.frozen
@@ -132,6 +180,19 @@ class StageCapacity:
             ``next_bottleneck_rate`` for the bottleneck stage, to
             ``bottleneck_rate + headroom`` for every other stage), never below
             ``w_sustain``.
+        starved_warm: Whether the stage has ready capacity but no local pending
+            input.
+        suppress_growth: Whether demand sizing must avoid growing this stage
+            this cycle.
+        binding_feeder: Upstream stage chosen as this stage's binding feeder,
+            or ``-1`` when none was selected.
+        feeder_path_delay_s: Estimated upstream delay for the selected feeder.
+        feeder_required_workers: Uncapped worker target from feeder pressure.
+        feeder_boost_cap: Cap applied to the feeder-pressure target.
+        feeder_boost: Additional target workers applied to this feeder.
+        feeder_downstreams: Downstream stages whose requests were aggregated
+            into this feeder's boost.
+        feeder_reason: Searchable feeder-pressure reason string for logs.
     """
 
     speed: float
@@ -140,6 +201,15 @@ class StageCapacity:
     a_ewma: float
     w_sustain: int
     w_target: int
+    starved_warm: bool = False
+    suppress_growth: bool = False
+    binding_feeder: int = -1
+    feeder_path_delay_s: float = 0.0
+    feeder_required_workers: int = 0
+    feeder_boost_cap: int = 0
+    feeder_boost: int = 0
+    feeder_downstreams: tuple[int, ...] = ()
+    feeder_reason: str = ""
 
 
 @attrs.frozen
@@ -155,12 +225,18 @@ class CapacityPlan:
         next_bottleneck_rate: The second-minimum ``cap_src`` -- the rate the
             bottleneck can usefully climb toward (falls back to
             ``bottleneck_rate`` when fewer than two stages are measured).
+        bottleneck_streak: Current challenger confirmation streak.
+        bottleneck_candidate: Current minimum-capacity measured stage.
+        bottleneck_candidate_rate: Candidate stage's source-rate capacity.
     """
 
     stages: tuple[StageCapacity, ...]
     bottleneck_stage: int
     bottleneck_rate: float
     next_bottleneck_rate: float
+    bottleneck_streak: int = 0
+    bottleneck_candidate: int = -1
+    bottleneck_candidate_rate: float = 0.0
 
 
 @attrs.frozen
@@ -199,34 +275,33 @@ def _source_capacities(workers: Sequence[int], speed: Sequence[float], chain: Se
 
 def _select_bottleneck(
     cap_src: Sequence[float], prev_bn: int, prev_streak: int, margin: float, confirm: int
-) -> tuple[int, float, int]:
-    """Return the sticky global bottleneck as ``(index, cap_src, streak)``.
+) -> tuple[int, float, int, int, float]:
+    """Return the sticky bottleneck plus current challenger facts.
 
     Holds the incumbent unless a different measured stage is the minimum AND
     lower by ``margin`` for ``confirm`` consecutive cycles. The returned
     capacity is always ``cap_src`` of the SELECTED stage (the incumbent while
     held), so the hold window uses a consistent bottleneck rate even if a
-    just-shrunk stage transiently shows a lower ``cap_src``. ``(-1, 0.0, 0)``
-    when no stage is measured.
+    just-shrunk stage transiently shows a lower ``cap_src``.
     """
     measured = [(index, capacity) for index, capacity in enumerate(cap_src) if capacity > 0.0]
     if not measured:
-        return -1, 0.0, 0
+        return -1, 0.0, 0, -1, 0.0
     challenger, challenger_cap = min(measured, key=lambda item: item[1])
     if prev_bn < 0 or cap_src[prev_bn] <= 0.0:
         # No incumbent, or the incumbent went cold: adopt the current minimum.
-        return challenger, challenger_cap, 0
+        return challenger, challenger_cap, 0, challenger, challenger_cap
     incumbent_cap = cap_src[prev_bn]
     decisive = challenger != prev_bn and challenger_cap < incumbent_cap * (1.0 - margin)
     if not decisive:
         # Incumbent still (near-)slowest: hold it and reset the streak.
-        return prev_bn, incumbent_cap, 0
+        return prev_bn, incumbent_cap, 0, challenger, challenger_cap
     streak = prev_streak + 1
     if streak >= confirm:
         # A challenger has been decisively slower long enough: switch.
-        return challenger, challenger_cap, 0
+        return challenger, challenger_cap, 0, challenger, challenger_cap
     # Decisive this cycle but not yet confirmed: hold, accruing confirmation.
-    return prev_bn, incumbent_cap, streak
+    return prev_bn, incumbent_cap, streak, challenger, challenger_cap
 
 
 def _second_min_capacity(cap_src: Sequence[float], exclude: int, fallback: float) -> float:
@@ -238,6 +313,128 @@ def _second_min_capacity(cap_src: Sequence[float], exclude: int, fallback: float
     """
     others = [capacity for index, capacity in enumerate(cap_src) if capacity > 0.0 and index != exclude]
     return min(others) if others else fallback
+
+
+def _stage_completion_rate(workers: int, speed: float) -> float:
+    """Return stage completion rate for trusted positive inputs."""
+    if workers <= 0 or speed <= 0.0:
+        return 0.0
+    return workers * speed
+
+
+def _drain_time(active_depth: float, workers: int, speed: float) -> float:
+    """Return seconds needed to drain active depth at current capacity."""
+    if active_depth <= 0.0:
+        return 0.0
+    completion_rate = _stage_completion_rate(workers, speed)
+    if completion_rate <= 0.0:
+        return math.inf
+    return active_depth / completion_rate
+
+
+def _binding_upstream(downstream: int, inputs: CapacityInputs) -> tuple[int, float] | None:
+    """Return the upstream stage with the longest valid drain time."""
+    best_stage = -1
+    best_delay = 0.0
+    for index in range(downstream):
+        if inputs.chain[index] <= 0.0 or inputs.active_depth[index] <= 0.0:
+            continue
+        delay = _drain_time(inputs.active_depth[index], inputs.workers[index], inputs.speed[index])
+        if not math.isfinite(delay) or delay <= best_delay:
+            continue
+        best_stage = index
+        best_delay = delay
+    if best_stage < 0:
+        return None
+    return best_stage, best_delay
+
+
+def _is_starved_warm(index: int, inputs: CapacityInputs, stages: Sequence[StageCapacity]) -> bool:
+    """Return whether a stage is locally dry while enough workers are ready."""
+    return (
+        inputs.local_pending_depth[index] <= inputs.local_input_threshold[index]
+        and inputs.ready_workers[index] >= stages[index].w_sustain
+    )
+
+
+def _feeder_boost_cap(base_target: int, multiplier: float) -> int:
+    """Return the capped target allowed by feeder pressure."""
+    return max(base_target + 1, math.ceil(base_target * multiplier))
+
+
+def _apply_feeder_pressure(
+    stages: Sequence[StageCapacity],
+    inputs: CapacityInputs,
+    prev: CapacityState,
+    params: CapacityParams,
+    bottleneck_stage: int,
+) -> tuple[tuple[StageCapacity, ...], tuple[int, ...]]:
+    """Apply bounded feeder-pressure targets to warm, locally starved stages."""
+    requested_targets = [stage.w_target for stage in stages]
+    next_streak = [0] * len(stages)
+    stage_updates: list[dict[str, object]] = [{} for _ in stages]
+    downstreams_by_feeder: list[list[int]] = [[] for _ in stages]
+
+    for downstream in range(len(stages)):
+        if not _is_starved_warm(downstream, inputs, stages):
+            if prev.feeder_pressure_streak[downstream] > 0:
+                reason = (
+                    FeederReason.CLEARED_LOCAL_INPUT
+                    if inputs.local_pending_depth[downstream] > inputs.local_input_threshold[downstream]
+                    else FeederReason.CLEARED_NOT_WARM
+                )
+                stage_updates[downstream]["feeder_reason"] = reason.value
+            continue
+
+        stage_updates[downstream]["starved_warm"] = True
+        binding = _binding_upstream(downstream, inputs)
+        if binding is None:
+            stage_updates[downstream]["feeder_reason"] = FeederReason.NO_BOOST_INVALID_SUPPLY.value
+            continue
+
+        feeder, path_delay_s = binding
+        stage_updates[downstream]["binding_feeder"] = feeder
+        stage_updates[downstream]["feeder_path_delay_s"] = path_delay_s
+        stage_updates[downstream]["suppress_growth"] = True
+        if path_delay_s <= params.feeder_arrival_horizon_s:
+            stage_updates[downstream]["feeder_reason"] = FeederReason.NO_BOOST_IMMINENT_ARRIVAL.value
+            continue
+
+        next_streak[downstream] = prev.feeder_pressure_streak[downstream] + 1
+        if next_streak[downstream] < params.feeder_pressure_confirm:
+            stage_updates[downstream]["feeder_reason"] = FeederReason.PENDING_CONFIRM.value
+            continue
+
+        if feeder == bottleneck_stage:
+            stage_updates[downstream]["feeder_reason"] = FeederReason.NO_BOOST_GLOBAL_BOTTLENECK.value
+            continue
+        if inputs.is_manual[feeder]:
+            stage_updates[downstream]["feeder_reason"] = FeederReason.NO_BOOST_MANUAL_FEEDER.value
+            continue
+
+        base_target = stages[feeder].w_target
+        required_workers = math.ceil(
+            inputs.active_depth[feeder] / (inputs.speed[feeder] * params.feeder_arrival_horizon_s)
+        )
+        boost_cap = _feeder_boost_cap(base_target, params.feeder_boost_max_multiplier)
+        final_target = max(base_target, min(required_workers, boost_cap))
+        requested_targets[feeder] = max(requested_targets[feeder], final_target)
+        downstreams_by_feeder[feeder].append(downstream)
+        stage_updates[downstream]["feeder_required_workers"] = required_workers
+        stage_updates[downstream]["feeder_boost_cap"] = boost_cap
+        stage_updates[downstream]["feeder_reason"] = FeederReason.BOOSTED.value
+
+    updated_stages: list[StageCapacity] = []
+    for index, stage in enumerate(stages):
+        updates = stage_updates[index]
+        target = requested_targets[index]
+        if target > stage.w_target:
+            updates["w_target"] = target
+            updates["feeder_boost"] = target - stage.w_target
+            updates["feeder_downstreams"] = tuple(downstreams_by_feeder[index])
+            updates["feeder_reason"] = FeederReason.BOOSTED.value
+        updated_stages.append(attrs.evolve(stage, **updates))
+    return tuple(updated_stages), tuple(next_streak)
 
 
 def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: CapacityParams) -> CapacityResult:
@@ -265,16 +462,35 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             length from ``workers``.
     """
     num_stages = len(inputs.workers)
-    if not (len(inputs.speed) == len(inputs.chain) == len(inputs.is_gpu) == len(prev.a_ewma) == num_stages):
+    if not (
+        len(inputs.speed)
+        == len(inputs.chain)
+        == len(inputs.is_gpu)
+        == len(inputs.is_manual)
+        == len(inputs.local_qin)
+        == len(inputs.local_pending_depth)
+        == len(inputs.local_input_threshold)
+        == len(inputs.active_depth)
+        == len(inputs.ready_workers)
+        == len(prev.a_ewma)
+        == len(prev.feeder_pressure_streak)
+        == num_stages
+    ):
         raise ValueError(
             "capacity inputs length mismatch: "
             f"workers={num_stages} speed={len(inputs.speed)} chain={len(inputs.chain)} "
-            f"is_gpu={len(inputs.is_gpu)} prev_a_ewma={len(prev.a_ewma)}"
+            f"is_gpu={len(inputs.is_gpu)} is_manual={len(inputs.is_manual)} local_qin={len(inputs.local_qin)} "
+            f"local_pending_depth={len(inputs.local_pending_depth)} "
+            f"local_input_threshold={len(inputs.local_input_threshold)} active_depth={len(inputs.active_depth)} "
+            f"ready_workers={len(inputs.ready_workers)} prev_a_ewma={len(prev.a_ewma)} "
+            f"prev_feeder_pressure_streak={len(prev.feeder_pressure_streak)}"
         )
 
     cap_src = _source_capacities(inputs.workers, inputs.speed, inputs.chain)
-    bottleneck_stage, bottleneck_rate, bottleneck_streak = _select_bottleneck(
-        cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
+    bottleneck_stage, bottleneck_rate, bottleneck_streak, bottleneck_candidate, bottleneck_candidate_rate = (
+        _select_bottleneck(
+            cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
+        )
     )
     next_bottleneck_rate = _second_min_capacity(cap_src, bottleneck_stage, bottleneck_rate)
     headroom_rate = bottleneck_rate * (1.0 + params.capacity_headroom)
@@ -312,14 +528,24 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         )
         next_ewma.append(a_ewma)
 
+    final_stages, feeder_pressure_streak = _apply_feeder_pressure(stages, inputs, prev, params, bottleneck_stage)
+
     return CapacityResult(
         plan=CapacityPlan(
-            stages=tuple(stages),
+            stages=final_stages,
             bottleneck_stage=bottleneck_stage,
             bottleneck_rate=bottleneck_rate,
             next_bottleneck_rate=next_bottleneck_rate,
+            bottleneck_streak=bottleneck_streak,
+            bottleneck_candidate=bottleneck_candidate,
+            bottleneck_candidate_rate=bottleneck_candidate_rate,
         ),
-        state=CapacityState(a_ewma=tuple(next_ewma), bottleneck=bottleneck_stage, bottleneck_streak=bottleneck_streak),
+        state=CapacityState(
+            a_ewma=tuple(next_ewma),
+            bottleneck=bottleneck_stage,
+            bottleneck_streak=bottleneck_streak,
+            feeder_pressure_streak=feeder_pressure_streak,
+        ),
     )
 
 

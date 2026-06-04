@@ -21,7 +21,9 @@ hold target ``w_sustain``) lives in ``capacity.py``; this module only decides,
 per stage, how far the solver may shrink it this cycle:
 
     hold     -> floor = min(w_sustain, workers)   (clamp deletes to the
-                                                    capacity hold target)
+                                                    capacity hold target;
+                                                    expensive stages ignore
+                                                    one-worker dips)
     release  -> floor = min_workers               (whole-chain work has
                                                     drained for release_confirm_cycles)
 
@@ -87,6 +89,8 @@ class FloorInputs:
         batch_sizes: Per-stage input batch sizes.
         w_sustain: Per-stage capacity hold target from the capacity plan; the
             floor clamps deletes to ``min(w_sustain, workers)`` while holding.
+        is_gpu: Whether each stage holds GPU workers; used only to absorb tiny
+            scale-down churn while holding.
     """
 
     workers: tuple[int, ...]
@@ -95,6 +99,7 @@ class FloorInputs:
     active_depths: tuple[float, ...]
     batch_sizes: tuple[int, ...]
     w_sustain: tuple[int, ...]
+    is_gpu: tuple[bool, ...]
 
 
 @attrs.frozen
@@ -108,12 +113,15 @@ class FloorDecision:
         release_streak: Consecutive low-stock cycles observed so far.
         stock_threshold: Source-unit stock threshold below which the stage is
             considered drained (one batch's worth, ``batch_size / chain``).
+        churn_guarded: Whether an expensive stage ignored a one-worker hold
+            target dip while not releasing.
     """
 
     floor: int
     releasing: bool
     release_streak: int
     stock_threshold: float
+    churn_guarded: bool = False
 
 
 @attrs.frozen
@@ -166,10 +174,29 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         The cycle's floor plan and the :class:`FloorState` to carry into the
         next cycle.
     """
+    num_stages = len(inputs.workers)
+    if not (
+        len(inputs.chain)
+        == len(inputs.stock_src)
+        == len(inputs.active_depths)
+        == len(inputs.batch_sizes)
+        == len(inputs.w_sustain)
+        == len(inputs.is_gpu)
+        == len(prev.release_streak)
+        == num_stages
+    ):
+        raise ValueError(
+            "floor inputs length mismatch: "
+            f"workers={num_stages} chain={len(inputs.chain)} stock_src={len(inputs.stock_src)} "
+            f"active_depths={len(inputs.active_depths)} batch_sizes={len(inputs.batch_sizes)} "
+            f"w_sustain={len(inputs.w_sustain)} is_gpu={len(inputs.is_gpu)} "
+            f"prev_release_streak={len(prev.release_streak)}"
+        )
+
     decisions: list[FloorDecision] = []
     next_streak: list[int] = []
 
-    for k in range(len(inputs.workers)):
+    for k in range(num_stages):
         if inputs.chain[k] <= 0.0 and inputs.active_depths[k] > 0.0:
             # A zero-fanout / drop stage (chain <= 0) cannot express its own
             # admitted work in source units, so whole_chain_stock() omits it
@@ -184,10 +211,19 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             streak = 0 if inputs.stock_src[k] > threshold else prev.release_streak[k] + 1
             releasing = inputs.stock_src[k] <= threshold and streak >= params.release_confirm_cycles
 
-        held = max(params.min_workers, min(inputs.w_sustain[k], inputs.workers[k]))
+        raw_held = max(params.min_workers, min(inputs.w_sustain[k], inputs.workers[k]))
+        shrink_gap = inputs.workers[k] - raw_held
+        churn_guarded = inputs.is_gpu[k] and not releasing and 0 < shrink_gap <= 1
+        held = inputs.workers[k] if churn_guarded else raw_held
         floor = params.min_workers if releasing else held
         decisions.append(
-            FloorDecision(floor=floor, releasing=releasing, release_streak=streak, stock_threshold=threshold)
+            FloorDecision(
+                floor=floor,
+                releasing=releasing,
+                release_streak=streak,
+                stock_threshold=threshold,
+                churn_guarded=churn_guarded,
+            )
         )
         next_streak.append(streak)
 
