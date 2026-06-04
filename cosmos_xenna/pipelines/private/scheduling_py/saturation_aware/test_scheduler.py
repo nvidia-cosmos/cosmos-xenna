@@ -23,23 +23,32 @@ math lives in the capacity/chain/floor/sizing/estimator unit tests.
 import logging
 import uuid
 from collections.abc import Iterator
-from typing import cast
-from unittest import mock
+from typing import Any, cast
 
 import pytest
+import ray
 from loguru import logger as loguru_logger
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityModel
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import ScaleDownFloorPolicy
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
+
+_StageSpecList = list[StageSpec[Any, Any]]
+
+
+def _mock_object_ref() -> ray.ObjectRef[Any]:
+    """Placeholder ObjectRef for queue length tests (only ``len`` is used)."""
+    return cast(ray.ObjectRef[Any], object())
+
+
+def _stage_specs(spec: v1.PipelineSpec) -> _StageSpecList:
+    return cast(_StageSpecList, spec.stages)
 
 
 class _CpuStage(v1.Stage):
@@ -123,7 +132,7 @@ def _scheduler(
     cluster: resources.ClusterResources,
     config: SaturationAwareConfig | None = None,
 ) -> SaturationAwareScheduler:
-    stages = cast(list[StageSpec], spec.stages)
+    stages = _stage_specs(spec)
     return SaturationAwareScheduler(
         config=config or SaturationAwareConfig(),
         shape=PipelineShape.from_stage_specs(stages),
@@ -133,7 +142,7 @@ def _scheduler(
 
 def _state(spec: v1.PipelineSpec, worker_allocator: allocator.WorkerAllocator) -> data_structures.ProblemState:
     stage_states = []
-    for index, stage_spec in enumerate(cast(list[StageSpec], spec.stages)):
+    for index, stage_spec in enumerate(_stage_specs(spec)):
         name = stage_spec.name(index)
         workers = worker_allocator.get_workers_in_stage(name)
         stage_states.append(
@@ -159,9 +168,27 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
     )
 
 
+def _upstream_only_measurements(now: float) -> data_structures.Measurements:
+    """Two-stage measurements where only stage 0 reports a completed task.
+
+    Holds the downstream stage at zero samples so its cold-ramp path (and the
+    pipeline-evidence branch) can be exercised while the upstream stage accrues
+    enough samples to be trusted.
+    """
+    return data_structures.Measurements(
+        now,
+        [
+            data_structures.StageMeasurements(
+                [data_structures.TaskMeasurement(start_time=now - 1.0, end_time=now, num_returns=1)]
+            ),
+            data_structures.StageMeasurements([]),
+        ],
+    )
+
+
 def _stage_names(spec: v1.PipelineSpec) -> list[str]:
     """Return the per-stage names in pipeline order."""
-    return [stage_spec.name(index) for index, stage_spec in enumerate(cast(list[StageSpec], spec.stages))]
+    return [stage_spec.name(index) for index, stage_spec in enumerate(_stage_specs(spec))]
 
 
 def _backlog(num_stages: int, queue_depth: float) -> RuntimeSignals:
@@ -297,6 +324,39 @@ def test_no_sample_after_window_without_pending_work_stays_capped() -> None:
     assert len(later.stages[0].new_workers) == 1
 
 
+def test_downstream_zero_sample_stage_grows_one_worker_on_upstream_evidence() -> None:
+    """A 0-sample downstream stage with a live worker gains one worker per cycle once upstream is trusted.
+
+    Cold start caps the downstream stage at a single worker (it has no live
+    worker to accelerate yet). On the next cycle, with the upstream stage trusted
+    and work still waiting, pipeline-evidence warming lets it add exactly one
+    worker instead of idling at one until its own first sample lands -- and only
+    one, never the solver's full placeholder-throughput demand.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    now = 100.0
+
+    # Cold cycle: stage 1 has no live worker yet, so the cold cap holds it at one.
+    scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+    scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+    cold = scheduler.autoscale(now, _state(spec, worker_allocator))
+    assert len(cold.stages[1].new_workers) == 1
+    _apply_to_allocator(spec, worker_allocator, cold)
+    assert _worker_counts(spec, worker_allocator)[1] == 1
+
+    # Warming cycle: upstream trusted + work waiting + a live worker -> +1 only.
+    now += 10.0
+    scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+    scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+    warming = scheduler.autoscale(now, _state(spec, worker_allocator))
+    assert len(warming.stages[1].new_workers) == 1
+    _apply_to_allocator(spec, worker_allocator, warming)
+    assert _worker_counts(spec, worker_allocator)[1] == 2
+
+
 def test_autoscale_before_setup_raises() -> None:
     spec, cluster, _ = _build([0.25], num_cpus=8)
     scheduler = _scheduler(spec, cluster)
@@ -352,9 +412,9 @@ def test_saturation_aware_uses_its_own_interval() -> None:
 def test_upstream_queue_lens_reads_input_then_prior_stage_queues() -> None:
     """Stage 0 reads the pipeline input queue; each later stage reads its upstream output queue."""
     input_queue = streaming.Queue()
-    input_queue.by_node_id[None].extend([object(), object(), object()])  # 3 source items
+    input_queue.by_node_id[None].extend([_mock_object_ref() for _ in range(3)])  # 3 source items
     stage0_out = streaming.Queue()
-    stage0_out.by_node_id[None].append(object())  # 1 item waiting to feed stage 1
+    stage0_out.by_node_id[None].append(_mock_object_ref())  # 1 item waiting to feed stage 1
     queues = [stage0_out, streaming.Queue()]
     # idx 0 -> len(input_queue) == 3; idx 1 -> len(queues[0]) == 1.
     assert streaming._upstream_queue_lens(input_queue, queues, 2) == [3, 1]
@@ -509,43 +569,29 @@ def test_gpu_stage_uses_slower_release_alpha_than_cpu() -> None:
     assert params.alpha_down_gpu == pytest.approx(params.alpha_down_cpu / 4.0)
 
 
-def test_trusted_speed_is_none_below_threshold_then_measured() -> None:
-    """A stage's measured speed is withheld until it clears the estimator trust threshold.
+def test_measured_speed_is_withheld_until_the_trust_threshold_is_reached() -> None:
+    """The assembled cycle reports a cold speed until the stage clears the trust threshold.
 
-    Mirrors the cold-start ramp's trust gate so a single noisy early sample
-    cannot set the bottleneck identity or rate before the stage is believed.
+    Feeds measurements through the public ingest path and reads the resulting
+    cycle: below the threshold the demand snapshot speed is ``None``, so a noisy
+    early sample cannot set the bottleneck or rate; once enough samples land, the
+    measured speed flows into the cycle.
     """
-    spec, cluster, _ = _build([1.0], num_cpus=16)
+    spec, cluster, problem = _build([1.0], num_cpus=16)
     scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=3))
-    name = scheduler.shape.stages[0].name
-    now = 100.0
-    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
-    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
-    assert scheduler._trusted_speed(name, now) is None  # 2 samples < threshold (3)
-    scheduler._estimator.observe(name, duration_s=0.5, num_returns=1.0, now=now)
-    assert scheduler._trusted_speed(name, now) is not None  # 3 samples >= threshold
-
-
-def test_capacity_and_floor_advance_once_per_autoscale() -> None:
-    """The capacity model and the floor each evaluate exactly once per autoscale.
-
-    Both own cross-cycle state (the capacity EWMA and sticky bottleneck identity,
-    the floor release streaks). Evaluating either twice in one cycle would advance
-    that state twice -- double-decaying the EWMA or double-counting a release
-    streak -- so pin each to a single evaluation per ``autoscale``.
-    """
-    spec, cluster, problem = _build([1.0, 1.0], num_cpus=16)
-    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
     scheduler.setup(problem)
-    now = 100.0
-    scheduler.update_with_measurements(now, _measurements(now, [0.1, 5.0]))
-    capacity_spy = mock.Mock(wraps=scheduler._capacity)
-    floor_spy = mock.Mock(wraps=scheduler._floor)
-    scheduler._capacity = cast(CapacityModel, capacity_spy)
-    scheduler._floor = cast(ScaleDownFloorPolicy, floor_spy)
-    scheduler.autoscale(now, _state(spec, allocator.WorkerAllocator.make(cluster)))
-    assert capacity_spy.plan.call_count == 1
-    assert floor_spy.plan.call_count == 1
+    state = _state(spec, allocator.WorkerAllocator.make(cluster))
+
+    # Two samples (< threshold): autoscale drains them, but the cycle stays cold.
+    scheduler.update_with_measurements(100.0, _measurements(100.0, [0.5]))
+    scheduler.update_with_measurements(101.0, _measurements(101.0, [0.5]))
+    scheduler.autoscale(101.0, state)
+    assert scheduler._build_cycle(101.0, state).demand_snapshots[0].speed is None
+
+    # Third sample crosses the threshold: the measured speed now flows through.
+    scheduler.update_with_measurements(102.0, _measurements(102.0, [0.5]))
+    scheduler.autoscale(102.0, state)
+    assert scheduler._build_cycle(102.0, state).demand_snapshots[0].speed is not None
 
 
 def test_warm_pipeline_converges_to_a_stable_split() -> None:

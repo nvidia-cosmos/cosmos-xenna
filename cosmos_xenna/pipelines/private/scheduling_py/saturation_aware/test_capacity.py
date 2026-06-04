@@ -59,9 +59,6 @@ def _inputs(
     )
 
 
-# --- asymmetric throughput smoothing (moved here from the floor) ---
-
-
 def test_asymmetric_ewma_initializes_to_first_sample() -> None:
     assert capacity.asymmetric_ewma(None, 8.0, 0.6, 0.1) == 8.0
 
@@ -73,9 +70,6 @@ def test_asymmetric_ewma_is_fast_up_slow_down() -> None:
     assert up == pytest.approx(0.6 * 10.0 + 0.4 * 2.0)
     assert down == pytest.approx(0.1 * 2.0 + 0.9 * 10.0)
     assert (up - 2.0) > (10.0 - down)  # up step larger than down step
-
-
-# --- bottleneck identification and the w_sustain hold target ---
 
 
 def test_self_bottleneck_stage_sustains_its_current_size() -> None:
@@ -141,9 +135,6 @@ def test_gpu_stage_sustain_decays_slower_than_cpu() -> None:
     assert gpu_result.plan.stages[1].w_sustain >= cpu_result.plan.stages[1].w_sustain
 
 
-# --- cold-stage exclusion ---
-
-
 def test_cold_stage_is_excluded_from_the_bottleneck() -> None:
     """A stage with no speed estimate neither becomes nor drags the bottleneck."""
     model = capacity.CapacityModel.create(3, _params())
@@ -169,9 +160,6 @@ def test_bottleneck_reassigned_when_incumbent_goes_cold() -> None:
     result = capacity.compute_capacity(_inputs(workers=(10, 5), speed=(0.0, 1.0)), state, _params())
     # cap_src = [0, 5]; the cold incumbent is dropped -> adopt the only measured stage.
     assert result.plan.bottleneck_stage == 1
-
-
-# --- the w_target grow target ---
 
 
 def test_non_bottleneck_target_is_bottleneck_rate_plus_headroom() -> None:
@@ -218,9 +206,6 @@ def test_source_grows_toward_next_bottleneck_when_it_is_the_bottleneck() -> None
     assert plan.stages[0].w_target == 20
 
 
-# --- sticky bottleneck hysteresis ---
-
-
 def test_hold_window_can_have_next_rate_below_bottleneck_rate() -> None:
     """While holding the incumbent, a transiently slower challenger makes next_bottleneck_rate < bottleneck_rate."""
     params = _params(hysteresis_margin=0.15, switch_confirm=2)
@@ -250,9 +235,6 @@ def test_capacity_model_holds_incumbent_then_switches_across_cycles() -> None:
     decisive = _inputs(workers=(10, 8, 30), speed=(1.0, 1.0, 1.0))  # challenger 20% slower
     assert model.plan(decisive).bottleneck_stage == 0  # cycle 1: holding (streak 1 < 2)
     assert model.plan(decisive).bottleneck_stage == 1  # cycle 2: confirmed -> switched
-
-
-# --- StageCapacity.speed echo and input validation ---
 
 
 def test_stage_capacity_echoes_trusted_speed() -> None:

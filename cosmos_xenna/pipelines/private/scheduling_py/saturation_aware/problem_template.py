@@ -24,7 +24,7 @@ current worker count when the cluster cannot grow it.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Self
+from typing import Any, Self
 
 import attrs
 
@@ -64,7 +64,9 @@ class SolverProblemTemplate:
     stages: tuple[SolverStageTemplate, ...]
 
     @classmethod
-    def from_stage_specs(cls, stage_specs: Sequence[specs.StageSpec], cluster: resources.ClusterResources) -> Self:
+    def from_stage_specs(
+        cls, stage_specs: Sequence[specs.StageSpec[Any, Any]], cluster: resources.ClusterResources
+    ) -> Self:
         """Capture each stage spec's solver inputs against ``cluster``."""
         num_nodes = len(cluster.nodes)
         return cls(

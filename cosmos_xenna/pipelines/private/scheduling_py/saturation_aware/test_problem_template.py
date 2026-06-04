@@ -15,7 +15,7 @@
 
 """Tests for the rebuildable solver problem template."""
 
-from typing import cast
+from typing import Any
 
 import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import data_structures, resources
@@ -47,19 +47,19 @@ def _cluster(num_nodes: int) -> resources.ClusterResources:
 
 def test_from_stage_specs_resolves_pinned_counts() -> None:
     """num_workers passes through; num_workers_per_node scales by node count; neither yields None."""
-    specs = [
+    specs: list[StageSpec[Any, Any]] = [
         v1.StageSpec(_CpuStage(), num_workers=4),
         v1.StageSpec(_CpuStage(), num_workers_per_node=2.0),
         v1.StageSpec(_CpuStage()),
     ]
-    template = SolverProblemTemplate.from_stage_specs(cast(list[StageSpec], specs), _cluster(2))
+    template = SolverProblemTemplate.from_stage_specs(specs, _cluster(2))
     assert [stage.requested_num_workers for stage in template.stages] == [4, 4, None]
 
 
 def test_build_returns_a_problem_with_and_without_overrides() -> None:
     """build() and build(overrides) each produce a fresh solver problem."""
-    specs = [v1.StageSpec(_CpuStage(), num_workers=4)]
-    template = SolverProblemTemplate.from_stage_specs(cast(list[StageSpec], specs), _cluster(1))
+    specs: list[StageSpec[Any, Any]] = [v1.StageSpec(_CpuStage(), num_workers=4)]
+    template = SolverProblemTemplate.from_stage_specs(specs, _cluster(1))
     pinned_name = template.stages[0].name
     assert isinstance(template.build(), data_structures.Problem)
     assert isinstance(template.build({pinned_name: 0}), data_structures.Problem)

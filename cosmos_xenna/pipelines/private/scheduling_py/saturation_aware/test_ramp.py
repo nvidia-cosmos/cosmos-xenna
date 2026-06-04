@@ -37,6 +37,7 @@ def make_input() -> RampInputFactory:
         sample_count: int = 0,
         stage_age_s: float = 0.0,
         has_pending_work: bool = False,
+        has_upstream_evidence: bool = False,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
@@ -45,6 +46,7 @@ def make_input() -> RampInputFactory:
             sample_count=sample_count,
             stage_age_s=stage_age_s,
             has_pending_work=has_pending_work,
+            has_upstream_evidence=has_upstream_evidence,
         )
 
     return _make_input
@@ -97,6 +99,68 @@ def test_no_sample_after_window_without_pending_work_stays_cold(make_input: Ramp
     )
     assert decision.cap == 1
     assert decision.reason is RampReason.COLD
+
+
+def test_pipeline_warming_grows_by_one_on_upstream_evidence(make_input: RampInputFactory) -> None:
+    """A 0-sample stage with a live worker, work waiting, and a trusted upstream grows by exactly one."""
+    decision = decide(
+        make_input(
+            sample_count=0, current_workers=1, proposed_post=13, has_pending_work=True, has_upstream_evidence=True
+        ),
+        _config(),
+    )
+    assert decision.cap == 2
+    assert decision.keep_new == 1
+    assert decision.reason is RampReason.PIPELINE_WARMING
+
+
+def test_pipeline_warming_requires_pending_work(make_input: RampInputFactory) -> None:
+    """Upstream evidence alone does not grow a stage with no work waiting; it stays cold."""
+    decision = decide(
+        make_input(
+            sample_count=0, current_workers=1, proposed_post=13, has_pending_work=False, has_upstream_evidence=True
+        ),
+        _config(),
+    )
+    assert decision.cap == 1
+    assert decision.reason is RampReason.COLD
+
+
+def test_pipeline_warming_requires_upstream_evidence(make_input: RampInputFactory) -> None:
+    """Without any trusted upstream stage, a 0-sample stage with work waiting still holds at one."""
+    decision = decide(
+        make_input(
+            sample_count=0, current_workers=1, proposed_post=13, has_pending_work=True, has_upstream_evidence=False
+        ),
+        _config(),
+    )
+    assert decision.cap == 1
+    assert decision.reason is RampReason.COLD
+
+
+def test_pipeline_warming_requires_an_existing_worker(make_input: RampInputFactory) -> None:
+    """A stage with no live worker clears the first cold cap before evidence can accelerate it."""
+    decision = decide(
+        make_input(
+            sample_count=0, current_workers=0, proposed_post=13, has_pending_work=True, has_upstream_evidence=True
+        ),
+        _config(),
+    )
+    assert decision.cap == 1
+    assert decision.reason is RampReason.COLD
+
+
+def test_pipeline_warming_caps_growth_at_one_per_cycle(make_input: RampInputFactory) -> None:
+    """Pipeline-evidence warming adds a single worker even when the solver wants many more."""
+    decision = decide(
+        make_input(
+            sample_count=0, current_workers=3, proposed_post=15, has_pending_work=True, has_upstream_evidence=True
+        ),
+        _config(),
+    )
+    assert decision.cap == 4
+    assert decision.keep_new == 1
+    assert decision.reason is RampReason.PIPELINE_WARMING
 
 
 def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -> None:

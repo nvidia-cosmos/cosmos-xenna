@@ -21,7 +21,7 @@ tuples (names, batch sizes, GPU flags) indexed in lockstep.
 """
 
 from collections.abc import Sequence
-from typing import Self
+from typing import Any, Self
 
 import attrs
 
@@ -59,7 +59,7 @@ class PipelineShape:
     stages: tuple[StageShape, ...]
 
     @classmethod
-    def from_stage_specs(cls, stage_specs: Sequence[specs.StageSpec]) -> Self:
+    def from_stage_specs(cls, stage_specs: Sequence[specs.StageSpec[Any, Any]]) -> Self:
         """Build the shape from ordered pipeline stage specs.
 
         Args:

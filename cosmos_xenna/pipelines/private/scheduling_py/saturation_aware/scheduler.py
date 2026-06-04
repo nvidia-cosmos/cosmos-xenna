@@ -44,7 +44,7 @@ across threads.
 import math
 import queue
 from collections.abc import Sequence
-from typing import Self, cast
+from typing import Any, Self, cast
 
 import attrs
 
@@ -242,7 +242,7 @@ class SaturationAwareScheduler:
         Returns:
             A constructed (not yet set up) :class:`SaturationAwareScheduler`.
         """
-        stages = [cast(specs.StageSpec, stage) for stage in pipeline_spec.stages]
+        stages = [cast(specs.StageSpec[Any, Any], stage) for stage in pipeline_spec.stages]
         return cls(
             config=config,
             shape=PipelineShape.from_stage_specs(stages),
@@ -506,6 +506,10 @@ class SaturationAwareScheduler:
             deleted = editor.proposed_deletes(index)
             samples = self._estimator.sample_count(stage.name)
             has_pending_work = cycle.active_depths[index] > 0.0
+            # Pipeline evidence: any upstream stage with a trusted (non-None)
+            # speed proves the chain is feeding this stage, letting a 0-sample
+            # stage grow by one worker per cycle before its own first sample.
+            has_upstream_evidence = any(snapshot.speed is not None for snapshot in cycle.demand_snapshots[:index])
             decision = ramp.decide(
                 StageRampInput(
                     current_workers=current,
@@ -514,12 +518,14 @@ class SaturationAwareScheduler:
                     sample_count=samples,
                     stage_age_s=stage_age_s,
                     has_pending_work=has_pending_work,
+                    has_upstream_evidence=has_upstream_evidence,
                 ),
                 self.config,
             )
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
-                f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu}"
+                f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
+                f"pending_work={has_pending_work} upstream_evidence={has_upstream_evidence}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:
@@ -548,7 +554,8 @@ class SaturationAwareScheduler:
                 f"frag_new={frag_new} frag_post={frag_post} "
                 f"ramp_new={ramp_new} ramp_post={ramp_post} trimmed={frag_new - ramp_new} "
                 f"cap={decision.cap} samples={samples}/{min_data_points} confidence={confidence:.2f} "
-                f"is_gpu={stage.is_gpu}"
+                f"is_gpu={stage.is_gpu} "
+                f"has_pending_work={has_pending_work} has_upstream_evidence={has_upstream_evidence}"
             )
         if summaries:
             logger.debug("saturation-aware ramp: " + " | ".join(summaries))
@@ -622,14 +629,22 @@ class SaturationAwareScheduler:
         from logs alone.
         """
         snapshot = cycle.activity_snapshot
-        has_activity = snapshot is not None and len(snapshot.stages) == len(cycle.workers)
+        activity_stages = (
+            snapshot.stages
+            if snapshot is not None and len(snapshot.stages) == len(cycle.workers)
+            else None
+        )
         bottleneck_name = self._bottleneck_name(capacity)
         groups: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             cap = capacity.stages[index]
             decision = floor_plan.decisions[index]
-            inflight = snapshot.stages[index].inflight_slots if has_activity else 0
-            pool_queued = snapshot.stages[index].pool_queued_tasks if has_activity else 0
+            if activity_stages is not None:
+                inflight = activity_stages[index].inflight_slots
+                pool_queued = activity_stages[index].pool_queued_tasks
+            else:
+                inflight = 0
+                pool_queued = 0
             utilization = inflight / max(cycle.workers[index], 1)
             groups.append(
                 f"{stage.name}[w={cycle.workers[index]} cap_src={cap.cap_src:.2f} "
