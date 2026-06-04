@@ -123,8 +123,8 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
     Pipeline-evidence warming bridges the gap before a stage's own first sample:
     a 0-sample stage that has work waiting and at least one already-trusted
     upstream stage is allowed one extra worker per cycle, so an expensive
-    downstream stage can begin loading a
-    second model in parallel instead of idling at a single worker. Growth stays
+    downstream stage (one with a costly per-worker warmup) can warm a second
+    worker in parallel instead of idling at a single worker. Growth stays
     at ``+1`` per cycle, so a 0-sample stage can never perform the large
     first-cycle over-spawn the cold cap was built to prevent, and the
     upstream-trust gate keeps this branch dark on cycle one (before any stage is
@@ -152,9 +152,9 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
             return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
         if stage.current_workers >= 1 and stage.has_pending_work and stage.has_upstream_evidence:
             # No completed task yet, but work is waiting and an upstream stage is
-            # already trusted: the pipeline is probably feeding this stage. Grow
-            # by exactly one worker so an expensive downstream stage can begin a
-            # second model load in parallel before its own first sample lands.
+            # already trusted: the pipeline is provably feeding this stage. Grow
+            # by exactly one worker so an expensive downstream stage can warm a
+            # second worker in parallel before its own first sample lands.
             # The +1 bound preserves the original anti-fragmentation guarantee
             # (no large first-cycle over-spawn from placeholder throughput), and
             # the current_workers >= 1 guard means this only accelerates a stage

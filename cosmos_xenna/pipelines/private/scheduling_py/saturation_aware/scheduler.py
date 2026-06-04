@@ -509,6 +509,11 @@ class SaturationAwareScheduler:
             # Pipeline evidence: any upstream stage with a trusted (non-None)
             # speed proves the chain is feeding this stage, letting a 0-sample
             # stage grow by one worker per cycle before its own first sample.
+            # "Any upstream" (rather than only the immediate feeder) is
+            # deliberate: the +1/cycle bound and the has_pending_work gate
+            # already contain growth, so the broader signal only front-loads a
+            # deep stage's warmup sooner without widening the cycle-1-dark
+            # fragmentation window.
             has_upstream_evidence = any(snapshot.speed is not None for snapshot in cycle.demand_snapshots[:index])
             decision = ramp.decide(
                 StageRampInput(
@@ -525,7 +530,7 @@ class SaturationAwareScheduler:
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
-                f"pending_work={has_pending_work} upstream_evidence={has_upstream_evidence}"
+                f"has_pending_work={has_pending_work} has_upstream_evidence={has_upstream_evidence}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:

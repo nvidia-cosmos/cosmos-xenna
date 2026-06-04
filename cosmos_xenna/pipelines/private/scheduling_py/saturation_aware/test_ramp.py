@@ -163,6 +163,42 @@ def test_pipeline_warming_caps_growth_at_one_per_cycle(make_input: RampInputFact
     assert decision.reason is RampReason.PIPELINE_WARMING
 
 
+def test_pipeline_warming_keeps_one_net_worker_when_solver_also_deletes(make_input: RampInputFactory) -> None:
+    """With deletes proposed alongside additions, the kept-new count still nets exactly one extra worker."""
+    decision = decide(
+        make_input(
+            sample_count=0,
+            current_workers=3,
+            deleted_count=2,
+            proposed_post=10,
+            has_pending_work=True,
+            has_upstream_evidence=True,
+        ),
+        _config(),
+    )
+    assert decision.cap == 4
+    assert decision.keep_new == 3
+    assert decision.reason is RampReason.PIPELINE_WARMING
+
+
+def test_slow_start_takes_precedence_over_pipeline_warming(make_input: RampInputFactory) -> None:
+    """Once the window elapses with work waiting, the solver is trusted even with full warming preconditions."""
+    config = SaturationAwareConfig()
+    decision = decide(
+        make_input(
+            sample_count=0,
+            current_workers=1,
+            proposed_post=13,
+            stage_age_s=config.speed_estimation_window_s,
+            has_pending_work=True,
+            has_upstream_evidence=True,
+        ),
+        config,
+    )
+    assert decision.cap is None
+    assert decision.reason is RampReason.SLOW_START
+
+
 def test_warming_thin_evidence_allows_small_step(make_input: RampInputFactory) -> None:
     """One sample of five unlocks ceil(0.2 * solver_growth) workers."""
     decision = decide(make_input(sample_count=1, current_workers=1, proposed_post=11), _config())
