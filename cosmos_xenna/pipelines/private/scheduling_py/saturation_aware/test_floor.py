@@ -50,6 +50,23 @@ def _inputs(*, upstream_workers: int, caption_workers: int, stock: tuple[float, 
     )
 
 
+def _bottleneck_inputs() -> floor.FloorInputs:
+    """Three-stage pipeline whose global bottleneck is the last (GPU) stage.
+
+    cap_src = [10*10, 60*1, 7*0.4] = [100, 60, 2.8], so the bottleneck is the
+    last stage at 2.8 source items/s and the over-fed middle stage is floored
+    down to it.
+    """
+    return floor.FloorInputs(
+        workers=(10, 60, 7),
+        speed=(10.0, 1.0, 0.4),
+        chain=(1.0, 1.0, 1.0),
+        stock_src=(5000.0, 5000.0, 5000.0),
+        batch_sizes=(1, 1, 1),
+        is_gpu=(False, False, True),
+    )
+
+
 def _caption_floor_after_two_cycles(stock: tuple[float, float], params: floor.FloorParams) -> int:
     """Run the floor two cycles at fixed workers and return caption's floor.
 
@@ -92,7 +109,8 @@ def test_transient_lull_holds_expensive_stage_warm() -> None:
         floor.FloorState.initial(2),
         _params(),
     )
-    # A = 8 * (10 * 0.1) = 8.0; w_sustain = ceil(8/0.5) = 16; floor = min(16, 15) = 15.
+    # cap_src = [1.0, 0.9375]; the global bottleneck is caption itself (0.9375).
+    # A = 8 * 0.9375 = 7.5; w_sustain = ceil(7.5/0.5) = 15; floor = min(15, 15) = 15.
     assert result.floors[1] == 15
 
 
@@ -108,14 +126,75 @@ def test_persistent_bottleneck_shrinks_to_sustainable_size() -> None:
     assert result.floors[1] == 5
 
 
+def test_global_bottleneck_frees_overfed_upstream_stage() -> None:
+    """A stage fed faster than the global bottleneck is floored down to it."""
+    result = floor.compute_floors(_bottleneck_inputs(), floor.FloorState.initial(3), _params())
+    # Stage 1: a_raw = 1 * 2.8 = 2.8; w_sustain = ceil(2.8/1.0) = 3; floor = min(3, 60) = 3.
+    assert result.bottleneck_stage == 2
+    assert result.floors[1] == 3
+
+
+def test_global_bottleneck_stage_holds_itself() -> None:
+    """The bottleneck's own capacity bounds the floor, so it is not shrunk."""
+    result = floor.compute_floors(_bottleneck_inputs(), floor.FloorState.initial(3), _params())
+    # Stage 2 (bottleneck): a_raw = 1 * 2.8 = 2.8; w_sustain = ceil(2.8/0.4) = 7; floor = min(7, 7) = 7.
+    assert result.floors[2] == 7
+
+
+def test_cold_stage_is_excluded_from_the_global_bottleneck() -> None:
+    """A stage with no speed estimate neither becomes nor drags the bottleneck."""
+    inputs = floor.FloorInputs(
+        workers=(10, 60, 7),
+        speed=(10.0, 0.0, 0.4),  # middle stage not yet measured
+        chain=(1.0, 1.0, 1.0),
+        stock_src=(5000.0, 5000.0, 5000.0),
+        batch_sizes=(1, 1, 1),
+        is_gpu=(False, False, True),
+    )
+    result = floor.compute_floors(inputs, floor.FloorState.initial(3), _params())
+    # cap_src = [100, 0, 2.8]; the cold stage is skipped -> bottleneck = 2.8 at stage 2.
+    assert result.bottleneck_stage == 2
+    assert result.floors[1] == 1
+
+
+def test_all_cold_pipeline_floors_at_min_with_no_bottleneck() -> None:
+    """With no measured stage, the floor cannot size and reports no bottleneck."""
+    inputs = floor.FloorInputs(
+        workers=(10, 60, 7),
+        speed=(0.0, 0.0, 0.0),
+        chain=(1.0, 1.0, 1.0),
+        stock_src=(5000.0, 5000.0, 5000.0),
+        batch_sizes=(1, 1, 1),
+        is_gpu=(False, False, True),
+    )
+    result = floor.compute_floors(inputs, floor.FloorState.initial(3), _params())
+    assert result.bottleneck_stage == -1
+    assert result.floors == (1, 1, 1)
+
+
+def test_single_cycle_bottleneck_dip_does_not_collapse_floor() -> None:
+    """A one-cycle bottleneck drop decays the floor slowly, not all at once."""
+    # Stage 1 converged at the higher arrival it saw before the dip (a_ewma=8.0).
+    converged = floor.FloorState(a_ewma=(None, 8.0, None), release_streak=(0, 0, 0))
+    result = floor.compute_floors(_bottleneck_inputs(), converged, _params())
+    # a_raw drops to 2.8 but CPU slow-down holds a_ewma ~7.13 -> w_sustain = 8,
+    # well above the fully-decayed sustainable size (3).
+    assert result.floors[1] > 3
+
+
 def test_floor_never_exceeds_current_workers() -> None:
     """The floor is a shrink-veto, never a grow command."""
+    # Seed a high prior arrival: the slow GPU decay keeps w_sustain above the
+    # current workers this cycle. (Once a_ewma settles the clamp is a no-op,
+    # because a stage's own capacity bounds the global bottleneck.)
+    converged = floor.FloorState(a_ewma=(None, 9.0), release_streak=(0, 0))
     result = floor.compute_floors(
         _inputs(upstream_workers=10, caption_workers=10, stock=_DEEP_STOCK),
-        floor.FloorState.initial(2),
+        converged,
         _params(),
     )
-    # w_sustain = 16 but only 10 workers exist -> floor = 10, not 16.
+    # a_raw = 8 * 0.625 = 5.0; slow GPU decay holds a_ewma ~8.78 -> w_sustain = 18;
+    # only 10 workers exist -> floor = min(18, 10) = 10, not 18.
     assert result.floors[1] == 10
 
 
@@ -213,5 +292,5 @@ def test_scale_down_floor_policy_carries_state_across_cycles() -> None:
     """
     policy = floor.ScaleDownFloorPolicy.create(2, _params())
     inputs = _inputs(upstream_workers=10, caption_workers=15, stock=_EMPTY_STOCK)
-    assert policy.plan(inputs)[1] == 15
-    assert policy.plan(inputs)[1] == 1
+    assert policy.plan(inputs).floors[1] == 15
+    assert policy.plan(inputs).floors[1] == 1

@@ -57,6 +57,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.estimator imp
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.floor import (
     FloorInputs,
     FloorParams,
+    FloorPlan,
     ScaleDownFloorPolicy,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
@@ -75,7 +76,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.solution_edit
 from cosmos_xenna.utils import python_log as logger
 
 _ALPHA_UP = 1.0
-_GPU_RELEASE_SLOWDOWN = 2.0
+_GPU_RELEASE_SLOWDOWN = 4.0
 _RELEASE_CONFIRM_DIVISOR = 3
 _MIN_WORKERS = 1
 _OVERALLOCATION_TARGET = 1.0
@@ -199,7 +200,8 @@ class SaturationAwareScheduler:
         solution = self._solve(problem_state, Estimates(estimates), workers)
         editor = SolutionEditor(solution)
         self._apply_cold_start_ramp(editor, workers, time)
-        self._apply_scale_down_floor(editor, workers, sizings)
+        plan = self._apply_scale_down_floor(editor, workers, sizings)
+        self._apply_growth_cap(editor, workers, plan)
         editor.commit()
         return solution
 
@@ -349,14 +351,19 @@ class SaturationAwareScheduler:
 
     def _apply_scale_down_floor(
         self, editor: SolutionEditor, workers: Sequence[int], sizings: Sequence[DemandResult]
-    ) -> None:
+    ) -> FloorPlan:
         """Cap each stage's delete set to its pipeline-aware scale-down floor.
 
         The release gate is driven by active stock (queued backlog plus upstream
         pool-queued and in-flight work) so a downstream stage is not released
         while upstream work is still in flight. Trims the solver's deletes so the
         post-delete worker count stays at or above the floor, logging each stage
-        it overrides alongside the queued-vs-active stock that justified it.
+        it overrides alongside the signals (speed, capacity, sustainable arrival,
+        and the global bottleneck) that justified it.
+
+        Returns:
+            The cycle's :class:`FloorPlan`, reused by the growth cap so the
+            floor's smoothing state advances exactly once per cycle.
         """
         num_stages = len(workers)
         speeds = [sizing.measured_speed_for_floor for sizing in sizings]
@@ -367,7 +374,7 @@ class SaturationAwareScheduler:
         chain_values = chain.chain_factors(returns, batch_sizes)
         queued_stock = chain.whole_chain_stock(queue_depths, chain_values)
         active_stock = chain.whole_chain_stock(active_depths, chain_values)
-        floors = self._floor.plan(
+        plan = self._floor.plan(
             FloorInputs(
                 workers=tuple(workers),
                 speed=tuple(speeds),
@@ -377,12 +384,14 @@ class SaturationAwareScheduler:
                 is_gpu=tuple(stage.is_gpu for stage in self.shape.stages),
             )
         )
+        bottleneck_name = self.shape.stages[plan.bottleneck_stage].name if plan.bottleneck_stage >= 0 else "none"
         for index in range(editor.stage_count):
             frag_delete = editor.proposed_deletes(index)
             if frag_delete == 0:
                 continue
+            decision = plan.decisions[index]
             new_count = editor.proposed_new_workers(index)
-            max_deletes = max(0, workers[index] + new_count - floors[index])
+            max_deletes = max(0, workers[index] + new_count - decision.floor)
             if not editor.cap_deletes(index, max_deletes):
                 continue
             sat_delete = editor.proposed_deletes(index)
@@ -393,10 +402,49 @@ class SaturationAwareScheduler:
                 f"current={workers[index]} new={new_count} "
                 f"frag_delete={frag_delete} frag_post={frag_post} "
                 f"sat_delete={sat_delete} sat_post={sat_post} "
-                f"floor_protected={frag_delete - sat_delete} floor_target={floors[index]} max_deletes={max_deletes} "
+                f"floor_protected={frag_delete - sat_delete} floor_target={decision.floor} max_deletes={max_deletes} "
+                f"speed={speeds[index]:.4f} cap_src={decision.cap_src:.3f} a_raw={decision.a_raw:.2f} "
+                f"a_ewma={decision.a_ewma:.2f} w_sustain={decision.w_sustain} bottleneck='{bottleneck_name}' "
                 f"queued_stock={queued_stock[index]:.2f} "
                 f"active_stock={active_stock[index]:.2f} "
                 f"active_depth={active_depths[index]:.2f}"
+            )
+        return plan
+
+    def _apply_growth_cap(self, editor: SolutionEditor, workers: Sequence[int], plan: FloorPlan) -> None:
+        """Cap each non-bottleneck stage's growth at the bottleneck-matched size.
+
+        The floor frees an over-fed stage (lower bound); this ceiling stops the
+        local demand multiplier from immediately re-growing it past what the
+        global bottleneck can absorb (upper bound ``w_sustain``). The source,
+        the bottleneck, operator-pinned, and cold stages grow freely, so the cap
+        is inert until the pipeline is measured.
+        """
+        if plan.bottleneck_stage < 0:
+            return
+        bottleneck_name = self.shape.stages[plan.bottleneck_stage].name
+        for index in range(editor.stage_count):
+            stage = self.shape.stages[index]
+            decision = plan.decisions[index]
+            # index 0 is the source (w_sustain is a placeholder there); the
+            # bottleneck must grow; the operator owns pinned counts; a cold or
+            # zero-worker stage (cap_src == 0) is governed by the cold-start ramp.
+            if index == 0 or index == plan.bottleneck_stage or stage.is_manual or decision.cap_src <= 0.0:
+                continue
+            frag_new = editor.proposed_new_workers(index)
+            if frag_new == 0:
+                continue
+            # post = workers - deletes + keep_new; solve for post == w_sustain.
+            # proposed_deletes reflects the floor-capped deletes (the floor ran first).
+            keep_new = max(0, decision.w_sustain - workers[index] + editor.proposed_deletes(index))
+            if not editor.trim_new_workers(index, keep_new):
+                continue
+            cap_post = workers[index] + keep_new - editor.proposed_deletes(index)
+            logger.info(
+                f"saturation-aware growth cap: stage='{stage.name}' "
+                f"current={workers[index]} frag_new={frag_new} keep_new={keep_new} "
+                f"trimmed={frag_new - keep_new} cap_post={cap_post} "
+                f"w_sustain={decision.w_sustain} cap_src={decision.cap_src:.3f} bottleneck='{bottleneck_name}'"
             )
 
     def _queue_for_cycle(self, num_stages: int) -> tuple[float, ...]:
