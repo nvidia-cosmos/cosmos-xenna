@@ -635,9 +635,7 @@ class SaturationAwareScheduler:
         """
         snapshot = cycle.activity_snapshot
         activity_stages = (
-            snapshot.stages
-            if snapshot is not None and len(snapshot.stages) == len(cycle.workers)
-            else None
+            snapshot.stages if snapshot is not None and len(snapshot.stages) == len(cycle.workers) else None
         )
         bottleneck_name = self._bottleneck_name(capacity)
         groups: list[str] = []
