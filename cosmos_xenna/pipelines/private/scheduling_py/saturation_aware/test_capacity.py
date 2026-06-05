@@ -439,6 +439,26 @@ def test_feeder_pressure_caps_required_workers() -> None:
     assert feeder.w_target <= downstream.feeder_boost_cap
 
 
+def test_feeder_pressure_does_not_compound_across_cycles() -> None:
+    """Identical boost inputs hold the feeder target at a fixed ceiling (no ratchet)."""
+    # Each cycle recomputes the boost from the capacity-model base target, never
+    # from the previously boosted value, so a sustained deficit cannot snowball.
+    params = _params()
+    args = _inputs(
+        workers=(5, 5, 20),
+        speed=(5.0, 1.0, 0.1),
+        local_pending_depth=(50.0, 20.0, 0.0),
+        active_depth=(50.0, 100.0, 0.0),
+        ready_workers=(5, 5, 20),
+    )
+    prev = _state(a_ewma=(None, None, None), bottleneck=2, feeder_pressure_streak=(0, 0, 1))
+    first = capacity.compute_capacity(args, prev, params)
+    second = capacity.compute_capacity(args, first.state, params)
+    assert first.plan.stages[1].feeder_boost > 0
+    assert second.plan.stages[1].w_target == first.plan.stages[1].w_target
+    assert second.plan.stages[1].feeder_boost == first.plan.stages[1].feeder_boost
+
+
 def test_feeder_pressure_resets_when_local_input_recovers() -> None:
     """Recovered local pending work clears the starved downstream streak."""
     prev = _state(a_ewma=(None, None), bottleneck=1, feeder_pressure_streak=(0, 2))
@@ -454,6 +474,26 @@ def test_feeder_pressure_resets_when_local_input_recovers() -> None:
         _params(),
     )
     assert result.plan.stages[1].feeder_reason == capacity.FeederReason.CLEARED_LOCAL_INPUT.value
+    assert result.state.feeder_pressure_streak[1] == 0
+
+
+def test_feeder_pressure_clears_when_downstream_becomes_busy() -> None:
+    """A still-dry downstream that fills its ready workers clears via not-warm."""
+    # local_pending stays dry (<= threshold) but ready_workers (0) < w_sustain,
+    # so the downstream is busy rather than starved-warm: the prior streak clears.
+    prev = _state(a_ewma=(None, None), bottleneck=1, feeder_pressure_streak=(0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(5, 5),
+            speed=(5.0, 1.0),
+            local_pending_depth=(10.0, 0.0),
+            active_depth=(100.0, 5.0),
+            ready_workers=(5, 0),
+        ),
+        prev,
+        _params(),
+    )
+    assert result.plan.stages[1].feeder_reason == capacity.FeederReason.CLEARED_NOT_WARM.value
     assert result.state.feeder_pressure_streak[1] == 0
 
 

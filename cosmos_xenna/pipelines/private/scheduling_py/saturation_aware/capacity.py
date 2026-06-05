@@ -55,7 +55,6 @@ class FeederReason(enum.StrEnum):
     NO_BOOST_INVALID_SUPPLY = "no-boost-invalid-supply"
     CLEARED_LOCAL_INPUT = "cleared-local-input"
     CLEARED_NOT_WARM = "cleared-not-warm"
-    CLEARED_NO_DELAY = "cleared-no-delay"
 
 
 @attrs.frozen
