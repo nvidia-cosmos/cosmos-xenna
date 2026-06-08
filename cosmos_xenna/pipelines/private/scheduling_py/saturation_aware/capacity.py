@@ -226,7 +226,7 @@ class StageCapacity:
         downstream_buffer_deficit: Downstream input-buffer shortfall below one
             batch per ready worker, in stage-input samples.
         feeder_effective_horizon_s: Arrival horizon used for this downstream
-            request; halved when the downstream is under-buffered.
+            request; reduced while the downstream is under-buffered.
         feeder_boost_cap: Cap applied to the feeder-pressure target.
         feeder_boost: Additional target workers applied to this feeder.
         feeder_downstreams: Downstream stages whose requests were aggregated
@@ -489,15 +489,17 @@ def _required_feeder_workers(
     stages: Sequence[StageCapacity],
     inputs: CapacityInputs,
     horizon_s: float,
+    buffer_deficit: float,
 ) -> tuple[int, int, int]:
     """Return feeder workers to (drain backlog, meet demand, refill buffer).
 
-    The caller takes ``max`` of the three for the feeder target. Components are
-    sized so a warm, locally dry downstream gets enough upstream supply to feed
-    its ready workers and refill its dispatch buffer within ``horizon_s``;
-    downstream item rates are converted to feeder item rates through chain
-    factors. A non-positive divisor yields ``0`` for that component instead of
-    raising, so normal scheduling never throws on a transiently cold feeder.
+    The caller takes ``max`` of the three for the feeder target and passes the
+    same ``buffer_deficit`` it logged, so the refill component cannot diverge
+    from the reported deficit. Components are sized so a warm, locally dry
+    downstream gets enough upstream supply to feed its ready workers and refill
+    its dispatch buffer within ``horizon_s``; downstream item rates are converted
+    to feeder item rates through chain factors. A non-positive divisor yields
+    ``0`` for that component instead of raising.
 
     ::
 
@@ -526,10 +528,8 @@ def _required_feeder_workers(
     feeder_rate_for_demand = downstream_rate / downstream_chain * feeder_chain
     demand_workers = math.ceil(feeder_rate_for_demand / feeder_speed)
 
-    # Extra supply to rebuild one batch per ready worker so the downstream does
-    # not immediately go dry again after consuming the arriving supply.
-    buffer_target = inputs.ready_workers[downstream] * inputs.local_input_threshold[downstream]
-    buffer_deficit = max(buffer_target - inputs.local_pending_depth[downstream], 0.0)
+    # Extra supply to rebuild the downstream buffer (one batch per ready worker)
+    # so it does not immediately go dry again after consuming arriving supply.
     feeder_rate_for_refill = buffer_deficit / horizon_s / downstream_chain * feeder_chain
     refill_workers = math.ceil(feeder_rate_for_refill / feeder_speed)
 
@@ -637,7 +637,7 @@ def _apply_feeder_pressure(
         feeder = selected.stage
         base_target = stages[feeder].w_target
         drain_w, demand_w, refill_w = _required_feeder_workers(
-            selected, downstream, stages, inputs, effective_horizon_s
+            selected, downstream, stages, inputs, effective_horizon_s, buffer_deficit
         )
         required_workers = max(drain_w, demand_w, refill_w)
         boost_cap = _feeder_boost_cap(base_target, params.feeder_boost_max_multiplier)
