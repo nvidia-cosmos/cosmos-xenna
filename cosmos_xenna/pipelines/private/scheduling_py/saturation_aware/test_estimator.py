@@ -52,3 +52,34 @@ def test_num_returns_is_ewma_of_observed_returns() -> None:
     _feed(est, stage="s", count=4, returns=8.0)
     # Constant returns -> EWMA settles at that value.
     assert est.num_returns("s") == pytest.approx(8.0)
+
+
+def test_empty_instant_skip_does_not_poison_speed() -> None:
+    """An empty + instant skip must not enter speed or the trust count."""
+    est = estimator.PipelineRateEstimator(_WINDOW_S, 5, 1e-3)  # window, min_dp, eps=1ms
+    for i in range(1, 4):  # 3 real tasks @ 5 s, 2 returns
+        est.observe("s", duration_s=5.0, num_returns=2.0, now=float(i))
+    est.observe("s", duration_s=1e-4, num_returns=0.0, now=4.0)  # empty + instant skip (~0.1 ms)
+    assert est.speed("s", now=4.0) == pytest.approx(0.2)  # 1/5 s, not ~10000/s
+    assert est.sample_count("s") == 3  # skip excluded from the trust count
+
+
+def test_slow_zero_return_filter_is_kept() -> None:
+    """A real filter/drop (zero returns but real duration >= eps) is still measured.
+
+    Zero output is a legitimate result; a stage that does real work then returns
+    nothing still has a real drain rate, so it must keep feeding the speed window.
+    """
+    est = estimator.PipelineRateEstimator(_WINDOW_S, 5, 1e-3)
+    for i in range(1, 6):
+        est.observe("f", duration_s=2.0, num_returns=0.0, now=float(i))  # 0 returns, real 2 s
+    assert est.speed("f", now=5.0) == pytest.approx(0.5)  # counted normally (1/2 s)
+    assert est.sample_count("f") == 5
+
+
+def test_default_eps_used_when_not_supplied() -> None:
+    """The defaulted eps still excludes an instant empty when no value is supplied."""
+    est = estimator.PipelineRateEstimator(_WINDOW_S, 5)  # no eps arg -> module default
+    est.observe("s", duration_s=1e-6, num_returns=0.0, now=1.0)
+    assert est.sample_count("s") == 0  # instant empty excluded from the trust count
+    assert est.speed("s", now=1.0) is None  # below trust count -> cold

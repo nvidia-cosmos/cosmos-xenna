@@ -23,7 +23,7 @@ only translates "grow toward ``w_target``" into a multiplier the fragmentation
 solver understands: a stage at or above its target asks for nothing extra
 (multiplier ``1.0``), and a below-target stage with local pending input asks
 for ``w_target / workers``. There is no local backlog math and no
-cross-cycle state here -- the throughput smoothing lives in ``capacity.py``.
+cross-cycle state here - the throughput smoothing lives in ``capacity.py``.
 """
 
 from collections.abc import Callable, Sequence

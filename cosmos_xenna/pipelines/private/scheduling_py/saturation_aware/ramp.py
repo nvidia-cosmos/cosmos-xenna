@@ -24,9 +24,9 @@ its own pending work to feed a new worker. With no completed sample and no
 pending work the stage is held at one worker; once the speed estimate is trusted
 the stage is uncapped and the solver decides. A stage that still has work waiting
 but produces no sample within a full speed-estimation window is treated as a
-confirmed slow-starter and is uncapped so all its workers spawn and warm up in
-parallel rather than one at a time. Pure and native-extension-free, so it is
-unit-testable without the solver.
+confirmed slow-starter and, unless capacity has suppressed its growth, is uncapped
+so all its workers spawn and warm up in parallel rather than one at a time. Pure
+and native-extension-free, so it is unit-testable without the solver.
 """
 
 import enum
@@ -40,17 +40,19 @@ class RampReason(enum.StrEnum):
     """Why the cold-start ramp reached its decision (log/diagnostic tag).
 
     Attributes:
-        COLD: No completed sample yet, still within the warmup window, and no
-            pending work to feed another worker (or growth suppressed); held at
-            one worker.
+        COLD: No completed sample yet and the slow-starter release did not fire
+            (no pending work, or capacity suppressed growth); held at one worker.
+            Reached within the warmup window and also past it whenever the
+            slow-starter release is gated.
         PIPELINE_WARMING: No completed sample yet, but capacity allows growth and
             the stage has its own pending work; allowed one extra worker this
             cycle.
         WARMING: Some samples but below the trust threshold; allowed one extra
             worker per cycle under the same work-and-suppression gate, never
             scaled by the solver's proposal.
-        SLOW_START: No sample after a full speed-estimation window; released to
-            the solver as a confirmed slow-starter.
+        SLOW_START: No sample after a full speed-estimation window with work
+            waiting and growth not suppressed; released to the solver as a
+            confirmed slow-starter.
         UNCAPPED: Enough samples to trust the speed estimate; the solver owns
             growth.
     """
@@ -74,7 +76,8 @@ class StageRampInput:
         sample_count: Measured throughput samples observed for this stage.
         stage_age_s: Seconds since the scheduler first saw this stage. Lets a
             stage that has produced no sample within a full speed-estimation
-            window be released to the solver as a confirmed slow-starter.
+            window be released to the solver as a confirmed slow-starter, unless
+            capacity has suppressed its growth.
         has_pending_work: Whether the stage has work waiting (queued, pool-queued,
             or in-flight). Gates the slow-starter release so a stage merely
             starved of input is not over-spawned from placeholder throughput, and
@@ -119,7 +122,7 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
     the new worker. Trusted stages (sample count at or above the threshold) are
     uncapped and the solver owns growth. A 0-sample stage with work still waiting
     after a full speed-estimation window is released to the solver as a confirmed
-    slow-starter.
+    slow-starter, unless capacity has suppressed its growth.
 
     The fixed one-per-cycle warming step never scales with the solver's
     proposal, so a stage can never convert a large solver proposal into a
@@ -137,13 +140,21 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
         return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
 
     is_cold = stage.sample_count == 0
-    if is_cold and stage.stage_age_s >= config.speed_estimation_window_s and stage.has_pending_work:
+    if (
+        is_cold
+        and stage.stage_age_s >= config.speed_estimation_window_s
+        and stage.has_pending_work
+        and not stage.suppress_growth
+    ):
         # A full estimation window has passed with no completed task while work
         # is still waiting: a slow-warmup stage whose first result lands long
         # after the window. Trust the solver so every worker spawns now and their
         # models load in parallel. The pending-work gate keeps a stage merely
         # starved of input capped, so the solver cannot over-spawn it from
-        # placeholder throughput.
+        # placeholder throughput. The suppress_growth gate keeps capacity's hold
+        # authoritative: a locally dry stage whose upstream feeder should be
+        # boosted instead is never released here, so its in-flight work alone
+        # cannot re-authorize a placeholder-sized over-spawn.
         return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
 
     # Authorize one warming worker only when capacity allows growth and the stage

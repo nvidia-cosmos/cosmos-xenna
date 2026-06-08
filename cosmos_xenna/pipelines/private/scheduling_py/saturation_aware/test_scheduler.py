@@ -168,6 +168,23 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
     )
 
 
+def _empty_skip_measurements(now: float) -> data_structures.Measurements:
+    """Single-stage measurements with one empty, near-instant skip task.
+
+    Mirrors the production "no clips to transcode" event: a task that produced
+    no output (``num_returns=0``) and returned in ~0.1 ms. Such a sample must
+    not enter the speed window, or ``1/mean(duration)`` would explode.
+    """
+    return data_structures.Measurements(
+        now,
+        [
+            data_structures.StageMeasurements(
+                [data_structures.TaskMeasurement(start_time=now - 1e-4, end_time=now, num_returns=0)]
+            )
+        ],
+    )
+
+
 def _upstream_only_measurements(now: float) -> data_structures.Measurements:
     """Two-stage measurements where only stage 0 reports a completed task.
 
@@ -321,6 +338,74 @@ def test_no_sample_after_window_without_pending_work_stays_capped() -> None:
         t0 + config.speed_estimation_window_s + 1.0, _state(spec, allocator.WorkerAllocator.make(cluster))
     )
     assert len(later.stages[0].new_workers) == 1
+
+
+def _feeder_starved_downstream_signals() -> RuntimeSignals:
+    """Two-stage signals: a deep upstream backlog while the downstream is locally dry with in-flight work.
+
+    The downstream stage holds one in-flight slot (active_depth > 0 -> has_pending_work) but an empty
+    input queue (local_pending below threshold -> locally dry), so capacity classifies it starved-warm and
+    suppresses its growth in favour of the upstream feeder. ``suppress_growth`` and ``has_pending_work``
+    being true together is the exact state that gates the slow-starter release.
+    """
+    return RuntimeSignals(
+        queue_depths=(200.0, 0.0),
+        pool_queued_tasks=(0, 0),
+        inflight_slots=(0, 1),
+        batch_sizes=(1, 1),
+    )
+
+
+def test_suppressed_downstream_past_window_is_held_not_released(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """A cold downstream past the window is held (reason=cold) when capacity suppresses it, not released.
+
+    Grows the cold downstream to two workers, then drives it locally dry with one in-flight slot while the
+    upstream keeps a deep backlog. Real capacity marks the downstream starved-warm (suppress_growth=True);
+    because it still holds in-flight work it also has pending work -- the exact state where the slow-starter
+    release would otherwise uncap it after a full window. The ramp must instead defer to capacity's hold and
+    tag the decision reason=cold, never slow_start, so a placeholder-sized over-spawn cannot be re-authorized.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    config = SaturationAwareConfig(speed_estimation_min_data_points=1)
+    scheduler = _scheduler(spec, cluster, config)
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    t0 = 100.0
+
+    # Two warm-up cycles grow the cold downstream to two workers, so that once it goes locally dry
+    # with one in-flight slot it still has a ready worker and reads as starved-warm (not merely busy).
+    for cycle in range(2):
+        now = t0 + cycle * 10.0
+        scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        _apply_to_allocator(spec, worker_allocator, scheduler.autoscale(now, _state(spec, worker_allocator)))
+    assert _worker_counts(spec, worker_allocator)[1] == 2
+
+    # Past the estimation window: downstream locally dry but holding in-flight work, upstream still deep.
+    loguru_caplog.clear()
+    now = t0 + config.speed_estimation_window_s + 1.0
+    scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+    scheduler.observe_runtime(_feeder_starved_downstream_signals())
+    solution = scheduler.autoscale(now, _state(spec, worker_allocator))
+
+    # Behavioral outcome: the suppressed stage is held, not released -- the solver's
+    # placeholder-sized proposal is trimmed to at most a single worker instead of bursting.
+    assert len(solution.stages[1].new_workers) <= 1
+
+    # Diagnostic outcome: the ramp summary tags the decision reason=cold (never slow_start).
+    downstream = _stage_names(spec)[1]
+    summaries = [r.getMessage() for r in loguru_caplog.records if "saturation-aware ramp:" in r.getMessage()]
+    assert summaries, "expected a ramp summary log for the grown downstream stage"
+    segments = summaries[-1].split(" | ")
+    segment = next((s for s in segments if f"{downstream}:" in s), None)
+    assert segment is not None, summaries[-1]
+    assert f"{downstream}: cold samples=" in segment, segment
+    assert "has_pending_work=True" in segment, segment
+    assert "suppress_growth=True" in segment, segment
+    assert not any(
+        "reason=slow_start" in message and downstream in message
+        for message in (r.getMessage() for r in loguru_caplog.records)
+    )
 
 
 def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
@@ -528,6 +613,34 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
         loguru_logger.remove(handler_id)
 
 
+def test_feeder_pressure_log_reports_demand_and_buffer_fields(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """The focused feeder-pressure log line exposes the demand / refill / buffer diagnostics."""
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    config = SaturationAwareConfig(speed_estimation_min_data_points=1)
+    scheduler = _scheduler(spec, cluster, config)
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    t0 = 100.0
+
+    for cycle in range(2):
+        now = t0 + cycle * 10.0
+        scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        _apply_to_allocator(spec, worker_allocator, scheduler.autoscale(now, _state(spec, worker_allocator)))
+
+    loguru_caplog.clear()
+    now = t0 + config.speed_estimation_window_s + 1.0
+    scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+    scheduler.observe_runtime(_feeder_starved_downstream_signals())
+    scheduler.autoscale(now, _state(spec, worker_allocator))
+
+    lines = [r.getMessage() for r in loguru_caplog.records if "saturation-aware feeder-pressure:" in r.getMessage()]
+    assert lines, "expected a feeder-pressure diagnostic line for the starved-warm downstream"
+    line = lines[-1]
+    for field in ("drain_workers=", "demand_workers=", "refill_workers=", "buffer_deficit=", "effective_horizon_s="):
+        assert field in line, line
+
+
 def test_pinned_stage_held_at_zero_escalates_to_error(loguru_caplog: pytest.LogCaptureFixture) -> None:
     """A pinned stage that cannot place even one worker is escalated to ERROR.
 
@@ -591,6 +704,29 @@ def test_measured_speed_is_withheld_until_the_trust_threshold_is_reached() -> No
     scheduler.update_with_measurements(102.0, _measurements(102.0, [0.5]))
     scheduler.autoscale(102.0, state)
     assert scheduler._build_cycle(102.0, state).demand_snapshots[0].speed is not None
+
+
+def test_empty_skip_does_not_inflate_measured_speed_in_a_cycle() -> None:
+    """An empty + instant skip drained through the ingest path cannot spike the cycle speed.
+
+    Reproduces the incident chain at the scheduler boundary: warm a stage with
+    real durations, then feed one ``num_returns=0`` ~0.1 ms skip. The assembled
+    cycle's measured speed must stay at the real value, so ``cap_src`` and the
+    bottleneck rate it feeds cannot blow up.
+    """
+    spec, cluster, problem = _build([1.0], num_cpus=16)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
+    scheduler.setup(problem)
+    state = _state(spec, allocator.WorkerAllocator.make(cluster))
+
+    scheduler.update_with_measurements(100.0, _measurements(100.0, [0.5]))  # real 0.5 s task -> 2.0/s
+    scheduler.autoscale(100.0, state)
+    real_speed = scheduler._build_cycle(100.0, state).demand_snapshots[0].speed
+    assert real_speed == pytest.approx(2.0)
+
+    scheduler.update_with_measurements(101.0, _empty_skip_measurements(101.0))  # empty + instant skip
+    scheduler.autoscale(101.0, state)
+    assert scheduler._build_cycle(101.0, state).demand_snapshots[0].speed == pytest.approx(2.0)
 
 
 def test_warm_pipeline_converges_to_a_stable_split() -> None:

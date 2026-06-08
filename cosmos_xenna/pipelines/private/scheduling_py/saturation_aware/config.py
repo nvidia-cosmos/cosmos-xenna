@@ -47,6 +47,13 @@ class SaturationAwareConfig:
         speed_estimation_min_data_points: Samples retained even when
             older than the window; also the trust threshold below which a
             stage is treated as cold/unmeasured for capacity and demand.
+        speed_estimation_min_task_duration_s: Lower service-time bound that
+            distinguishes a degenerate empty skip from real work. A sample
+            that produced no output AND completed faster than this is not a
+            service-rate observation (it would drive ``1/mean(duration)``
+            toward infinity), so it is excluded from the speed window and the
+            trusted-sample count. Real zero-output filter stages, which take
+            real time, are unaffected.
         scale_down_release_cycles: Scale-down release speed;
             ``alpha_down = 1 / scale_down_release_cycles`` (larger means
             the smoothed sustainable rate decays slower, so an expensive
@@ -57,6 +64,7 @@ class SaturationAwareConfig:
     capacity_headroom: float = attrs.field(default=0.10, validator=_UNIT_INTERVAL)
     speed_estimation_window_s: float = attrs.field(default=60.0, validator=attrs.validators.gt(0.0))
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
+    speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
 
     @classmethod

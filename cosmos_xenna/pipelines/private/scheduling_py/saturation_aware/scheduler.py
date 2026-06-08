@@ -99,7 +99,7 @@ class _Cycle:
     Built once by :meth:`SaturationAwareScheduler._build_cycle` from scheduler
     state and the live problem state, then threaded through capacity, sizing,
     ramp, floor, and logging so every collaborator reads the same per-stage
-    numbers instead of recomputing them. Holds derived inputs only -- no policy
+    numbers instead of recomputing them. Holds derived inputs only - no policy
     state advances here.
 
     Attributes:
@@ -219,7 +219,9 @@ class SaturationAwareScheduler:
         """
         config = self.config
         self._estimator = PipelineRateEstimator(
-            config.speed_estimation_window_s, config.speed_estimation_min_data_points
+            config.speed_estimation_window_s,
+            config.speed_estimation_min_data_points,
+            config.speed_estimation_min_task_duration_s,
         )
         cycles = config.scale_down_release_cycles
         self._capacity = CapacityModel.create(
@@ -729,6 +731,10 @@ class SaturationAwareScheduler:
                     f"blocked_path_delay_s={cap.blocked_feeder_path_delay_s:.2f} feeder_streak={cap.feeder_streak} "
                     f"candidate_feeders={self._format_feeder_candidates(cap.feeder_candidates)} "
                     f"required_workers={cap.feeder_required_workers} boost_cap={cap.feeder_boost_cap} "
+                    f"drain_workers={cap.feeder_drain_workers} demand_workers={cap.feeder_demand_workers} "
+                    f"refill_workers={cap.feeder_queue_refill_workers} "
+                    f"buffer_deficit={cap.downstream_buffer_deficit:.2f} "
+                    f"effective_horizon_s={cap.feeder_effective_horizon_s:.2f} "
                     f"feeder_boost={cap.feeder_boost} downstreams={downstreams} aggregation='max'"
                 )
             frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]

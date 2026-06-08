@@ -19,7 +19,7 @@ The fragmentation solver returns a ``Solution`` whose native stage list reads
 back as a fresh clone, so a mutation only persists when the whole list is
 written back. This editor reads the list once, applies trims/caps to the
 buffer in stage-index and count terms, and writes it back a single time on
-commit -- keeping the scheduler free of ``solution.rust`` mutation details.
+commit - keeping the scheduler free of ``solution.rust`` mutation details.
 """
 
 from typing import Any

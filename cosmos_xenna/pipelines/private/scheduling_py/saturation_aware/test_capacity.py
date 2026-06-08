@@ -32,6 +32,9 @@ def _params(
     capacity_headroom: float = 0.10,
     hysteresis_margin: float = 0.15,
     switch_confirm: int = 2,
+    feeder_pressure_confirm: int = 2,
+    feeder_arrival_horizon_s: float = 10.0,
+    feeder_boost_max_multiplier: float = 2.0,
 ) -> capacity.CapacityParams:
     # alpha_down_gpu = alpha_down_cpu / 4 mirrors the scheduler's GPU release slowdown.
     return capacity.CapacityParams(
@@ -41,6 +44,9 @@ def _params(
         capacity_headroom=capacity_headroom,
         hysteresis_margin=hysteresis_margin,
         switch_confirm=switch_confirm,
+        feeder_pressure_confirm=feeder_pressure_confirm,
+        feeder_arrival_horizon_s=feeder_arrival_horizon_s,
+        feeder_boost_max_multiplier=feeder_boost_max_multiplier,
         min_workers=1,
     )
 
@@ -54,6 +60,7 @@ def _inputs(
     is_manual: tuple[bool, ...] | None = None,
     local_qin: tuple[float, ...] | None = None,
     local_pending_depth: tuple[float, ...] | None = None,
+    local_input_threshold: tuple[float, ...] | None = None,
     active_depth: tuple[float, ...] | None = None,
     ready_workers: tuple[int, ...] | None = None,
 ) -> capacity.CapacityInputs:
@@ -66,7 +73,7 @@ def _inputs(
         is_manual=is_manual if is_manual is not None else (False,) * num,
         local_qin=local_qin if local_qin is not None else (0.0,) * num,
         local_pending_depth=local_pending_depth if local_pending_depth is not None else (0.0,) * num,
-        local_input_threshold=(1.0,) * num,
+        local_input_threshold=local_input_threshold if local_input_threshold is not None else (1.0,) * num,
         active_depth=active_depth if active_depth is not None else (0.0,) * num,
         ready_workers=ready_workers if ready_workers is not None else workers,
     )
@@ -237,17 +244,21 @@ def test_source_grows_toward_next_bottleneck_when_it_is_the_bottleneck() -> None
     assert plan.stages[0].w_target == 20
 
 
-def test_hold_window_can_have_next_rate_below_bottleneck_rate() -> None:
-    """While holding the incumbent, a transiently slower challenger makes next_bottleneck_rate < bottleneck_rate."""
+def test_hold_window_sizes_to_measured_min_rate() -> None:
+    """While holding the incumbent, the sizing rate is the measured-min cap_src, not the incumbent's.
+
+    Identity stays sticky on stage 0, but a transiently slower challenger
+    (stage 1) is the true minimum, so ``bottleneck_rate`` is the measured min
+    (8) and ``next_bottleneck_rate`` is the second-min excluding that argmin
+    (10). This prevents a held incumbent's cap_src from inflating every stage.
+    """
     params = _params(hysteresis_margin=0.15, switch_confirm=2)
     state = _state(a_ewma=(None, None, None), bottleneck=0)
     decisive = _inputs(workers=(10, 8, 20), speed=(1.0, 1.0, 1.0))
     result = capacity.compute_capacity(decisive, state, params)
-    # Holding stage 0 (streak 1 < confirm): bottleneck_rate = incumbent 10, but
-    # the dipped challenger sets next_bottleneck_rate = 8 (< bottleneck_rate).
-    assert result.plan.bottleneck_stage == 0
-    assert result.plan.bottleneck_rate == pytest.approx(10.0)
-    assert result.plan.next_bottleneck_rate == pytest.approx(8.0)
+    assert result.plan.bottleneck_stage == 0  # identity still sticky (held)
+    assert result.plan.bottleneck_rate == pytest.approx(8.0)  # measured min, not incumbent 10
+    assert result.plan.next_bottleneck_rate == pytest.approx(10.0)  # second-min excluding argmin
 
 
 def test_capacity_model_holds_incumbent_then_switches_across_cycles() -> None:
@@ -591,6 +602,159 @@ def test_feeder_pressure_skips_cold_or_invalid_feeder() -> None:
     )
     assert result.plan.stages[1].feeder_reason == capacity.FeederReason.NO_BOOST_INVALID_SUPPLY.value
     assert result.plan.stages[0].feeder_boost == 0
+
+
+def test_feeder_pressure_demand_workers_drive_sizing() -> None:
+    """Ready downstream workers can demand more feeder workers than backlog drain alone."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 2, 20),
+            speed=(0.1, 1.0, 0.5),
+            local_pending_depth=(0.0, 5.0, 0.0),
+            active_depth=(0.0, 12.0, 0.0),
+            ready_workers=(1, 2, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[2]
+    assert downstream.binding_feeder == 1
+    assert downstream.feeder_effective_horizon_s == pytest.approx(5.0)
+    assert downstream.feeder_drain_workers == 3
+    assert downstream.feeder_demand_workers == 10
+    assert downstream.feeder_queue_refill_workers == 4
+    assert downstream.feeder_required_workers == 10
+
+
+def test_feeder_pressure_refill_workers_drive_sizing() -> None:
+    """An empty deep input buffer demands feeder workers to refill, beyond ready-worker demand."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 1, 20),
+            speed=(0.1, 1.0, 0.1),
+            local_pending_depth=(0.0, 5.0, 0.0),
+            local_input_threshold=(1.0, 1.0, 5.0),
+            active_depth=(0.0, 6.0, 0.0),
+            ready_workers=(1, 1, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[2]
+    assert downstream.downstream_buffer_deficit == pytest.approx(100.0)
+    assert downstream.feeder_effective_horizon_s == pytest.approx(5.0)
+    assert downstream.feeder_drain_workers == 2
+    assert downstream.feeder_demand_workers == 2
+    assert downstream.feeder_queue_refill_workers == 20
+    assert downstream.feeder_required_workers == 20
+
+
+def test_feeder_pressure_buffered_downstream_keeps_full_horizon() -> None:
+    """A downstream whose buffer already meets target keeps the full (unhalved) arrival horizon."""
+    prev = _state(a_ewma=(None, None), bottleneck=1, feeder_pressure_streak=(0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 1),
+            speed=(1.0, 0.5),
+            local_pending_depth=(50.0, 2.0),
+            local_input_threshold=(1.0, 2.0),
+            active_depth=(6.0, 0.0),
+            ready_workers=(1, 1),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[1]
+    assert downstream.downstream_buffer_deficit == pytest.approx(0.0)
+    assert downstream.feeder_effective_horizon_s == pytest.approx(10.0)
+    assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_IMMINENT_ARRIVAL.value
+
+
+def test_feeder_pressure_is_resource_agnostic() -> None:
+    """Feeder sizing depends on demand, not on whether the stages hold GPUs."""
+
+    def plan_for(is_gpu: tuple[bool, ...]) -> capacity.CapacityPlan:
+        return capacity.compute_capacity(
+            _inputs(
+                workers=(1, 2, 20),
+                speed=(0.1, 1.0, 0.5),
+                is_gpu=is_gpu,
+                local_pending_depth=(0.0, 5.0, 0.0),
+                active_depth=(0.0, 12.0, 0.0),
+                ready_workers=(1, 2, 20),
+            ),
+            _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1)),
+            _params(),
+        ).plan
+
+    cpu = plan_for((False, False, False))
+    gpu = plan_for((True, True, True))
+    assert cpu.stages[2].feeder_required_workers == gpu.stages[2].feeder_required_workers
+    assert cpu.stages[1].feeder_boost == gpu.stages[1].feeder_boost
+
+
+def test_feeder_pressure_blocked_only_does_not_advance_streak() -> None:
+    """A blocked-only feeder cycle resets the confirmation streak instead of advancing it."""
+    prev = _state(a_ewma=(None, None), bottleneck=0, feeder_pressure_streak=(0, 3))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(5, 20),
+            speed=(0.1, 1.0),
+            local_pending_depth=(20.0, 0.0),
+            active_depth=(100.0, 0.0),
+            ready_workers=(5, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[1]
+    assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_GLOBAL_BOTTLENECK.value
+    assert result.state.feeder_pressure_streak[1] == 0
+
+
+def test_feeder_pressure_converts_demand_through_chain_factors() -> None:
+    """Downstream demand is converted to the feeder item rate using the stages' chain factors."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 2, 20),
+            speed=(0.1, 1.0, 0.5),
+            chain=(1.0, 1.0, 2.0),
+            local_pending_depth=(0.0, 5.0, 0.0),
+            active_depth=(0.0, 12.0, 0.0),
+            ready_workers=(1, 2, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[2]
+    # chain[downstream]=2 halves the per-feeder-item demand (chain=1 yields 10 / 4).
+    assert downstream.feeder_demand_workers == 5
+    assert downstream.feeder_queue_refill_workers == 2
+
+
+def test_feeder_pressure_reports_sufficient_feeder_without_boosting() -> None:
+    """When the feeder is already large enough, feeder pressure records sufficiency and adds no boost."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 1, 10),
+            speed=(0.6, 1.0, 0.5),
+            local_pending_depth=(0.0, 5.0, 0.0),
+            active_depth=(0.0, 6.0, 0.0),
+            ready_workers=(1, 1, 2),
+        ),
+        prev,
+        _params(capacity_headroom=1.0),
+    )
+    downstream = result.plan.stages[2]
+    feeder = result.plan.stages[1]
+    assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_FEEDER_SUFFICIENT.value
+    assert downstream.feeder_required_workers == 2
+    assert feeder.feeder_boost == 0
+    assert feeder.w_target == 2
 
 
 def test_transient_speed_drop_does_not_spike_target_to_raw_division_result() -> None:

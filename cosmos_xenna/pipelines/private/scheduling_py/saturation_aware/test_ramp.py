@@ -72,6 +72,14 @@ def test_no_samples_running_stage_trims_all_new_workers(make_input: RampInputFac
     assert decision.keep_new == 0
 
 
+def test_cold_stage_above_cap_adds_no_new_workers(make_input: RampInputFactory) -> None:
+    """A 0-sample stage already above the one-worker cap gains nothing; the ramp never deletes existing workers."""
+    decision = decide(make_input(sample_count=0, current_workers=2, proposed_post=11), _config())
+    assert decision.cap == 1
+    assert decision.keep_new == 0
+    assert decision.reason is RampReason.COLD
+
+
 def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> None:
     """A 0-sample stage is held at one worker until a full estimation window elapses."""
     config = SaturationAwareConfig()
@@ -204,6 +212,30 @@ def test_slow_start_takes_precedence_over_pipeline_warming(make_input: RampInput
     assert decision.reason is RampReason.SLOW_START
 
 
+def test_slow_start_blocked_when_growth_suppressed(make_input: RampInputFactory) -> None:
+    """Suppression hard-gates even the slow-starter release: a suppressed dry stage holds at one worker.
+
+    A locally dry stage can hold in-flight work (has_pending_work) while capacity marks it starved and
+    suppresses its growth so its upstream feeder is boosted instead. Releasing it to the solver here would
+    re-authorize a placeholder-sized over-spawn, so the window-elapsed slow-starter path must not fire.
+    """
+    config = SaturationAwareConfig()
+    decision = decide(
+        make_input(
+            sample_count=0,
+            current_workers=2,
+            proposed_post=13,
+            stage_age_s=config.speed_estimation_window_s,
+            has_pending_work=True,
+            suppress_growth=True,
+        ),
+        config,
+    )
+    assert decision.cap == 1
+    assert decision.keep_new == 0
+    assert decision.reason is RampReason.COLD
+
+
 def test_warming_grows_by_one_with_local_work(make_input: RampInputFactory) -> None:
     """A warming stage with its own backlog grows by exactly one worker per cycle."""
     decision = decide(
@@ -220,6 +252,24 @@ def test_warming_caps_growth_at_one_per_cycle_regardless_of_sample_count(make_in
     decision = decide(
         make_input(sample_count=4, current_workers=1, proposed_post=11, has_pending_work=True),
         _config(),
+    )
+    assert decision.cap == 2
+    assert decision.keep_new == 1
+    assert decision.reason is RampReason.WARMING
+
+
+def test_warming_past_window_is_not_released_to_solver(make_input: RampInputFactory) -> None:
+    """The slow-starter release is cold-only: a stage with samples past the window still grows +1, never uncapped."""
+    config = SaturationAwareConfig()
+    decision = decide(
+        make_input(
+            sample_count=2,
+            current_workers=1,
+            proposed_post=11,
+            stage_age_s=config.speed_estimation_window_s,
+            has_pending_work=True,
+        ),
+        config,
     )
     assert decision.cap == 2
     assert decision.keep_new == 1
@@ -262,6 +312,17 @@ def test_warming_blocked_when_growth_suppressed(make_input: RampInputFactory) ->
 def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
     """Once samples reach the trust threshold the stage is uncapped."""
     decision = decide(make_input(sample_count=5, current_workers=1, proposed_post=11), _config())
+    assert decision.cap is None
+    assert decision.keep_new is None
+    assert decision.reason is RampReason.UNCAPPED
+
+
+def test_trusted_stage_uncapped_even_when_growth_suppressed(make_input: RampInputFactory) -> None:
+    """Suppression gates only not-yet-trusted growth; a trusted stage stays uncapped and sizing owns it."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=1, proposed_post=11, suppress_growth=True),
+        _config(),
+    )
     assert decision.cap is None
     assert decision.keep_new is None
     assert decision.reason is RampReason.UNCAPPED

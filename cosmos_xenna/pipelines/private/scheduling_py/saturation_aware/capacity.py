@@ -25,7 +25,7 @@ fact this module derives two per-stage worker targets that the grow
 - ``w_sustain``: workers to sustain the smoothed ``bottleneck_rate`` (the
   scale-down hold target; no headroom).
 - ``w_target``: workers worth asking the solver for this cycle. The bottleneck
-  climbs toward ``next_bottleneck_rate`` -- the second-slowest stage's capacity,
+  climbs toward ``next_bottleneck_rate`` - the second-slowest stage's capacity,
   i.e. the move that actually raises pipeline speed; every other stage,
   including the source, is bounded to ``bottleneck_rate * (1 +
   capacity_headroom)`` (a small read-ahead, never free growth).
@@ -53,6 +53,7 @@ class FeederReason(enum.StrEnum):
     NO_BOOST_GLOBAL_BOTTLENECK = "no-boost-global-bottleneck"
     NO_BOOST_MANUAL_FEEDER = "no-boost-manual-feeder"
     NO_BOOST_INVALID_SUPPLY = "no-boost-invalid-supply"
+    NO_BOOST_FEEDER_SUFFICIENT = "no-boost-feeder-sufficient"
     CLEARED_LOCAL_INPUT = "cleared-local-input"
     CLEARED_NOT_WARM = "cleared-not-warm"
 
@@ -214,7 +215,18 @@ class StageCapacity:
         blocked_feeder_reason: Why ``blocked_feeder`` cannot be boosted.
         blocked_feeder_path_delay_s: Drain delay for ``blocked_feeder``.
         feeder_streak: Confirmation streak for this downstream request.
-        feeder_required_workers: Uncapped worker target from feeder pressure.
+        feeder_required_workers: Uncapped worker target from feeder pressure
+            (the max of the drain / demand / refill components below).
+        feeder_drain_workers: Component sizing the feeder to drain its own
+            active backlog within the effective horizon.
+        feeder_demand_workers: Component sizing the feeder to match the
+            downstream stage's ready-worker consumption rate.
+        feeder_queue_refill_workers: Component sizing the feeder to refill the
+            downstream input buffer to one batch per ready worker.
+        downstream_buffer_deficit: Downstream input-buffer shortfall below one
+            batch per ready worker, in stage-input samples.
+        feeder_effective_horizon_s: Arrival horizon used for this downstream
+            request; halved when the downstream is under-buffered.
         feeder_boost_cap: Cap applied to the feeder-pressure target.
         feeder_boost: Additional target workers applied to this feeder.
         feeder_downstreams: Downstream stages whose requests were aggregated
@@ -240,6 +252,11 @@ class StageCapacity:
     blocked_feeder_path_delay_s: float = 0.0
     feeder_streak: int = 0
     feeder_required_workers: int = 0
+    feeder_drain_workers: int = 0
+    feeder_demand_workers: int = 0
+    feeder_queue_refill_workers: int = 0
+    downstream_buffer_deficit: float = 0.0
+    feeder_effective_horizon_s: float = 0.0
     feeder_boost_cap: int = 0
     feeder_boost: int = 0
     feeder_downstreams: tuple[int, ...] = ()
@@ -253,13 +270,16 @@ class CapacityPlan:
 
     Attributes:
         stages: One :class:`StageCapacity` per stage, in pipeline order.
-        bottleneck_stage: Index of the global bottleneck (sticky minimum
-            ``cap_src``), or ``-1`` when no stage is measured yet.
-        bottleneck_rate: Pipeline throughput: the (sticky) minimum ``cap_src``,
-            in source items/s.
-        next_bottleneck_rate: The second-minimum ``cap_src`` -- the rate the
-            bottleneck can usefully climb toward (falls back to
-            ``bottleneck_rate`` when fewer than two stages are measured).
+        bottleneck_stage: Index of the sticky global bottleneck (identity
+            only; may differ from the current argmin during a hold window), or
+            ``-1`` when no stage is measured yet.
+        bottleneck_rate: Pipeline throughput: the measured minimum ``cap_src``
+            this cycle (``min_k cap_src[k]``), in source items/s. Only the
+            bottleneck identity is sticky, not this rate.
+        next_bottleneck_rate: The second-minimum ``cap_src`` (excluding the
+            measured argmin) - the rate the bottleneck can usefully climb
+            toward (falls back to ``bottleneck_rate`` when fewer than two
+            stages are measured).
         bottleneck_streak: Current challenger confirmation streak.
         bottleneck_candidate: Current minimum-capacity measured stage.
         bottleneck_candidate_rate: Candidate stage's source-rate capacity.
@@ -310,33 +330,38 @@ def _source_capacities(workers: Sequence[int], speed: Sequence[float], chain: Se
 
 def _select_bottleneck(
     cap_src: Sequence[float], prev_bn: int, prev_streak: int, margin: float, confirm: int
-) -> tuple[int, float, int, int, float]:
-    """Return the sticky bottleneck plus current challenger facts.
+) -> tuple[int, int, int, float]:
+    """Return the sticky bottleneck identity plus current challenger facts.
 
     Holds the incumbent unless a different measured stage is the minimum AND
-    lower by ``margin`` for ``confirm`` consecutive cycles. The returned
-    capacity is always ``cap_src`` of the SELECTED stage (the incumbent while
-    held), so the hold window uses a consistent bottleneck rate even if a
-    just-shrunk stage transiently shows a lower ``cap_src``.
+    lower by ``margin`` for ``confirm`` consecutive cycles. Only the bottleneck
+    IDENTITY is sticky; the caller derives the sizing rate from the measured-min
+    candidate (``cap_src`` argmin), so a transient incumbent spike cannot inflate
+    the pipeline rate.
+
+    Returns:
+        ``(selected_stage, streak, candidate_stage, candidate_cap)`` where
+        ``selected_stage`` is the sticky incumbent identity and ``candidate_*``
+        is the current measured argmin / minimum ``cap_src``.
     """
     measured = [(index, capacity) for index, capacity in enumerate(cap_src) if capacity > 0.0]
     if not measured:
-        return -1, 0.0, 0, -1, 0.0
+        return -1, 0, -1, 0.0
     challenger, challenger_cap = min(measured, key=lambda item: item[1])
     if prev_bn < 0 or cap_src[prev_bn] <= 0.0:
         # No incumbent, or the incumbent went cold: adopt the current minimum.
-        return challenger, challenger_cap, 0, challenger, challenger_cap
+        return challenger, 0, challenger, challenger_cap
     incumbent_cap = cap_src[prev_bn]
     decisive = challenger != prev_bn and challenger_cap < incumbent_cap * (1.0 - margin)
     if not decisive:
         # Incumbent still (near-)slowest: hold it and reset the streak.
-        return prev_bn, incumbent_cap, 0, challenger, challenger_cap
+        return prev_bn, 0, challenger, challenger_cap
     streak = prev_streak + 1
     if streak >= confirm:
         # A challenger has been decisively slower long enough: switch.
-        return challenger, challenger_cap, 0, challenger, challenger_cap
+        return challenger, 0, challenger, challenger_cap
     # Decisive this cycle but not yet confirmed: hold, accruing confirmation.
-    return prev_bn, incumbent_cap, streak, challenger, challenger_cap
+    return prev_bn, streak, challenger, challenger_cap
 
 
 def _second_min_capacity(cap_src: Sequence[float], exclude: int, fallback: float) -> float:
@@ -370,12 +395,12 @@ def _drain_time(active_depth: float, workers: int, speed: float) -> float:
 def _classify_feeder(
     index: int,
     delay_s: float,
-    params: CapacityParams,
+    effective_horizon_s: float,
     bottleneck_stage: int,
     inputs: CapacityInputs,
 ) -> FeederCandidateStatus:
     """Classify whether an upstream feeder can receive autoscaler pressure."""
-    if delay_s <= params.feeder_arrival_horizon_s:
+    if delay_s <= effective_horizon_s:
         return FeederCandidateStatus.IMMINENT
     if index == bottleneck_stage:
         return FeederCandidateStatus.GLOBAL_BOTTLENECK
@@ -387,8 +412,8 @@ def _classify_feeder(
 def _feeder_candidates(
     downstream: int,
     inputs: CapacityInputs,
-    params: CapacityParams,
     bottleneck_stage: int,
+    effective_horizon_s: float,
 ) -> tuple[FeederCandidate, ...]:
     """Return upstream feeder candidates sorted by descending drain delay."""
     candidates: list[FeederCandidate] = []
@@ -398,7 +423,7 @@ def _feeder_candidates(
         delay = _drain_time(inputs.active_depth[index], inputs.workers[index], inputs.speed[index])
         if not math.isfinite(delay):
             continue
-        status = _classify_feeder(index, delay, params, bottleneck_stage, inputs)
+        status = _classify_feeder(index, delay, effective_horizon_s, bottleneck_stage, inputs)
         candidates.append(FeederCandidate(stage=index, delay_s=delay, status=status))
     return tuple(sorted(candidates, key=lambda candidate: candidate.delay_s, reverse=True))
 
@@ -458,13 +483,57 @@ def _feeder_boost_cap(base_target: int, multiplier: float) -> int:
     return max(base_target + 1, math.ceil(base_target * multiplier))
 
 
-def _required_feeder_workers(candidate: FeederCandidate, inputs: CapacityInputs, params: CapacityParams) -> int:
-    """Return the worker count needed to drain a delayed actionable feeder."""
-    speed = inputs.speed[candidate.stage]
-    if speed <= 0.0:
-        msg = f"actionable feeder {candidate.stage} has non-positive speed {speed}"
-        raise ValueError(msg)
-    return math.ceil(inputs.active_depth[candidate.stage] / (speed * params.feeder_arrival_horizon_s))
+def _required_feeder_workers(
+    candidate: FeederCandidate,
+    downstream: int,
+    stages: Sequence[StageCapacity],
+    inputs: CapacityInputs,
+    horizon_s: float,
+) -> tuple[int, int, int]:
+    """Return feeder workers to (drain backlog, meet demand, refill buffer).
+
+    The caller takes ``max`` of the three for the feeder target. Components are
+    sized so a warm, locally dry downstream gets enough upstream supply to feed
+    its ready workers and refill its dispatch buffer within ``horizon_s``;
+    downstream item rates are converted to feeder item rates through chain
+    factors. A non-positive divisor yields ``0`` for that component instead of
+    raising, so normal scheduling never throws on a transiently cold feeder.
+
+    ::
+
+        drain  = feeder backlog / horizon
+        demand = downstream ready-worker rate -> feeder rate
+        refill = downstream buffer deficit / horizon -> feeder rate
+
+    Returns:
+        ``(drain_workers, demand_workers, refill_workers)``.
+    """
+    feeder = candidate.stage
+    feeder_speed = inputs.speed[feeder]
+    if feeder_speed <= 0.0 or horizon_s <= 0.0:
+        return 0, 0, 0
+
+    drain_workers = math.ceil(inputs.active_depth[feeder] / (feeder_speed * horizon_s))
+
+    feeder_chain = inputs.chain[feeder]
+    downstream_chain = inputs.chain[downstream]
+    if downstream_chain <= 0.0 or feeder_chain <= 0.0:
+        return drain_workers, 0, 0
+
+    # Downstream consumption the feeder must match right now, converted from the
+    # downstream item rate back to the feeder item rate through chain factors.
+    downstream_rate = inputs.ready_workers[downstream] * stages[downstream].target_speed
+    feeder_rate_for_demand = downstream_rate / downstream_chain * feeder_chain
+    demand_workers = math.ceil(feeder_rate_for_demand / feeder_speed)
+
+    # Extra supply to rebuild one batch per ready worker so the downstream does
+    # not immediately go dry again after consuming the arriving supply.
+    buffer_target = inputs.ready_workers[downstream] * inputs.local_input_threshold[downstream]
+    buffer_deficit = max(buffer_target - inputs.local_pending_depth[downstream], 0.0)
+    feeder_rate_for_refill = buffer_deficit / horizon_s / downstream_chain * feeder_chain
+    refill_workers = math.ceil(feeder_rate_for_refill / feeder_speed)
+
+    return drain_workers, demand_workers, refill_workers
 
 
 def _mark_blocked_candidate(
@@ -529,7 +598,17 @@ def _apply_feeder_pressure(
             continue
 
         stage_updates[downstream]["starved_warm"] = True
-        candidates = _feeder_candidates(downstream, inputs, params, bottleneck_stage)
+
+        # Downstream-only demand signals, computed before feeder classification so
+        # an under-buffered downstream uses a stricter (halved) arrival horizon.
+        buffer_target = inputs.ready_workers[downstream] * inputs.local_input_threshold[downstream]
+        buffer_deficit = max(buffer_target - inputs.local_pending_depth[downstream], 0.0)
+        underbuffered = inputs.ready_workers[downstream] > 0 and buffer_deficit > 0.0
+        effective_horizon_s = params.feeder_arrival_horizon_s * (0.5 if underbuffered else 1.0)
+        stage_updates[downstream]["downstream_buffer_deficit"] = buffer_deficit
+        stage_updates[downstream]["feeder_effective_horizon_s"] = effective_horizon_s
+
+        candidates = _feeder_candidates(downstream, inputs, bottleneck_stage, effective_horizon_s)
         selected, blocked = _select_feeder(candidates)
         _mark_candidate_set(stage_updates[downstream], selected, blocked, candidates)
         if selected is None and blocked is None:
@@ -544,25 +623,35 @@ def _apply_feeder_pressure(
         if candidate.status is FeederCandidateStatus.IMMINENT:
             continue
 
+        if selected is None:
+            # Blocked-only (global bottleneck / manual): reason already recorded
+            # by _mark_candidate_set; do not advance the confirmation streak.
+            continue
+
         next_streak[downstream] = prev.feeder_pressure_streak[downstream] + 1
         stage_updates[downstream]["feeder_streak"] = next_streak[downstream]
         if next_streak[downstream] < params.feeder_pressure_confirm:
             stage_updates[downstream]["feeder_reason"] = FeederReason.PENDING_CONFIRM.value
             continue
 
-        if selected is None:
-            continue
-
         feeder = selected.stage
         base_target = stages[feeder].w_target
-        required_workers = _required_feeder_workers(selected, inputs, params)
+        drain_w, demand_w, refill_w = _required_feeder_workers(
+            selected, downstream, stages, inputs, effective_horizon_s
+        )
+        required_workers = max(drain_w, demand_w, refill_w)
         boost_cap = _feeder_boost_cap(base_target, params.feeder_boost_max_multiplier)
         final_target = max(base_target, min(required_workers, boost_cap))
         requested_targets[feeder] = max(requested_targets[feeder], final_target)
         downstreams_by_feeder[feeder].append(downstream)
         stage_updates[downstream]["feeder_required_workers"] = required_workers
+        stage_updates[downstream]["feeder_drain_workers"] = drain_w
+        stage_updates[downstream]["feeder_demand_workers"] = demand_w
+        stage_updates[downstream]["feeder_queue_refill_workers"] = refill_w
         stage_updates[downstream]["feeder_boost_cap"] = boost_cap
-        stage_updates[downstream]["feeder_reason"] = FeederReason.BOOSTED.value
+        stage_updates[downstream]["feeder_reason"] = (
+            FeederReason.BOOSTED.value if final_target > base_target else FeederReason.NO_BOOST_FEEDER_SUFFICIENT.value
+        )
 
     updated_stages: list[StageCapacity] = []
     for index, stage in enumerate(stages):
@@ -580,8 +669,9 @@ def _apply_feeder_pressure(
 def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: CapacityParams) -> CapacityResult:
     """Compute the capacity plan for one cycle and the next-cycle state.
 
-    Identifies the sticky global ``bottleneck_rate`` and the
-    ``next_bottleneck_rate``, smooths each stage's bottleneck-matched arrival,
+    Identifies the sticky bottleneck identity, derives the measured-min
+    ``bottleneck_rate`` and the ``next_bottleneck_rate``, smooths each stage's
+    bottleneck-matched arrival,
     and derives the hold target ``w_sustain`` and the growth target
     ``w_target``. Cold / untrusted stages (``speed <= 0`` or ``chain <= 0``)
     and an all-cold pipeline (``bottleneck_rate <= 0``) yield ``min_workers``
@@ -629,12 +719,17 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         )
 
     cap_src = _source_capacities(inputs.workers, inputs.speed, inputs.chain)
-    bottleneck_stage, bottleneck_rate, bottleneck_streak, bottleneck_candidate, bottleneck_candidate_rate = (
-        _select_bottleneck(
-            cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
-        )
+    bottleneck_stage, bottleneck_streak, bottleneck_candidate, bottleneck_candidate_rate = _select_bottleneck(
+        cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
     )
-    next_bottleneck_rate = _second_min_capacity(cap_src, bottleneck_stage, bottleneck_rate)
+    # The sizing rate is the TRUE measured-min cap_src (the module's definition of
+    # the pipeline bottleneck), never the held incumbent's cap_src. A held incumbent
+    # whose cap_src transiently spikes can no longer broadcast that spike to every
+    # stage via a_raw. The sticky identity (bottleneck_stage) is consulted only for
+    # the growth-owner branch (k == bottleneck_stage) below, so the growth target
+    # still does not flap on a one-cycle dip.
+    bottleneck_rate = bottleneck_candidate_rate
+    next_bottleneck_rate = _second_min_capacity(cap_src, bottleneck_candidate, bottleneck_rate)
     headroom_rate = bottleneck_rate * (1.0 + params.capacity_headroom)
 
     stages: list[StageCapacity] = []

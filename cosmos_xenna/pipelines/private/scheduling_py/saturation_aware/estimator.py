@@ -18,6 +18,10 @@
 Each stage gets a windowed per-worker speed estimate (from completed-task
 durations, via ``RateEstimatorDuration``) and an EWMA of returns-per-batch
 (fan-out). Both read ``None`` until the first sample for that stage arrives.
+
+Degenerate empty + instant "skip" samples (no output and a near-zero
+duration) are excluded from the speed window so they cannot inflate
+``1/mean(duration)``; they still update the fan-out EWMA.
 """
 
 import attrs
@@ -25,6 +29,7 @@ import attrs
 from cosmos_xenna.utils.timing import RateEstimatorDuration
 
 _DEFAULT_RETURNS_ALPHA = 0.3
+_DEFAULT_MIN_TASK_DURATION_S = 1e-3
 
 
 @attrs.define
@@ -33,16 +38,29 @@ class _StageEstimator:
 
     _speed: RateEstimatorDuration
     _returns_alpha: float
+    _min_task_duration_s: float
     _returns_ewma: float | None = None
     _sample_count: int = 0
 
     def observe(self, duration_s: float, num_returns: float, now: float) -> None:
-        """Record one completed task's service duration and return count."""
-        self._speed.update(duration_s, now)
+        """Record one completed task's service duration and return count.
+
+        A degenerate "skip" sample - one that produced no output AND returned
+        faster than ``_min_task_duration_s`` - is not a service-rate
+        observation: feeding its near-zero duration drives
+        ``speed = 1/mean(duration)`` toward infinity. Such a sample is kept out
+        of the speed window and the trusted-sample count. A real filter/drop
+        stage (zero returns but real duration) is still measured. The fan-out
+        EWMA observes every task, because "zero items produced" is an accurate
+        fan-out observation for downstream chain sizing.
+        """
         if self._returns_ewma is None:
             self._returns_ewma = num_returns
         else:
             self._returns_ewma = self._returns_alpha * num_returns + (1.0 - self._returns_alpha) * self._returns_ewma
+        if num_returns == 0.0 and duration_s < self._min_task_duration_s:
+            return
+        self._speed.update(duration_s, now)
         self._sample_count += 1
 
     def speed(self, now: float) -> float | None:
@@ -71,6 +89,7 @@ class PipelineRateEstimator:
 
     _window_s: float
     _min_data_points: int
+    _min_task_duration_s: float = _DEFAULT_MIN_TASK_DURATION_S
     _returns_alpha: float = _DEFAULT_RETURNS_ALPHA
     _stages: dict[str, _StageEstimator] = attrs.field(factory=dict)
 
@@ -99,6 +118,7 @@ class PipelineRateEstimator:
             estimator = _StageEstimator(
                 RateEstimatorDuration(self._window_s, self._min_data_points),
                 self._returns_alpha,
+                self._min_task_duration_s,
             )
             self._stages[stage_name] = estimator
         return estimator
