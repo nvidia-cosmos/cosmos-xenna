@@ -20,19 +20,14 @@ A thin lower-bound gate over the capacity model. The throughput math (per-stage
 hold target ``w_sustain``) lives in ``capacity.py``; this module only decides,
 per stage, how far the solver may shrink it this cycle:
 
-    hold     -> floor = min(w_sustain, workers)   (clamp deletes to the
-                                                    capacity hold target;
-                                                    expensive stages ignore
-                                                    one-worker dips)
-    release  -> floor = min_workers               (whole-chain work has
-                                                    drained for release_confirm_cycles)
+    hold     -> floor = stabilized min(w_sustain, workers)
+    release  -> floor = min(min_workers, workers)
 
 The floor never demands growth (``floor <= workers``), so growth stays owned by
-the demand multiplier. The release decision is driven by whole-chain
-at-or-upstream stock so a downstream stage is not released while upstream work
-is still in flight; a zero-fanout / drop stage (whose admitted work cannot be
-expressed in source units) is instead held while it still has local active
-work.
+the demand multiplier. A lower hold target must persist before deletes are
+allowed to follow it, while rises are accepted immediately. Release is driven by
+whole-chain at-or-upstream stock so a downstream stage is not released while
+upstream work is still in flight.
 """
 
 from typing import Self
@@ -62,14 +57,25 @@ class FloorState:
 
     Attributes:
         release_streak: Consecutive low-stock cycles per stage.
+        held_floor: Last stabilized hold floor per stage; ``0`` means unset.
+        shrink_streak: Consecutive cycles with a lower desired hold floor.
+        pending_shrink_floor: Conservative lower hold floor being confirmed.
     """
 
     release_streak: tuple[int, ...]
+    held_floor: tuple[int, ...]
+    shrink_streak: tuple[int, ...]
+    pending_shrink_floor: tuple[int, ...]
 
     @classmethod
     def initial(cls, num_stages: int) -> Self:
         """Return empty state for a pipeline with ``num_stages`` stages."""
-        return cls(release_streak=(0,) * num_stages)
+        return cls(
+            release_streak=(0,) * num_stages,
+            held_floor=(0,) * num_stages,
+            shrink_streak=(0,) * num_stages,
+            pending_shrink_floor=(0,) * num_stages,
+        )
 
 
 @attrs.frozen
@@ -89,8 +95,6 @@ class FloorInputs:
         batch_sizes: Per-stage input batch sizes.
         w_sustain: Per-stage capacity hold target from the capacity plan; the
             floor clamps deletes to ``min(w_sustain, workers)`` while holding.
-        is_gpu: Whether each stage holds GPU workers; used only to absorb tiny
-            scale-down churn while holding.
     """
 
     workers: tuple[int, ...]
@@ -99,7 +103,6 @@ class FloorInputs:
     active_depths: tuple[float, ...]
     batch_sizes: tuple[int, ...]
     w_sustain: tuple[int, ...]
-    is_gpu: tuple[bool, ...]
 
 
 @attrs.frozen
@@ -113,15 +116,18 @@ class FloorDecision:
         release_streak: Consecutive low-stock cycles observed so far.
         stock_threshold: Source-unit stock threshold below which the stage is
             considered drained (one batch's worth, ``batch_size / chain``).
-        churn_guarded: Whether an expensive stage ignored a one-worker hold
-            target dip while not releasing.
+        shrink_streak: Consecutive lower-hold-target cycles observed so far.
+        pending_shrink_floor: Lower hold floor being confirmed.
+        shrink_deferred: Whether a lower hold target is awaiting confirmation.
     """
 
     floor: int
     releasing: bool
     release_streak: int
     stock_threshold: float
-    churn_guarded: bool = False
+    shrink_streak: int = 0
+    pending_shrink_floor: int = 0
+    shrink_deferred: bool = False
 
 
 @attrs.frozen
@@ -156,13 +162,12 @@ class FloorResult:
 def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -> FloorResult:
     """Compute per-stage scale-down floors for one cycle.
 
-    Each stage holds at ``min(w_sustain, workers)`` (so the solver may shrink
-    an over-fed stage down to its capacity hold target but no further) until
-    its whole-chain at-or-upstream stock stays drained for
+    Each stage holds at a stabilized ``min(w_sustain, workers)`` until its
+    whole-chain at-or-upstream stock stays drained for
     ``release_confirm_cycles`` consecutive cycles, at which point it releases
-    to ``min_workers``. A zero-fanout / drop stage cannot express its admitted
-    work in source units, so it is gated on local active depth instead and is
-    never released while it still owns in-flight or queued work.
+    as far as ``min_workers`` without exceeding current workers. Lower hold
+    targets must persist for the same confirm window; higher targets take
+    effect immediately.
 
     Args:
         inputs: Per-cycle observed per-stage inputs, including the capacity
@@ -181,20 +186,26 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         == len(inputs.active_depths)
         == len(inputs.batch_sizes)
         == len(inputs.w_sustain)
-        == len(inputs.is_gpu)
         == len(prev.release_streak)
+        == len(prev.held_floor)
+        == len(prev.shrink_streak)
+        == len(prev.pending_shrink_floor)
         == num_stages
     ):
         raise ValueError(
             "floor inputs length mismatch: "
             f"workers={num_stages} chain={len(inputs.chain)} stock_src={len(inputs.stock_src)} "
             f"active_depths={len(inputs.active_depths)} batch_sizes={len(inputs.batch_sizes)} "
-            f"w_sustain={len(inputs.w_sustain)} is_gpu={len(inputs.is_gpu)} "
-            f"prev_release_streak={len(prev.release_streak)}"
+            f"w_sustain={len(inputs.w_sustain)} prev_release_streak={len(prev.release_streak)} "
+            f"prev_held_floor={len(prev.held_floor)} prev_shrink_streak={len(prev.shrink_streak)} "
+            f"prev_pending_shrink_floor={len(prev.pending_shrink_floor)}"
         )
 
     decisions: list[FloorDecision] = []
-    next_streak: list[int] = []
+    next_release_streak: list[int] = []
+    next_held_floor: list[int] = []
+    next_shrink_streak: list[int] = []
+    next_pending_shrink_floor: list[int] = []
 
     for k in range(num_stages):
         if inputs.chain[k] <= 0.0 and inputs.active_depths[k] > 0.0:
@@ -211,25 +222,54 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             streak = 0 if inputs.stock_src[k] > threshold else prev.release_streak[k] + 1
             releasing = inputs.stock_src[k] <= threshold and streak >= params.release_confirm_cycles
 
-        raw_held = max(params.min_workers, min(inputs.w_sustain[k], inputs.workers[k]))
-        shrink_gap = inputs.workers[k] - raw_held
-        churn_guarded = inputs.is_gpu[k] and not releasing and 0 < shrink_gap <= 1
-        held = inputs.workers[k] if churn_guarded else raw_held
-        floor = params.min_workers if releasing else held
+        min_floor = min(params.min_workers, inputs.workers[k])
+        desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
+        base = min(prev.held_floor[k], inputs.workers[k])
+        if base <= 0 or desired >= base:
+            held = desired
+            shrink_streak = 0
+            pending_shrink_floor = 0
+            shrink_deferred = False
+        else:
+            shrink_streak = prev.shrink_streak[k] + 1
+            prior_pending = prev.pending_shrink_floor[k]
+            pending_shrink_floor = desired if prior_pending <= 0 else max(min(prior_pending, base), desired)
+            shrink_confirmed = shrink_streak >= params.release_confirm_cycles
+            held = pending_shrink_floor if shrink_confirmed else base
+            shrink_deferred = not shrink_confirmed
+            if shrink_confirmed:
+                shrink_streak = 0
+                pending_shrink_floor = 0
+        floor = min_floor if releasing else held
+        if releasing:
+            held = min_floor
+            shrink_streak = 0
+            pending_shrink_floor = 0
+            shrink_deferred = False
         decisions.append(
             FloorDecision(
                 floor=floor,
                 releasing=releasing,
                 release_streak=streak,
                 stock_threshold=threshold,
-                churn_guarded=churn_guarded,
+                shrink_streak=shrink_streak,
+                pending_shrink_floor=pending_shrink_floor,
+                shrink_deferred=shrink_deferred,
             )
         )
-        next_streak.append(streak)
+        next_release_streak.append(streak)
+        next_held_floor.append(held)
+        next_shrink_streak.append(shrink_streak)
+        next_pending_shrink_floor.append(pending_shrink_floor)
 
     return FloorResult(
         plan=FloorPlan(decisions=tuple(decisions)),
-        state=FloorState(release_streak=tuple(next_streak)),
+        state=FloorState(
+            release_streak=tuple(next_release_streak),
+            held_floor=tuple(next_held_floor),
+            shrink_streak=tuple(next_shrink_streak),
+            pending_shrink_floor=tuple(next_pending_shrink_floor),
+        ),
     )
 
 

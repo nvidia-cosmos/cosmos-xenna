@@ -43,7 +43,6 @@ def _inputs(
     stock: tuple[float, float],
     active: tuple[float, float] = (0.0, 0.0),
     chain_factors: tuple[float, float] = _CHAIN,
-    is_gpu: tuple[bool, bool] = (False, True),
 ) -> floor.FloorInputs:
     # active_depths only affects the zero-fanout (chain <= 0) release branch.
     # _CHAIN is all-positive, so positive-chain tests are unaffected by it.
@@ -54,7 +53,6 @@ def _inputs(
         active_depths=active,
         batch_sizes=_BATCH,
         w_sustain=w_sustain,
-        is_gpu=is_gpu,
     )
 
 
@@ -91,6 +89,16 @@ def test_floor_never_exceeds_current_workers() -> None:
     )
     # w_sustain 18 > workers 10 -> floor = min(18, 10) = 10, not 18.
     assert result.plan.floors[1] == 10
+
+
+def test_floor_never_exceeds_zero_current_workers() -> None:
+    """A zero-worker stage gets a zero floor, not a growth request."""
+    result = floor.compute_floors(
+        _inputs(workers=(0, 0), w_sustain=(1, 1), stock=_DEEP_STOCK),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert result.plan.floors == (0, 0)
 
 
 def test_source_stage_is_clamped_like_any_other() -> None:
@@ -153,7 +161,6 @@ def _zero_fanout_inputs(active_caption_depth: float) -> floor.FloorInputs:
         active_depths=(0.0, active_caption_depth),
         batch_sizes=_BATCH,
         w_sustain=(1, 14),
-        is_gpu=(False, False),
     )
 
 
@@ -203,63 +210,160 @@ def test_scale_down_floor_policy_carries_state_across_cycles() -> None:
     assert policy.plan(args).floors[1] == 1
 
 
-def test_expensive_floor_absorbs_one_worker_dip() -> None:
-    """A GPU stage keeps its current workers through a one-worker hold dip."""
+def test_first_cycle_follows_desired_floor() -> None:
+    """Initial state follows the capacity hold target immediately."""
     result = floor.compute_floors(
-        _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK),
+        _inputs(workers=(1, 2), w_sustain=(1, 1), stock=_DEEP_STOCK),
         floor.FloorState.initial(2),
         _params(),
     )
-    assert result.plan.floors[1] == 15
-    assert result.plan.decisions[1].churn_guarded
+    assert result.plan.floors == (1, 1)
+    assert not result.plan.decisions[1].shrink_deferred
 
 
-def test_expensive_floor_allows_real_shrink() -> None:
-    """A larger expensive-stage gap still shrinks to the capacity hold target."""
-    result = floor.compute_floors(
-        _inputs(workers=(10, 15), w_sustain=(1, 13), stock=_DEEP_STOCK),
-        floor.FloorState.initial(2),
-        _params(),
-    )
-    assert result.plan.floors[1] == 13
-    assert not result.plan.decisions[1].churn_guarded
+def test_transient_dip_does_not_shrink() -> None:
+    """A one-cycle lower hold target is deferred, then cleared on recovery."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    dipped = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(dipped, first.state, params)
+    third = floor.compute_floors(steady, second.state, params)
+
+    assert second.plan.floors[1] == 15
+    assert second.plan.decisions[1].shrink_deferred
+    assert second.plan.decisions[1].shrink_streak == 1
+    assert third.plan.floors[1] == 15
+    assert third.plan.decisions[1].shrink_streak == 0
 
 
-def test_expensive_floor_does_not_block_release() -> None:
-    """A confirmed release still drops an expensive stage to min workers."""
-    params = _params(release_confirm_cycles=1)
-    result = floor.compute_floors(
-        _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_EMPTY_STOCK),
-        floor.FloorState.initial(2),
-        params,
-    )
-    assert result.plan.floors[1] == params.min_workers
-    assert result.plan.decisions[1].releasing
-    assert not result.plan.decisions[1].churn_guarded
+def test_sustained_drop_shrinks_after_confirm() -> None:
+    """A lower hold target applies after the confirmation window."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    dipped = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(dipped, first.state, params)
+    third = floor.compute_floors(dipped, second.state, params)
+
+    assert second.plan.floors[1] == 15
+    assert second.plan.decisions[1].shrink_deferred
+    assert third.plan.floors[1] == 14
+    assert not third.plan.decisions[1].shrink_deferred
 
 
-def test_cheap_stage_does_not_use_expensive_churn_guard() -> None:
-    """A CPU stage follows a one-worker sustain dip immediately."""
-    result = floor.compute_floors(
-        _inputs(workers=(10, 15), w_sustain=(9, 15), stock=_DEEP_STOCK, is_gpu=(False, True)),
-        floor.FloorState.initial(2),
-        _params(),
-    )
-    assert result.plan.floors[0] == 9
-    assert not result.plan.decisions[0].churn_guarded
+def test_deeper_one_cycle_dip_does_not_replace_pending_floor() -> None:
+    """A confirmation window applies the conservative pending shrink floor."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    shallow = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+    deep = _inputs(workers=(10, 15), w_sustain=(1, 1), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(shallow, first.state, params)
+    third = floor.compute_floors(deep, second.state, params)
+
+    assert second.plan.floors[1] == 15
+    assert second.plan.decisions[1].pending_shrink_floor == 14
+    assert third.plan.floors[1] == 14
+    assert third.plan.decisions[1].pending_shrink_floor == 0
 
 
-def test_mismatched_is_gpu_length_raises() -> None:
-    """A short GPU-flag tuple is a programming error."""
-    short_is_gpu: tuple[bool, ...] = (True,)
+def test_pending_shrink_floor_never_exceeds_current_workers() -> None:
+    """A carried pending floor is clamped when workers already dropped."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    shallow = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+    already_shrunk = _inputs(workers=(10, 13), w_sustain=(1, 1), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(shallow, first.state, params)
+    third = floor.compute_floors(already_shrunk, second.state, params)
+
+    assert third.plan.floors[1] == 13
+    assert third.plan.floors[1] <= already_shrunk.workers[1]
+
+
+def test_stable_overprovision_unpins() -> None:
+    """A persistent lower hold target shrinks instead of pinning a spare worker."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(1, 2), w_sustain=(1, 2), stock=_DEEP_STOCK)
+    lower = _inputs(workers=(1, 2), w_sustain=(1, 1), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(lower, first.state, params)
+    third = floor.compute_floors(lower, second.state, params)
+
+    assert second.plan.floors[1] == 2
+    assert second.plan.decisions[1].shrink_deferred
+    assert third.plan.floors[1] == 1
+
+
+def test_floor_rises_immediately() -> None:
+    """A higher hold target takes effect without waiting for confirmation."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    low = _inputs(workers=(10, 10), w_sustain=(1, 5), stock=_DEEP_STOCK)
+    high = _inputs(workers=(10, 10), w_sustain=(1, 8), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(low, state, params)
+    second = floor.compute_floors(high, first.state, params)
+
+    assert second.plan.floors[1] == 8
+    assert second.plan.decisions[1].shrink_streak == 0
+
+
+def test_active_stock_blocks_vllm_release_while_shrink_is_deferred() -> None:
+    """Active upstream stock prevents release while a lower hold target confirms."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    dipped = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(dipped, first.state, params)
+
+    assert second.plan.floors[1] > params.min_workers
+    assert not second.plan.decisions[1].releasing
+    assert second.plan.decisions[1].shrink_deferred
+
+
+def test_confirmed_drain_releases_even_if_shrink_was_deferred() -> None:
+    """A confirmed whole-chain drain releases even after a deferred shrink."""
+    params = _params(release_confirm_cycles=2)
+    state = floor.FloorState.initial(2)
+    steady = _inputs(workers=(10, 15), w_sustain=(1, 15), stock=_DEEP_STOCK)
+    dipped = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_DEEP_STOCK)
+    drained = _inputs(workers=(10, 15), w_sustain=(1, 14), stock=_EMPTY_STOCK)
+
+    first = floor.compute_floors(steady, state, params)
+    second = floor.compute_floors(dipped, first.state, params)
+    third = floor.compute_floors(drained, second.state, params)
+    fourth = floor.compute_floors(drained, third.state, params)
+
+    assert second.plan.decisions[1].shrink_deferred
+    assert fourth.plan.floors[1] == params.min_workers
+    assert fourth.plan.decisions[1].releasing
+    assert not fourth.plan.decisions[1].shrink_deferred
+
+
+def test_mismatched_input_length_raises() -> None:
+    """A short floor-input tuple is a programming error."""
+    short_w_sustain: tuple[int, ...] = (1,)
     mismatched = floor.FloorInputs(
         workers=(10, 15),
         chain=_CHAIN,
         stock_src=_DEEP_STOCK,
         active_depths=(0.0, 0.0),
         batch_sizes=_BATCH,
-        w_sustain=(1, 14),
-        is_gpu=short_is_gpu,
+        w_sustain=short_w_sustain,
     )
     with pytest.raises(ValueError, match="length mismatch"):
         floor.compute_floors(mismatched, floor.FloorState.initial(2), _params())

@@ -182,7 +182,6 @@ class _Cycle:
             active_depths=self.active_depths,
             batch_sizes=self.batch_sizes,
             w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
-            is_gpu=self.is_gpu,
         )
 
 
@@ -657,7 +656,9 @@ class SaturationAwareScheduler:
                 f"frag_delete={frag_delete} frag_post={frag_post} "
                 f"sat_delete={sat_delete} sat_post={sat_post} "
                 f"floor_protected={frag_delete - sat_delete} floor_target={decision.floor} max_deletes={max_deletes} "
-                f"releasing={decision.releasing} churn_guarded={decision.churn_guarded} "
+                f"releasing={decision.releasing} "
+                f"shrink_deferred={decision.shrink_deferred} shrink_streak={decision.shrink_streak} "
+                f"pending_shrink_floor={decision.pending_shrink_floor} "
                 f"speed={cap.speed:.4f} cap_src={cap.cap_src:.3f} "
                 f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} w_sustain={cap.w_sustain} w_target={cap.w_target} "
                 f"bottleneck_rate={capacity.bottleneck_rate:.3f} "
@@ -723,7 +724,9 @@ class SaturationAwareScheduler:
                 f"w_sustain={cap.w_sustain} w_target={cap.w_target} mult={sizings[index].multiplier:.2f} "
                 f"starved={cap.starved_warm} suppress={cap.suppress_growth} "
                 f"feeder_boost={cap.feeder_boost} feeder_reason='{cap.feeder_reason}' "
-                f"floor={decision.floor} churn_guarded={decision.churn_guarded} releasing={decision.releasing} "
+                f"floor={decision.floor} shrink_deferred={decision.shrink_deferred} "
+                f"shrink_streak={decision.shrink_streak} pending_shrink_floor={decision.pending_shrink_floor} "
+                f"releasing={decision.releasing} "
                 f"local_qin={cycle.local_depths[index]:.1f} local_pending={cycle.local_pending_depths[index]:.1f} "
                 f"ready={cycle.ready_workers[index]} "
                 f"q_stock={cycle.queued_stock[index]:.1f} a_stock={cycle.active_stock[index]:.1f} "
