@@ -63,6 +63,7 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity impo
     CapacityModel,
     CapacityParams,
     CapacityPlan,
+    FeederCandidate,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.estimator import PipelineRateEstimator
@@ -520,6 +521,16 @@ class SaturationAwareScheduler:
             return self.shape.stages[capacity.bottleneck_stage].name
         return "none"
 
+    def _format_feeder_candidates(self, candidates: Sequence[FeederCandidate]) -> str:
+        """Return a compact candidate summary for feeder-pressure logs."""
+        if not candidates:
+            return "none"
+        parts = (
+            f"{self.shape.stages[candidate.stage].name}:{candidate.status.value}:{candidate.delay_s:.2f}s"
+            for candidate in candidates
+        )
+        return "(" + ", ".join(parts) + ")"
+
     def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
 
@@ -659,7 +670,7 @@ class SaturationAwareScheduler:
                 f"releasing={decision.releasing} "
                 f"shrink_deferred={decision.shrink_deferred} shrink_streak={decision.shrink_streak} "
                 f"pending_shrink_floor={decision.pending_shrink_floor} "
-                f"speed={cap.speed:.4f} cap_src={cap.cap_src:.3f} "
+                f"speed={cap.speed:.4f} target_speed={cap.target_speed:.4f} cap_src={cap.cap_src:.3f} "
                 f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} w_sustain={cap.w_sustain} w_target={cap.w_target} "
                 f"bottleneck_rate={capacity.bottleneck_rate:.3f} "
                 f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
@@ -705,6 +716,7 @@ class SaturationAwareScheduler:
             utilization = inflight / max(cycle.workers[index], 1)
             if cap.starved_warm or cap.feeder_boost > 0 or cap.feeder_reason:
                 feeder_name = self.shape.stages[cap.binding_feeder].name if cap.binding_feeder >= 0 else "none"
+                blocked_feeder_name = self.shape.stages[cap.blocked_feeder].name if cap.blocked_feeder >= 0 else "none"
                 downstreams = tuple(self.shape.stages[item].name for item in cap.feeder_downstreams)
                 logger.debug(
                     f"saturation-aware feeder-pressure: stage='{stage.name}' reason='{cap.feeder_reason}' "
@@ -715,12 +727,19 @@ class SaturationAwareScheduler:
                     f"workers={cycle.workers[index]} ready={cycle.ready_workers[index]} "
                     f"w_sustain={cap.w_sustain} active_depth={cycle.active_depths[index]:.2f} "
                     f"binding_feeder='{feeder_name}' path_delay_s={cap.feeder_path_delay_s:.2f} "
+                    f"blocked_feeder='{blocked_feeder_name}' blocked_reason='{cap.blocked_feeder_reason}' "
+                    f"blocked_path_delay_s={cap.blocked_feeder_path_delay_s:.2f} feeder_streak={cap.feeder_streak} "
+                    f"candidate_feeders={self._format_feeder_candidates(cap.feeder_candidates)} "
                     f"required_workers={cap.feeder_required_workers} boost_cap={cap.feeder_boost_cap} "
                     f"feeder_boost={cap.feeder_boost} downstreams={downstreams} aggregation='max'"
                 )
+            frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]
+            sat_post = cycle.workers[index] + sat_new[index] - sat_delete[index]
             groups.append(
                 f"{stage.name}[w={cycle.workers[index]} frag_new={frag_new[index]} sat_new={sat_new[index]} "
-                f"frag_del={frag_delete[index]} sat_del={sat_delete[index]} cap_src={cap.cap_src:.2f} "
+                f"frag_del={frag_delete[index]} sat_del={sat_delete[index]} frag_post={frag_post} "
+                f"sat_post={sat_post} requested={sat_post} cap_src={cap.cap_src:.2f} "
+                f"speed={cap.speed:.4f} target_speed={cap.target_speed:.4f} "
                 f"w_sustain={cap.w_sustain} w_target={cap.w_target} mult={sizings[index].multiplier:.2f} "
                 f"starved={cap.starved_warm} suppress={cap.suppress_growth} "
                 f"feeder_boost={cap.feeder_boost} feeder_reason='{cap.feeder_reason}' "

@@ -20,6 +20,8 @@ asymmetric throughput smoothing, and the two per-stage targets (w_sustain hold,
 w_target grow).
 """
 
+import math
+
 import pytest
 
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import capacity
@@ -73,6 +75,7 @@ def _inputs(
 def _state(
     *,
     a_ewma: tuple[float | None, ...],
+    target_speed_ewma: tuple[float | None, ...] | None = None,
     bottleneck: int,
     bottleneck_streak: int = 0,
     feeder_pressure_streak: tuple[int, ...] | None = None,
@@ -80,6 +83,7 @@ def _state(
     """Return capacity state with feeder-pressure streaks initialized."""
     return capacity.CapacityState(
         a_ewma=a_ewma,
+        target_speed_ewma=target_speed_ewma if target_speed_ewma is not None else (None,) * len(a_ewma),
         bottleneck=bottleneck,
         bottleneck_streak=bottleneck_streak,
         feeder_pressure_streak=feeder_pressure_streak if feeder_pressure_streak is not None else (0,) * len(a_ewma),
@@ -400,6 +404,56 @@ def test_feeder_pressure_does_not_boost_manual_feeder() -> None:
     assert result.plan.stages[0].feeder_boost == 0
 
 
+def test_feeder_pressure_skips_manual_source_and_boosts_actionable_feeder() -> None:
+    """A pinned high-delay source does not hide a boostable downstream feeder."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=2, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 5, 20),
+            speed=(1.0, 1.0, 0.1),
+            is_manual=(True, False, False),
+            local_pending_depth=(300.0, 30.0, 0.0),
+            active_depth=(3000.0, 100.0, 0.0),
+            ready_workers=(1, 5, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[2]
+    actionable_feeder = result.plan.stages[1]
+    assert downstream.binding_feeder == 1
+    assert downstream.blocked_feeder == 0
+    assert downstream.blocked_feeder_reason == capacity.FeederCandidateStatus.MANUAL.value
+    assert downstream.feeder_reason == capacity.FeederReason.BOOSTED.value
+    assert tuple(candidate.status for candidate in downstream.feeder_candidates) == (
+        capacity.FeederCandidateStatus.MANUAL,
+        capacity.FeederCandidateStatus.ACTIONABLE,
+    )
+    assert actionable_feeder.feeder_boost > 0
+
+
+def test_feeder_pressure_logs_blocked_manual_when_no_actionable_feeder_exists() -> None:
+    """A pinned source is reported as blocked when no boostable feeder exists."""
+    prev = _state(a_ewma=(None, None), bottleneck=1, feeder_pressure_streak=(0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 20),
+            speed=(1.0, 0.1),
+            is_manual=(True, False),
+            local_pending_depth=(300.0, 0.0),
+            active_depth=(3000.0, 0.0),
+            ready_workers=(1, 20),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[1]
+    assert downstream.binding_feeder == -1
+    assert downstream.blocked_feeder == 0
+    assert downstream.blocked_feeder_reason == capacity.FeederCandidateStatus.MANUAL.value
+    assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_MANUAL_FEEDER.value
+
+
 def test_feeder_pressure_uses_max_not_sum_for_shared_feeder() -> None:
     """Two dry downstream stages sharing one feeder aggregate by max target."""
     prev = _state(a_ewma=(None, None, None), bottleneck=2, feeder_pressure_streak=(0, 1, 1))
@@ -497,6 +551,31 @@ def test_feeder_pressure_clears_when_downstream_becomes_busy() -> None:
     assert result.state.feeder_pressure_streak[1] == 0
 
 
+def test_starved_warm_when_current_workers_ready_but_sustain_target_is_higher() -> None:
+    """A fully ready under-target stage is warm enough to request feeder pressure."""
+    prev = _state(
+        a_ewma=(None, 8.0),
+        target_speed_ewma=(None, 1.0),
+        bottleneck=1,
+        feeder_pressure_streak=(0, 0),
+    )
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(5, 7),
+            speed=(5.0, 1.0),
+            local_pending_depth=(100.0, 0.0),
+            active_depth=(300.0, 0.0),
+            ready_workers=(5, 7),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[1]
+    assert downstream.w_sustain > 7
+    assert downstream.starved_warm
+    assert downstream.feeder_reason == capacity.FeederReason.PENDING_CONFIRM.value
+
+
 def test_feeder_pressure_skips_cold_or_invalid_feeder() -> None:
     """Cold or empty upstream stages cannot be selected as useful feeders."""
     result = capacity.compute_capacity(
@@ -512,6 +591,30 @@ def test_feeder_pressure_skips_cold_or_invalid_feeder() -> None:
     )
     assert result.plan.stages[1].feeder_reason == capacity.FeederReason.NO_BOOST_INVALID_SUPPLY.value
     assert result.plan.stages[0].feeder_boost == 0
+
+
+def test_transient_speed_drop_does_not_spike_target_to_raw_division_result() -> None:
+    """Target sizing uses smoothed speed so one-cycle dips do not over-request."""
+    prev = _state(
+        a_ewma=(None, None),
+        target_speed_ewma=(2.0, 2.0),
+        bottleneck=1,
+    )
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(4, 4),
+            speed=(2.0, 0.25),
+            active_depth=(10.0, 10.0),
+            ready_workers=(4, 4),
+        ),
+        prev,
+        _params(),
+    )
+    dipped = result.plan.stages[1]
+    raw_target = math.ceil(result.plan.next_bottleneck_rate / 0.25)
+    assert dipped.target_speed > 0.25
+    assert dipped.w_target < raw_target
+    assert result.state.target_speed_ewma[1] == dipped.target_speed
 
 
 def test_stage_capacity_echoes_trusted_speed() -> None:

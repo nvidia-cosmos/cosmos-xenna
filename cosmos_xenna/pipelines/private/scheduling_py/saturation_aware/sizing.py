@@ -115,13 +115,14 @@ def size_stage(snapshot: StageDemandSnapshot, capacity: StageCapacity, has_local
     """
     num_returns = resolve_num_returns(snapshot)
     speed = snapshot.speed
-    if speed is None or speed <= 0.0:
+    solver_speed = capacity.target_speed
+    if speed is None or speed <= 0.0 or solver_speed <= 0.0:
         return StageSizingResult(effective_speed=_SOLVER_DEFAULT_SPEED, num_returns=num_returns, multiplier=1.0)
     if has_local_input and not capacity.suppress_growth and capacity.w_target > snapshot.workers:
         multiplier = capacity.w_target / max(snapshot.workers, 1)
     else:
         multiplier = 1.0
-    return StageSizingResult(effective_speed=speed / multiplier, num_returns=num_returns, multiplier=multiplier)
+    return StageSizingResult(effective_speed=solver_speed / multiplier, num_returns=num_returns, multiplier=multiplier)
 
 
 def size_pipeline(

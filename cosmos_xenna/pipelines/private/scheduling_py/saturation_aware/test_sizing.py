@@ -52,10 +52,19 @@ def make_snapshot() -> SnapshotFactory:
     return _make_snapshot
 
 
-def _capacity(*, w_target: int, w_sustain: int = 1, speed: float = 2.0, suppress_growth: bool = False) -> StageCapacity:
+def _capacity(
+    *,
+    w_target: int,
+    w_sustain: int = 1,
+    speed: float = 2.0,
+    target_speed: float | None = None,
+    suppress_growth: bool = False,
+) -> StageCapacity:
     """A StageCapacity carrying only the fields demand sizing reads."""
+    solver_speed = speed if target_speed is None else target_speed
     return StageCapacity(
         speed=speed,
+        target_speed=solver_speed,
         cap_src=0.0,
         a_raw=0.0,
         a_ewma=0.0,
@@ -103,6 +112,17 @@ def test_below_target_with_local_input_grows_toward_target(make_snapshot: Snapsh
     result = size_stage(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_local_input=True)
     assert result.multiplier == pytest.approx(3.0)
     assert result.effective_speed == pytest.approx(2.0 / 3.0)
+
+
+def test_solver_speed_uses_smoothed_capacity_target_speed(make_snapshot: SnapshotFactory) -> None:
+    """Demand sizing deflates the smoothed capacity speed, not a one-cycle raw dip."""
+    result = size_stage(
+        make_snapshot(workers=2, speed=0.25),
+        _capacity(w_target=6, speed=0.25, target_speed=1.5),
+        has_local_input=True,
+    )
+    assert result.multiplier == pytest.approx(3.0)
+    assert result.effective_speed == pytest.approx(1.5 / 3.0)
 
 
 def test_below_target_without_local_input_does_not_grow(make_snapshot: SnapshotFactory) -> None:
