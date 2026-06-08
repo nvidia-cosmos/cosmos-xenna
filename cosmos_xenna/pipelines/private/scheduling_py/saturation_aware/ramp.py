@@ -16,18 +16,20 @@
 """Cold-start worker ramp for the saturation-aware scheduler.
 
 Bounds how fast any not-yet-trusted stage may grow while the fragmentation
-solver is still sizing it from placeholder throughput. With no completed sample
-a stage is capped at one worker; while warming, allowed growth scales with
-sample confidence; once the speed estimate is trusted, the stage is uncapped
-and the solver decides. A stage that still has work waiting but produces no
-sample within a full speed-estimation window is treated as a confirmed
-slow-starter and is uncapped so all its workers spawn and warm up in parallel
-rather than one at a time. Pure and native-extension-free, so it is
+solver is still sizing it from placeholder throughput. One generic rule governs
+every stage, regardless of resource shape (CPU-only, whole-GPU, or
+fractional-GPU): a not-yet-trusted stage may grow by at most one worker per
+cycle, and only when capacity has not suppressed its growth and the stage has
+its own pending work to feed a new worker. With no completed sample and no
+pending work the stage is held at one worker; once the speed estimate is trusted
+the stage is uncapped and the solver decides. A stage that still has work waiting
+but produces no sample within a full speed-estimation window is treated as a
+confirmed slow-starter and is uncapped so all its workers spawn and warm up in
+parallel rather than one at a time. Pure and native-extension-free, so it is
 unit-testable without the solver.
 """
 
 import enum
-import math
 
 import attrs
 
@@ -39,13 +41,14 @@ class RampReason(enum.StrEnum):
 
     Attributes:
         COLD: No completed sample yet, still within the warmup window, and no
-            upstream evidence the pipeline is feeding this stage; held at one
-            worker.
-        PIPELINE_WARMING: No completed sample yet, but work is waiting and an
-            upstream stage is already trusted (the pipeline is provably feeding
-            this stage); allowed one extra worker this cycle.
-        WARMING: Some samples but below the trust threshold; growth scaled by
-            confidence.
+            pending work to feed another worker (or growth suppressed); held at
+            one worker.
+        PIPELINE_WARMING: No completed sample yet, but capacity allows growth and
+            the stage has its own pending work; allowed one extra worker this
+            cycle.
+        WARMING: Some samples but below the trust threshold; allowed one extra
+            worker per cycle under the same work-and-suppression gate, never
+            scaled by the solver's proposal.
         SLOW_START: No sample after a full speed-estimation window; released to
             the solver as a confirmed slow-starter.
         UNCAPPED: Enough samples to trust the speed estimate; the solver owns
@@ -74,12 +77,11 @@ class StageRampInput:
             window be released to the solver as a confirmed slow-starter.
         has_pending_work: Whether the stage has work waiting (queued, pool-queued,
             or in-flight). Gates the slow-starter release so a stage merely
-            starved of input is not over-spawned from placeholder throughput.
-        has_upstream_evidence: Whether any upstream stage already has a trusted
-            speed. Proof the pipeline is feeding work down the chain, used to let
-            a 0-sample stage grow by one worker per cycle before its own first
-            sample lands. Resource-shape-agnostic by design (a boolean, not a
-            GPU fraction), so the pure ramp stays measurement-driven.
+            starved of input is not over-spawned from placeholder throughput, and
+            authorizes one warming worker when the stage has its own backlog.
+        suppress_growth: Whether capacity has decided this stage must not grow
+            this cycle (for example a locally starved stage whose upstream feeder
+            should be boosted instead). Hard-gates all not-yet-trusted growth.
     """
 
     current_workers: int
@@ -88,7 +90,7 @@ class StageRampInput:
     sample_count: int
     stage_age_s: float
     has_pending_work: bool
-    has_upstream_evidence: bool
+    suppress_growth: bool
 
 
 @attrs.frozen
@@ -111,27 +113,20 @@ class RampDecision:
 def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision:
     """Return the cold-start cap and trim count for one stage.
 
-    Evidence-scaled cold-start cap for not-yet-trusted stages: allowed growth
-    interpolates from one worker (no evidence) to the solver's full proposal
-    (trusted), scaled by sample confidence. No completed sample caps the stage
-    at one worker until a full speed-estimation window has elapsed with work
-    still waiting, after which the stage is treated as a slow-starter and
-    uncapped; while warming, the allowed growth is
-    ``ceil(confidence * solver_growth)`` (at least one); trusted stages are
-    uncapped.
+    One generic rule for every stage, independent of resource shape: a
+    not-yet-trusted stage grows by at most one worker per cycle, and only when
+    capacity has not suppressed it and the stage has its own pending work to feed
+    the new worker. Trusted stages (sample count at or above the threshold) are
+    uncapped and the solver owns growth. A 0-sample stage with work still waiting
+    after a full speed-estimation window is released to the solver as a confirmed
+    slow-starter.
 
-    Pipeline-evidence warming bridges the gap before a stage's own first sample:
-    a 0-sample stage that has work waiting and at least one already-trusted
-    upstream stage is allowed one extra worker per cycle, so an expensive
-    downstream stage (one with a costly per-worker warmup) can warm a second
-    worker in parallel instead of idling at a single worker. Growth stays
-    at ``+1`` per cycle, so a 0-sample stage can never perform the large
-    first-cycle over-spawn the cold cap was built to prevent, and the
-    upstream-trust gate keeps this branch dark on cycle one (before any stage is
-    trusted, no upstream evidence exists).
+    The fixed one-per-cycle warming step never scales with the solver's
+    proposal, so a stage can never convert a large solver proposal into a
+    first-cycle burst.
 
     Args:
-        stage: One stage's pre-solve counts, sample count, age, and work flag.
+        stage: One stage's pre-solve counts, sample count, age, and SAT signals.
         config: Operator tunables (provides the trust threshold and window).
 
     Returns:
@@ -140,39 +135,40 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
     min_data_points = config.speed_estimation_min_data_points
     if stage.sample_count >= min_data_points:
         return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
-    if stage.sample_count == 0:
-        window_elapsed = stage.stage_age_s >= config.speed_estimation_window_s
-        if window_elapsed and stage.has_pending_work:
-            # A full estimation window has passed with no completed task yet
-            # work is still waiting: this is a slow-warmup stage (its first
-            # result lands long after the window). Trust the solver so every
-            # worker spawns now and their models load in parallel. The
-            # pending-work gate keeps a stage merely starved of input capped,
-            # so the solver cannot over-spawn it from placeholder throughput.
-            return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
-        if stage.current_workers >= 1 and stage.has_pending_work and stage.has_upstream_evidence:
-            # No completed task yet, but work is waiting and an upstream stage is
-            # already trusted: the pipeline is provably feeding this stage. Grow
-            # by exactly one worker so an expensive downstream stage can warm a
-            # second worker in parallel before its own first sample lands.
-            # The +1 bound preserves the original anti-fragmentation guarantee
-            # (no large first-cycle over-spawn from placeholder throughput), and
-            # the current_workers >= 1 guard means this only accelerates a stage
-            # that has already cleared the very first cold cap.
-            cap = stage.current_workers + 1
-            reason = RampReason.PIPELINE_WARMING
-        else:
-            # No completed task yet and no pipeline evidence (still within the
-            # warmup window with no trusted upstream stage, or no work waiting):
-            # hold at a single worker so a 0-sample stage cannot creep upward
-            # cycle after cycle while it could still produce its first sample.
-            cap = 1
-            reason = RampReason.COLD
+
+    is_cold = stage.sample_count == 0
+    if is_cold and stage.stage_age_s >= config.speed_estimation_window_s and stage.has_pending_work:
+        # A full estimation window has passed with no completed task while work
+        # is still waiting: a slow-warmup stage whose first result lands long
+        # after the window. Trust the solver so every worker spawns now and their
+        # models load in parallel. The pending-work gate keeps a stage merely
+        # starved of input capped, so the solver cannot over-spawn it from
+        # placeholder throughput.
+        return RampDecision(cap=None, keep_new=None, reason=RampReason.SLOW_START)
+
+    # Authorize one warming worker only when capacity allows growth and the stage
+    # has its own pending work to feed it. A locally dry stage is owned by
+    # capacity (feeder pressure or the imminent-arrival hold), which signals its
+    # decision through suppress_growth, so the ramp never speculatively grows a
+    # stage that has no work waiting.
+    if stage.current_workers >= 1 and stage.has_pending_work and not stage.suppress_growth:
+        # The current_workers >= 1 guard means this only accelerates a stage that
+        # has already cleared the first cold cap; cold stages still start at one.
+        cap = stage.current_workers + 1
+        reason = RampReason.PIPELINE_WARMING if is_cold else RampReason.WARMING
+    elif is_cold:
+        # No completed task and no usable pending work (still within the warmup
+        # window with no work waiting, or growth suppressed): hold at a single
+        # worker so a 0-sample stage cannot creep upward while it could still
+        # produce its first sample.
+        cap = 1
+        reason = RampReason.COLD
     else:
-        confidence = stage.sample_count / min_data_points
-        solver_growth = max(0, stage.proposed_post - stage.current_workers)
-        cap = stage.current_workers + max(1, math.ceil(confidence * solver_growth))
+        # Warming but suppressed or with no pending work: hold at the current
+        # size rather than scaling growth off the solver proposal.
+        cap = stage.current_workers
         reason = RampReason.WARMING
+
     if stage.proposed_post <= cap:
         return RampDecision(cap=cap, keep_new=None, reason=reason)
     keep_new = max(0, cap - (stage.current_workers - stage.deleted_count))

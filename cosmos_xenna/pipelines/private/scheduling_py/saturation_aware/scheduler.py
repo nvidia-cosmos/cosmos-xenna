@@ -345,7 +345,7 @@ class SaturationAwareScheduler:
 
         solution = self._solve(problem, problem_state, estimates, cycle.workers)
         frag_new, frag_delete = self._solution_counts(solution)
-        self._apply_cold_start_ramp(solution, cycle)
+        self._apply_cold_start_ramp(solution, cycle, capacity)
         sat_new, _ = self._solution_counts(solution)
         floor_plan = self._apply_scale_down_floor(solution, cycle, capacity)
         _, sat_delete = self._solution_counts(solution)
@@ -531,14 +531,16 @@ class SaturationAwareScheduler:
         )
         return "(" + ", ".join(parts) + ")"
 
-    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle) -> None:
+    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle, capacity: CapacityPlan) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
 
         Caps each untrusted stage's new-worker additions so the solver cannot
         make large commitments while it is still sizing the stage from
-        placeholder throughput. A stage that has work waiting but produces no
-        sample within a full speed-estimation window is released to the solver
-        (slow-starter).
+        placeholder throughput. One generic policy covers every resource shape:
+        a not-yet-trusted stage grows by at most one worker per cycle, gated by
+        capacity's ``suppress_growth`` and by the stage's own pending work. A
+        stage that has work waiting but produces no sample within a full
+        speed-estimation window is released to the solver (slow-starter).
 
         Runs before :meth:`_apply_scale_down_floor`, committing its own editor
         so the floor reads these trims.
@@ -546,6 +548,8 @@ class SaturationAwareScheduler:
         Args:
             solution: The solver's solution, mutated in place via its own editor.
             cycle: This cycle's immutable derived inputs (workers, depths, age).
+            capacity: This cycle's capacity plan, source of the ``suppress_growth``
+                gate.
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
@@ -562,16 +566,9 @@ class SaturationAwareScheduler:
             current = cycle.workers[index]
             deleted = editor.proposed_deletes(index)
             samples = self._estimator.sample_count(stage.name)
-            has_pending_work = cycle.active_depths[index] > 0.0
-            # Pipeline evidence: any upstream stage with a trusted (non-None)
-            # speed proves the chain is feeding this stage, letting a 0-sample
-            # stage grow by one worker per cycle before its own first sample.
-            # "Any upstream" (rather than only the immediate feeder) is
-            # deliberate: the +1/cycle bound and the has_pending_work gate
-            # already contain growth, so the broader signal only front-loads a
-            # deep stage's warmup sooner without widening the cycle-1-dark
-            # fragmentation window.
-            has_upstream_evidence = any(snapshot.speed is not None for snapshot in cycle.demand_snapshots[:index])
+            active_depth = cycle.active_depths[index]
+            has_pending_work = active_depth > 0.0
+            suppress_growth = capacity.stages[index].suppress_growth
             decision = ramp.decide(
                 StageRampInput(
                     current_workers=current,
@@ -580,14 +577,15 @@ class SaturationAwareScheduler:
                     sample_count=samples,
                     stage_age_s=stage_age_s,
                     has_pending_work=has_pending_work,
-                    has_upstream_evidence=has_upstream_evidence,
+                    suppress_growth=suppress_growth,
                 ),
                 self.config,
             )
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
-                f"has_pending_work={has_pending_work} has_upstream_evidence={has_upstream_evidence}"
+                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f} "
+                f"suppress_growth={suppress_growth}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:
@@ -599,7 +597,7 @@ class SaturationAwareScheduler:
                     f"current={current} frag_new={frag_new} "
                     f"stage_age_s={stage_age_s:.1f} window_s={self.config.speed_estimation_window_s:.1f} "
                     f"samples={samples}/{min_data_points} has_pending_work={has_pending_work} "
-                    f"active_depth={cycle.active_depths[index]:.2f} is_gpu={stage.is_gpu} "
+                    f"active_depth={active_depth:.2f} is_gpu={stage.is_gpu} "
                     f"(no sample within window and work waiting; trusting solver)"
                 )
             if decision.keep_new is None or decision.keep_new >= frag_new:
@@ -609,15 +607,15 @@ class SaturationAwareScheduler:
             ramp_new = decision.keep_new
             frag_post = current + frag_new - deleted
             ramp_post = current + ramp_new - deleted
-            confidence = samples / min_data_points
             logger.info(
                 f"saturation-aware cold-start ramp: stage='{stage.name}' reason={decision.reason} "
                 f"current={current} deleted={deleted} "
                 f"frag_new={frag_new} frag_post={frag_post} "
                 f"ramp_new={ramp_new} ramp_post={ramp_post} trimmed={frag_new - ramp_new} "
-                f"cap={decision.cap} samples={samples}/{min_data_points} confidence={confidence:.2f} "
+                f"cap={decision.cap} samples={samples}/{min_data_points} "
                 f"is_gpu={stage.is_gpu} "
-                f"has_pending_work={has_pending_work} has_upstream_evidence={has_upstream_evidence}"
+                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f} "
+                f"suppress_growth={suppress_growth}"
             )
         if summaries:
             logger.debug("saturation-aware ramp: " + " | ".join(summaries))

@@ -171,9 +171,8 @@ def _measurements(now: float, durations: list[float]) -> data_structures.Measure
 def _upstream_only_measurements(now: float) -> data_structures.Measurements:
     """Two-stage measurements where only stage 0 reports a completed task.
 
-    Holds the downstream stage at zero samples so its cold-ramp path (and the
-    pipeline-evidence branch) can be exercised while the upstream stage accrues
-    enough samples to be trusted.
+    Holds the downstream stage at zero samples so its cold-ramp warming path can
+    be exercised while the upstream stage accrues enough samples to be trusted.
     """
     return data_structures.Measurements(
         now,
@@ -324,14 +323,14 @@ def test_no_sample_after_window_without_pending_work_stays_capped() -> None:
     assert len(later.stages[0].new_workers) == 1
 
 
-def test_downstream_zero_sample_stage_grows_one_worker_on_upstream_evidence() -> None:
-    """A 0-sample downstream stage with a live worker gains one worker per cycle once upstream is trusted.
+def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
+    """A 0-sample downstream stage with a live worker and local backlog gains one worker per cycle.
 
     Cold start caps the downstream stage at a single worker (it has no live
-    worker to accelerate yet). On the next cycle, with the upstream stage trusted
-    and work still waiting, pipeline-evidence warming lets it add exactly one
-    worker instead of idling at one until its own first sample lands -- and only
-    one, never the solver's full placeholder-throughput demand.
+    worker to accelerate yet). On the next cycle, with its own work still waiting
+    and capacity not suppressing growth, pipeline-evidence warming lets it add
+    exactly one worker instead of idling at one until its own first sample lands
+    -- and only one, never the solver's full placeholder-throughput demand.
     """
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
     scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
@@ -347,7 +346,7 @@ def test_downstream_zero_sample_stage_grows_one_worker_on_upstream_evidence() ->
     _apply_to_allocator(spec, worker_allocator, cold)
     assert _worker_counts(spec, worker_allocator)[1] == 1
 
-    # Warming cycle: upstream trusted + work waiting + a live worker -> +1 only.
+    # Warming cycle: local work waiting + a live worker + no suppression -> +1 only.
     now += 10.0
     scheduler.update_with_measurements(now, _upstream_only_measurements(now))
     scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
