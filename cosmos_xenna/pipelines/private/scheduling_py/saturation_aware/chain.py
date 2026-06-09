@@ -24,6 +24,16 @@ fan out to it (not only its own immediate input depth).
 
 from collections.abc import Sequence
 
+# Smallest chain factor treated as a usable measurement. A chain factor below
+# this (a near-total fan-in, or a corrupted/degenerate measurement) makes the
+# reciprocal ``1 / factor`` explode, which previously inflated source-normalized
+# stock and capacity to non-physical values (observed ``1e8+`` cap_src / stock).
+# Both source normalizers (here and ``capacity._source_capacities``) treat a
+# sub-threshold factor as unusable (contributes ``0.0``) so an impossible value
+# can never enter the bottleneck min or the floor's stock reasoning. A legitimate
+# heavy fan-in down to ~``1e6:1`` still passes.
+MIN_CHAIN_FACTOR = 1e-6
+
 
 def chain_factors(num_returns_per_batch: Sequence[float], stage_batch_sizes: Sequence[int]) -> list[float]:
     """Return cumulative fan-out ``k[i] = product over j < i of f[j]``.
@@ -90,8 +100,10 @@ def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> 
 
     ``stock[k] = sum over u <= k of D[u] / k[u]``, where ``D[u]`` is the
     stage-``u`` depth (queued or active, in stage-``u`` input samples) and
-    ``k[u]`` the chain factor. A non-positive ``k[u]`` (a fully dropping
-    upstream stage) contributes nothing, since no work flows past it.
+    ``k[u]`` the chain factor. A chain factor below :data:`MIN_CHAIN_FACTOR`
+    (a fully dropping upstream stage, or a degenerate/corrupted factor whose
+    reciprocal would explode) contributes nothing, since no work it admits can
+    be expressed in source units.
 
     Args:
         queue_depths: Per-stage depths, in stage-input samples.
@@ -109,7 +121,7 @@ def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> 
     running = 0.0
     for queue_depth, factor in zip(queue_depths, chain, strict=True):
         non_negative_depth = max(queue_depth, 0.0)
-        if factor > 0.0:
+        if factor >= MIN_CHAIN_FACTOR:
             running += non_negative_depth / factor
         stock.append(running)
     return stock

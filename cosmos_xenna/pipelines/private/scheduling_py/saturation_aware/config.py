@@ -54,10 +54,14 @@ class SaturationAwareConfig:
             toward infinity), so it is excluded from the speed window and the
             trusted-sample count. Real zero-output filter stages, which take
             real time, are unaffected.
-        scale_down_release_cycles: Scale-down release speed;
-            ``alpha_down = 1 / scale_down_release_cycles`` (larger means
-            the smoothed sustainable rate decays slower, so an expensive
-            stage is held longer through a transient upstream lull).
+        scale_down_release_cycles: Base scale-down release speed, combined with
+            ``scale_down_release_slowdown`` as ``alpha_down = 1 /
+            (scale_down_release_cycles * scale_down_release_slowdown)`` (larger
+            means the smoothed sustainable rate decays slower, so a stage is held
+            longer through a transient upstream lull).
+        scale_down_release_slowdown: Extra release-time multiplier applied
+            uniformly to every stage. The default holds a stage longer through a
+            transient dip; ``1.0`` restores the fast base release for all stages.
     """
 
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
@@ -66,6 +70,7 @@ class SaturationAwareConfig:
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
     speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
+    scale_down_release_slowdown: float = attrs.field(default=4.0, validator=attrs.validators.ge(1.0))
 
     @classmethod
     def resolve(cls, config: Self | None) -> Self:

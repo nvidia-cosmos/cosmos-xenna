@@ -80,16 +80,14 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.solution_edit
 from cosmos_xenna.utils import python_log as logger
 
 _ALPHA_UP = 1.0
-_GPU_RELEASE_SLOWDOWN = 4.0
 _RELEASE_CONFIRM_DIVISOR = 3
 _MIN_WORKERS = 1
 _OVERALLOCATION_TARGET = 1.0
 # Bottleneck hysteresis: a challenger must be >=15% slower than the incumbent
 # for 2 consecutive cycles before it takes over, so a one-cycle cap_src dip
-# (for example a transient floor cut) cannot flap the pipeline target rate.
+# cannot flap the pipeline target rate.
 _HYSTERESIS_MARGIN = 0.15
 _SWITCH_CONFIRM = 2
-_FEEDER_BOOST_MAX_MULTIPLIER = 2.0
 
 
 @attrs.frozen
@@ -109,7 +107,6 @@ class _Cycle:
         demand_snapshots: Per-stage estimator snapshot (speed, returns, batch).
         batch_sizes: Per-stage input items consumed per batch.
         chain_factors: Per-stage cumulative fan-out from the source.
-        is_gpu: Per-stage GPU flag (drives the capacity release alpha).
         is_manual: Per-stage manual pin flag (blocks feeder-pressure boosts).
         local_depths: Per-stage input queue depth, in stage-input samples.
         local_pending_depths: Per-stage queue plus pool-queued depth, excluding
@@ -128,7 +125,6 @@ class _Cycle:
     demand_snapshots: tuple[sizing.StageDemandSnapshot, ...]
     batch_sizes: tuple[int, ...]
     chain_factors: tuple[float, ...]
-    is_gpu: tuple[bool, ...]
     is_manual: tuple[bool, ...]
     local_depths: tuple[float, ...]
     local_pending_depths: tuple[float, ...]
@@ -161,7 +157,6 @@ class _Cycle:
             workers=self.workers,
             speed=tuple(max(0.0, snapshot.speed or 0.0) for snapshot in self.demand_snapshots),
             chain=self.chain_factors,
-            is_gpu=self.is_gpu,
             is_manual=self.is_manual,
             local_qin=self.local_depths,
             local_pending_depth=self.local_pending_depths,
@@ -228,14 +223,12 @@ class SaturationAwareScheduler:
             self.shape.num_stages,
             CapacityParams(
                 alpha_up=_ALPHA_UP,
-                alpha_down_cpu=1.0 / cycles,
-                alpha_down_gpu=1.0 / (cycles * _GPU_RELEASE_SLOWDOWN),
+                alpha_down=1.0 / (cycles * config.scale_down_release_slowdown),
                 capacity_headroom=config.capacity_headroom,
                 hysteresis_margin=_HYSTERESIS_MARGIN,
                 switch_confirm=_SWITCH_CONFIRM,
                 feeder_pressure_confirm=_SWITCH_CONFIRM,
                 feeder_arrival_horizon_s=config.interval_s,
-                feeder_boost_max_multiplier=_FEEDER_BOOST_MAX_MULTIPLIER,
                 min_workers=_MIN_WORKERS,
             ),
         )
@@ -410,7 +403,6 @@ class SaturationAwareScheduler:
             demand_snapshots=snapshots,
             batch_sizes=batch_sizes,
             chain_factors=chain_factors,
-            is_gpu=tuple(stage.is_gpu for stage in self.shape.stages),
             is_manual=tuple(stage.is_manual for stage in self.shape.stages),
             local_depths=queue_depths,
             local_pending_depths=local_pending_depths,
@@ -730,12 +722,10 @@ class SaturationAwareScheduler:
                     f"blocked_feeder='{blocked_feeder_name}' blocked_reason='{cap.blocked_feeder_reason}' "
                     f"blocked_path_delay_s={cap.blocked_feeder_path_delay_s:.2f} feeder_streak={cap.feeder_streak} "
                     f"candidate_feeders={self._format_feeder_candidates(cap.feeder_candidates)} "
-                    f"required_workers={cap.feeder_required_workers} boost_cap={cap.feeder_boost_cap} "
-                    f"drain_workers={cap.feeder_drain_workers} demand_workers={cap.feeder_demand_workers} "
-                    f"refill_workers={cap.feeder_queue_refill_workers} "
+                    f"required_workers={cap.feeder_required_workers} "
                     f"buffer_deficit={cap.downstream_buffer_deficit:.2f} "
                     f"effective_horizon_s={cap.feeder_effective_horizon_s:.2f} "
-                    f"feeder_boost={cap.feeder_boost} downstreams={downstreams} aggregation='max'"
+                    f"feeder_boost={cap.feeder_boost} downstreams={downstreams}"
                 )
             frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]
             sat_post = cycle.workers[index] + sat_new[index] - sat_delete[index]

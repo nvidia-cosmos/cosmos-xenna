@@ -43,6 +43,8 @@ from typing import Any, Self, cast
 
 import attrs
 
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import chain
+
 
 class FeederReason(enum.StrEnum):
     """Feeder-pressure reason values emitted in scheduler logs."""
@@ -54,6 +56,7 @@ class FeederReason(enum.StrEnum):
     NO_BOOST_MANUAL_FEEDER = "no-boost-manual-feeder"
     NO_BOOST_INVALID_SUPPLY = "no-boost-invalid-supply"
     NO_BOOST_FEEDER_SUFFICIENT = "no-boost-feeder-sufficient"
+    NO_BOOST_FEEDER_UNTRUSTED = "no-boost-feeder-untrusted"
     CLEARED_LOCAL_INPUT = "cleared-local-input"
     CLEARED_NOT_WARM = "cleared-not-warm"
 
@@ -83,9 +86,8 @@ class CapacityParams:
     Attributes:
         alpha_up: EWMA weight when the sustainable arrival rises (fast
             re-protect).
-        alpha_down_cpu: EWMA weight when it falls, for CPU stages.
-        alpha_down_gpu: EWMA weight when it falls, for GPU stages
-            (smaller = slower release, since warmup is costly).
+        alpha_down: EWMA weight when it falls, applied uniformly to every stage
+            (smaller = slower release).
         capacity_headroom: Spare-capacity fraction added to the bottleneck
             rate for the bounded read-ahead / tie-break growth target.
         hysteresis_margin: A challenger must be at least this much slower
@@ -97,20 +99,16 @@ class CapacityParams:
             downstream stage may boost its binding feeder.
         feeder_arrival_horizon_s: Delay threshold below which upstream arrivals
             are considered imminent and no feeder boost is needed.
-        feeder_boost_max_multiplier: Maximum feeder-pressure target multiplier
-            relative to the normal capacity target.
         min_workers: Floor a stage's targets never fall below while active.
     """
 
     alpha_up: float
-    alpha_down_cpu: float
-    alpha_down_gpu: float
+    alpha_down: float
     capacity_headroom: float
     hysteresis_margin: float
     switch_confirm: int
     feeder_pressure_confirm: int = 2
     feeder_arrival_horizon_s: float = 10.0
-    feeder_boost_max_multiplier: float = 2.0
     min_workers: int = 1
 
 
@@ -159,8 +157,6 @@ class CapacityInputs:
             items/s; ``0.0`` for a cold / untrusted stage (excluded from the
             bottleneck).
         chain: Chain factors from :func:`chain.chain_factors`.
-        is_gpu: Whether each stage holds GPU workers (selects the slower
-            release alpha).
         is_manual: Whether each stage has an operator-pinned worker count.
         local_qin: Inter-stage input queue depth per stage, in stage-input
             samples.
@@ -176,7 +172,6 @@ class CapacityInputs:
     workers: tuple[int, ...]
     speed: tuple[float, ...]
     chain: tuple[float, ...]
-    is_gpu: tuple[bool, ...]
     is_manual: tuple[bool, ...]
     local_qin: tuple[float, ...]
     local_pending_depth: tuple[float, ...]
@@ -190,12 +185,17 @@ class StageCapacity:
     """One stage's capacity facts for this cycle.
 
     Attributes:
-        speed: Trusted per-worker speed used this cycle (``0.0`` when cold);
-            carried so the scheduler's logs stay self-contained.
-        target_speed: Smoothed per-worker speed used for ``w_sustain``,
-            ``w_target``, and solver demand sizing.
-        cap_src: Source-rate capacity ``workers * speed / chain`` (``0.0``
-            when cold).
+        speed: Trusted raw per-worker speed observed this cycle (``0.0`` when
+            cold); carried for logs only so an analyst can compare it against
+            ``target_speed`` -- it no longer feeds ``cap_src``.
+        target_speed: Smoothed per-worker speed used for ``cap_src`` /
+            bottleneck selection, ``w_sustain``, ``w_target``, and solver demand
+            sizing.
+        cap_src: Source-rate capacity ``workers * target_speed / chain``
+            (``0.0`` when cold). Built from the smoothed ``target_speed`` (not
+            raw ``speed``) so a single under-fed cycle, where raw speed collapses
+            while the stage stays capable, cannot make the stage a false global
+            bottleneck and flap ``bottleneck_rate``.
         a_raw: Sustainable arrival before smoothing (``chain * bottleneck_rate``).
         a_ewma: Asymmetrically smoothed sustainable arrival used this cycle.
         w_sustain: Hold / scale-down target ``ceil(a_ewma / target_speed)``
@@ -215,19 +215,12 @@ class StageCapacity:
         blocked_feeder_reason: Why ``blocked_feeder`` cannot be boosted.
         blocked_feeder_path_delay_s: Drain delay for ``blocked_feeder``.
         feeder_streak: Confirmation streak for this downstream request.
-        feeder_required_workers: Uncapped worker target from feeder pressure
-            (the max of the drain / demand / refill components below).
-        feeder_drain_workers: Component sizing the feeder to drain its own
-            active backlog within the effective horizon.
-        feeder_demand_workers: Component sizing the feeder to match the
-            downstream stage's ready-worker consumption rate.
-        feeder_queue_refill_workers: Component sizing the feeder to refill the
-            downstream input buffer to one batch per ready worker.
+        feeder_required_workers: Worker target from feeder pressure, covering the
+            downstream consume rate plus buffer refill in one bounded count.
         downstream_buffer_deficit: Downstream input-buffer shortfall below one
             batch per ready worker, in stage-input samples.
         feeder_effective_horizon_s: Arrival horizon used for this downstream
             request; reduced while the downstream is under-buffered.
-        feeder_boost_cap: Cap applied to the feeder-pressure target.
         feeder_boost: Additional target workers applied to this feeder.
         feeder_downstreams: Downstream stages whose requests were aggregated
             into this feeder's boost.
@@ -252,12 +245,8 @@ class StageCapacity:
     blocked_feeder_path_delay_s: float = 0.0
     feeder_streak: int = 0
     feeder_required_workers: int = 0
-    feeder_drain_workers: int = 0
-    feeder_demand_workers: int = 0
-    feeder_queue_refill_workers: int = 0
     downstream_buffer_deficit: float = 0.0
     feeder_effective_horizon_s: float = 0.0
-    feeder_boost_cap: int = 0
     feeder_boost: int = 0
     feeder_downstreams: tuple[int, ...] = ()
     feeder_candidates: tuple[FeederCandidate, ...] = ()
@@ -320,11 +309,15 @@ def asymmetric_ewma(prev: float | None, raw: float, alpha_up: float, alpha_down:
     return alpha * raw + (1.0 - alpha) * prev
 
 
-def _source_capacities(workers: Sequence[int], speed: Sequence[float], chain: Sequence[float]) -> list[float]:
-    """Return per-stage capacity ``w * s / k`` in source items/s (``0`` cold)."""
+def _source_capacities(workers: Sequence[int], speed: Sequence[float], chain_factors: Sequence[float]) -> list[float]:
+    """Return per-stage source-rate capacity ``w * s / k`` (``0.0`` when cold).
+
+    A chain factor below :data:`chain.MIN_CHAIN_FACTOR` is unusable (its
+    reciprocal would explode) and contributes ``0.0``.
+    """
     return [
-        worker_count * speed_k / factor if factor > 0.0 else 0.0
-        for worker_count, speed_k, factor in zip(workers, speed, chain, strict=True)
+        worker_count * speed_k / factor if factor >= chain.MIN_CHAIN_FACTOR else 0.0
+        for worker_count, speed_k, factor in zip(workers, speed, chain_factors, strict=True)
     ]
 
 
@@ -478,9 +471,18 @@ def _is_starved_warm(index: int, inputs: CapacityInputs, stages: Sequence[StageC
     )
 
 
-def _feeder_boost_cap(base_target: int, multiplier: float) -> int:
-    """Return the capped target allowed by feeder pressure."""
-    return max(base_target + 1, math.ceil(base_target * multiplier))
+def _safe_fanout(downstream_chain: float, feeder_chain: float) -> float | None:
+    """Return downstream-items per feeder-item, or ``None`` when unusable.
+
+    Rejects non-finite, non-positive, and implausibly tiny chain factors (below
+    :data:`chain.MIN_CHAIN_FACTOR`) so a divide-by-tiny-chain cannot explode
+    feeder sizing. A legitimate heavy fan-in still passes.
+    """
+    if not (math.isfinite(downstream_chain) and math.isfinite(feeder_chain)):
+        return None
+    if downstream_chain < chain.MIN_CHAIN_FACTOR or feeder_chain < chain.MIN_CHAIN_FACTOR:
+        return None
+    return downstream_chain / feeder_chain
 
 
 def _required_feeder_workers(
@@ -490,50 +492,29 @@ def _required_feeder_workers(
     inputs: CapacityInputs,
     horizon_s: float,
     buffer_deficit: float,
-) -> tuple[int, int, int]:
-    """Return feeder workers to (drain backlog, meet demand, refill buffer).
+) -> int:
+    """Return feeder workers to feed downstream consumption and refill its buffer.
 
-    The caller takes ``max`` of the three for the feeder target and passes the
-    same ``buffer_deficit`` it logged, so the refill component cannot diverge
-    from the reported deficit. Components are sized so a warm, locally dry
-    downstream gets enough upstream supply to feed its ready workers and refill
-    its dispatch buffer within ``horizon_s``; downstream item rates are converted
-    to feeder item rates through chain factors. A non-positive divisor yields
-    ``0`` for that component instead of raising.
-
-    ::
-
-        drain  = feeder backlog / horizon
-        demand = downstream ready-worker rate -> feeder rate
-        refill = downstream buffer deficit / horizon -> feeder rate
-
-    Returns:
-        ``(drain_workers, demand_workers, refill_workers)``.
+    Covers two additive needs in one bounded, rounded count: keep all running
+    downstream workers fed (consume) and rebuild the downstream dispatch buffer
+    within ``horizon_s`` (refill). Sizing is bounded by downstream capacity
+    (``workers[d] * target_speed[d]``), never by feeder backlog; downstream item
+    rates are converted to feeder item rates through the guarded fan-out. An
+    unusable feeder speed, fan-out, or horizon yields ``0`` (no boost).
     """
     feeder = candidate.stage
-    feeder_speed = inputs.speed[feeder]
-    if feeder_speed <= 0.0 or horizon_s <= 0.0:
-        return 0, 0, 0
+    feeder_speed = stages[feeder].target_speed
+    fanout = _safe_fanout(inputs.chain[downstream], inputs.chain[feeder])
+    if feeder_speed <= 0.0 or fanout is None or horizon_s <= 0.0:
+        return 0
 
-    drain_workers = math.ceil(inputs.active_depth[feeder] / (feeder_speed * horizon_s))
-
-    feeder_chain = inputs.chain[feeder]
-    downstream_chain = inputs.chain[downstream]
-    if downstream_chain <= 0.0 or feeder_chain <= 0.0:
-        return drain_workers, 0, 0
-
-    # Downstream consumption the feeder must match right now, converted from the
-    # downstream item rate back to the feeder item rate through chain factors.
-    downstream_rate = inputs.ready_workers[downstream] * stages[downstream].target_speed
-    feeder_rate_for_demand = downstream_rate / downstream_chain * feeder_chain
-    demand_workers = math.ceil(feeder_rate_for_demand / feeder_speed)
-
-    # Extra supply to rebuild the downstream buffer (one batch per ready worker)
-    # so it does not immediately go dry again after consuming arriving supply.
-    feeder_rate_for_refill = buffer_deficit / horizon_s / downstream_chain * feeder_chain
-    refill_workers = math.ceil(feeder_rate_for_refill / feeder_speed)
-
-    return drain_workers, demand_workers, refill_workers
+    # Feed every running downstream worker (not only the idle ones) and rebuild
+    # the dispatch buffer within the horizon. Both are downstream item rates: sum
+    # them, convert to the feeder item rate, and round once.
+    consume_rate = inputs.workers[downstream] * stages[downstream].target_speed
+    refill_rate = buffer_deficit / horizon_s
+    feeder_rate = (consume_rate + refill_rate) / fanout
+    return math.ceil(feeder_rate / feeder_speed)
 
 
 def _mark_blocked_candidate(
@@ -634,21 +615,23 @@ def _apply_feeder_pressure(
             stage_updates[downstream]["feeder_reason"] = FeederReason.PENDING_CONFIRM.value
             continue
 
-        feeder = selected.stage
-        base_target = stages[feeder].w_target
-        drain_w, demand_w, refill_w = _required_feeder_workers(
+        required_workers = _required_feeder_workers(
             selected, downstream, stages, inputs, effective_horizon_s, buffer_deficit
         )
-        required_workers = max(drain_w, demand_w, refill_w)
-        boost_cap = _feeder_boost_cap(base_target, params.feeder_boost_max_multiplier)
-        final_target = max(base_target, min(required_workers, boost_cap))
+        if required_workers <= 0:
+            # Untrusted feeder/downstream speed or an invalid chain: leave the
+            # feeder unsized rather than boost on a non-physical number.
+            stage_updates[downstream]["feeder_reason"] = FeederReason.NO_BOOST_FEEDER_UNTRUSTED.value
+            continue
+
+        feeder = selected.stage
+        base_target = stages[feeder].w_target
+        # No cap: required is already bounded by downstream consumption, and the
+        # solver / cold-start ramp still gate per-cycle actor creation.
+        final_target = max(base_target, required_workers)
         requested_targets[feeder] = max(requested_targets[feeder], final_target)
         downstreams_by_feeder[feeder].append(downstream)
         stage_updates[downstream]["feeder_required_workers"] = required_workers
-        stage_updates[downstream]["feeder_drain_workers"] = drain_w
-        stage_updates[downstream]["feeder_demand_workers"] = demand_w
-        stage_updates[downstream]["feeder_queue_refill_workers"] = refill_w
-        stage_updates[downstream]["feeder_boost_cap"] = boost_cap
         stage_updates[downstream]["feeder_reason"] = (
             FeederReason.BOOSTED.value if final_target > base_target else FeederReason.NO_BOOST_FEEDER_SUFFICIENT.value
         )
@@ -695,7 +678,6 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
     if not (
         len(inputs.speed)
         == len(inputs.chain)
-        == len(inputs.is_gpu)
         == len(inputs.is_manual)
         == len(inputs.local_qin)
         == len(inputs.local_pending_depth)
@@ -710,7 +692,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         raise ValueError(
             "capacity inputs length mismatch: "
             f"workers={num_stages} speed={len(inputs.speed)} chain={len(inputs.chain)} "
-            f"is_gpu={len(inputs.is_gpu)} is_manual={len(inputs.is_manual)} local_qin={len(inputs.local_qin)} "
+            f"is_manual={len(inputs.is_manual)} local_qin={len(inputs.local_qin)} "
             f"local_pending_depth={len(inputs.local_pending_depth)} "
             f"local_input_threshold={len(inputs.local_input_threshold)} active_depth={len(inputs.active_depth)} "
             f"ready_workers={len(inputs.ready_workers)} prev_a_ewma={len(prev.a_ewma)} "
@@ -718,7 +700,24 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             f"prev_feeder_pressure_streak={len(prev.feeder_pressure_streak)}"
         )
 
-    cap_src = _source_capacities(inputs.workers, inputs.speed, inputs.chain)
+    # Smooth each stage's speed FIRST so cap_src / the bottleneck are built from
+    # the dip-resistant target_speed: a single under-fed cycle (raw speed
+    # collapsed while the stage stays capable) cannot make it a false bottleneck
+    # and flap bottleneck_rate -> w_sustain. The asymmetric EWMA still detects a
+    # genuine sustained slowdown (slow-down side) within a few cycles.
+    target_speeds: list[float] = []
+    next_target_speed_ewma: list[float | None] = []
+    for k in range(num_stages):
+        target_speed, target_speed_state = _target_speed_for_cycle(
+            prev.target_speed_ewma[k],
+            inputs.speed[k],
+            params.alpha_up,
+            params.alpha_down,
+        )
+        target_speeds.append(target_speed)
+        next_target_speed_ewma.append(target_speed_state)
+
+    cap_src = _source_capacities(inputs.workers, target_speeds, inputs.chain)
     bottleneck_stage, bottleneck_streak, bottleneck_candidate, bottleneck_candidate_rate = _select_bottleneck(
         cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
     )
@@ -734,18 +733,10 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
 
     stages: list[StageCapacity] = []
     next_ewma: list[float | None] = []
-    next_target_speed_ewma: list[float | None] = []
     for k in range(num_stages):
         a_raw = inputs.chain[k] * bottleneck_rate
-        alpha_down = params.alpha_down_gpu if inputs.is_gpu[k] else params.alpha_down_cpu
-        a_ewma = asymmetric_ewma(prev.a_ewma[k], a_raw, params.alpha_up, alpha_down)
-        speed_k = inputs.speed[k]
-        target_speed, target_speed_state = _target_speed_for_cycle(
-            prev.target_speed_ewma[k],
-            speed_k,
-            params.alpha_up,
-            alpha_down,
-        )
+        a_ewma = asymmetric_ewma(prev.a_ewma[k], a_raw, params.alpha_up, params.alpha_down)
+        target_speed = target_speeds[k]
         if target_speed <= 0.0 or inputs.chain[k] <= 0.0 or bottleneck_rate <= 0.0:
             # Cold / untrusted stage, or no measured bottleneck yet: the
             # cold-start ramp owns spawning, so target only min_workers.
@@ -762,7 +753,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = max(w_target, w_sustain)
         stages.append(
             StageCapacity(
-                speed=speed_k,
+                speed=inputs.speed[k],
                 target_speed=target_speed,
                 cap_src=cap_src[k],
                 a_raw=a_raw,
@@ -772,7 +763,6 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             )
         )
         next_ewma.append(a_ewma)
-        next_target_speed_ewma.append(target_speed_state)
 
     final_stages, feeder_pressure_streak = _apply_feeder_pressure(stages, inputs, prev, params, bottleneck_stage)
 

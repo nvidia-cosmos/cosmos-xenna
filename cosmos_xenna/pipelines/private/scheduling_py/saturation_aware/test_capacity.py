@@ -29,24 +29,21 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import capaci
 
 def _params(
     *,
+    alpha_down: float = 1.0 / 6.0,
     capacity_headroom: float = 0.10,
     hysteresis_margin: float = 0.15,
     switch_confirm: int = 2,
     feeder_pressure_confirm: int = 2,
     feeder_arrival_horizon_s: float = 10.0,
-    feeder_boost_max_multiplier: float = 2.0,
 ) -> capacity.CapacityParams:
-    # alpha_down_gpu = alpha_down_cpu / 4 mirrors the scheduler's GPU release slowdown.
     return capacity.CapacityParams(
         alpha_up=1.0,
-        alpha_down_cpu=1.0 / 6.0,
-        alpha_down_gpu=1.0 / 24.0,
+        alpha_down=alpha_down,
         capacity_headroom=capacity_headroom,
         hysteresis_margin=hysteresis_margin,
         switch_confirm=switch_confirm,
         feeder_pressure_confirm=feeder_pressure_confirm,
         feeder_arrival_horizon_s=feeder_arrival_horizon_s,
-        feeder_boost_max_multiplier=feeder_boost_max_multiplier,
         min_workers=1,
     )
 
@@ -56,7 +53,6 @@ def _inputs(
     workers: tuple[int, ...],
     speed: tuple[float, ...],
     chain: tuple[float, ...] | None = None,
-    is_gpu: tuple[bool, ...] | None = None,
     is_manual: tuple[bool, ...] | None = None,
     local_qin: tuple[float, ...] | None = None,
     local_pending_depth: tuple[float, ...] | None = None,
@@ -69,7 +65,6 @@ def _inputs(
         workers=workers,
         speed=speed,
         chain=chain if chain is not None else (1.0,) * num,
-        is_gpu=is_gpu if is_gpu is not None else (False,) * num,
         is_manual=is_manual if is_manual is not None else (False,) * num,
         local_qin=local_qin if local_qin is not None else (0.0,) * num,
         local_pending_depth=local_pending_depth if local_pending_depth is not None else (0.0,) * num,
@@ -113,7 +108,7 @@ def test_asymmetric_ewma_is_fast_up_slow_down() -> None:
 def test_self_bottleneck_stage_sustains_its_current_size() -> None:
     """A stage that is its own bottleneck sustains exactly its current workers."""
     model = capacity.CapacityModel.create(2, _params())
-    plan = model.plan(_inputs(workers=(10, 15), speed=(0.1, 0.5), chain=(1.0, 8.0), is_gpu=(False, True)))
+    plan = model.plan(_inputs(workers=(10, 15), speed=(0.1, 0.5), chain=(1.0, 8.0)))
     # cap_src = [1.0, 0.9375]; caption is the global bottleneck (0.9375).
     # a_raw = 8 * 0.9375 = 7.5; w_sustain = ceil(7.5 / 0.5) = 15.
     assert plan.bottleneck_stage == 1
@@ -123,7 +118,7 @@ def test_self_bottleneck_stage_sustains_its_current_size() -> None:
 def test_overfed_non_bottleneck_stage_sustain_matches_bottleneck() -> None:
     """A stage fed faster than the global bottleneck sustains down to the bottleneck rate."""
     model = capacity.CapacityModel.create(3, _params())
-    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4), is_gpu=(False, False, True)))
+    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4)))
     # cap_src = [100, 60, 2.8]; bottleneck = stage 2 at 2.8.
     # Stage 1: a_raw = 1 * 2.8 = 2.8; w_sustain = ceil(2.8 / 1.0) = 3.
     assert plan.bottleneck_stage == 2
@@ -133,7 +128,7 @@ def test_overfed_non_bottleneck_stage_sustain_matches_bottleneck() -> None:
 def test_bottleneck_stage_sustains_its_full_size() -> None:
     """The bottleneck's own capacity bounds its sustain target, so it is not shrunk."""
     model = capacity.CapacityModel.create(3, _params())
-    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4), is_gpu=(False, False, True)))
+    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4)))
     # Stage 2 (bottleneck): a_raw = 2.8; w_sustain = ceil(2.8 / 0.4) = 7.
     assert plan.stages[2].w_sustain == 7
 
@@ -141,9 +136,7 @@ def test_bottleneck_stage_sustains_its_full_size() -> None:
 def test_persistent_upstream_bottleneck_shrinks_sustain_target() -> None:
     """When upstream is genuinely slow, a downstream stage's sustain target follows it down."""
     prev = _state(a_ewma=(None, 2.4), bottleneck=0)
-    result = capacity.compute_capacity(
-        _inputs(workers=(3, 15), speed=(0.1, 0.5), chain=(1.0, 8.0), is_gpu=(False, True)), prev, _params()
-    )
+    result = capacity.compute_capacity(_inputs(workers=(3, 15), speed=(0.1, 0.5), chain=(1.0, 8.0)), prev, _params())
     # cap_src = [0.3, 0.9375]; bottleneck = stage 0 (0.3).
     # a_raw = 8 * 0.3 = 2.4; w_sustain = ceil(2.4 / 0.5) = 5.
     assert result.plan.bottleneck_stage == 0
@@ -153,30 +146,16 @@ def test_persistent_upstream_bottleneck_shrinks_sustain_target() -> None:
 def test_single_cycle_dip_decays_sustain_slowly() -> None:
     """A one-cycle bottleneck drop decays the sustain target slowly, not all at once."""
     prev = _state(a_ewma=(None, 8.0, None), bottleneck=2)
-    result = capacity.compute_capacity(
-        _inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4), is_gpu=(False, False, True)), prev, _params()
-    )
-    # a_raw drops to 2.8 but the CPU slow-down holds a_ewma ~7.13 -> w_sustain = 8,
+    result = capacity.compute_capacity(_inputs(workers=(10, 60, 7), speed=(10.0, 1.0, 0.4)), prev, _params())
+    # a_raw drops to 2.8 but the slow-down release holds a_ewma ~7.13 -> w_sustain = 8,
     # well above the fully decayed bottleneck-matched size (3).
     assert result.plan.stages[1].w_sustain > 3
-
-
-def test_gpu_stage_sustain_decays_slower_than_cpu() -> None:
-    """A GPU stage uses the slower release alpha, so its sustain target decays less per drop."""
-    params = _params()
-    prev = _state(a_ewma=(None, 8.0), bottleneck=0)
-    dropped = _inputs(workers=(3, 15), speed=(0.1, 0.5), chain=(1.0, 8.0), is_gpu=(False, True))
-    cpu = _inputs(workers=(3, 15), speed=(0.1, 0.5), chain=(1.0, 8.0), is_gpu=(False, False))
-
-    gpu_result = capacity.compute_capacity(dropped, prev, params)
-    cpu_result = capacity.compute_capacity(cpu, prev, params)
-    assert gpu_result.plan.stages[1].w_sustain >= cpu_result.plan.stages[1].w_sustain
 
 
 def test_cold_stage_is_excluded_from_the_bottleneck() -> None:
     """A stage with no speed estimate neither becomes nor drags the bottleneck."""
     model = capacity.CapacityModel.create(3, _params())
-    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 0.0, 0.4), is_gpu=(False, False, True)))
+    plan = model.plan(_inputs(workers=(10, 60, 7), speed=(10.0, 0.0, 0.4)))
     # cap_src = [100, 0, 2.8]; the cold stage is skipped -> bottleneck = stage 2.
     assert plan.bottleneck_stage == 2
     assert plan.stages[1].w_sustain == 1
@@ -208,7 +187,7 @@ def test_non_bottleneck_target_is_bottleneck_rate_plus_headroom() -> None:
     queued, so it can never be inflated to dozens of workers.
     """
     model = capacity.CapacityModel.create(3, _params(capacity_headroom=0.10))
-    plan = model.plan(_inputs(workers=(4, 4, 8), speed=(10.0, 8.0, 0.5), is_gpu=(False, False, True)))
+    plan = model.plan(_inputs(workers=(4, 4, 8), speed=(10.0, 8.0, 0.5)))
     # cap_src = [40, 32, 4]; bottleneck = stage 2 (4); headroom_rate = 4.4.
     # Fast stage 0: w_target = ceil(1 * 4.4 / 10) = 1 (bounded).
     assert plan.bottleneck_stage == 2
@@ -218,7 +197,7 @@ def test_non_bottleneck_target_is_bottleneck_rate_plus_headroom() -> None:
 def test_bottleneck_target_climbs_toward_next_bottleneck_rate() -> None:
     """The bottleneck grows toward the next bottleneck (the move that raises pipeline speed)."""
     model = capacity.CapacityModel.create(3, _params())
-    plan = model.plan(_inputs(workers=(4, 4, 8), speed=(10.0, 8.0, 0.5), is_gpu=(False, False, True)))
+    plan = model.plan(_inputs(workers=(4, 4, 8), speed=(10.0, 8.0, 0.5)))
     # next_bottleneck_rate = second-min(cap_src) = 32; w_target = ceil(1 * 32 / 0.5) = 64.
     assert plan.next_bottleneck_rate == pytest.approx(32.0)
     assert plan.stages[2].w_target == 64
@@ -227,7 +206,7 @@ def test_bottleneck_target_climbs_toward_next_bottleneck_rate() -> None:
 def test_non_bottleneck_source_is_bounded_to_headroom() -> None:
     """The source (index 0), when not the bottleneck, is bounded to the read-ahead, not its size."""
     model = capacity.CapacityModel.create(2, _params())
-    plan = model.plan(_inputs(workers=(10, 4), speed=(1.0, 0.5), is_gpu=(False, True)))
+    plan = model.plan(_inputs(workers=(10, 4), speed=(1.0, 0.5)))
     # cap_src = [10, 2]; bottleneck = stage 1 (2); headroom_rate = 2.2.
     # Source w_target = ceil(1 * 2.2 / 1.0) = 3, far below its current 10 (no overproduction).
     assert plan.bottleneck_stage == 1
@@ -480,12 +459,16 @@ def test_feeder_pressure_uses_max_not_sum_for_shared_feeder() -> None:
         _params(),
     )
     feeder = result.plan.stages[0]
+    req_one = result.plan.stages[1].feeder_required_workers
+    req_two = result.plan.stages[2].feeder_required_workers
     assert feeder.feeder_downstreams == (1, 2)
-    assert feeder.w_target == result.plan.stages[1].feeder_boost_cap
+    # A shared feeder aggregates by max across its downstreams, never the sum.
+    assert feeder.w_target == max(req_one, req_two)
+    assert feeder.w_target < req_one + req_two
 
 
-def test_feeder_pressure_caps_required_workers() -> None:
-    """Extreme upstream stock cannot exceed the feeder boost multiplier."""
+def test_feeder_pressure_ignores_feeder_backlog() -> None:
+    """A huge feeder backlog no longer inflates the feeder target (drain term removed)."""
     prev = _state(a_ewma=(None, None), bottleneck=1, feeder_pressure_streak=(0, 1))
     result = capacity.compute_capacity(
         _inputs(
@@ -498,10 +481,10 @@ def test_feeder_pressure_caps_required_workers() -> None:
         prev,
         _params(),
     )
-    feeder = result.plan.stages[0]
     downstream = result.plan.stages[1]
-    assert downstream.feeder_required_workers > downstream.feeder_boost_cap
-    assert feeder.w_target <= downstream.feeder_boost_cap
+    # consume = 20 * 0.1 = 2; refill = 20 / 5 = 4; required = ceil(6 / fanout(1) / 5) = 2.
+    # The removed drain term would have demanded ceil(1000 / (5 * 5)) = 40.
+    assert downstream.feeder_required_workers == 2
 
 
 def test_feeder_pressure_does_not_compound_across_cycles() -> None:
@@ -604,8 +587,8 @@ def test_feeder_pressure_skips_cold_or_invalid_feeder() -> None:
     assert result.plan.stages[0].feeder_boost == 0
 
 
-def test_feeder_pressure_demand_workers_drive_sizing() -> None:
-    """Ready downstream workers can demand more feeder workers than backlog drain alone."""
+def test_feeder_pressure_sizes_for_consume_plus_refill() -> None:
+    """Feeder sizing folds the downstream consume rate and buffer refill into one count."""
     prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
     result = capacity.compute_capacity(
         _inputs(
@@ -621,14 +604,12 @@ def test_feeder_pressure_demand_workers_drive_sizing() -> None:
     downstream = result.plan.stages[2]
     assert downstream.binding_feeder == 1
     assert downstream.feeder_effective_horizon_s == pytest.approx(5.0)
-    assert downstream.feeder_drain_workers == 3
-    assert downstream.feeder_demand_workers == 10
-    assert downstream.feeder_queue_refill_workers == 4
-    assert downstream.feeder_required_workers == 10
+    # consume = 20 * 0.5 = 10; refill = deficit(20) / 5 = 4; required = ceil(14 / fanout(1) / 1) = 14.
+    assert downstream.feeder_required_workers == 14
 
 
-def test_feeder_pressure_refill_workers_drive_sizing() -> None:
-    """An empty deep input buffer demands feeder workers to refill, beyond ready-worker demand."""
+def test_feeder_pressure_refill_drives_sizing_for_deep_buffer() -> None:
+    """A deep empty input buffer adds refill workers on top of the consume rate."""
     prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
     result = capacity.compute_capacity(
         _inputs(
@@ -645,10 +626,8 @@ def test_feeder_pressure_refill_workers_drive_sizing() -> None:
     downstream = result.plan.stages[2]
     assert downstream.downstream_buffer_deficit == pytest.approx(100.0)
     assert downstream.feeder_effective_horizon_s == pytest.approx(5.0)
-    assert downstream.feeder_drain_workers == 2
-    assert downstream.feeder_demand_workers == 2
-    assert downstream.feeder_queue_refill_workers == 20
-    assert downstream.feeder_required_workers == 20
+    # consume = 20 * 0.1 = 2; refill = 100 / 5 = 20; required = ceil(22 / fanout(1) / 1) = 22.
+    assert downstream.feeder_required_workers == 22
 
 
 def test_feeder_pressure_buffered_downstream_keeps_full_horizon() -> None:
@@ -672,27 +651,25 @@ def test_feeder_pressure_buffered_downstream_keeps_full_horizon() -> None:
     assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_IMMINENT_ARRIVAL.value
 
 
-def test_feeder_pressure_is_resource_agnostic() -> None:
-    """Feeder sizing depends on demand, not on whether the stages hold GPUs."""
-
-    def plan_for(is_gpu: tuple[bool, ...]) -> capacity.CapacityPlan:
-        return capacity.compute_capacity(
-            _inputs(
-                workers=(1, 2, 20),
-                speed=(0.1, 1.0, 0.5),
-                is_gpu=is_gpu,
-                local_pending_depth=(0.0, 5.0, 0.0),
-                active_depth=(0.0, 12.0, 0.0),
-                ready_workers=(1, 2, 20),
-            ),
-            _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1)),
-            _params(),
-        ).plan
-
-    cpu = plan_for((False, False, False))
-    gpu = plan_for((True, True, True))
-    assert cpu.stages[2].feeder_required_workers == gpu.stages[2].feeder_required_workers
-    assert cpu.stages[1].feeder_boost == gpu.stages[1].feeder_boost
+def test_feeder_pressure_consume_uses_workers_not_ready_workers() -> None:
+    """Consumption sizing feeds all running downstream workers, not only the idle ones."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(1, 2, 10),
+            speed=(0.1, 1.0, 0.5),
+            local_pending_depth=(0.0, 5.0, 0.0),
+            active_depth=(0.0, 12.0, 0.0),
+            ready_workers=(1, 2, 4),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[2]
+    # consume = workers(10) * 0.5 = 5; refill = deficit(4) / 5 = 0.8; required = ceil(5.8) = 6.
+    # Sizing off ready_workers(4) instead would give consume 2 -> ceil(2.8) = 3.
+    assert downstream.binding_feeder == 1
+    assert downstream.feeder_required_workers == 6
 
 
 def test_feeder_pressure_blocked_only_does_not_advance_streak() -> None:
@@ -715,7 +692,7 @@ def test_feeder_pressure_blocked_only_does_not_advance_streak() -> None:
 
 
 def test_feeder_pressure_converts_demand_through_chain_factors() -> None:
-    """Downstream demand is converted to the feeder item rate using the stages' chain factors."""
+    """Combined downstream demand is converted to the feeder item rate via the chain fan-out."""
     prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
     result = capacity.compute_capacity(
         _inputs(
@@ -730,31 +707,32 @@ def test_feeder_pressure_converts_demand_through_chain_factors() -> None:
         _params(),
     )
     downstream = result.plan.stages[2]
-    # chain[downstream]=2 halves the per-feeder-item demand (chain=1 yields 10 / 4).
-    assert downstream.feeder_demand_workers == 5
-    assert downstream.feeder_queue_refill_workers == 2
+    # fanout = chain[2] / chain[1] = 2 halves the combined demand: required =
+    # ceil((consume 10 + refill 4) / 2 / 1) = 7 (chain[2]=1 would yield 14).
+    assert downstream.feeder_required_workers == 7
 
 
 def test_feeder_pressure_reports_sufficient_feeder_without_boosting() -> None:
-    """When the feeder is already large enough, feeder pressure records sufficiency and adds no boost."""
-    prev = _state(a_ewma=(None, None, None), bottleneck=0, feeder_pressure_streak=(0, 0, 1))
+    """When the feeder already covers the bounded requirement, no boost is applied."""
+    prev = _state(a_ewma=(None, None, None), bottleneck=2, feeder_pressure_streak=(0, 0, 1))
     result = capacity.compute_capacity(
         _inputs(
-            workers=(1, 1, 10),
-            speed=(0.6, 1.0, 0.5),
-            local_pending_depth=(0.0, 5.0, 0.0),
-            active_depth=(0.0, 6.0, 0.0),
-            ready_workers=(1, 1, 2),
+            workers=(5, 5, 2),
+            speed=(5.0, 5.0, 0.5),
+            local_pending_depth=(0.0, 5.0, 1.0),
+            active_depth=(0.0, 200.0, 0.0),
+            ready_workers=(5, 5, 2),
         ),
         prev,
-        _params(capacity_headroom=1.0),
+        _params(),
     )
     downstream = result.plan.stages[2]
     feeder = result.plan.stages[1]
+    # consume = 2 * 0.5 = 1; refill = deficit(1) / 5 = 0.2; required = ceil(1.2 / 5) = 1 <= base 1.
     assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_FEEDER_SUFFICIENT.value
-    assert downstream.feeder_required_workers == 2
+    assert downstream.feeder_required_workers == 1
     assert feeder.feeder_boost == 0
-    assert feeder.w_target == 2
+    assert feeder.w_target == 1
 
 
 def test_transient_speed_drop_does_not_spike_target_to_raw_division_result() -> None:
@@ -797,7 +775,6 @@ def test_mismatched_input_lengths_raise() -> None:
                 workers=(1, 2),
                 speed=(1.0,),
                 chain=(1.0, 1.0),
-                is_gpu=(False, False),
                 is_manual=(False, False),
                 local_qin=(0.0, 0.0),
                 local_pending_depth=(0.0, 0.0),
@@ -828,3 +805,62 @@ def test_mismatched_state_length_raises() -> None:
             capacity.CapacityState.initial(3),
             _params(),
         )
+
+
+def test_safe_fanout_rejects_degenerate_chain() -> None:
+    """The fan-out guard rejects non-finite, non-positive, and sub-threshold chain factors."""
+    tiny = capacity.chain.MIN_CHAIN_FACTOR / 2
+    assert capacity._safe_fanout(2.0, 1.0) == pytest.approx(2.0)
+    assert capacity._safe_fanout(math.inf, 1.0) is None
+    assert capacity._safe_fanout(1.0, 0.0) is None
+    assert capacity._safe_fanout(1.0, -1.0) is None
+    assert capacity._safe_fanout(tiny, 1.0) is None
+
+
+def test_source_capacities_excludes_degenerate_chain() -> None:
+    """A sub-MIN_CHAIN_FACTOR chain factor yields 0.0 capacity instead of a reciprocal blowup."""
+    caps = capacity._source_capacities((10, 10), (1.0, 1.0), (1.0, capacity.chain.MIN_CHAIN_FACTOR / 2))
+    assert caps[0] == pytest.approx(10.0)
+    assert caps[1] == 0.0
+
+
+def test_feeder_pressure_untrusted_when_fanout_degenerate() -> None:
+    """A selected feeder whose own chain is sub-threshold yields no usable fan-out and no boost."""
+    # The tiny chain sits on the feeder (stage 0); its cap_src is 0.0 so it is not
+    # the global bottleneck and stays actionable, but its fan-out is unusable.
+    prev = _state(a_ewma=(None, None), bottleneck=0, feeder_pressure_streak=(0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(5, 5),
+            speed=(5.0, 1.0),
+            chain=(capacity.chain.MIN_CHAIN_FACTOR / 2, 1.0),
+            local_pending_depth=(50.0, 0.0),
+            active_depth=(300.0, 0.0),
+            ready_workers=(5, 5),
+        ),
+        prev,
+        _params(),
+    )
+    downstream = result.plan.stages[1]
+    feeder = result.plan.stages[0]
+    assert downstream.binding_feeder == 0
+    assert downstream.feeder_required_workers == 0
+    assert downstream.feeder_reason == capacity.FeederReason.NO_BOOST_FEEDER_UNTRUSTED.value
+    assert feeder.feeder_boost == 0
+
+
+def test_under_fed_stage_is_not_a_false_bottleneck() -> None:
+    """A stage whose raw speed collapsed below its smoothed target_speed is not the bottleneck."""
+    prev = _state(a_ewma=(None, None), target_speed_ewma=(None, 1.0), bottleneck=-1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(2, 10), speed=(1.0, 0.1)),
+        prev,
+        _params(),
+    )
+    underfed = result.plan.stages[1]
+    # target_speed smooths the collapsed raw 0.1 back toward ~0.85, so cap_src uses
+    # 10 * 0.85 = 8.5 (not raw 10 * 0.1 = 1.0); the genuinely slow stage 0 stays the min.
+    assert underfed.speed == pytest.approx(0.1)
+    assert underfed.target_speed > 0.5
+    assert result.plan.bottleneck_stage == 0
+    assert result.plan.bottleneck_candidate_rate == pytest.approx(2.0)

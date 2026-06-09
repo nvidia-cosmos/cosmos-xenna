@@ -614,7 +614,7 @@ def loguru_caplog(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptur
 
 
 def test_feeder_pressure_log_reports_demand_and_buffer_fields(loguru_caplog: pytest.LogCaptureFixture) -> None:
-    """The focused feeder-pressure log line exposes the demand / refill / buffer diagnostics."""
+    """The focused feeder-pressure log line exposes the bounded sizing / buffer diagnostics."""
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
     config = SaturationAwareConfig(speed_estimation_min_data_points=1)
     scheduler = _scheduler(spec, cluster, config)
@@ -637,7 +637,7 @@ def test_feeder_pressure_log_reports_demand_and_buffer_fields(loguru_caplog: pyt
     lines = [r.getMessage() for r in loguru_caplog.records if "saturation-aware feeder-pressure:" in r.getMessage()]
     assert lines, "expected a feeder-pressure diagnostic line for the starved-warm downstream"
     line = lines[-1]
-    for field in ("drain_workers=", "demand_workers=", "refill_workers=", "buffer_deficit=", "effective_horizon_s="):
+    for field in ("required_workers=", "buffer_deficit=", "effective_horizon_s="):
         assert field in line, line
 
 
@@ -667,18 +667,18 @@ def test_solve_reraises_when_nothing_can_be_relaxed() -> None:
         scheduler.autoscale(100.0, _state(spec, allocator.WorkerAllocator.make(cluster)))
 
 
-def test_gpu_stage_uses_slower_release_alpha_than_cpu() -> None:
-    """GPU stages decay their sustainable rate four times slower than CPU stages.
+def test_release_alpha_is_uniform_and_config_driven() -> None:
+    """Every stage shares one release alpha derived from the two release tunables.
 
-    The slower GPU ratchet keeps an expensive warmup stage warm while a
-    transient upstream bottleneck clears, instead of tearing it down and
-    paying the cold-start cost again when work resumes. The release alphas now
-    live on the capacity model, which owns the throughput smoothing.
+    Release is resource-agnostic: a single ``alpha_down = 1 /
+    (scale_down_release_cycles * scale_down_release_slowdown)`` smooths the
+    sustainable rate for GPU and CPU stages alike, so the slowdown factor is the
+    one knob that trades release caution against responsiveness.
     """
     spec, cluster, _ = _build([1.0, 1.0], num_cpus=16)
-    params = _scheduler(spec, cluster)._capacity.params
-    assert params.alpha_down_gpu < params.alpha_down_cpu
-    assert params.alpha_down_gpu == pytest.approx(params.alpha_down_cpu / 4.0)
+    config = SaturationAwareConfig(scale_down_release_cycles=6, scale_down_release_slowdown=4.0)
+    params = _scheduler(spec, cluster, config)._capacity.params
+    assert params.alpha_down == pytest.approx(1.0 / (6 * 4.0))
 
 
 def test_measured_speed_is_withheld_until_the_trust_threshold_is_reached() -> None:
