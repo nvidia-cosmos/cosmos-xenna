@@ -338,7 +338,7 @@ class SaturationAwareScheduler:
 
         solution = self._solve(problem, problem_state, estimates, cycle.workers)
         frag_new, frag_delete = self._solution_counts(solution)
-        self._apply_cold_start_ramp(solution, cycle, capacity)
+        self._apply_cold_start_ramp(solution, cycle)
         sat_new, _ = self._solution_counts(solution)
         floor_plan = self._apply_scale_down_floor(solution, cycle, capacity)
         _, sat_delete = self._solution_counts(solution)
@@ -513,7 +513,7 @@ class SaturationAwareScheduler:
             return self.shape.stages[capacity.bottleneck_stage].name
         return "none"
 
-    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle, capacity: CapacityPlan) -> None:
+    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
 
         Caps each untrusted stage's new-worker additions so the solver cannot
@@ -530,7 +530,6 @@ class SaturationAwareScheduler:
         Args:
             solution: The solver's solution, mutated in place via its own editor.
             cycle: This cycle's immutable derived inputs (workers, depths, age).
-            capacity: This cycle's capacity plan.
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points

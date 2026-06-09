@@ -355,6 +355,37 @@ def test_balanced_pipeline_falls_back_to_smoothed_capacity() -> None:
     assert result.plan.bottleneck_rate == pytest.approx(2.0)
 
 
+def test_cold_queue_cliff_candidate_keeps_trusted_upstream_sized() -> None:
+    """A cold queue cliff must not collapse bottleneck_rate and strip upstream holds.
+
+    Regression: a downstream stage that just (re)started has a full input queue
+    (a queue cliff) but no trusted speed yet, so its raw rate is 0.0. The rate
+    source must fall back to the slowest MEASURED smoothed rate so the trusted
+    upstream feeder keeps its bottleneck-matched ``w_sustain`` instead of being
+    sized down to ``min_workers`` (which the floor would later tear down).
+    """
+    result = capacity.compute_capacity(
+        _inputs(
+            # stage 0 trusted feeder; stages 1-2 just (re)started, no speed yet.
+            workers=(4, 2, 2),
+            speed=(1.0, 0.0, 0.0),
+            # stage 1 has a full input queue, stage 2 is empty -> stage 1 is the
+            # cliff, but it is cold so cap_real[1] == 0.0.
+            local_qin=(2.0, 2.0, 0.0),
+            local_input_threshold=(1.0, 1.0, 1.0),
+        ),
+        capacity.CapacityState.initial(3),
+        _params(),
+    )
+    # The cold cliff owns growth identity, but its 0.0 raw rate must not size.
+    assert result.plan.stages[1].queue_state is capacity.StageQueueState.BOTTLENECK
+    assert result.plan.bottleneck_candidate == 1
+    # Sizing falls back to the slowest measured smoothed rate (cap_src[0] = 4*1/1).
+    assert result.plan.bottleneck_rate == pytest.approx(4.0)
+    # The trusted upstream feeder stays bottleneck-matched, not collapsed to 1.
+    assert result.plan.stages[0].w_sustain == 4
+
+
 def test_terminal_stage_becomes_candidate_only_when_no_ready_workers() -> None:
     """The last stage has no consumer queue, so readiness is its terminal drain signal."""
     blocked = capacity.compute_capacity(
@@ -400,6 +431,36 @@ def test_queue_candidate_switch_confirm_holds_valid_incumbent() -> None:
     assert result.plan.bottleneck_candidate == 2
     assert result.plan.bottleneck_stage == 0
     assert result.plan.bottleneck_streak == 1
+
+
+def test_confirm_streak_resets_when_queue_regime_flips() -> None:
+    """A streak accrued in the cap_src regime must not carry into the queue regime.
+
+    The two confirm regimes (queue cliff vs smoothed-cap_src fallback) share one
+    streak counter, so a streak from the opposite regime must be discarded on a
+    flip; otherwise a switch could confirm faster than ``switch_confirm`` intends.
+    """
+    states = (
+        capacity.StageQueueState.BOTTLENECK,
+        capacity.StageQueueState.STARVED,
+        capacity.StageQueueState.BOTTLENECK,
+    )
+    # Incumbent stage 0 is still a valid cliff; stage 2 is the deeper challenger.
+    # A streak of 1 carried from the previous (fallback) regime must be dropped,
+    # so the returned streak is the first confirm cycle (1), not 2.
+    bottleneck, streak, candidate, from_queue = capacity._select_bottleneck_by_queue(
+        states,
+        cap_src=(4.0, 0.0, 2.0),
+        prev_bn=0,
+        prev_streak=1,
+        prev_from_queue=False,
+        margin=0.15,
+        confirm=3,
+    )
+    assert from_queue is True
+    assert candidate == 2
+    assert bottleneck == 0  # incumbent held this cycle
+    assert streak == 1  # reset on the flip, then +1 -- not the carried 2
 
 
 def test_starved_incumbent_is_replaced_immediately() -> None:

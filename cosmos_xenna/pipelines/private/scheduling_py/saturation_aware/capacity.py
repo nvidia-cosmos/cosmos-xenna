@@ -92,14 +92,20 @@ class CapacityState:
             until a trusted speed has been observed.
         bottleneck: Incumbent global-bottleneck index, or ``-1`` when no
             stage is measured yet.
-        bottleneck_streak: Consecutive cycles a margin-clearing challenger
-            has beaten the incumbent (resets on any hold).
+        bottleneck_streak: Consecutive cycles a challenger has beaten the
+            incumbent (resets on any hold, and on a regime flip - see
+            ``bottleneck_from_queue``).
+        bottleneck_from_queue: Whether the previous cycle selected from a queue
+            cliff (``True``) or from the smoothed-``cap_src`` fallback
+            (``False``). A confirmation streak only counts within one regime, so
+            ``bottleneck_streak`` is discarded when this flips between cycles.
     """
 
     a_ewma: tuple[float | None, ...]
     target_speed_ewma: tuple[float | None, ...]
     bottleneck: int
     bottleneck_streak: int
+    bottleneck_from_queue: bool = False
 
     @classmethod
     def initial(cls, num_stages: int) -> Self:
@@ -109,6 +115,7 @@ class CapacityState:
             target_speed_ewma=(None,) * num_stages,
             bottleneck=-1,
             bottleneck_streak=0,
+            bottleneck_from_queue=False,
         )
 
 
@@ -188,16 +195,20 @@ class CapacityPlan:
         stages: One :class:`StageCapacity` per stage, in pipeline order.
         bottleneck_stage: Sticky growth-owner bottleneck identity, or ``-1``
             when no stage is measured yet.
-        bottleneck_rate: Current rate-source candidate's source-rate capacity,
-            in source items/s. Only growth ownership is sticky, not this rate.
+        bottleneck_rate: Effective sizing rate for the whole pipeline this cycle,
+            in source items/s. It is the candidate's RAW rate for a warm queue
+            cliff, else the slowest MEASURED smoothed rate (so a cold cliff or a
+            balanced pipeline never collapses sizing to 0). Only growth ownership
+            is sticky, not this rate.
         next_bottleneck_rate: The second-minimum rate in the active rate table
             (excluding the current candidate) - the rate the growth owner can
             usefully climb toward.
         bottleneck_streak: Current challenger confirmation streak.
         bottleneck_candidate: Current queue-cliff candidate, or smoothed-capacity
             fallback candidate when no queue cliff exists.
-        bottleneck_candidate_rate: Candidate stage's source-rate capacity from
-            the active rate table.
+        bottleneck_candidate_rate: Effective sizing rate (equal to
+            ``bottleneck_rate``); kept as a distinct logged field for decision
+            snapshots.
     """
 
     stages: tuple[StageCapacity, ...]
@@ -272,11 +283,15 @@ def _select_bottleneck_by_queue(
     cap_src: Sequence[float],
     prev_bn: int,
     prev_streak: int,
+    prev_from_queue: bool,
     margin: float,
     confirm: int,
 ) -> tuple[int, int, int, bool]:
     """Return sticky growth owner and current rate-source candidate."""
     candidates = [index for index, state in enumerate(states) if state is StageQueueState.BOTTLENECK]
+    from_queue = bool(candidates)
+    if from_queue != prev_from_queue:
+        prev_streak = 0
     if candidates:
         challenger = max(candidates)
         incumbent_valid = (
@@ -395,13 +410,39 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
     cap_real = _source_capacities(inputs.workers, inputs.speed, inputs.chain)
     queue_states = classify_stages(inputs)
     bottleneck_stage, bottleneck_streak, bottleneck_candidate, has_queue_candidate = _select_bottleneck_by_queue(
-        queue_states, cap_src, prev.bottleneck, prev.bottleneck_streak, params.hysteresis_margin, params.switch_confirm
+        queue_states,
+        cap_src,
+        prev.bottleneck,
+        prev.bottleneck_streak,
+        prev.bottleneck_from_queue,
+        params.hysteresis_margin,
+        params.switch_confirm,
     )
-    rate_table = cap_real if has_queue_candidate else cap_src
-    bottleneck_candidate_rate = rate_table[bottleneck_candidate] if bottleneck_candidate >= 0 else 0.0
-    # The sizing rate is the current candidate's measured rate, never the held
-    # incumbent's rate. Sticky identity only controls which stage owns growth.
-    bottleneck_rate = bottleneck_candidate_rate
+    # Pick the rate source that sizes every stage this cycle.
+    #
+    # A WARM queue-cliff candidate (populated input AND a trusted raw speed)
+    # uses its RAW rate for an immediate response: its input is full by
+    # construction, so the raw measurement is trustworthy now and need not wait
+    # for smoothing.
+    #
+    # Otherwise the regime is a fallback. Either there is no queue cliff
+    # (balanced) or the cliff stage is COLD - it has a full input queue but no
+    # trusted speed yet (just (re)started, still owned by the cold-start ramp),
+    # so its raw rate is 0.0. Sizing then follows the slowest MEASURED smoothed
+    # rate. This is the critical guard: a cold candidate's 0.0 raw rate must NOT
+    # become bottleneck_rate, or every stage collapses to min_workers and the
+    # floor tears down the trusted upstream feeders that are keeping the cold
+    # stage supplied. The sizing rate is always the current candidate's effective
+    # rate, never a held incumbent's rate; sticky identity only owns growth.
+    queue_candidate_warm = has_queue_candidate and bottleneck_candidate >= 0 and cap_real[bottleneck_candidate] > 0.0
+    if queue_candidate_warm:
+        rate_table = cap_real
+        bottleneck_rate = cap_real[bottleneck_candidate]
+    else:
+        rate_table = cap_src
+        measured_caps = [cap for cap in cap_src if cap > 0.0]
+        bottleneck_rate = min(measured_caps) if measured_caps else 0.0
+    bottleneck_candidate_rate = bottleneck_rate
     next_bottleneck_rate = _second_min_capacity(rate_table, bottleneck_candidate, bottleneck_rate)
     headroom_rate = bottleneck_rate * (1.0 + params.capacity_headroom)
 
@@ -422,7 +463,11 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
                 w_sustain = min(w_sustain, inputs.workers[k])
             # Growing the bottleneck toward next_bottleneck_rate is the move
             # that raises pipeline speed; growing any other stage past
-            # bottleneck_rate + headroom does not.
+            # bottleneck_rate + headroom does not. While a switch is confirming,
+            # the growth owner (held incumbent) can differ from the rate-source
+            # candidate; next_bottleneck_rate excludes the candidate, so the
+            # owner may briefly target near its own rate (a transient near no-op)
+            # until the challenger confirms - this is intended, not a stall.
             target_rate = max(next_bottleneck_rate, headroom_rate) if k == bottleneck_stage else headroom_rate
             w_target = math.ceil(inputs.chain[k] * target_rate / target_speed)
             # Headroom lives in w_target; never target below the hold floor.
@@ -458,6 +503,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             target_speed_ewma=tuple(next_target_speed_ewma),
             bottleneck=bottleneck_stage,
             bottleneck_streak=bottleneck_streak,
+            bottleneck_from_queue=has_queue_candidate,
         ),
     )
 

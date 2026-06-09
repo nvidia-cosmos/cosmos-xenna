@@ -40,18 +40,16 @@ class RampReason(enum.StrEnum):
 
     Attributes:
         COLD: No completed sample yet and the slow-starter release did not fire
-            (no pending work, or capacity suppressed growth); held at one worker.
-            Reached within the warmup window and also past it whenever the
-            slow-starter release is gated.
-        PIPELINE_WARMING: No completed sample yet, but capacity allows growth and
-            the stage has its own pending work; allowed one extra worker this
-            cycle.
+            (no pending work, or no live worker to accelerate yet); held at one
+            worker. Reached within the warmup window and also past it whenever
+            the slow-starter release is gated by missing pending work.
+        PIPELINE_WARMING: No completed sample yet, but the stage has a live worker
+            and its own pending work; allowed one extra worker this cycle.
         WARMING: Some samples but below the trust threshold; allowed one extra
-            worker per cycle under the same work-and-suppression gate, never
-            scaled by the solver's proposal.
+            worker per cycle under the same pending-work gate, never scaled by
+            the solver's proposal.
         SLOW_START: No sample after a full speed-estimation window with work
-            waiting and growth not suppressed; released to the solver as a
-            confirmed slow-starter.
+            waiting; released to the solver as a confirmed slow-starter.
         UNCAPPED: Enough samples to trust the speed estimate; the solver owns
             growth.
     """

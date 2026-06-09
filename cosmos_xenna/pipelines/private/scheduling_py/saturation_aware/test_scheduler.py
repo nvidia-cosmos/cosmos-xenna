@@ -374,7 +374,6 @@ def test_queue_gradient_logs_upstream_bottleneck_and_starved_downstream(
     assert f"{downstream}[" in lines[-1]
     assert "qstate=bottleneck" in lines[-1]
     assert "qstate=starved" in lines[-1]
-    assert "saturation-aware feeder-pressure:" not in "\n".join(r.getMessage() for r in loguru_caplog.records)
 
 
 def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
@@ -382,9 +381,10 @@ def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
 
     Cold start caps the downstream stage at a single worker (it has no live
     worker to accelerate yet). On the next cycle, with its own work still waiting
-    and capacity not suppressing growth, pipeline-evidence warming lets it add
-    exactly one worker instead of idling at one until its own first sample lands
-    -- and only one, never the solver's full placeholder-throughput demand.
+    and the queue gradient making it the growth owner, pipeline-evidence warming
+    lets it add exactly one worker instead of idling at one until its own first
+    sample lands - and only one, never the solver's full placeholder-throughput
+    demand.
     """
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
     scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=1))
@@ -400,7 +400,7 @@ def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
     _apply_to_allocator(spec, worker_allocator, cold)
     assert _worker_counts(spec, worker_allocator)[1] == 1
 
-    # Warming cycle: local work waiting + a live worker + no suppression -> +1 only.
+    # Warming cycle: local work waiting + a live worker + growth owner -> +1 only.
     now += 10.0
     scheduler.update_with_measurements(now, _upstream_only_measurements(now))
     scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
@@ -704,8 +704,8 @@ def test_bottleneck_shift_scales_down_now_fast_stage_gradually() -> None:
     This is the only path that drives deletes end-to-end. Warm stage 0 as the
     bottleneck, then flip the measured speeds so stage 1 becomes the bottleneck.
     The solver now wants stage 0's workers for stage 1; the scale-down floor
-    releases stage 0 a bounded amount per cycle -- never to zero and never in a
-    single jump -- exercising the floor delete-cap and the ramp/floor editor
+    releases stage 0 a bounded amount per cycle - never to zero and never in a
+    single jump - exercising the floor delete-cap and the ramp/floor editor
     composition.
     """
     spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)

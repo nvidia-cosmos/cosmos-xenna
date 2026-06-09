@@ -22,7 +22,7 @@ bottleneck climb to the next bottleneck (see ``capacity.py``), so this stage
 only translates "grow toward ``w_target``" into a multiplier the fragmentation
 solver understands: a stage at or above its target asks for nothing extra
 (multiplier ``1.0``), and a below-target stage with local pending input asks
-for ``w_target / workers``. There is no local backlog math and no
+for ``max(w_target / max(workers, 1), 1.0)``. There is no local backlog math and no
 cross-cycle state here - the throughput smoothing lives in ``capacity.py``.
 """
 
@@ -119,7 +119,7 @@ def size_stage(snapshot: StageDemandSnapshot, capacity: StageCapacity, has_local
     if speed is None or speed <= 0.0 or solver_speed <= 0.0:
         return StageSizingResult(effective_speed=_SOLVER_DEFAULT_SPEED, num_returns=num_returns, multiplier=1.0)
     if has_local_input and capacity.w_target > snapshot.workers:
-        multiplier = capacity.w_target / max(snapshot.workers, 1)
+        multiplier = max(capacity.w_target / max(snapshot.workers, 1), 1.0)
     else:
         multiplier = 1.0
     return StageSizingResult(effective_speed=solver_speed / multiplier, num_returns=num_returns, multiplier=multiplier)
