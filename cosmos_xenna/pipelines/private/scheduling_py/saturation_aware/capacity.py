@@ -474,9 +474,12 @@ def _is_starved_warm(index: int, inputs: CapacityInputs, stages: Sequence[StageC
 def _safe_fanout(downstream_chain: float, feeder_chain: float) -> float | None:
     """Return downstream-items per feeder-item, or ``None`` when unusable.
 
-    Rejects non-finite, non-positive, and implausibly tiny chain factors (below
-    :data:`chain.MIN_CHAIN_FACTOR`) so a divide-by-tiny-chain cannot explode
-    feeder sizing. A legitimate heavy fan-in still passes.
+    Guards each chain factor individually: rejects non-finite, non-positive, and
+    implausibly tiny factors (below :data:`chain.MIN_CHAIN_FACTOR`) so a single
+    degenerate factor cannot drive the reciprocal to a non-physical value. The
+    returned ratio may still fall below ``1`` for a legitimate net fan-in (more
+    filtering than fan-out between feeder and downstream); that case is real and
+    is handled by the caller, which amplifies the feeder rate by ``1 / fanout``.
     """
     if not (math.isfinite(downstream_chain) and math.isfinite(feeder_chain)):
         return None
@@ -495,11 +498,15 @@ def _required_feeder_workers(
 ) -> int:
     """Return feeder workers to feed downstream consumption and refill its buffer.
 
-    Covers two additive needs in one bounded, rounded count: keep all running
-    downstream workers fed (consume) and rebuild the downstream dispatch buffer
-    within ``horizon_s`` (refill). Sizing is bounded by downstream capacity
-    (``workers[d] * target_speed[d]``), never by feeder backlog; downstream item
-    rates are converted to feeder item rates through the guarded fan-out. An
+    Covers two additive needs in one rounded count: keep all running downstream
+    workers fed (consume) and rebuild the downstream dispatch buffer within
+    ``horizon_s`` (refill). Both are downstream item rates; they are converted to
+    the feeder item rate through the static, config-derived chain fan-out and
+    never depend on the feeder's own backlog. The count tracks downstream demand,
+    not feeder queue depth: under net fan-out (``fanout >= 1``) it stays at or
+    below ``(workers[d] * target_speed[d] + refill) / feeder_speed``; under net
+    fan-in (``fanout < 1``, a filtered path) it is amplified by ``1 / fanout``
+    because the feeder must over-produce to deliver one downstream item. An
     unusable feeder speed, fan-out, or horizon yields ``0`` (no boost).
     """
     feeder = candidate.stage
@@ -626,8 +633,10 @@ def _apply_feeder_pressure(
 
         feeder = selected.stage
         base_target = stages[feeder].w_target
-        # No cap: required is already bounded by downstream consumption, and the
-        # solver / cold-start ramp still gate per-cycle actor creation.
+        # No cap: required tracks downstream consumption converted through the
+        # static, config-derived chain fan-out (amplified by 1 / fanout only for
+        # a genuine net fan-in, where over-production is physically required), and
+        # the solver / cold-start ramp still gate per-cycle actor creation.
         final_target = max(base_target, required_workers)
         requested_targets[feeder] = max(requested_targets[feeder], final_target)
         downstreams_by_feeder[feeder].append(downstream)

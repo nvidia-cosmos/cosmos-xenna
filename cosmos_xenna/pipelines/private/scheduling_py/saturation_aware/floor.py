@@ -233,6 +233,18 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         else:
             shrink_streak = prev.shrink_streak[k] + 1
             prior_pending = prev.pending_shrink_floor[k]
+            # pending_shrink_floor is the lower hold target being confirmed.
+            # With no prior target (prior_pending <= 0) start fresh at desired;
+            # otherwise combine the carried target with the new one:
+            #   min(prior_pending, base) clamps the prior target down to the
+            #     current base (base only ever decreases), so a stale-high prior
+            #     cannot hold the floor above what we hold now; and
+            #   max(..., desired) keeps the most conservative (highest) shrink
+            #     target between that clamped prior and the new desired.
+            # held stays at base until shrink_streak reaches
+            # params.release_confirm_cycles, the confirming cycle that drops held
+            # to pending_shrink_floor and resets shrink_streak and
+            # pending_shrink_floor to 0 for the next window.
             pending_shrink_floor = desired if prior_pending <= 0 else max(min(prior_pending, base), desired)
             shrink_confirmed = shrink_streak >= params.release_confirm_cycles
             held = pending_shrink_floor if shrink_confirmed else base

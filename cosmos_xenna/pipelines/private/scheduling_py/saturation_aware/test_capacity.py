@@ -29,6 +29,9 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware import capaci
 
 def _params(
     *,
+    # Arbitrary smoothing value chosen for legible per-cycle release math in the
+    # tests; NOT the production default (which derives 1/24 from
+    # scale_down_release_cycles * scale_down_release_slowdown).
     alpha_down: float = 1.0 / 6.0,
     capacity_headroom: float = 0.10,
     hysteresis_margin: float = 0.15,
