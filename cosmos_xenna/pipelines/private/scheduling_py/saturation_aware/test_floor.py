@@ -43,6 +43,7 @@ def _inputs(
     stock: tuple[float, float],
     active: tuple[float, float] = (0.0, 0.0),
     chain_factors: tuple[float, float] = _CHAIN,
+    protect_downstream_of: int = -1,
 ) -> floor.FloorInputs:
     # active_depths only affects the zero-fanout (chain <= 0) release branch.
     # _CHAIN is all-positive, so positive-chain tests are unaffected by it.
@@ -53,6 +54,7 @@ def _inputs(
         active_depths=active,
         batch_sizes=_BATCH,
         w_sustain=w_sustain,
+        protect_downstream_of=protect_downstream_of,
     )
 
 
@@ -99,6 +101,22 @@ def test_floor_never_exceeds_zero_current_workers() -> None:
         _params(),
     )
     assert result.plan.floors == (0, 0)
+
+
+def test_downstream_protection_holds_current_workers_while_stock_is_in_flight() -> None:
+    """H1 blocks downstream shrink behind the current rate-source candidate."""
+    protected = floor.compute_floors(
+        _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_DEEP_STOCK, protect_downstream_of=0),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    drained = floor.compute_floors(
+        _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_EMPTY_STOCK, protect_downstream_of=0),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert protected.plan.floors[1] == 15
+    assert drained.plan.floors[1] == 5
 
 
 def test_source_stage_is_clamped_like_any_other() -> None:

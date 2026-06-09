@@ -103,7 +103,7 @@ def size_stage(snapshot: StageDemandSnapshot, capacity: StageCapacity, has_local
     Cold start (no trusted speed) returns the solver default speed and a unit
     multiplier so the cold-start ramp owns the stage. Otherwise the multiplier
     grows the stage toward ``w_target`` only when local input can use new
-    workers and capacity has not suppressed downstream growth.
+    workers.
 
     Args:
         snapshot: One stage's per-cycle demand inputs.
@@ -118,7 +118,7 @@ def size_stage(snapshot: StageDemandSnapshot, capacity: StageCapacity, has_local
     solver_speed = capacity.target_speed
     if speed is None or speed <= 0.0 or solver_speed <= 0.0:
         return StageSizingResult(effective_speed=_SOLVER_DEFAULT_SPEED, num_returns=num_returns, multiplier=1.0)
-    if has_local_input and not capacity.suppress_growth and capacity.w_target > snapshot.workers:
+    if has_local_input and capacity.w_target > snapshot.workers:
         multiplier = capacity.w_target / max(snapshot.workers, 1)
     else:
         multiplier = 1.0

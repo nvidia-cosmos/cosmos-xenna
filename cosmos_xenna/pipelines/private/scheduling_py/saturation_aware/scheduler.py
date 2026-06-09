@@ -63,7 +63,6 @@ from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity impo
     CapacityModel,
     CapacityParams,
     CapacityPlan,
-    FeederCandidate,
 )
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.estimator import PipelineRateEstimator
@@ -107,7 +106,7 @@ class _Cycle:
         demand_snapshots: Per-stage estimator snapshot (speed, returns, batch).
         batch_sizes: Per-stage input items consumed per batch.
         chain_factors: Per-stage cumulative fan-out from the source.
-        is_manual: Per-stage manual pin flag (blocks feeder-pressure boosts).
+        is_manual: Per-stage manual pin flag (blocks automatic bottleneck growth).
         local_depths: Per-stage input queue depth, in stage-input samples.
         local_pending_depths: Per-stage queue plus pool-queued depth, excluding
             in-flight work, in stage-input samples.
@@ -178,6 +177,7 @@ class _Cycle:
             active_depths=self.active_depths,
             batch_sizes=self.batch_sizes,
             w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
+            protect_downstream_of=capacity.bottleneck_candidate,
         )
 
 
@@ -227,8 +227,6 @@ class SaturationAwareScheduler:
                 capacity_headroom=config.capacity_headroom,
                 hysteresis_margin=_HYSTERESIS_MARGIN,
                 switch_confirm=_SWITCH_CONFIRM,
-                feeder_pressure_confirm=_SWITCH_CONFIRM,
-                feeder_arrival_horizon_s=config.interval_s,
                 min_workers=_MIN_WORKERS,
             ),
         )
@@ -515,16 +513,6 @@ class SaturationAwareScheduler:
             return self.shape.stages[capacity.bottleneck_stage].name
         return "none"
 
-    def _format_feeder_candidates(self, candidates: Sequence[FeederCandidate]) -> str:
-        """Return a compact candidate summary for feeder-pressure logs."""
-        if not candidates:
-            return "none"
-        parts = (
-            f"{self.shape.stages[candidate.stage].name}:{candidate.status.value}:{candidate.delay_s:.2f}s"
-            for candidate in candidates
-        )
-        return "(" + ", ".join(parts) + ")"
-
     def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle, capacity: CapacityPlan) -> None:
         """Trim cold-start over-spawn of not-yet-trusted stages.
 
@@ -532,9 +520,9 @@ class SaturationAwareScheduler:
         make large commitments while it is still sizing the stage from
         placeholder throughput. One generic policy covers every resource shape:
         a not-yet-trusted stage grows by at most one worker per cycle, gated by
-        capacity's ``suppress_growth`` and by the stage's own pending work. A
-        stage that has work waiting but produces no sample within a full
-        speed-estimation window is released to the solver (slow-starter).
+        the stage's own pending work. A stage that has work waiting but produces
+        no sample within a full speed-estimation window is released to the solver
+        (slow-starter).
 
         Runs before :meth:`_apply_scale_down_floor`, committing its own editor
         so the floor reads these trims.
@@ -542,8 +530,7 @@ class SaturationAwareScheduler:
         Args:
             solution: The solver's solution, mutated in place via its own editor.
             cycle: This cycle's immutable derived inputs (workers, depths, age).
-            capacity: This cycle's capacity plan, source of the ``suppress_growth``
-                gate.
+            capacity: This cycle's capacity plan.
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
@@ -562,7 +549,6 @@ class SaturationAwareScheduler:
             samples = self._estimator.sample_count(stage.name)
             active_depth = cycle.active_depths[index]
             has_pending_work = active_depth > 0.0
-            suppress_growth = capacity.stages[index].suppress_growth
             decision = ramp.decide(
                 StageRampInput(
                     current_workers=current,
@@ -571,15 +557,13 @@ class SaturationAwareScheduler:
                     sample_count=samples,
                     stage_age_s=stage_age_s,
                     has_pending_work=has_pending_work,
-                    suppress_growth=suppress_growth,
                 ),
                 self.config,
             )
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
-                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f} "
-                f"suppress_growth={suppress_growth}"
+                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:
@@ -608,8 +592,7 @@ class SaturationAwareScheduler:
                 f"ramp_new={ramp_new} ramp_post={ramp_post} trimmed={frag_new - ramp_new} "
                 f"cap={decision.cap} samples={samples}/{min_data_points} "
                 f"is_gpu={stage.is_gpu} "
-                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f} "
-                f"suppress_growth={suppress_growth}"
+                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
             )
         if summaries:
             logger.debug("saturation-aware ramp: " + " | ".join(summaries))
@@ -663,7 +646,8 @@ class SaturationAwareScheduler:
                 f"shrink_deferred={decision.shrink_deferred} shrink_streak={decision.shrink_streak} "
                 f"pending_shrink_floor={decision.pending_shrink_floor} "
                 f"speed={cap.speed:.4f} target_speed={cap.target_speed:.4f} cap_src={cap.cap_src:.3f} "
-                f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} w_sustain={cap.w_sustain} w_target={cap.w_target} "
+                f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} "
+                f"w_sustain={cap.w_sustain} w_target={cap.w_target} qstate={cap.queue_state.value} "
                 f"bottleneck_rate={capacity.bottleneck_rate:.3f} "
                 f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
                 f"bottleneck_streak={capacity.bottleneck_streak} "
@@ -706,27 +690,6 @@ class SaturationAwareScheduler:
                 inflight = 0
                 pool_queued = 0
             utilization = inflight / max(cycle.workers[index], 1)
-            if cap.starved_warm or cap.feeder_boost > 0 or cap.feeder_reason:
-                feeder_name = self.shape.stages[cap.binding_feeder].name if cap.binding_feeder >= 0 else "none"
-                blocked_feeder_name = self.shape.stages[cap.blocked_feeder].name if cap.blocked_feeder >= 0 else "none"
-                downstreams = tuple(self.shape.stages[item].name for item in cap.feeder_downstreams)
-                logger.debug(
-                    f"saturation-aware feeder-pressure: stage='{stage.name}' reason='{cap.feeder_reason}' "
-                    f"starved_warm={cap.starved_warm} suppress_growth={cap.suppress_growth} "
-                    f"local_qin={cycle.local_depths[index]:.2f} "
-                    f"local_pending={cycle.local_pending_depths[index]:.2f} "
-                    f"local_threshold={float(cycle.batch_sizes[index]):.2f} "
-                    f"workers={cycle.workers[index]} ready={cycle.ready_workers[index]} "
-                    f"w_sustain={cap.w_sustain} active_depth={cycle.active_depths[index]:.2f} "
-                    f"binding_feeder='{feeder_name}' path_delay_s={cap.feeder_path_delay_s:.2f} "
-                    f"blocked_feeder='{blocked_feeder_name}' blocked_reason='{cap.blocked_feeder_reason}' "
-                    f"blocked_path_delay_s={cap.blocked_feeder_path_delay_s:.2f} feeder_streak={cap.feeder_streak} "
-                    f"candidate_feeders={self._format_feeder_candidates(cap.feeder_candidates)} "
-                    f"required_workers={cap.feeder_required_workers} "
-                    f"buffer_deficit={cap.downstream_buffer_deficit:.2f} "
-                    f"effective_horizon_s={cap.feeder_effective_horizon_s:.2f} "
-                    f"feeder_boost={cap.feeder_boost} downstreams={downstreams}"
-                )
             frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]
             sat_post = cycle.workers[index] + sat_new[index] - sat_delete[index]
             groups.append(
@@ -735,8 +698,7 @@ class SaturationAwareScheduler:
                 f"sat_post={sat_post} requested={sat_post} cap_src={cap.cap_src:.2f} "
                 f"speed={cap.speed:.4f} target_speed={cap.target_speed:.4f} "
                 f"w_sustain={cap.w_sustain} w_target={cap.w_target} mult={sizings[index].multiplier:.2f} "
-                f"starved={cap.starved_warm} suppress={cap.suppress_growth} "
-                f"feeder_boost={cap.feeder_boost} feeder_reason='{cap.feeder_reason}' "
+                f"qstate={cap.queue_state.value} "
                 f"floor={decision.floor} shrink_deferred={decision.shrink_deferred} "
                 f"shrink_streak={decision.shrink_streak} pending_shrink_floor={decision.pending_shrink_floor} "
                 f"releasing={decision.releasing} "

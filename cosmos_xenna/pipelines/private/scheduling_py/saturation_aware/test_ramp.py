@@ -37,7 +37,6 @@ def make_input() -> RampInputFactory:
         sample_count: int = 0,
         stage_age_s: float = 0.0,
         has_pending_work: bool = False,
-        suppress_growth: bool = False,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
@@ -46,7 +45,6 @@ def make_input() -> RampInputFactory:
             sample_count=sample_count,
             stage_age_s=stage_age_s,
             has_pending_work=has_pending_work,
-            suppress_growth=suppress_growth,
         )
 
     return _make_input
@@ -135,23 +133,6 @@ def test_pipeline_warming_requires_pending_work(make_input: RampInputFactory) ->
     assert decision.reason is RampReason.COLD
 
 
-def test_pipeline_warming_blocked_when_growth_suppressed(make_input: RampInputFactory) -> None:
-    """Capacity suppression hard-gates 0-sample growth even with local work present."""
-    decision = decide(
-        make_input(
-            sample_count=0,
-            current_workers=1,
-            proposed_post=13,
-            has_pending_work=True,
-            suppress_growth=True,
-        ),
-        _config(),
-    )
-    assert decision.cap == 1
-    assert decision.keep_new == 0
-    assert decision.reason is RampReason.COLD
-
-
 def test_pipeline_warming_requires_an_existing_worker(make_input: RampInputFactory) -> None:
     """A stage with no live worker clears the first cold cap before pending work can accelerate it."""
     decision = decide(
@@ -212,30 +193,6 @@ def test_slow_start_takes_precedence_over_pipeline_warming(make_input: RampInput
     assert decision.reason is RampReason.SLOW_START
 
 
-def test_slow_start_blocked_when_growth_suppressed(make_input: RampInputFactory) -> None:
-    """Suppression hard-gates even the slow-starter release: a suppressed dry stage holds at one worker.
-
-    A locally dry stage can hold in-flight work (has_pending_work) while capacity marks it starved and
-    suppresses its growth so its upstream feeder is boosted instead. Releasing it to the solver here would
-    re-authorize a placeholder-sized over-spawn, so the window-elapsed slow-starter path must not fire.
-    """
-    config = SaturationAwareConfig()
-    decision = decide(
-        make_input(
-            sample_count=0,
-            current_workers=2,
-            proposed_post=13,
-            stage_age_s=config.speed_estimation_window_s,
-            has_pending_work=True,
-            suppress_growth=True,
-        ),
-        config,
-    )
-    assert decision.cap == 1
-    assert decision.keep_new == 0
-    assert decision.reason is RampReason.COLD
-
-
 def test_warming_grows_by_one_with_local_work(make_input: RampInputFactory) -> None:
     """A warming stage with its own backlog grows by exactly one worker per cycle."""
     decision = decide(
@@ -292,37 +249,9 @@ def test_warming_dry_stage_holds_at_current(make_input: RampInputFactory) -> Non
     assert decision.reason is RampReason.WARMING
 
 
-def test_warming_blocked_when_growth_suppressed(make_input: RampInputFactory) -> None:
-    """Capacity suppression hard-gates warming growth even with local work present."""
-    decision = decide(
-        make_input(
-            sample_count=2,
-            current_workers=2,
-            proposed_post=10,
-            has_pending_work=True,
-            suppress_growth=True,
-        ),
-        _config(),
-    )
-    assert decision.cap == 2
-    assert decision.keep_new == 0
-    assert decision.reason is RampReason.WARMING
-
-
 def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
     """Once samples reach the trust threshold the stage is uncapped."""
     decision = decide(make_input(sample_count=5, current_workers=1, proposed_post=11), _config())
-    assert decision.cap is None
-    assert decision.keep_new is None
-    assert decision.reason is RampReason.UNCAPPED
-
-
-def test_trusted_stage_uncapped_even_when_growth_suppressed(make_input: RampInputFactory) -> None:
-    """Suppression gates only not-yet-trusted growth; a trusted stage stays uncapped and sizing owns it."""
-    decision = decide(
-        make_input(sample_count=5, current_workers=1, proposed_post=11, suppress_growth=True),
-        _config(),
-    )
     assert decision.cap is None
     assert decision.keep_new is None
     assert decision.reason is RampReason.UNCAPPED

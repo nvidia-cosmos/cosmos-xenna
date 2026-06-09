@@ -95,6 +95,8 @@ class FloorInputs:
         batch_sizes: Per-stage input batch sizes.
         w_sustain: Per-stage capacity hold target from the capacity plan; the
             floor clamps deletes to ``min(w_sustain, workers)`` while holding.
+        protect_downstream_of: Rate-source stage whose downstream stages should
+            not shrink while source-normalized stock is still in flight.
     """
 
     workers: tuple[int, ...]
@@ -103,6 +105,7 @@ class FloorInputs:
     active_depths: tuple[float, ...]
     batch_sizes: tuple[int, ...]
     w_sustain: tuple[int, ...]
+    protect_downstream_of: int = -1
 
 
 @attrs.frozen
@@ -224,6 +227,8 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
 
         min_floor = min(params.min_workers, inputs.workers[k])
         desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
+        if inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of and inputs.stock_src[k] > threshold:
+            desired = inputs.workers[k]
         base = min(prev.held_floor[k], inputs.workers[k])
         if base <= 0 or desired >= base:
             held = desired

@@ -58,7 +58,6 @@ def _capacity(
     w_sustain: int = 1,
     speed: float = 2.0,
     target_speed: float | None = None,
-    suppress_growth: bool = False,
 ) -> StageCapacity:
     """A StageCapacity carrying only the fields demand sizing reads."""
     solver_speed = speed if target_speed is None else target_speed
@@ -70,7 +69,6 @@ def _capacity(
         a_ewma=0.0,
         w_sustain=w_sustain,
         w_target=w_target,
-        suppress_growth=suppress_growth,
     )
 
 
@@ -128,17 +126,6 @@ def test_solver_speed_uses_smoothed_capacity_target_speed(make_snapshot: Snapsho
 def test_below_target_without_local_input_does_not_grow(make_snapshot: SnapshotFactory) -> None:
     """Without local input the stage holds at a unit multiplier even below target."""
     result = size_stage(make_snapshot(workers=2, speed=2.0), _capacity(w_target=6), has_local_input=False)
-    assert result.multiplier == 1.0
-    assert result.effective_speed == pytest.approx(2.0)
-
-
-def test_suppressed_growth_does_not_grow_even_with_local_input(make_snapshot: SnapshotFactory) -> None:
-    """Capacity can suppress a locally dry downstream stage's growth."""
-    result = size_stage(
-        make_snapshot(workers=2, speed=2.0),
-        _capacity(w_target=6, suppress_growth=True),
-        has_local_input=True,
-    )
     assert result.multiplier == 1.0
     assert result.effective_speed == pytest.approx(2.0)
 
