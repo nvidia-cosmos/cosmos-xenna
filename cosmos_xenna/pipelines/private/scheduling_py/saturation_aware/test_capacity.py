@@ -357,6 +357,40 @@ def test_feeder_pressure_boosts_binding_non_bottleneck() -> None:
     assert downstream.feeder_reason == capacity.FeederReason.BOOSTED.value
     assert feeder.feeder_boost > 0
     assert feeder.feeder_downstreams == (2,)
+    # The boost is a HOLD requirement: it lands in w_sustain, not only w_target.
+    assert feeder.w_sustain == feeder.w_target
+
+
+def test_feeder_boost_writes_hold_tier_so_floor_protects_it() -> None:
+    """A boosted feeder's hold target (w_sustain) is raised to the boost target.
+
+    The scale-down floor holds ``min(w_sustain, workers)``; if the boost lived
+    only in ``w_target`` (growth) the floor would tear the grown feeder back to
+    its base ``w_sustain`` next cycle. The fix writes the boost to both tiers.
+    """
+    params = _params()
+    prev = _state(a_ewma=(None, None, None), bottleneck=2, feeder_pressure_streak=(0, 0, 1))
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(5, 5, 20),
+            speed=(5.0, 1.0, 0.1),
+            local_pending_depth=(50.0, 20.0, 0.0),
+            active_depth=(50.0, 100.0, 0.0),
+            ready_workers=(5, 5, 20),
+        ),
+        prev,
+        params,
+    )
+    feeder = result.plan.stages[1]
+    downstream = result.plan.stages[2]
+    # consume = workers[2]*target_speed[2] = 20*0.1 = 2; buffer_deficit = 20,
+    # halved horizon 5s -> refill = 4; fanout = 1 -> required = ceil(6/1.0) = 6.
+    assert feeder.feeder_boost > 0
+    assert feeder.w_target == 6
+    assert feeder.w_sustain == 6
+    # A non-feeder stage keeps its base hold target (feeder pressure left it alone).
+    assert downstream.feeder_boost == 0
+    assert downstream.w_sustain == math.ceil(downstream.a_ewma / downstream.target_speed)
 
 
 def test_feeder_pressure_does_not_boost_global_bottleneck() -> None:
@@ -508,6 +542,10 @@ def test_feeder_pressure_does_not_compound_across_cycles() -> None:
     assert first.plan.stages[1].feeder_boost > 0
     assert second.plan.stages[1].w_target == first.plan.stages[1].w_target
     assert second.plan.stages[1].feeder_boost == first.plan.stages[1].feeder_boost
+    # The hold tier is raised to the same target and likewise does not ratchet:
+    # w_sustain is recomputed from a_ewma each cycle before feeder pressure.
+    assert first.plan.stages[1].w_sustain == first.plan.stages[1].w_target
+    assert second.plan.stages[1].w_sustain == first.plan.stages[1].w_sustain
 
 
 def test_feeder_pressure_resets_when_local_input_recovers() -> None:

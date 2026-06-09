@@ -199,7 +199,9 @@ class StageCapacity:
         a_raw: Sustainable arrival before smoothing (``chain * bottleneck_rate``).
         a_ewma: Asymmetrically smoothed sustainable arrival used this cycle.
         w_sustain: Hold / scale-down target ``ceil(a_ewma / target_speed)``
-            (matched to ``bottleneck_rate``, no headroom).
+            (matched to ``bottleneck_rate``, no headroom). Raised to the
+            feeder-pressure target for a binding feeder so the scale-down floor
+            holds the boosted feeder warm (see :func:`_apply_feeder_pressure`).
         w_target: Useful growth target this cycle (matched to
             ``next_bottleneck_rate`` for the bottleneck stage, to
             ``bottleneck_rate + headroom`` for every other stage), never below
@@ -651,6 +653,7 @@ def _apply_feeder_pressure(
         target = requested_targets[index]
         if target > stage.w_target:
             updates["w_target"] = target
+            updates["w_sustain"] = target
             updates["feeder_boost"] = target - stage.w_target
             updates["feeder_downstreams"] = tuple(downstreams_by_feeder[index])
             updates["feeder_reason"] = FeederReason.BOOSTED.value
