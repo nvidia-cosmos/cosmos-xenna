@@ -66,13 +66,22 @@ labels each stage from its own and its downstream's queue occupancy:
 - `BALANCED`: last stage, input populated, with ready workers to spare.
 
 The bottleneck is the deepest stage with a full input queue and an under-fed
-consumer. Its rate drives `bottleneck_rate`, always sized from one stable rate,
-the smoothed source capacity `cap_src`:
+consumer. It owns growth (sticky identity), but the pipeline-sizing rate
+`bottleneck_rate` is always the slowest MEASURED source capacity `cap_src`:
 
-- warm queue cliff: use the candidate's own `cap_src` (its input is full by
-  construction, so it is the live constraint).
-- cold cliff / no cliff: fall back to the slowest measured `cap_src`, so a cold
-  candidate's `0.0` rate never collapses sizing to `min_workers`.
+- a serial pipeline runs no faster than its slowest stage, so the sizing rate
+  is the measured minimum. A warm queue-cliff candidate that is the genuine
+  constraint already IS this minimum, so the common case is unchanged.
+- a chain-factor collapse can only inflate a stage's `cap_src` (it is the
+  reciprocal of a near-zero fan-out), so the measured minimum is structurally
+  immune and clamps a transiently corrupted candidate before its impossible
+  rate poisons every stage's smoothed arrival.
+- a cold candidate (`cap_src == 0.0`) is excluded from the minimum, so its
+  `0.0` rate never collapses sizing to `min_workers`. The candidate's own
+  (possibly inflated) `cap_src` stays visible on `bottleneck_candidate_rate`,
+  which exceeds `bottleneck_rate` whenever the candidate is not itself the
+  slowest measured stage (a fast warm candidate fed by a slower upstream, or a
+  chain-factor collapse).
 
 `cap_src` is built from each stage's per-worker speed smoothed with dedicated
 EWMA weights (`speed_alpha_up` modest, `speed_alpha_down` protective), so one

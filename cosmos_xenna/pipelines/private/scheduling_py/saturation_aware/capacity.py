@@ -213,19 +213,22 @@ class CapacityPlan:
         bottleneck_stage: Sticky growth-owner bottleneck identity, or ``-1``
             when no stage is measured yet.
         bottleneck_rate: Effective sizing rate for the whole pipeline this cycle,
-            in source items/s. It is the candidate's smoothed ``cap_src`` for a
-            warm queue cliff, else the slowest MEASURED ``cap_src`` (so a cold
-            cliff or a balanced pipeline never collapses sizing to 0). Only
-            growth ownership is sticky, not this rate.
+            in source items/s. Always the slowest MEASURED ``cap_src`` (so a
+            cold cliff or a balanced pipeline never collapses sizing to 0, and a
+            transiently inflated candidate cannot exceed the physical minimum).
+            Only growth ownership is sticky, not this rate.
         next_bottleneck_rate: The second-minimum ``cap_src`` (excluding the
             current candidate) - the rate the growth owner can usefully climb
             toward.
         bottleneck_streak: Current challenger confirmation streak.
         bottleneck_candidate: Current queue-cliff candidate, or smoothed-capacity
             fallback candidate when no queue cliff exists.
-        bottleneck_candidate_rate: Effective sizing rate (equal to
-            ``bottleneck_rate``); kept as a distinct logged field for decision
-            snapshots.
+        bottleneck_candidate_rate: The candidate's own ``cap_src`` before the
+            measured-min bound (or ``bottleneck_rate`` when the candidate is
+            cold, ``cap_src == 0``). It exceeds ``bottleneck_rate`` whenever the
+            candidate is not itself the slowest measured stage - a fast warm
+            candidate fed by a slower upstream, or a transient chain-factor
+            collapse.
     """
 
     stages: tuple[StageCapacity, ...]
@@ -448,27 +451,31 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         params.hysteresis_margin,
         params.switch_confirm,
     )
-    # One stable rate sizes every stage: the smoothed source capacity cap_src.
+    # One stable rate sizes every stage: the slowest MEASURED source capacity
+    # cap_src. A serial pipeline's throughput is its minimum stage capacity, so
+    # the sizing rate can never physically exceed that minimum.
     #
-    # A WARM queue-cliff candidate (populated input AND a trusted speed, so
-    # cap_src[candidate] > 0) sets bottleneck_rate to its own smoothed rate: its
-    # input is full by construction, so the candidate is the live constraint.
+    # A warm queue-cliff candidate that is the genuine constraint already IS
+    # this minimum, so the common case is unchanged. A chain-factor collapse can
+    # only INFLATE a stage's cap_src (it is the reciprocal of a near-zero
+    # fan-out), never deflate it, so the measured minimum is structurally immune
+    # and clamps a transiently corrupted candidate before its impossible rate
+    # poisons every stage's smoothed arrival a_ewma.
     #
-    # Otherwise the regime is a fallback. Either there is no queue cliff
-    # (balanced) or the cliff stage is COLD - it has a full input queue but no
-    # trusted speed yet (just (re)started, still owned by the cold-start ramp),
-    # so its cap_src is 0.0. Sizing then follows the slowest MEASURED cap_src.
+    # A COLD candidate (full input queue but no trusted speed yet, still owned
+    # by the cold-start ramp) has cap_src 0.0 and is excluded from the minimum.
     # This is the critical guard: a cold candidate's 0.0 rate must NOT become
     # bottleneck_rate, or every stage collapses to min_workers and the floor
-    # tears down the trusted upstream feeders that are keeping the cold stage
-    # supplied. The sizing rate is always the current candidate's effective
-    # rate, never a held incumbent's rate; sticky identity only owns growth.
-    if has_queue_candidate and bottleneck_candidate >= 0 and cap_src[bottleneck_candidate] > 0.0:
-        bottleneck_rate = cap_src[bottleneck_candidate]
-    else:
-        measured_caps = [cap for cap in cap_src if cap > 0.0]
-        bottleneck_rate = min(measured_caps) if measured_caps else 0.0
-    bottleneck_candidate_rate = bottleneck_rate
+    # tears down the trusted upstream feeders keeping the cold stage supplied.
+    #
+    # Bottleneck IDENTITY (bottleneck_stage) and the bottleneck's climb target
+    # (next_bottleneck_rate) still own growth; only the rate MAGNITUDE is bounded
+    # here. bottleneck_candidate_rate keeps the candidate's own (possibly
+    # inflated) cap_src so a decision snapshot shows when the bound engaged.
+    measured_caps = [cap for cap in cap_src if cap > 0.0]
+    bottleneck_rate = min(measured_caps) if measured_caps else 0.0
+    candidate_cap = cap_src[bottleneck_candidate] if 0 <= bottleneck_candidate < num_stages else 0.0
+    bottleneck_candidate_rate = candidate_cap if candidate_cap > 0.0 else bottleneck_rate
     next_bottleneck_rate = _second_min_capacity(cap_src, bottleneck_candidate, bottleneck_rate)
     headroom_rate = bottleneck_rate * (1.0 + params.capacity_headroom)
 
@@ -488,8 +495,9 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             if inputs.rate_is_stale[k]:
                 # A stalled stage's target_speed is collapsing toward zero, so
                 # the divisive hold target is untrustworthy and would inflate;
-                # hold at the current worker count instead.
-                w_sustain = min(w_sustain, inputs.workers[k])
+                # hold at the current worker count instead, but never below the
+                # min_workers floor (current workers can be below it mid-ramp).
+                w_sustain = max(min(w_sustain, inputs.workers[k]), params.min_workers)
             # A manual stage must never be grown by the autoscaler while it is
             # the rate identity (sticky growth owner) OR the current rate-source
             # candidate during a switch confirmation; cap both its hold and

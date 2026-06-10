@@ -441,8 +441,88 @@ def test_cold_queue_cliff_candidate_keeps_trusted_upstream_sized() -> None:
     assert result.plan.bottleneck_candidate == 1
     # Sizing falls back to the slowest measured cap_src (cap_src[0] = 4*1/1).
     assert result.plan.bottleneck_rate == pytest.approx(4.0)
+    # A cold candidate has no own cap_src, so its candidate rate reports the bound.
+    assert result.plan.bottleneck_candidate_rate == pytest.approx(4.0)
     # The trusted upstream feeder stays bottleneck-matched, not collapsed to 1.
     assert result.plan.stages[0].w_sustain == 4
+
+
+def test_warm_candidate_rate_is_bounded_by_measured_min() -> None:
+    """A warm queue-cliff candidate cannot set a sizing rate above the physical min.
+
+    The candidate (last stage) is the queue cliff but has a higher ``cap_src``
+    than a slower upstream feeder. Its identity still owns growth, but the
+    pipeline-sizing ``bottleneck_rate`` is the slowest MEASURED ``cap_src`` (a
+    serial pipeline cannot run faster than its slowest stage). The candidate's
+    own rate stays visible on ``bottleneck_candidate_rate`` so the snapshot shows
+    the bound engaged.
+    """
+    result = capacity.compute_capacity(
+        # Feeder cap_src = 2*1/1 = 2.0 (the true min); candidate cap_src = 10.0.
+        _inputs(
+            workers=(2, 10),
+            speed=(1.0, 1.0),
+            local_qin=(0.0, 2.0),  # stage 0 starved, stage 1 is the warm cliff
+            local_input_threshold=(1.0, 1.0),
+            ready_workers=(2, 0),  # last stage drains -> bottleneck candidate
+        ),
+        capacity.CapacityState.initial(2),
+        _params(),
+    )
+    assert result.plan.bottleneck_candidate == 1
+    assert result.plan.bottleneck_rate == pytest.approx(2.0)
+    assert result.plan.bottleneck_candidate_rate == pytest.approx(10.0)
+
+
+def test_corrupted_chain_candidate_does_not_poison_upstream_targets() -> None:
+    """A chain-factor collapse on the candidate cannot inflate upstream targets.
+
+    A near-zero (but above ``MIN_CHAIN_FACTOR``) fan-out makes the candidate's
+    ``cap_src`` explode. Because sizing uses the slowest measured ``cap_src``,
+    the upstream feeder's ``a_raw = chain * bottleneck_rate`` stays physical, so
+    its ``w_sustain`` / ``w_target`` do not blow up.
+    """
+    tiny_chain = capacity.chain.MIN_CHAIN_FACTOR * 10.0
+    result = capacity.compute_capacity(
+        # Feeder cap_src = 2*1/1 = 2.0; candidate cap_src = 2*1/tiny ~ 200000.
+        _inputs(
+            workers=(2, 2),
+            speed=(1.0, 1.0),
+            chain=(1.0, tiny_chain),
+            local_qin=(0.0, 2.0),
+            local_input_threshold=(1.0, 1.0),
+            ready_workers=(2, 0),
+        ),
+        capacity.CapacityState.initial(2),
+        _params(),
+    )
+    assert result.plan.bottleneck_rate == pytest.approx(2.0)
+    # Upstream feeder stays physically sized (single-digit), not 10^5+.
+    assert result.plan.stages[0].w_sustain == 2
+    assert result.plan.stages[0].w_target <= 3
+
+
+def test_healthy_warm_bottleneck_rate_equals_candidate_cap_src() -> None:
+    """When the candidate IS the slowest stage, the bound is a no-op.
+
+    Guards against a regression that would under-size the normal warm-bottleneck
+    case: the measured minimum equals the candidate's own ``cap_src``.
+    """
+    result = capacity.compute_capacity(
+        # Candidate (stage 1) cap_src = 2*1/1 = 2.0 is the global min.
+        _inputs(
+            workers=(10, 2),
+            speed=(1.0, 1.0),
+            local_qin=(0.0, 2.0),
+            local_input_threshold=(1.0, 1.0),
+            ready_workers=(10, 0),
+        ),
+        capacity.CapacityState.initial(2),
+        _params(),
+    )
+    assert result.plan.bottleneck_candidate == 1
+    assert result.plan.bottleneck_rate == pytest.approx(2.0)
+    assert result.plan.bottleneck_candidate_rate == pytest.approx(2.0)
 
 
 def test_terminal_stage_becomes_candidate_only_when_no_ready_workers() -> None:
@@ -728,6 +808,32 @@ def test_stalled_stage_growth_is_bounded_to_step() -> None:
     stalled = bounded.plan.stages[1]
     assert stalled.w_target <= 4 + 2  # bounded step, not the divisive blowup
     assert stalled.w_target >= stalled.w_sustain  # never below the hold floor
+
+
+def test_stalled_stage_hold_never_drops_below_min_workers() -> None:
+    """The stale hold cap to current workers must still respect the min_workers floor.
+
+    A stage mid-ramp can hold fewer workers than min_workers; capping w_sustain
+    to that count must not breach the floor invariant the cold branch enforces.
+    """
+    prev = _state(a_ewma=(None, 2.0), target_speed_ewma=(2.0, 0.5), bottleneck=0)
+    result = capacity.compute_capacity(
+        _inputs(workers=(4, 1), speed=(2.0, 0.01), rate_is_stale=(False, True)),
+        prev,
+        capacity.CapacityParams(
+            alpha_up=1.0,
+            alpha_down=1.0,
+            speed_alpha_up=0.3,
+            speed_alpha_down=0.1,
+            capacity_headroom=0.1,
+            hysteresis_margin=0.0,
+            switch_confirm=2,
+            min_workers=2,
+        ),
+    )
+    stalled = result.plan.stages[1]
+    assert stalled.w_sustain >= 2  # floored at min_workers, not the single current worker
+    assert stalled.w_target >= stalled.w_sustain
 
 
 def test_non_stale_drop_is_still_damped_not_snapped() -> None:
