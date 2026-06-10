@@ -61,6 +61,18 @@ def test_averaging_samples_below_trust_threshold_is_rejected() -> None:
         SaturationAwareConfig(speed_estimation_averaging_samples=3, speed_estimation_min_data_points=5)
 
 
+def test_stale_multiple_at_or_below_one_is_rejected() -> None:
+    """A stale multiple <= 1.0 would flag a stage stalled at its mean service time."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_stale_multiple=1.0)
+
+
+def test_stale_growth_step_zero_is_rejected() -> None:
+    """The stale growth step must be a positive worker count."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_stale_growth_step=0)
+
+
 def test_resolve_returns_defaults_when_none() -> None:
     """resolve(None) yields a default-constructed config."""
     assert SaturationAwareConfig.resolve(None) == SaturationAwareConfig()

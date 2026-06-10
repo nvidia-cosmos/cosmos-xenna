@@ -38,6 +38,7 @@ def _params(
     switch_confirm: int = 2,
     speed_alpha_up: float = 1.0,
     speed_alpha_down: float | None = None,
+    stale_growth_step: int = 1,
 ) -> capacity.CapacityParams:
     # The speed EWMA defaults mirror the arrival alphas, so speed and arrival
     # smoothing behave identically unless a test opts into the split; tests that
@@ -51,6 +52,7 @@ def _params(
         hysteresis_margin=hysteresis_margin,
         switch_confirm=switch_confirm,
         min_workers=1,
+        stale_growth_step=stale_growth_step,
     )
 
 
@@ -65,6 +67,7 @@ def _inputs(
     local_input_threshold: tuple[float, ...] | None = None,
     active_depth: tuple[float, ...] | None = None,
     ready_workers: tuple[int, ...] | None = None,
+    rate_is_stale: tuple[bool, ...] | None = None,
 ) -> capacity.CapacityInputs:
     num = len(workers)
     return capacity.CapacityInputs(
@@ -77,6 +80,7 @@ def _inputs(
         local_input_threshold=local_input_threshold if local_input_threshold is not None else (1.0,) * num,
         active_depth=active_depth if active_depth is not None else (0.0,) * num,
         ready_workers=ready_workers if ready_workers is not None else workers,
+        rate_is_stale=rate_is_stale if rate_is_stale is not None else (False,) * num,
     )
 
 
@@ -642,6 +646,7 @@ def test_mismatched_input_lengths_raise() -> None:
                 local_input_threshold=(1.0, 1.0),
                 active_depth=(0.0, 0.0),
                 ready_workers=(1, 2),
+                rate_is_stale=(False, False),
             ),
             capacity.CapacityState.initial(2),
             _params(),
@@ -680,3 +685,62 @@ def test_under_fed_stage_is_not_a_false_bottleneck() -> None:
     assert underfed.target_speed > 0.5
     assert result.plan.bottleneck_stage == 0
     assert result.plan.bottleneck_candidate_rate == pytest.approx(2.0)
+
+
+def test_stalled_stage_target_speed_snaps_down_to_aged_rate() -> None:
+    """A stalled stage's collapsed raw speed snaps target_speed down, not damped.
+
+    With ``rate_is_stale`` set, the protective alpha_down is bypassed so the
+    stage's smoothed sizing speed follows the aged raw rate within one cycle.
+    Contrast with ``test_under_fed_stage_is_not_a_false_bottleneck`` where a
+    non-stale drop is damped back up.
+    """
+    prev = _state(a_ewma=(None, None), target_speed_ewma=(None, 1.0), bottleneck=-1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(2, 10), speed=(1.0, 0.1), rate_is_stale=(False, True)),
+        prev,
+        _params(speed_alpha_up=0.3, speed_alpha_down=0.1),
+    )
+    stalled = result.plan.stages[1]
+    assert stalled.target_speed == pytest.approx(0.1)  # snapped to the aged raw, not damped
+    assert result.state.target_speed_ewma[1] == pytest.approx(0.1)
+
+
+def test_stalled_stage_growth_is_bounded_to_step() -> None:
+    """A stalled bottleneck's near-zero target_speed cannot explode w_target.
+
+    The divisive ``w_target = ceil(chain * rate / target_speed)`` would request
+    a node-filling burst as ``target_speed -> 0``; the stale clamp bounds growth
+    to ``workers + stale_growth_step`` while keeping the hold floor.
+    """
+    prev = _state(a_ewma=(None, 5.0), target_speed_ewma=(2.0, 0.5), bottleneck=0)
+    bounded = capacity.compute_capacity(
+        _inputs(
+            workers=(4, 4),
+            speed=(2.0, 0.01),
+            local_qin=(2.0, 2.0),
+            ready_workers=(4, 4),
+            rate_is_stale=(False, True),
+        ),
+        prev,
+        _params(speed_alpha_up=0.3, speed_alpha_down=0.1, stale_growth_step=2),
+    )
+    stalled = bounded.plan.stages[1]
+    assert stalled.w_target <= 4 + 2  # bounded step, not the divisive blowup
+    assert stalled.w_target >= stalled.w_sustain  # never below the hold floor
+
+
+def test_non_stale_drop_is_still_damped_not_snapped() -> None:
+    """A non-stale one-cycle speed drop keeps the protective damping (no churn).
+
+    Regression guard for the anti-churn invariant: only a genuine stall bypasses
+    alpha_down, so normal completion variance does not snap target_speed down.
+    """
+    prev = _state(a_ewma=(None, None), target_speed_ewma=(None, 1.0), bottleneck=-1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(2, 10), speed=(1.0, 0.1), rate_is_stale=(False, False)),
+        prev,
+        _params(speed_alpha_up=0.3, speed_alpha_down=0.1),
+    )
+    # 0.1 * 0.1 + 0.9 * 1.0 = 0.91 (damped), not the raw 0.1.
+    assert result.plan.stages[1].target_speed == pytest.approx(0.91)

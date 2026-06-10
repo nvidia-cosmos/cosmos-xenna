@@ -670,6 +670,32 @@ def test_empty_skip_does_not_inflate_measured_speed_in_a_cycle() -> None:
     assert scheduler._build_cycle(101.0, state).demand_snapshots[0].speed == pytest.approx(2.0)
 
 
+def test_in_flight_stall_ages_cycle_speed_and_flags_stale() -> None:
+    """A warm stage stuck on an in-flight task ages its cycle speed and flags stale.
+
+    Drives the wiring end to end: warm a stage to the trust threshold, then
+    report a worker in flight with no further completions and advance the clock.
+    The assembled cycle's measured speed is aged far below the frozen windowed
+    rate and the stage is flagged stale for the capacity model.
+    """
+    spec, cluster, problem = _build([1.0], num_cpus=16)
+    scheduler = _scheduler(spec, cluster, SaturationAwareConfig(speed_estimation_min_data_points=3))
+    scheduler.setup(problem)
+    state = _state(spec, allocator.WorkerAllocator.make(cluster))
+    for t in (100.0, 101.0, 102.0):  # three 1 s tasks -> last completion at t=102
+        scheduler.update_with_measurements(t, _measurements(t, [1.0]))
+        scheduler.autoscale(t, state)
+
+    scheduler.observe_runtime(
+        RuntimeSignals(queue_depths=(5.0,), pool_queued_tasks=(0,), inflight_slots=(1,), batch_sizes=(1,))
+    )
+    cycle = scheduler._build_cycle(300.0, state)  # ~200 s with no completion while in flight
+    speed = cycle.demand_snapshots[0].speed
+    assert speed is not None
+    assert speed < 0.1  # aged from the frozen windowed 1.0/s toward 1/elapsed
+    assert cycle.rate_is_stale[0] is True
+
+
 def test_warm_pipeline_converges_to_a_stable_split() -> None:
     """A warmed pipeline reaches a steady worker split and then stops churning.
 
@@ -756,6 +782,7 @@ def _cycle_with_local_pending(local_pending: tuple[float, ...], batch_sizes: tup
         local_pending_depths=local_pending,
         active_depths=zeros,
         ready_workers=(0,) * n,
+        rate_is_stale=(False,) * n,
         queued_stock=zeros,
         active_stock=zeros,
         activity_snapshot=None,

@@ -34,13 +34,20 @@ _DEFAULT_MIN_TASK_DURATION_S = 1e-3
 
 @attrs.define
 class _StageEstimator:
-    """Windowed per-worker speed + fan-out (returns-per-batch) for one stage."""
+    """Windowed per-worker speed + fan-out (returns-per-batch) for one stage.
+
+    The windowed speed only changes when a task completes, so a stage grinding
+    on a long in-flight task would otherwise report a frozen, stale-high rate.
+    :meth:`speed` therefore ages the estimate by the time since the last
+    completion whenever the stage has work in flight (the in-flight ceiling).
+    """
 
     _speed: RateEstimatorDuration
     _returns_alpha: float
     _min_task_duration_s: float
     _returns_ewma: float | None = None
     _sample_count: int = 0
+    _last_completion_s: float | None = None
 
     def observe(self, duration_s: float, num_returns: float, now: float) -> None:
         """Record one completed task's service duration and return count.
@@ -58,16 +65,60 @@ class _StageEstimator:
             self._returns_ewma = num_returns
         else:
             self._returns_ewma = self._returns_alpha * num_returns + (1.0 - self._returns_alpha) * self._returns_ewma
+        # Track the latest completion time (start + service time) so the
+        # in-flight ceiling can age the rate. Every completion counts, including
+        # an excluded skip: rapidly skipping tasks is progress, not a stall.
+        completion_s = now + duration_s
+        self._last_completion_s = (
+            completion_s if self._last_completion_s is None else max(self._last_completion_s, completion_s)
+        )
         if num_returns == 0.0 and duration_s < self._min_task_duration_s:
             return
         self._speed.update(duration_s, now)
         self._sample_count += 1
 
-    def speed(self, now: float) -> float | None:
-        """Return the measured per-worker speed, or ``None`` before any sample."""
+    def speed(self, now: float, inflight: int) -> float | None:
+        """Return the measured per-worker speed, or ``None`` before any sample.
+
+        While the stage has work in flight, the windowed rate is capped at one
+        completion per elapsed-since-last-completion: a stage cannot truthfully
+        report ``N`` items/s if nothing has finished for longer than ``1/N`` s.
+        Right after a completion the cap is large (no effect); during a stall it
+        decays the rate toward zero. An idle stage (``inflight == 0``) is
+        starved, not stalled, so it keeps its last measured rate.
+
+        Args:
+            now: Decision time, in the same epoch as :meth:`observe`'s ``now``.
+            inflight: Logical in-flight tasks at this stage right now.
+        """
         if self._sample_count == 0:
             return None
-        return self._speed.get_rate(now)
+        rate = self._speed.get_rate(now)
+        if inflight > 0 and rate > 0.0 and self._last_completion_s is not None:
+            elapsed = now - self._last_completion_s
+            if elapsed > 0.0:
+                rate = min(rate, 1.0 / elapsed)
+        return rate
+
+    def rate_is_stale(self, now: float, inflight: int, stale_multiple: float) -> bool:
+        """Return whether the stage is busy but overdue for a completion.
+
+        True when the stage has work in flight yet nothing has completed for
+        longer than ``stale_multiple`` times its mean service time, so the
+        windowed rate is no longer a trustworthy basis for divisive sizing.
+
+        Args:
+            now: Decision time, in the same epoch as :meth:`observe`'s ``now``.
+            inflight: Logical in-flight tasks at this stage right now.
+            stale_multiple: Overdue factor relative to the mean service time.
+        """
+        if inflight <= 0 or self._sample_count == 0 or self._last_completion_s is None:
+            return False
+        rate = self._speed.get_rate(now)
+        if rate <= 0.0:
+            return False
+        mean_duration_s = 1.0 / rate
+        return (now - self._last_completion_s) > stale_multiple * mean_duration_s
 
     def num_returns(self) -> float | None:
         """Return the measured fan-out, or ``None`` before any sample."""
@@ -102,10 +153,18 @@ class PipelineRateEstimator:
         """Record one completed task for ``stage_name``."""
         self._ensure(stage_name).observe(duration_s, num_returns, now)
 
-    def speed(self, stage_name: str, now: float) -> float | None:
-        """Return the stage's measured per-worker speed, or ``None`` when unknown."""
+    def speed(self, stage_name: str, now: float, inflight: int) -> float | None:
+        """Return the stage's measured per-worker speed, or ``None`` when unknown.
+
+        Applies the in-flight aging ceiling (see :meth:`_StageEstimator.speed`).
+        """
         estimator = self._stages.get(stage_name)
-        return estimator.speed(now) if estimator is not None else None
+        return estimator.speed(now, inflight) if estimator is not None else None
+
+    def rate_is_stale(self, stage_name: str, now: float, inflight: int, stale_multiple: float) -> bool:
+        """Return whether ``stage_name`` is busy but overdue for a completion."""
+        estimator = self._stages.get(stage_name)
+        return estimator.rate_is_stale(now, inflight, stale_multiple) if estimator is not None else False
 
     def num_returns(self, stage_name: str) -> float | None:
         """Return the stage's measured fan-out, or ``None`` when unknown."""

@@ -65,9 +65,11 @@ class CapacityParams:
             every stage (smaller = slower release).
         speed_alpha_up: Per-worker speed EWMA weight when measured speed rises;
             modest so a transient fast task cannot collapse the worker target.
-        speed_alpha_down: Per-worker speed EWMA weight when measured speed
-            falls; protective (small) so a one-cycle dip does not mislabel a
-            capable stage as the bottleneck.
+        speed_alpha_down: Per-worker speed EWMA weight when measured speed falls
+            during normal completion variance; protective (small) so a one-cycle
+            dip does not mislabel a capable stage as the bottleneck. A genuine
+            stall (``rate_is_stale``) bypasses this damping and snaps down to the
+            aged rate instead.
         capacity_headroom: Spare-capacity fraction added to the bottleneck
             rate for the bounded read-ahead / tie-break growth target.
         hysteresis_margin: In balanced fallback mode, a challenger must be at
@@ -76,6 +78,9 @@ class CapacityParams:
         switch_confirm: Consecutive eligible cycles before the bottleneck
             identity switches to the challenger.
         min_workers: Floor a stage's targets never fall below while active.
+        stale_growth_step: Maximum workers a stale-rate stage may grow in one
+            cycle, so a stalled stage's collapsing ``target_speed`` cannot
+            explode its divisive ``w_target`` into a node-filling request.
     """
 
     alpha_up: float
@@ -86,6 +91,7 @@ class CapacityParams:
     hysteresis_margin: float
     switch_confirm: int
     min_workers: int = 1
+    stale_growth_step: int = 1
 
 
 @attrs.frozen
@@ -146,6 +152,8 @@ class CapacityInputs:
         active_depth: Local active work per stage, including in-flight work, in
             stage-input samples.
         ready_workers: Workers not currently holding in-flight slots.
+        rate_is_stale: Whether each stage is busy but overdue for a completion,
+            so its windowed speed is no longer trustworthy for divisive sizing.
     """
 
     workers: tuple[int, ...]
@@ -157,6 +165,7 @@ class CapacityInputs:
     local_input_threshold: tuple[float, ...]
     active_depth: tuple[float, ...]
     ready_workers: tuple[int, ...]
+    rate_is_stale: tuple[bool, ...]
 
 
 @attrs.frozen
@@ -344,10 +353,20 @@ def _target_speed_for_cycle(
     raw_speed: float,
     alpha_up: float,
     alpha_down: float,
+    is_stale: bool,
 ) -> tuple[float, float | None]:
-    """Return the smoothed target speed and next persisted speed sample."""
+    """Return the smoothed target speed and next persisted speed sample.
+
+    Normal completion variance is smoothed with the protective fast-up /
+    slow-down EWMA, so a single slow task cannot flap the worker target. A
+    genuine stall (``is_stale``) instead snaps the target down to the aged raw
+    rate, so a stalled feeder is recognized within one cycle rather than over
+    the slow ``alpha_down`` decay.
+    """
     if raw_speed <= 0.0:
         return 0.0, prev_target_speed
+    if is_stale and prev_target_speed is not None and raw_speed < prev_target_speed:
+        return raw_speed, raw_speed
     target_speed = asymmetric_ewma(prev_target_speed, raw_speed, alpha_up, alpha_down)
     return target_speed, target_speed
 
@@ -386,6 +405,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         == len(inputs.local_input_threshold)
         == len(inputs.active_depth)
         == len(inputs.ready_workers)
+        == len(inputs.rate_is_stale)
         == len(prev.a_ewma)
         == len(prev.target_speed_ewma)
         == num_stages
@@ -396,12 +416,14 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             f"is_manual={len(inputs.is_manual)} local_qin={len(inputs.local_qin)} "
             f"local_pending_depth={len(inputs.local_pending_depth)} "
             f"local_input_threshold={len(inputs.local_input_threshold)} active_depth={len(inputs.active_depth)} "
-            f"ready_workers={len(inputs.ready_workers)} prev_a_ewma={len(prev.a_ewma)} "
-            f"prev_target_speed_ewma={len(prev.target_speed_ewma)}"
+            f"ready_workers={len(inputs.ready_workers)} rate_is_stale={len(inputs.rate_is_stale)} "
+            f"prev_a_ewma={len(prev.a_ewma)} prev_target_speed_ewma={len(prev.target_speed_ewma)}"
         )
 
     # Smooth each stage's per-worker speed with the dedicated speed alphas
-    # (modest up / protective down), independent of the arrival-rate alphas.
+    # (modest up / protective down), independent of the arrival-rate alphas. A
+    # stalled stage bypasses the protective damping and snaps down to its aged
+    # rate so the feeder it is starving is grown without the slow decay delay.
     target_speeds: list[float] = []
     next_target_speed_ewma: list[float | None] = []
     for k in range(num_stages):
@@ -410,6 +432,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             inputs.speed[k],
             params.speed_alpha_up,
             params.speed_alpha_down,
+            inputs.rate_is_stale[k],
         )
         target_speeds.append(target_speed)
         next_target_speed_ewma.append(target_speed_state)
@@ -462,6 +485,11 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = params.min_workers
         else:
             w_sustain = math.ceil(a_ewma / target_speed)
+            if inputs.rate_is_stale[k]:
+                # A stalled stage's target_speed is collapsing toward zero, so
+                # the divisive hold target is untrustworthy and would inflate;
+                # hold at the current worker count instead.
+                w_sustain = min(w_sustain, inputs.workers[k])
             # A manual stage must never be grown by the autoscaler while it is
             # the rate identity (sticky growth owner) OR the current rate-source
             # candidate during a switch confirmation; cap both its hold and
@@ -480,6 +508,14 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = math.ceil(inputs.chain[k] * target_rate / target_speed)
             # Headroom lives in w_target; never target below the hold floor.
             w_target = max(w_target, w_sustain)
+            if inputs.rate_is_stale[k]:
+                # A stalled stage's target_speed is collapsing toward zero, which
+                # would inflate this divisive w_target into a node-filling burst.
+                # Adding workers only drains the queued backlog (the single long
+                # in-flight task is not parallelizable), so grow a bounded step
+                # per cycle and let completions un-freeze the rate, never below
+                # the hold floor.
+                w_target = max(min(w_target, inputs.workers[k] + params.stale_growth_step), w_sustain)
             if is_manual_rate_participant:
                 w_target = min(w_target, inputs.workers[k])
         stages.append(

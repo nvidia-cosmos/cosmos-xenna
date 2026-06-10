@@ -80,6 +80,16 @@ transient fast or slow task cannot swing the sizing rate. The underlying speed
 is averaged over `speed_estimation_averaging_samples` completed tasks, decoupled
 from the smaller `speed_estimation_min_data_points` cold-start trust gate.
 
+The windowed speed only updates on task completion, so a stage stuck on a long
+in-flight task is aged: while `inflight > 0` the per-worker rate is capped at
+one completion per elapsed-since-last-completion, so a stalled feeder is no
+longer reported as fast. A genuine stall (`rate_is_stale`: busy and overdue past
+`speed_stale_multiple` times its mean service time) bypasses the protective
+down-damping and snaps `target_speed` down to the aged rate, and its hold and
+growth targets are bounded to `workers + speed_stale_growth_step` so a
+collapsing `target_speed` cannot explode the divisive worker targets. Normal
+completion variance keeps the protective damping (no churn).
+
 ## One-batch boundary
 
 "Has at least one batch of work" uses one boundary everywhere:

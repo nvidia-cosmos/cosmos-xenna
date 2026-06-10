@@ -130,6 +130,7 @@ class _Cycle:
     local_pending_depths: tuple[float, ...]
     active_depths: tuple[float, ...]
     ready_workers: tuple[int, ...]
+    rate_is_stale: tuple[bool, ...]
     queued_stock: tuple[float, ...]
     active_stock: tuple[float, ...]
     activity_snapshot: PipelineActivitySnapshot | None
@@ -154,6 +155,7 @@ class _Cycle:
             local_input_threshold=tuple(float(batch_size) for batch_size in self.batch_sizes),
             active_depth=self.active_depths,
             ready_workers=self.ready_workers,
+            rate_is_stale=self.rate_is_stale,
         )
 
     def floor_inputs(self, capacity: CapacityPlan) -> FloorInputs:
@@ -222,6 +224,7 @@ class SaturationAwareScheduler:
                 hysteresis_margin=_HYSTERESIS_MARGIN,
                 switch_confirm=_SWITCH_CONFIRM,
                 min_workers=_MIN_WORKERS,
+                stale_growth_step=config.speed_stale_growth_step,
             ),
         )
         self._floor = ScaleDownFloorPolicy.create(
@@ -360,14 +363,12 @@ class SaturationAwareScheduler:
         """
         workers = tuple(stage.num_workers() for stage in problem_state.rust.stages)
         num_stages = len(workers)
-        snapshots = tuple(self._demand_snapshots(time, workers))
-        returns = [sizing.resolve_num_returns(snapshot) for snapshot in snapshots]
-        batch_sizes = tuple(stage.batch_size for stage in self.shape.stages)
-        chain_factors = tuple(chain.chain_factors(returns, batch_sizes))
         runtime = self._runtime_snapshot
         if runtime is not None and len(runtime.stages) == num_stages:
-            # Growth reads input queue depth; release reads the whole active
-            # snapshot (queued plus pool-queued plus in-flight).
+            # In-flight count gates the estimator's aging ceiling; growth reads
+            # input queue depth; release reads the whole active snapshot (queued
+            # plus pool-queued plus in-flight).
+            inflight_slots: tuple[int, ...] = tuple(stage.inflight_slots for stage in runtime.stages)
             queue_depths: tuple[float, ...] = tuple(stage.queue_depth_samples for stage in runtime.stages)
             local_pending_depths: tuple[float, ...] = tuple(
                 stage.queue_depth_samples + stage.pool_queued_tasks * stage.batch_size for stage in runtime.stages
@@ -378,10 +379,19 @@ class SaturationAwareScheduler:
             )
         else:
             # No runtime signal observed yet: treat every depth as drained.
+            inflight_slots = (0,) * num_stages
             queue_depths = (0.0,) * num_stages
             local_pending_depths = (0.0,) * num_stages
             active_depths = (0.0,) * num_stages
             ready_workers = workers
+        snapshots = tuple(self._demand_snapshots(time, workers, inflight_slots))
+        returns = [sizing.resolve_num_returns(snapshot) for snapshot in snapshots]
+        batch_sizes = tuple(stage.batch_size for stage in self.shape.stages)
+        chain_factors = tuple(chain.chain_factors(returns, batch_sizes))
+        rate_is_stale = tuple(
+            self._rate_is_stale(stage.name, time, inflight_slots[index])
+            for index, stage in enumerate(self.shape.stages)
+        )
         return _Cycle(
             time=time,
             pending_work_ages=self._pending_work_ages(time, active_depths),
@@ -394,6 +404,7 @@ class SaturationAwareScheduler:
             local_pending_depths=local_pending_depths,
             active_depths=active_depths,
             ready_workers=ready_workers,
+            rate_is_stale=rate_is_stale,
             queued_stock=tuple(chain.whole_chain_stock(queue_depths, chain_factors)),
             active_stock=tuple(chain.whole_chain_stock(active_depths, chain_factors)),
             activity_snapshot=runtime,
@@ -497,25 +508,33 @@ class SaturationAwareScheduler:
                 self._worker_id_factory,
             )
 
-    def _demand_snapshots(self, now: float, workers: Sequence[int]) -> list[sizing.StageDemandSnapshot]:
+    def _demand_snapshots(
+        self, now: float, workers: Sequence[int], inflight_slots: Sequence[int]
+    ) -> list[sizing.StageDemandSnapshot]:
         """Build one demand snapshot per stage from the estimator.
 
         The per-worker speed is gated through :meth:`_trusted_speed` so a stage
         with too few samples reports ``None`` (cold) and is excluded from both
         the bottleneck and demand growth until it is trusted.
+
+        Args:
+            now: Decision time, in seconds.
+            workers: Current worker count per stage.
+            inflight_slots: In-flight task count per stage, gating the
+                estimator's in-flight aging ceiling.
         """
         return [
             sizing.StageDemandSnapshot(
                 name=stage.name,
                 workers=workers[index],
-                speed=self._trusted_speed(stage.name, now),
+                speed=self._trusted_speed(stage.name, now, inflight_slots[index]),
                 num_returns=self._estimator.num_returns(stage.name),
                 batch_size=stage.batch_size,
             )
             for index, stage in enumerate(self.shape.stages)
         ]
 
-    def _trusted_speed(self, name: str, now: float) -> float | None:
+    def _trusted_speed(self, name: str, now: float, inflight: int) -> float | None:
         """Return the measured speed once trusted, else ``None``.
 
         Mirrors the cold-start ramp's trust threshold
@@ -525,7 +544,18 @@ class SaturationAwareScheduler:
         """
         if self._estimator.sample_count(name) < self.config.speed_estimation_min_data_points:
             return None
-        return self._estimator.speed(name, now)
+        return self._estimator.speed(name, now, inflight)
+
+    def _rate_is_stale(self, name: str, now: float, inflight: int) -> bool:
+        """Return whether a trusted stage is busy but overdue for a completion.
+
+        Gated on the same trust threshold as :meth:`_trusted_speed`, so an
+        untrusted stage (still owned by the cold-start ramp) is never flagged
+        stale.
+        """
+        if self._estimator.sample_count(name) < self.config.speed_estimation_min_data_points:
+            return False
+        return self._estimator.rate_is_stale(name, now, inflight, self.config.speed_stale_multiple)
 
     def _bottleneck_name(self, capacity: CapacityPlan) -> str:
         """Return the bottleneck stage's name, or ``"none"`` when no stage is trusted yet."""
@@ -726,7 +756,7 @@ class SaturationAwareScheduler:
                 f"ready={cycle.ready_workers[index]} "
                 f"q_stock={cycle.queued_stock[index]:.1f} a_stock={cycle.active_stock[index]:.1f} "
                 f"active_depth={cycle.active_depths[index]:.1f} inflight={inflight} pool_q={pool_queued} "
-                f"util={utilization:.2f}]"
+                f"util={utilization:.2f} stale={cycle.rate_is_stale[index]}]"
             )
         logger.debug(
             f"saturation-aware decision: bottleneck_rate={capacity.bottleneck_rate:.3f} "

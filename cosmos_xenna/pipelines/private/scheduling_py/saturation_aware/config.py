@@ -59,10 +59,18 @@ class SaturationAwareConfig:
         speed_alpha_up: EWMA weight when a stage's measured per-worker speed
             rises. Kept modest so a single transient fast task cannot collapse
             the worker target; distinct from the arrival-rate ``alpha_up``.
-        speed_alpha_down: EWMA weight when measured per-worker speed falls.
-            Kept small (protective) so a one-cycle dip does not mislabel a
-            capable stage as the bottleneck; also bounds how fast a genuinely
-            slowing stage's sizing rate is tracked.
+        speed_alpha_down: EWMA weight when measured per-worker speed falls during
+            normal completion variance. Kept small (protective) so a one-cycle
+            dip does not mislabel a capable stage as the bottleneck. A genuine
+            stall instead snaps the sizing rate down (see
+            ``speed_stale_multiple``), so this only governs noise, not stalls.
+        speed_stale_multiple: Overdue factor, relative to a stage's mean service
+            time, beyond which a busy stage with no completion is treated as
+            stalled. A stalled stage's sizing rate snaps down to the aged rate
+            and its growth is bounded (see ``speed_stale_growth_step``).
+        speed_stale_growth_step: Maximum workers a stalled stage may grow per
+            cycle, so its collapsing per-worker rate cannot explode the divisive
+            growth target into a node-filling request before completions resume.
         speed_estimation_min_task_duration_s: Lower service-time bound that
             distinguishes a degenerate empty skip from real work. A sample
             that produced no output AND completed faster than this is not a
@@ -85,11 +93,13 @@ class SaturationAwareConfig:
     speed_estimation_window_s: float = attrs.field(default=60.0, validator=attrs.validators.gt(0.0))
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
     speed_estimation_averaging_samples: int = attrs.field(
-        default=20,
+        default=10,
         validator=attrs_utils.validate_positive_int,
     )
     speed_alpha_up: float = attrs.field(default=0.3, validator=_SMOOTHING_ALPHA)
     speed_alpha_down: float = attrs.field(default=0.1, validator=_SMOOTHING_ALPHA)
+    speed_stale_multiple: float = attrs.field(default=3.0, validator=attrs.validators.gt(1.0))
+    speed_stale_growth_step: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
     speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
     scale_down_release_slowdown: float = attrs.field(default=4.0, validator=attrs.validators.ge(1.0))
