@@ -35,7 +35,7 @@ from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationB
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
-from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler, _Cycle
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
 
@@ -738,3 +738,54 @@ def test_bottleneck_shift_scales_down_now_fast_stage_gradually() -> None:
     assert any(
         1 < count < warm[0] for count in stage0_over_time
     )  # gradual: bounded per-cycle release, no one-shot collapse
+
+
+def _cycle_with_local_pending(local_pending: tuple[float, ...], batch_sizes: tuple[int, ...]) -> _Cycle:
+    """Build a _Cycle exercising only has_local_input; other fields are inert."""
+    n = len(local_pending)
+    zeros = (0.0,) * n
+    return _Cycle(
+        time=0.0,
+        pending_work_ages=zeros,
+        workers=(0,) * n,
+        demand_snapshots=(),
+        batch_sizes=batch_sizes,
+        chain_factors=(1.0,) * n,
+        is_manual=(False,) * n,
+        local_depths=zeros,
+        local_pending_depths=local_pending,
+        active_depths=zeros,
+        ready_workers=(0,) * n,
+        queued_stock=zeros,
+        active_stock=zeros,
+        activity_snapshot=None,
+    )
+
+
+def test_has_local_input_true_at_exactly_one_batch() -> None:
+    """local_pending == batch_size is one usable batch (>=), so growth is allowed."""
+    cycle = _cycle_with_local_pending(local_pending=(4.0,), batch_sizes=(4,))
+    assert cycle.has_local_input(0) is True
+
+
+def test_has_local_input_false_below_one_batch() -> None:
+    """local_pending below one batch cannot feed another worker."""
+    cycle = _cycle_with_local_pending(local_pending=(3.0,), batch_sizes=(4,))
+    assert cycle.has_local_input(0) is False
+
+
+def test_pending_work_age_resets_when_a_stage_drains() -> None:
+    """Per-stage pending-work age starts when work arrives and resets on drain.
+
+    The cold-start ramp's slow-starter release keys off how long work has
+    actually been blocked, not how long the scheduler has run, so a stage that
+    drains and later refills must start a fresh timer rather than inherit the
+    scheduler's elapsed time.
+    """
+    spec, cluster, _ = _build([1.0, 1.0], num_cpus=8)
+    scheduler = _scheduler(spec, cluster)
+    assert scheduler._pending_work_ages(0.0, (0.0, 5.0)) == (0.0, 0.0)
+    assert scheduler._pending_work_ages(10.0, (0.0, 5.0)) == (0.0, 10.0)
+    assert scheduler._pending_work_ages(12.0, (0.0, 0.0)) == (0.0, 0.0)  # drained -> timer reset
+    assert scheduler._pending_work_ages(20.0, (0.0, 3.0)) == (0.0, 0.0)  # refilled -> fresh start
+    assert scheduler._pending_work_ages(25.0, (0.0, 3.0)) == (0.0, 5.0)

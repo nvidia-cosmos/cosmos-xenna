@@ -77,22 +77,24 @@ def source_stock_threshold(batch_size: int, chain_factor: float) -> float:
     """Return one batch worth of source-item stock for a stage.
 
     A stage is considered to have real work when its whole-chain at-or-upstream
-    stock (in source-item units) exceeds one batch's worth of source items,
-    ``batch_size / chain_factor``. A non-positive ``chain_factor`` (a fully
-    dropping upstream stage, whose admitted work cannot be expressed in source
-    units) collapses the threshold to ``0.0``. This is the single source of
-    truth shared by the growth gate and the scale-down release gate, so both
-    agree on the "has work" boundary.
+    stock (in source-item units) reaches one batch's worth of source items,
+    ``batch_size / chain_factor``. A ``chain_factor`` below
+    :data:`MIN_CHAIN_FACTOR` (a fully dropping upstream stage, or a degenerate /
+    corrupted factor whose reciprocal would explode) collapses the threshold to
+    ``0.0``, matching :func:`whole_chain_stock`, which omits the same factors
+    from the stock sum. This is the single source of truth shared by the growth
+    gate and the scale-down release gate, so both agree on the "has work"
+    boundary.
 
     Args:
         batch_size: Stage input items consumed per batch (``> 0`` in practice).
         chain_factor: Stage's cumulative fan-out from :func:`chain_factors`.
 
     Returns:
-        The source-unit stock above which the stage has at least one batch of
-        work, or ``0.0`` when ``chain_factor`` is non-positive.
+        The source-unit stock at which the stage has at least one batch of work,
+        or ``0.0`` when ``chain_factor`` is below :data:`MIN_CHAIN_FACTOR`.
     """
-    return batch_size / chain_factor if chain_factor > 0.0 else 0.0
+    return batch_size / chain_factor if chain_factor >= MIN_CHAIN_FACTOR else 0.0
 
 
 def whole_chain_stock(queue_depths: Sequence[float], chain: Sequence[float]) -> list[float]:

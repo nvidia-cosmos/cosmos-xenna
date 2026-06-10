@@ -71,9 +71,10 @@ class StageRampInput:
         proposed_post: Post-solve worker count the solver proposes
             (``current_workers + new - deleted``).
         sample_count: Measured throughput samples observed for this stage.
-        stage_age_s: Seconds since the scheduler first saw this stage. Lets a
-            stage that has produced no sample within a full speed-estimation
-            window be released to the solver as a confirmed slow-starter.
+        pending_work_age_s: Seconds this stage has had pending work waiting
+            (reset when its work drains). Lets a stage that produced no sample
+            while work stayed blocked for a full speed-estimation window be
+            released to the solver as a confirmed slow-starter.
         has_pending_work: Whether the stage has work waiting (queued, pool-queued,
             or in-flight). Gates the slow-starter release so a stage merely
             starved of input is not over-spawned from placeholder throughput, and
@@ -84,7 +85,7 @@ class StageRampInput:
     deleted_count: int
     proposed_post: int
     sample_count: int
-    stage_age_s: float
+    pending_work_age_s: float
     has_pending_work: bool
 
 
@@ -132,7 +133,7 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
         return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
 
     is_cold = stage.sample_count == 0
-    if is_cold and stage.stage_age_s >= config.speed_estimation_window_s and stage.has_pending_work:
+    if is_cold and stage.pending_work_age_s >= config.speed_estimation_window_s and stage.has_pending_work:
         # A full estimation window has passed with no completed task while work
         # is still waiting: a slow-warmup stage whose first result lands long
         # after the window. Trust the solver so every worker spawns now and their

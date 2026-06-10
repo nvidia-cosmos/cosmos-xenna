@@ -218,16 +218,22 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             # 0. Hold it while local active work remains so the floor never
             # releases a stage that still owns in-flight or queued work.
             threshold = 0.0
+            has_stock = inputs.stock_src[k] > 0.0
             streak = 0
             releasing = False
         else:
             threshold = chain.source_stock_threshold(inputs.batch_sizes[k], inputs.chain[k])
-            streak = 0 if inputs.stock_src[k] > threshold else prev.release_streak[k] + 1
-            releasing = inputs.stock_src[k] <= threshold and streak >= params.release_confirm_cycles
+            # One-batch boundary. A positive threshold counts stock at or above
+            # it as work; a collapsed (0.0) threshold from zero / sub-MIN
+            # fan-out counts only strictly positive stock, so a fully drained
+            # stage can still release instead of looking permanently stocked.
+            has_stock = inputs.stock_src[k] >= threshold if threshold > 0.0 else inputs.stock_src[k] > 0.0
+            streak = 0 if has_stock else prev.release_streak[k] + 1
+            releasing = not has_stock and streak >= params.release_confirm_cycles
 
         min_floor = min(params.min_workers, inputs.workers[k])
         desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
-        if inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of and inputs.stock_src[k] > threshold:
+        if inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of and has_stock:
             desired = inputs.workers[k]
         base = min(prev.held_floor[k], inputs.workers[k])
         if base <= 0 or desired >= base:

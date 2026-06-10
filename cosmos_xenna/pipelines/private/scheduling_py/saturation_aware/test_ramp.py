@@ -35,7 +35,7 @@ def make_input() -> RampInputFactory:
         deleted_count: int = 0,
         proposed_post: int = 10,
         sample_count: int = 0,
-        stage_age_s: float = 0.0,
+        pending_work_age_s: float = 0.0,
         has_pending_work: bool = False,
     ) -> StageRampInput:
         return StageRampInput(
@@ -43,7 +43,7 @@ def make_input() -> RampInputFactory:
             deleted_count=deleted_count,
             proposed_post=proposed_post,
             sample_count=sample_count,
-            stage_age_s=stage_age_s,
+            pending_work_age_s=pending_work_age_s,
             has_pending_work=has_pending_work,
         )
 
@@ -81,7 +81,7 @@ def test_cold_stage_above_cap_adds_no_new_workers(make_input: RampInputFactory) 
 def test_no_sample_within_window_stays_cold(make_input: RampInputFactory) -> None:
     """A 0-sample stage is held at one worker until a full estimation window elapses."""
     config = SaturationAwareConfig()
-    decision = decide(make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s - 1.0), config)
+    decision = decide(make_input(sample_count=0, pending_work_age_s=config.speed_estimation_window_s - 1.0), config)
     assert decision.cap == 1
     assert decision.reason is RampReason.COLD
 
@@ -90,7 +90,7 @@ def test_no_sample_after_window_with_pending_work_trusts_solver(make_input: Ramp
     """A stage with work waiting but no sample after a full window is released to the solver."""
     config = SaturationAwareConfig()
     decision = decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=True), config
+        make_input(sample_count=0, pending_work_age_s=config.speed_estimation_window_s, has_pending_work=True), config
     )
     assert decision.cap is None
     assert decision.keep_new is None
@@ -101,7 +101,7 @@ def test_no_sample_after_window_without_pending_work_stays_cold(make_input: Ramp
     """A starved stage (no work waiting) stays capped past the window, never over-spawned."""
     config = SaturationAwareConfig()
     decision = decide(
-        make_input(sample_count=0, stage_age_s=config.speed_estimation_window_s, has_pending_work=False), config
+        make_input(sample_count=0, pending_work_age_s=config.speed_estimation_window_s, has_pending_work=False), config
     )
     assert decision.cap == 1
     assert decision.reason is RampReason.COLD
@@ -184,7 +184,7 @@ def test_slow_start_takes_precedence_over_pipeline_warming(make_input: RampInput
             sample_count=0,
             current_workers=1,
             proposed_post=13,
-            stage_age_s=config.speed_estimation_window_s,
+            pending_work_age_s=config.speed_estimation_window_s,
             has_pending_work=True,
         ),
         config,
@@ -223,7 +223,7 @@ def test_warming_past_window_is_not_released_to_solver(make_input: RampInputFact
             sample_count=2,
             current_workers=1,
             proposed_post=11,
-            stage_age_s=config.speed_estimation_window_s,
+            pending_work_age_s=config.speed_estimation_window_s,
             has_pending_work=True,
         ),
         config,

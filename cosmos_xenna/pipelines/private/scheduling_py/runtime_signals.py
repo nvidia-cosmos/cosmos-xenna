@@ -35,7 +35,8 @@ class RuntimeSignals:
     Attributes:
         queue_depths: Per-stage inter-stage input queue depth, in input samples.
         pool_queued_tasks: Per-stage batches queued in the pool awaiting a slot.
-        inflight_slots: Per-stage slots holding an in-flight batch.
+        inflight_slots: Per-stage count of logical in-flight batches/tasks (one
+            per running task), not raw actor-rank slots.
         batch_sizes: Per-stage input items consumed per batch.
     """
 

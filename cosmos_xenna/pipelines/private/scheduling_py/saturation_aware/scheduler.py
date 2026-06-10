@@ -101,7 +101,8 @@ class _Cycle:
 
     Attributes:
         time: Decision timestamp, in seconds.
-        stage_age_s: Seconds since the first decision, for the cold-start ramp.
+        pending_work_ages: Per-stage seconds work has been continuously waiting
+            (reset to 0 when a stage drains), for the cold-start ramp.
         workers: Current (pre-solve) worker count per stage.
         demand_snapshots: Per-stage estimator snapshot (speed, returns, batch).
         batch_sizes: Per-stage input items consumed per batch.
@@ -119,7 +120,7 @@ class _Cycle:
     """
 
     time: float
-    stage_age_s: float
+    pending_work_ages: tuple[float, ...]
     workers: tuple[int, ...]
     demand_snapshots: tuple[sizing.StageDemandSnapshot, ...]
     batch_sizes: tuple[int, ...]
@@ -133,18 +134,9 @@ class _Cycle:
     active_stock: tuple[float, ...]
     activity_snapshot: PipelineActivitySnapshot | None
 
-    def has_work(self, index: int) -> bool:
-        """Return whether stage ``index`` has real whole-chain stock waiting.
-
-        Uses the same one-batch source-stock boundary as the scale-down floor,
-        so growth and release agree on the "has work" line.
-        """
-        threshold = chain.source_stock_threshold(self.batch_sizes[index], self.chain_factors[index])
-        return self.active_stock[index] > threshold
-
     def has_local_input(self, index: int) -> bool:
         """Return whether local pending input can use another worker."""
-        return self.local_pending_depths[index] > float(self.batch_sizes[index])
+        return self.local_pending_depths[index] >= float(self.batch_sizes[index])
 
     def capacity_inputs(self) -> CapacityInputs:
         """Return the capacity model's inputs for this cycle.
@@ -202,7 +194,7 @@ class SaturationAwareScheduler:
     _floor: ScaleDownFloorPolicy = attrs.field(init=False)
     _worker_id_factory: WorkerIdFactory = attrs.field(init=False, factory=WorkerIdFactory)
     _problem: data_structures.Problem | None = attrs.field(init=False, default=None)
-    _first_decision_time: float | None = attrs.field(init=False, default=None)
+    _pending_work_since: list[float | None] = attrs.field(init=False, factory=list)
     _runtime_snapshot: PipelineActivitySnapshot | None = attrs.field(init=False, default=None)
     _pending_measurements: queue.Queue[data_structures.Measurements] = attrs.field(init=False, factory=queue.Queue)
 
@@ -349,13 +341,13 @@ class SaturationAwareScheduler:
     def _build_cycle(self, time: float, problem_state: data_structures.ProblemState) -> _Cycle:
         """Assemble this cycle's immutable derived inputs once.
 
-        Reads scheduler-owned state (shape, estimator, runtime snapshot, warmup
-        anchor) and the live problem state, then derives every per-stage value
-        the downstream policies share: worker counts, demand snapshots, chain
-        factors, queued and active depths, and their whole-chain stock. Anchors
-        ``_first_decision_time`` on the first call (lifecycle state) but runs no
-        capacity, sizing, placement, ramp, or floor logic and advances no
-        cross-cycle policy state.
+        Reads scheduler-owned state (shape, estimator, runtime snapshot,
+        per-stage pending-work timers) and the live problem state, then derives
+        every per-stage value the downstream policies share: worker counts,
+        demand snapshots, chain factors, queued and active depths, and their
+        whole-chain stock. Updates the per-stage pending-work timers (lifecycle
+        state) but runs no capacity, sizing, placement, ramp, or floor logic and
+        advances no cross-cycle policy state.
 
         Args:
             time: Decision timestamp, in seconds.
@@ -364,12 +356,6 @@ class SaturationAwareScheduler:
         Returns:
             The immutable :class:`_Cycle` for this decision.
         """
-        if self._first_decision_time is None:
-            # Anchor every stage's warmup clock to the first decision. The
-            # pipeline shape is static, so all stages exist from this cycle; the
-            # cold-start ramp uses the elapsed time to release a stage that has
-            # produced no sample within a full speed-estimation window.
-            self._first_decision_time = time
         workers = tuple(stage.num_workers() for stage in problem_state.rust.stages)
         num_stages = len(workers)
         snapshots = tuple(self._demand_snapshots(time, workers))
@@ -396,7 +382,7 @@ class SaturationAwareScheduler:
             ready_workers = workers
         return _Cycle(
             time=time,
-            stage_age_s=time - self._first_decision_time,
+            pending_work_ages=self._pending_work_ages(time, active_depths),
             workers=workers,
             demand_snapshots=snapshots,
             batch_sizes=batch_sizes,
@@ -410,6 +396,37 @@ class SaturationAwareScheduler:
             active_stock=tuple(chain.whole_chain_stock(active_depths, chain_factors)),
             activity_snapshot=runtime,
         )
+
+    def _pending_work_ages(self, time: float, active_depths: tuple[float, ...]) -> tuple[float, ...]:
+        """Return per-stage seconds work has been continuously waiting.
+
+        Records when each stage first held pending active work and clears that
+        timestamp when the stage drains, so the cold-start ramp's slow-starter
+        release reflects how long work has actually been blocked rather than how
+        long the scheduler has been running. The backing list is sized lazily to
+        the live stage count.
+
+        Args:
+            time: Decision timestamp, in seconds.
+            active_depths: Per-stage active work depth (queued, pool, in-flight).
+
+        Returns:
+            Per-stage waiting age in seconds; ``0.0`` for a drained stage.
+        """
+        if len(self._pending_work_since) != len(active_depths):
+            self._pending_work_since = [None] * len(active_depths)
+        ages: list[float] = []
+        for index, depth in enumerate(active_depths):
+            if depth <= 0.0:
+                self._pending_work_since[index] = None
+                ages.append(0.0)
+                continue
+            started = self._pending_work_since[index]
+            if started is None:
+                started = time
+                self._pending_work_since[index] = started
+            ages.append(time - started)
+        return tuple(ages)
 
     def _solution_counts(self, solution: data_structures.Solution) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return proposed new-worker and delete counts from a solution."""
@@ -533,7 +550,6 @@ class SaturationAwareScheduler:
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
-        stage_age_s = cycle.stage_age_s
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             if stage.is_manual:
@@ -548,13 +564,14 @@ class SaturationAwareScheduler:
             samples = self._estimator.sample_count(stage.name)
             active_depth = cycle.active_depths[index]
             has_pending_work = active_depth > 0.0
+            pending_work_age_s = cycle.pending_work_ages[index]
             decision = ramp.decide(
                 StageRampInput(
                     current_workers=current,
                     deleted_count=deleted,
                     proposed_post=current + frag_new - deleted,
                     sample_count=samples,
-                    stage_age_s=stage_age_s,
+                    pending_work_age_s=pending_work_age_s,
                     has_pending_work=has_pending_work,
                 ),
                 self.config,
@@ -562,7 +579,8 @@ class SaturationAwareScheduler:
             summaries.append(
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
-                f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
+                f"has_pending_work={has_pending_work} pending_work_age_s={pending_work_age_s:.1f} "
+                f"active_depth={active_depth:.2f}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:
@@ -572,7 +590,7 @@ class SaturationAwareScheduler:
                 logger.info(
                     f"saturation-aware cold-start ramp: stage='{stage.name}' reason={decision.reason} "
                     f"current={current} frag_new={frag_new} "
-                    f"stage_age_s={stage_age_s:.1f} window_s={self.config.speed_estimation_window_s:.1f} "
+                    f"pending_work_age_s={pending_work_age_s:.1f} window_s={self.config.speed_estimation_window_s:.1f} "
                     f"samples={samples}/{min_data_points} has_pending_work={has_pending_work} "
                     f"active_depth={active_depth:.2f} is_gpu={stage.is_gpu} "
                     f"(no sample within window and work waiting; trusting solver)"

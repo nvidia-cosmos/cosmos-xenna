@@ -372,6 +372,55 @@ def test_confirmed_drain_releases_even_if_shrink_was_deferred() -> None:
     assert not fourth.plan.decisions[1].shrink_deferred
 
 
+def test_stock_at_exactly_one_batch_is_held_not_released() -> None:
+    """Stock at exactly one batch counts as work (>=), so the stage is not released.
+
+    Matches the growth gate, which treats local_pending == batch_size as a usable
+    batch: the floor must not release a stage sitting on exactly one batch.
+    """
+    params = _params(release_confirm_cycles=2)
+    # caption threshold = batch / chain = 1 / 8 = 0.125 source units (one batch).
+    at_threshold = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=(0.0, 0.125))
+    first = floor.compute_floors(at_threshold, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(at_threshold, first.state, params)
+    assert second.state.release_streak[1] == 0
+    assert not second.plan.decisions[1].releasing
+    assert second.plan.floors[1] == 5
+
+
+def test_stock_just_below_one_batch_releases() -> None:
+    """Stock below one batch drains: the stage releases after the confirm window."""
+    params = _params(release_confirm_cycles=2)
+    below = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=(0.0, 0.124))
+    first = floor.compute_floors(below, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(below, first.state, params)
+    assert second.plan.decisions[1].releasing
+    assert second.plan.floors[1] == params.min_workers
+
+
+def test_downstream_protection_holds_at_exactly_one_batch() -> None:
+    """H1 protects a downstream stage holding exactly one batch of stock (>=)."""
+    params = _params(release_confirm_cycles=2)
+    at_threshold = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=(0.0, 0.125), protect_downstream_of=0)
+    result = floor.compute_floors(at_threshold, floor.FloorState.initial(2), params)
+    assert result.plan.floors[1] == 15
+
+
+def test_degenerate_chain_factor_does_not_explode_threshold() -> None:
+    """A sub-MIN_CHAIN_FACTOR fan-out collapses the threshold to 0, not a giant value.
+
+    The old reciprocal threshold (batch / 1e-9 ~= 1e9) marked a deeply backlogged
+    stage as drained and released it. With the collapsed threshold, real upstream
+    stock keeps the stage held.
+    """
+    params = _params(release_confirm_cycles=2)
+    degenerate = _inputs(workers=(10, 15), w_sustain=(1, 5), stock=_DEEP_STOCK, chain_factors=(1.0, 1e-9))
+    first = floor.compute_floors(degenerate, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(degenerate, first.state, params)
+    assert second.state.release_streak[1] == 0
+    assert second.plan.floors[1] == 5
+
+
 def test_mismatched_input_length_raises() -> None:
     """A short floor-input tuple is a programming error."""
     short_w_sustain: tuple[int, ...] = (1,)

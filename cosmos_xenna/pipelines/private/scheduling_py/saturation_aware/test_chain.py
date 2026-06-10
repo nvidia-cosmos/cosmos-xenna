@@ -80,3 +80,29 @@ def test_zero_fan_out_upstream_contributes_no_downstream_stock() -> None:
 def test_negative_queue_depth_does_not_reduce_stock() -> None:
     """Transient negative queue readings are clamped before stock accumulation."""
     assert chain.whole_chain_stock([4.0, -4.0], [1.0, 2.0]) == [4.0, 4.0]
+
+
+def test_source_stock_threshold_is_one_batch_in_source_units() -> None:
+    """One batch of stage input is batch_size / chain_factor source items."""
+    assert chain.source_stock_threshold(4, 8.0) == pytest.approx(0.5)
+
+
+def test_source_stock_threshold_collapses_for_subminimum_chain_factor() -> None:
+    """A chain factor below MIN_CHAIN_FACTOR collapses to 0, never a reciprocal blowup.
+
+    Mirrors whole_chain_stock(), which omits the same factors: a degenerate tiny
+    factor must not explode the threshold to a near-infinite value that would
+    mark a busy stage as drained.
+    """
+    assert chain.source_stock_threshold(4, chain.MIN_CHAIN_FACTOR / 2) == 0.0
+
+
+def test_source_stock_threshold_is_zero_for_non_positive_chain_factor() -> None:
+    """A fully dropping stage (chain_factor <= 0) has no source-expressible work."""
+    assert chain.source_stock_threshold(4, 0.0) == 0.0
+    assert chain.source_stock_threshold(4, -1.0) == 0.0
+
+
+def test_source_stock_threshold_is_finite_at_min_chain_factor() -> None:
+    """Exactly MIN_CHAIN_FACTOR is the smallest usable factor (>= boundary)."""
+    assert chain.source_stock_threshold(1, chain.MIN_CHAIN_FACTOR) == pytest.approx(1.0 / chain.MIN_CHAIN_FACTOR)

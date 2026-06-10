@@ -513,7 +513,7 @@ class Autoscaler:
             runtime_signals.RuntimeSignals(
                 queue_depths=tuple(float(depth) for depth in upstream_queue_lens),
                 pool_queued_tasks=tuple(pool.num_queued_tasks for pool in pools),
-                inflight_slots=tuple(pool.num_used_slots for pool in pools),
+                inflight_slots=tuple(pool.num_inflight_tasks for pool in pools),
                 batch_sizes=tuple(pool.stage_batch_size for pool in pools),
             ),
         )

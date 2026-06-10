@@ -459,7 +459,12 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = params.min_workers
         else:
             w_sustain = math.ceil(a_ewma / target_speed)
-            if k == bottleneck_stage and inputs.is_manual[k]:
+            # A manual stage must never be grown by the autoscaler while it is
+            # the rate identity (sticky growth owner) OR the current rate-source
+            # candidate during a switch confirmation; cap both its hold and
+            # growth targets to the operator-pinned worker count.
+            is_manual_rate_participant = inputs.is_manual[k] and (k == bottleneck_stage or k == bottleneck_candidate)
+            if is_manual_rate_participant:
                 w_sustain = min(w_sustain, inputs.workers[k])
             # Growing the bottleneck toward next_bottleneck_rate is the move
             # that raises pipeline speed; growing any other stage past
@@ -472,7 +477,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = math.ceil(inputs.chain[k] * target_rate / target_speed)
             # Headroom lives in w_target; never target below the hold floor.
             w_target = max(w_target, w_sustain)
-            if k == bottleneck_stage and inputs.is_manual[k]:
+            if is_manual_rate_participant:
                 w_target = min(w_target, inputs.workers[k])
         stages.append(
             StageCapacity(

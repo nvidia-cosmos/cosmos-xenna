@@ -514,6 +514,33 @@ def test_manual_bottleneck_target_is_capped_at_current_workers() -> None:
     assert result.plan.stages[0].w_target == 2
 
 
+def test_manual_candidate_is_capped_during_switch_confirmation() -> None:
+    """A pinned stage that is the rate-source candidate (mid switch-confirm) gets no growth.
+
+    Stage 0 is the held incumbent bottleneck; a deeper queue cliff makes the
+    pinned stage 2 the candidate for the confirm window. Capping must apply to
+    the candidate too -- not only the confirmed bottleneck -- so the autoscaler
+    never grows a pinned stage while it is winning the rate-source role.
+    """
+    prev = _state(a_ewma=(None, None, None), bottleneck=0, bottleneck_streak=0)
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(2, 2, 2),
+            speed=(1.0, 1.0, 0.1),
+            is_manual=(False, False, True),
+            local_qin=(2.0, 0.0, 2.0),
+            local_input_threshold=(1.0, 1.0, 1.0),
+            ready_workers=(2, 2, 0),
+        ),
+        prev,
+        _params(switch_confirm=2),
+    )
+    assert result.plan.bottleneck_stage == 0  # incumbent held during confirm
+    assert result.plan.bottleneck_candidate == 2  # pinned stage is the candidate
+    assert result.plan.stages[2].w_target == 2  # capped to current workers, not grown
+    assert result.plan.stages[2].w_sustain <= 2
+
+
 def test_transient_speed_drop_does_not_spike_target_to_raw_division_result() -> None:
     """Target sizing uses smoothed speed so one-cycle dips do not over-request."""
     prev = _state(
