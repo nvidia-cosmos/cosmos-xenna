@@ -85,10 +85,11 @@ in-flight task is aged: while `inflight > 0` the per-worker rate is capped at
 one completion per elapsed-since-last-completion, so a stalled feeder is no
 longer reported as fast. A genuine stall (`rate_is_stale`: busy and overdue past
 `speed_stale_multiple` times its mean service time) bypasses the protective
-down-damping and snaps `target_speed` down to the aged rate, and its hold and
-growth targets are bounded to `workers + speed_stale_growth_step` so a
-collapsing `target_speed` cannot explode the divisive worker targets. Normal
-completion variance keeps the protective damping (no churn).
+down-damping and snaps `target_speed` down to the aged rate; its hold target is
+held at the current worker count and its growth target is bounded to
+`workers + speed_stale_growth_step`, so a collapsing `target_speed` cannot
+explode the divisive worker targets. Normal completion variance keeps the
+protective damping (no churn).
 
 ## One-batch boundary
 
