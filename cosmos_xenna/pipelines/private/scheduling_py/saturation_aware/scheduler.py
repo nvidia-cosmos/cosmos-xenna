@@ -28,9 +28,9 @@ read-only and the returned ``Solution`` is mutated through a
 ::
 
     snapshot --> capacity --> demand --> solve --> ramp --> floor --> commit
-    (trusted    (cap_src,    (mult to   (FRAG,    (cap      (clamp     (write
-     speed)      rates,       w_target)  read-     cold)     deletes    edited
-                 targets)                only)               to         Solution)
+    (trusted    (cap_src,    (mult to   (FRAG,    (cap to   (clamp     (write
+     speed)      rates,       w_target)  read-     w_target  deletes    edited
+                 targets)                only)     + cold)   to         Solution)
                                                              w_sustain)
 
 The driver thread only enqueues inputs: ``update_with_measurements`` queues a
@@ -335,7 +335,7 @@ class SaturationAwareScheduler:
 
         solution = self._solve(problem, problem_state, estimates, cycle.workers)
         frag_new, frag_delete = self._solution_counts(solution)
-        self._apply_cold_start_ramp(solution, cycle)
+        self._apply_cold_start_ramp(solution, cycle, capacity)
         sat_new, _ = self._solution_counts(solution)
         floor_plan = self._apply_scale_down_floor(solution, cycle, capacity)
         _, sat_delete = self._solution_counts(solution)
@@ -563,16 +563,16 @@ class SaturationAwareScheduler:
             return self.shape.stages[capacity.bottleneck_stage].name
         return "none"
 
-    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle) -> None:
-        """Trim cold-start over-spawn of not-yet-trusted stages.
+    def _apply_cold_start_ramp(self, solution: data_structures.Solution, cycle: _Cycle, capacity: CapacityPlan) -> None:
+        """Trim per-cycle over-spawn of cold and trusted stages to their cap.
 
-        Caps each untrusted stage's new-worker additions so the solver cannot
-        make large commitments while it is still sizing the stage from
-        placeholder throughput. One generic policy covers every resource shape:
-        a not-yet-trusted stage grows by at most one worker per cycle, gated by
-        the stage's own pending work. A stage that has work waiting but produces
-        no sample within a full speed-estimation window is released to the solver
-        (slow-starter).
+        One generic policy covers every resource shape. A not-yet-trusted stage
+        grows by at most one worker per cycle, gated by the stage's own pending
+        work; a stage that has work waiting but produces no sample within a full
+        speed-estimation window is released to the solver (slow-starter). A
+        trusted stage is capped at its capacity growth target ``w_target`` (the
+        per-cycle growth ceiling), so the solver may place and degrade within
+        that ceiling but never grow the stage past the size capacity computed.
 
         Runs before :meth:`_apply_scale_down_floor`, committing its own editor
         so the floor reads these trims.
@@ -580,9 +580,15 @@ class SaturationAwareScheduler:
         Args:
             solution: The solver's solution, mutated in place via its own editor.
             cycle: This cycle's immutable derived inputs (workers, depths, age).
+            capacity: This cycle's capacity plan (per-stage growth targets).
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
+        # The capacity model collapses every stage's w_target to min_workers when
+        # it has no measured bottleneck yet (cold start, no live workers). That
+        # placeholder is not a real growth target, so the ceiling must defer to
+        # the solver (uncapped) until a bottleneck is measured.
+        has_bottleneck = capacity.bottleneck_rate > 0.0
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             if stage.is_manual:
@@ -606,6 +612,7 @@ class SaturationAwareScheduler:
                     sample_count=samples,
                     pending_work_age_s=pending_work_age_s,
                     has_pending_work=has_pending_work,
+                    w_target=capacity.stages[index].w_target if has_bottleneck else None,
                 ),
                 self.config,
             )
@@ -635,13 +642,17 @@ class SaturationAwareScheduler:
             ramp_new = decision.keep_new
             frag_post = current + frag_new - deleted
             ramp_post = current + ramp_new - deleted
+            # A trusted stage is held at its capacity ceiling (CAPPED); an
+            # untrusted stage is held by the cold-start ramp. Tag each so the
+            # cause of the trim is clear in the trace.
+            tag = "growth cap" if decision.reason is RampReason.CAPPED else "cold-start ramp"
             logger.info(
-                f"saturation-aware cold-start ramp: stage='{stage.name}' reason={decision.reason} "
+                f"saturation-aware {tag}: stage='{stage.name}' reason={decision.reason} "
                 f"current={current} deleted={deleted} "
                 f"frag_new={frag_new} frag_post={frag_post} "
                 f"ramp_new={ramp_new} ramp_post={ramp_post} trimmed={frag_new - ramp_new} "
-                f"cap={decision.cap} samples={samples}/{min_data_points} "
-                f"is_gpu={stage.is_gpu} "
+                f"cap={decision.cap} w_target={capacity.stages[index].w_target} "
+                f"samples={samples}/{min_data_points} is_gpu={stage.is_gpu} "
                 f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
             )
         if summaries:

@@ -21,11 +21,13 @@ every stage, regardless of resource shape (CPU-only, whole-GPU, or
 fractional-GPU): a not-yet-trusted stage may grow by at most one worker per
 cycle, and only when the stage has its own pending work to feed a new worker.
 With no completed sample and no pending work the stage is held at one worker;
-once the speed estimate is trusted the stage is uncapped and the solver decides.
-A stage that still has work waiting but produces no sample within a full
-speed-estimation window is treated as a confirmed slow-starter and is uncapped so
-all its workers spawn and warm up in parallel rather than one at a time. Pure and
-native-extension-free, so it is unit-testable without the solver.
+once the speed estimate is trusted the stage is capped at its capacity growth
+target ``w_target`` (the per-cycle growth ceiling), so the solver may place and
+degrade within that ceiling but never grow the stage past the size the capacity
+model computed. A stage that still has work waiting but produces no sample within
+a full speed-estimation window is treated as a confirmed slow-starter and is
+uncapped so all its workers spawn and warm up in parallel rather than one at a
+time. Pure and native-extension-free, so it is unit-testable without the solver.
 """
 
 import enum
@@ -50,14 +52,17 @@ class RampReason(enum.StrEnum):
             the solver's proposal.
         SLOW_START: No sample after a full speed-estimation window with work
             waiting; released to the solver as a confirmed slow-starter.
-        UNCAPPED: Enough samples to trust the speed estimate; the solver owns
-            growth.
+        CAPPED: Enough samples to trust the speed estimate; held at the capacity
+            growth target ``w_target`` (the per-cycle growth ceiling).
+        UNCAPPED: Enough samples to trust the speed estimate but no capacity
+            target this cycle (no measured bottleneck); the solver owns growth.
     """
 
     COLD = "cold"
     PIPELINE_WARMING = "pipeline_warming"
     WARMING = "warming"
     SLOW_START = "slow_start"
+    CAPPED = "capped"
     UNCAPPED = "uncapped"
 
 
@@ -79,6 +84,10 @@ class StageRampInput:
             or in-flight). Gates the slow-starter release so a stage merely
             starved of input is not over-spawned from placeholder throughput, and
             authorizes one warming worker when the stage has its own backlog.
+        w_target: Capacity growth target for this stage this cycle, or ``None``
+            when no capacity target is available (no measured bottleneck yet).
+            Consulted only once the stage is trusted, where it is the per-cycle
+            growth ceiling; ``None`` then falls back to uncapped.
     """
 
     current_workers: int
@@ -87,6 +96,7 @@ class StageRampInput:
     sample_count: int
     pending_work_age_s: float
     has_pending_work: bool
+    w_target: int | None
 
 
 @attrs.frozen
@@ -106,31 +116,62 @@ class RampDecision:
     reason: RampReason
 
 
+def _apply_cap(stage: StageRampInput, cap: int, reason: RampReason) -> RampDecision:
+    """Trim the solver's new workers so the post-solve count stays within ``cap``.
+
+    Computes how many of the solver's proposed new workers to keep so the
+    post-solve count does not exceed ``cap``, flooring the kept count at zero so
+    a cap below the surviving worker count never converts the solver's proposal
+    into a forced delete.
+
+    Args:
+        stage: One stage's pre-solve counts and solver proposal.
+        cap: Maximum post-solve worker count this cycle.
+        reason: The branch that produced this cap (log/diagnostic tag).
+
+    Returns:
+        The :class:`RampDecision`; ``keep_new`` is ``None`` when the proposal is
+        already within ``cap`` (nothing trimmed).
+    """
+    if stage.proposed_post <= cap:
+        return RampDecision(cap=cap, keep_new=None, reason=reason)
+    keep_new = max(0, cap - (stage.current_workers - stage.deleted_count))
+    return RampDecision(cap=cap, keep_new=keep_new, reason=reason)
+
+
 def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision:
-    """Return the cold-start cap and trim count for one stage.
+    """Return the per-cycle growth cap and trim count for one stage.
 
     One generic rule for every stage, independent of resource shape: a
     not-yet-trusted stage grows by at most one worker per cycle, and only when
-    the stage has its own pending work to feed the new worker. Trusted stages
-    (sample count at or above the threshold) are uncapped and the solver owns
-    growth. A 0-sample stage with work still waiting after a full
+    the stage has its own pending work to feed the new worker. A trusted stage
+    (sample count at or above the threshold) is capped at its capacity growth
+    target ``w_target``; with no capacity target it is uncapped and the solver
+    owns growth. A 0-sample stage with work still waiting after a full
     speed-estimation window is released to the solver as a confirmed
     slow-starter.
 
-    The fixed one-per-cycle warming step never scales with the solver's
-    proposal, so a stage can never convert a large solver proposal into a
-    first-cycle burst.
+    Neither the fixed one-per-cycle warming step nor the trusted ``w_target``
+    cap scales with the solver's proposal, so a stage can never convert a large
+    solver proposal into a first-cycle burst.
 
     Args:
         stage: One stage's pre-solve counts, sample count, age, and SAT signals.
         config: Operator tunables (provides the trust threshold and window).
 
     Returns:
-        The cold-start :class:`RampDecision` (cap, trim count, and reason tag).
+        The :class:`RampDecision` (cap, trim count, and reason tag).
     """
     min_data_points = config.speed_estimation_min_data_points
     if stage.sample_count >= min_data_points:
-        return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
+        if stage.w_target is None:
+            # Trusted, but capacity has no useful target this cycle (no measured
+            # bottleneck): let the solver own growth.
+            return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
+        # Trusted: SAT's capacity target is the per-cycle growth ceiling. The
+        # shared cap-application trims growth without ever forcing a shrink
+        # (keep_new floors at zero); the scale-down floor still owns shrink.
+        return _apply_cap(stage, stage.w_target, RampReason.CAPPED)
 
     is_cold = stage.sample_count == 0
     if is_cold and stage.pending_work_age_s >= config.speed_estimation_window_s and stage.has_pending_work:
@@ -161,7 +202,4 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
         cap = stage.current_workers
         reason = RampReason.WARMING
 
-    if stage.proposed_post <= cap:
-        return RampDecision(cap=cap, keep_new=None, reason=reason)
-    keep_new = max(0, cap - (stage.current_workers - stage.deleted_count))
-    return RampDecision(cap=cap, keep_new=keep_new, reason=reason)
+    return _apply_cap(stage, cap, reason)

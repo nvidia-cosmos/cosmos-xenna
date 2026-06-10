@@ -25,9 +25,9 @@ read-only solver:
 
 ```
 snapshot --> capacity --> demand --> solve --> ramp --> floor --> commit
-(trusted    (rates,      (mult to   (FRAG,    (cap     (clamp     (write
- speed)      targets)     w_target)  read-     cold)    deletes    edited
-                                     only)              to         Solution)
+(trusted    (rates,      (mult to   (FRAG,    (cap to  (clamp     (write
+ speed)      targets)     w_target)  read-     w_target deletes    edited
+                                     only)     + cold)  to         Solution)
                                                         w_sustain)
 ```
 
@@ -36,7 +36,9 @@ snapshot --> capacity --> demand --> solve --> ramp --> floor --> commit
 - `sizing.py`: turns `w_target` into a solver growth multiplier, gated by
   `has_local_input`.
 - `chain.py`: cumulative fan-out factors and whole-chain stock in source units.
-- `ramp.py`: cold-start clamp (+1 worker per cycle for not-yet-trusted stages).
+- `ramp.py`: per-cycle growth clamp - not-yet-trusted stages grow +1 worker per
+  cycle; a trusted stage is capped at its capacity target `w_target` (the growth
+  ceiling), unless no bottleneck is measured yet (then the solver owns growth).
 - `floor.py`: scale-down floor; clamps deletes to `w_sustain` while stock is
   still in flight.
 

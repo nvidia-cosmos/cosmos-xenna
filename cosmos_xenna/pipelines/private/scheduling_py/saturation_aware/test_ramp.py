@@ -37,6 +37,7 @@ def make_input() -> RampInputFactory:
         sample_count: int = 0,
         pending_work_age_s: float = 0.0,
         has_pending_work: bool = False,
+        w_target: int | None = None,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
@@ -45,6 +46,7 @@ def make_input() -> RampInputFactory:
             sample_count=sample_count,
             pending_work_age_s=pending_work_age_s,
             has_pending_work=has_pending_work,
+            w_target=w_target,
         )
 
     return _make_input
@@ -249,12 +251,45 @@ def test_warming_dry_stage_holds_at_current(make_input: RampInputFactory) -> Non
     assert decision.reason is RampReason.WARMING
 
 
-def test_trusted_stage_is_uncapped(make_input: RampInputFactory) -> None:
-    """Once samples reach the trust threshold the stage is uncapped."""
-    decision = decide(make_input(sample_count=5, current_workers=1, proposed_post=11), _config())
+def test_trusted_stage_without_capacity_target_is_uncapped(make_input: RampInputFactory) -> None:
+    """A trusted stage with no capacity target (no measured bottleneck) is uncapped."""
+    decision = decide(make_input(sample_count=5, current_workers=1, proposed_post=11, w_target=None), _config())
     assert decision.cap is None
     assert decision.keep_new is None
     assert decision.reason is RampReason.UNCAPPED
+
+
+def test_trusted_stage_is_capped_to_w_target(make_input: RampInputFactory) -> None:
+    """A trusted stage's large solver proposal is trimmed to its capacity target."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=1, deleted_count=0, proposed_post=12, w_target=2),
+        _config(),
+    )
+    assert decision.cap == 2
+    assert decision.keep_new == 1
+    assert decision.reason is RampReason.CAPPED
+
+
+def test_trusted_proposal_within_w_target_is_not_trimmed(make_input: RampInputFactory) -> None:
+    """A trusted stage proposing at or below its capacity target keeps all new workers."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=1, proposed_post=4, w_target=5),
+        _config(),
+    )
+    assert decision.cap == 5
+    assert decision.keep_new is None
+    assert decision.reason is RampReason.CAPPED
+
+
+def test_trusted_w_target_below_current_never_forces_shrink(make_input: RampInputFactory) -> None:
+    """A capacity target below the current size trims growth to zero, never deletes."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=5, deleted_count=0, proposed_post=5, w_target=2),
+        _config(),
+    )
+    assert decision.cap == 2
+    assert decision.keep_new == 0
+    assert decision.reason is RampReason.CAPPED
 
 
 def test_ramp_input_does_not_carry_resource_shape(make_input: RampInputFactory) -> None:
