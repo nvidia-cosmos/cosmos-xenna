@@ -27,6 +27,9 @@ import attrs
 from cosmos_xenna.utils import attrs_utils
 
 _UNIT_INTERVAL = attrs.validators.and_(attrs.validators.ge(0.0), attrs.validators.le(1.0))
+# Smoothing weights must be strictly positive (0.0 would freeze the EWMA at its
+# previous value) and at most 1.0 (1.0 = no smoothing, take the raw sample).
+_SMOOTHING_ALPHA = attrs.validators.and_(attrs.validators.gt(0.0), attrs.validators.le(1.0))
 
 
 @attrs.frozen
@@ -44,9 +47,22 @@ class SaturationAwareConfig:
             ``w_target`` (the bounded source-rate read-ahead). It is a
             target headroom, not a demand-multiplier floor.
         speed_estimation_window_s: Throughput-estimator window.
-        speed_estimation_min_data_points: Samples retained even when
-            older than the window; also the trust threshold below which a
-            stage is treated as cold/unmeasured for capacity and demand.
+        speed_estimation_min_data_points: Trust threshold below which a stage
+            is treated as cold/unmeasured for capacity and demand. It does not
+            set the averaging depth (see ``speed_estimation_averaging_samples``).
+        speed_estimation_averaging_samples: Minimum completed-task samples the
+            speed estimator retains for its ``1/mean(duration)`` average, even
+            when older than the window. Decoupled from the trust threshold so
+            the per-worker speed can be averaged over enough samples to be
+            stable for heterogeneous task durations without delaying cold-start
+            trust. Must be >= ``speed_estimation_min_data_points``.
+        speed_alpha_up: EWMA weight when a stage's measured per-worker speed
+            rises. Kept modest so a single transient fast task cannot collapse
+            the worker target; distinct from the arrival-rate ``alpha_up``.
+        speed_alpha_down: EWMA weight when measured per-worker speed falls.
+            Kept small (protective) so a one-cycle dip does not mislabel a
+            capable stage as the bottleneck; also bounds how fast a genuinely
+            slowing stage's sizing rate is tracked.
         speed_estimation_min_task_duration_s: Lower service-time bound that
             distinguishes a degenerate empty skip from real work. A sample
             that produced no output AND completed faster than this is not a
@@ -68,9 +84,28 @@ class SaturationAwareConfig:
     capacity_headroom: float = attrs.field(default=0.10, validator=_UNIT_INTERVAL)
     speed_estimation_window_s: float = attrs.field(default=60.0, validator=attrs.validators.gt(0.0))
     speed_estimation_min_data_points: int = attrs.field(default=5, validator=attrs_utils.validate_positive_int)
+    speed_estimation_averaging_samples: int = attrs.field(
+        default=20,
+        validator=attrs_utils.validate_positive_int,
+    )
+    speed_alpha_up: float = attrs.field(default=0.3, validator=_SMOOTHING_ALPHA)
+    speed_alpha_down: float = attrs.field(default=0.1, validator=_SMOOTHING_ALPHA)
     speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
     scale_down_release_slowdown: float = attrs.field(default=4.0, validator=attrs.validators.ge(1.0))
+
+    def __attrs_post_init__(self) -> None:
+        """Validate cross-field invariants."""
+        if self.speed_estimation_averaging_samples >= self.speed_estimation_min_data_points:
+            return
+
+        msg = (
+            "speed_estimation_averaging_samples "
+            f"({self.speed_estimation_averaging_samples}) must be >= "
+            "speed_estimation_min_data_points "
+            f"({self.speed_estimation_min_data_points})"
+        )
+        raise ValueError(msg)
 
     @classmethod
     def resolve(cls, config: Self | None) -> Self:

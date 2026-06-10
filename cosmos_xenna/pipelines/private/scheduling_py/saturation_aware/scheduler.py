@@ -207,7 +207,7 @@ class SaturationAwareScheduler:
         config = self.config
         self._estimator = PipelineRateEstimator(
             config.speed_estimation_window_s,
-            config.speed_estimation_min_data_points,
+            config.speed_estimation_averaging_samples,
             config.speed_estimation_min_task_duration_s,
         )
         cycles = config.scale_down_release_cycles
@@ -216,6 +216,8 @@ class SaturationAwareScheduler:
             CapacityParams(
                 alpha_up=_ALPHA_UP,
                 alpha_down=1.0 / (cycles * config.scale_down_release_slowdown),
+                speed_alpha_up=config.speed_alpha_up,
+                speed_alpha_down=config.speed_alpha_down,
                 capacity_headroom=config.capacity_headroom,
                 hysteresis_margin=_HYSTERESIS_MARGIN,
                 switch_confirm=_SWITCH_CONFIRM,
@@ -403,8 +405,9 @@ class SaturationAwareScheduler:
         Records when each stage first held pending active work and clears that
         timestamp when the stage drains, so the cold-start ramp's slow-starter
         release reflects how long work has actually been blocked rather than how
-        long the scheduler has been running. The backing list is sized lazily to
-        the live stage count.
+        long the scheduler has been running. The backing list is initialized
+        lazily on first use; the pipeline shape is static, so it is sized once
+        and any future length change re-initializes every stage's timer.
 
         Args:
             time: Decision timestamp, in seconds.

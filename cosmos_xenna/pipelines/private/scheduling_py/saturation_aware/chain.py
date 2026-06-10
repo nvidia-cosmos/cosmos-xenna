@@ -82,9 +82,11 @@ def source_stock_threshold(batch_size: int, chain_factor: float) -> float:
     :data:`MIN_CHAIN_FACTOR` (a fully dropping upstream stage, or a degenerate /
     corrupted factor whose reciprocal would explode) collapses the threshold to
     ``0.0``, matching :func:`whole_chain_stock`, which omits the same factors
-    from the stock sum. This is the single source of truth shared by the growth
-    gate and the scale-down release gate, so both agree on the "has work"
-    boundary.
+    from the stock sum. This defines the one-batch "has work" boundary in
+    source-item units for the scale-down release gate (``floor.compute_floors``).
+    The growth gate enforces the same one-batch concept directly on local pending
+    depth (``_Cycle.has_local_input``), so growth and release agree on the line
+    without both routing through this helper.
 
     Args:
         batch_size: Stage input items consumed per batch (``> 0`` in practice).

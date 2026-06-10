@@ -66,10 +66,19 @@ labels each stage from its own and its downstream's queue occupancy:
 - `BALANCED`: last stage, input populated, with ready workers to spare.
 
 The bottleneck is the deepest stage with a full input queue and an under-fed
-consumer. Its rate drives `bottleneck_rate`:
+consumer. Its rate drives `bottleneck_rate`, always sized from one stable rate,
+the smoothed source capacity `cap_src`:
 
-- warm queue cliff: use the candidate's raw rate (`cap_real`) for fast response.
-- cold cliff / no cliff: fall back to the slowest measured smoothed `cap_src`.
+- warm queue cliff: use the candidate's own `cap_src` (its input is full by
+  construction, so it is the live constraint).
+- cold cliff / no cliff: fall back to the slowest measured `cap_src`, so a cold
+  candidate's `0.0` rate never collapses sizing to `min_workers`.
+
+`cap_src` is built from each stage's per-worker speed smoothed with dedicated
+EWMA weights (`speed_alpha_up` modest, `speed_alpha_down` protective), so one
+transient fast or slow task cannot swing the sizing rate. The underlying speed
+is averaged over `speed_estimation_averaging_samples` completed tasks, decoupled
+from the smaller `speed_estimation_min_data_points` cold-start trust gate.
 
 ## One-batch boundary
 

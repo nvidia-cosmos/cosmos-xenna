@@ -59,10 +59,15 @@ class CapacityParams:
     """Static tuning for the capacity model.
 
     Attributes:
-        alpha_up: EWMA weight when the sustainable arrival rises (fast
-            re-protect).
-        alpha_down: EWMA weight when it falls, applied uniformly to every stage
-            (smaller = slower release).
+        alpha_up: Arrival-rate EWMA weight when the sustainable arrival rises
+            (fast re-protect).
+        alpha_down: Arrival-rate EWMA weight when it falls, applied uniformly to
+            every stage (smaller = slower release).
+        speed_alpha_up: Per-worker speed EWMA weight when measured speed rises;
+            modest so a transient fast task cannot collapse the worker target.
+        speed_alpha_down: Per-worker speed EWMA weight when measured speed
+            falls; protective (small) so a one-cycle dip does not mislabel a
+            capable stage as the bottleneck.
         capacity_headroom: Spare-capacity fraction added to the bottleneck
             rate for the bounded read-ahead / tie-break growth target.
         hysteresis_margin: In balanced fallback mode, a challenger must be at
@@ -75,6 +80,8 @@ class CapacityParams:
 
     alpha_up: float
     alpha_down: float
+    speed_alpha_up: float
+    speed_alpha_down: float
     capacity_headroom: float
     hysteresis_margin: float
     switch_confirm: int
@@ -158,8 +165,9 @@ class StageCapacity:
 
     Attributes:
         speed: Trusted raw per-worker speed observed this cycle (``0.0`` when
-            cold); used for a queue-cliff candidate's source-rate capacity and
-            carried for logs so it can be compared against ``target_speed``.
+            cold); carried for logs so it can be compared against the smoothed
+            ``target_speed``. Sizing uses ``target_speed`` / ``cap_src``, not
+            this raw value.
         target_speed: Smoothed per-worker speed used for ``cap_src``,
             balanced-fallback selection, ``w_sustain``, ``w_target``, and solver
             demand sizing.
@@ -196,13 +204,13 @@ class CapacityPlan:
         bottleneck_stage: Sticky growth-owner bottleneck identity, or ``-1``
             when no stage is measured yet.
         bottleneck_rate: Effective sizing rate for the whole pipeline this cycle,
-            in source items/s. It is the candidate's RAW rate for a warm queue
-            cliff, else the slowest MEASURED smoothed rate (so a cold cliff or a
-            balanced pipeline never collapses sizing to 0). Only growth ownership
-            is sticky, not this rate.
-        next_bottleneck_rate: The second-minimum rate in the active rate table
-            (excluding the current candidate) - the rate the growth owner can
-            usefully climb toward.
+            in source items/s. It is the candidate's smoothed ``cap_src`` for a
+            warm queue cliff, else the slowest MEASURED ``cap_src`` (so a cold
+            cliff or a balanced pipeline never collapses sizing to 0). Only
+            growth ownership is sticky, not this rate.
+        next_bottleneck_rate: The second-minimum ``cap_src`` (excluding the
+            current candidate) - the rate the growth owner can usefully climb
+            toward.
         bottleneck_streak: Current challenger confirmation streak.
         bottleneck_candidate: Current queue-cliff candidate, or smoothed-capacity
             fallback candidate when no queue cliff exists.
@@ -392,22 +400,21 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             f"prev_target_speed_ewma={len(prev.target_speed_ewma)}"
         )
 
-    # Keep the smoothed speed for balanced fallback sizing, but let a queue-cliff
-    # candidate use raw speed because its input is populated by construction.
+    # Smooth each stage's per-worker speed with the dedicated speed alphas
+    # (modest up / protective down), independent of the arrival-rate alphas.
     target_speeds: list[float] = []
     next_target_speed_ewma: list[float | None] = []
     for k in range(num_stages):
         target_speed, target_speed_state = _target_speed_for_cycle(
             prev.target_speed_ewma[k],
             inputs.speed[k],
-            params.alpha_up,
-            params.alpha_down,
+            params.speed_alpha_up,
+            params.speed_alpha_down,
         )
         target_speeds.append(target_speed)
         next_target_speed_ewma.append(target_speed_state)
 
     cap_src = _source_capacities(inputs.workers, target_speeds, inputs.chain)
-    cap_real = _source_capacities(inputs.workers, inputs.speed, inputs.chain)
     queue_states = classify_stages(inputs)
     bottleneck_stage, bottleneck_streak, bottleneck_candidate, has_queue_candidate = _select_bottleneck_by_queue(
         queue_states,
@@ -418,32 +425,28 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         params.hysteresis_margin,
         params.switch_confirm,
     )
-    # Pick the rate source that sizes every stage this cycle.
+    # One stable rate sizes every stage: the smoothed source capacity cap_src.
     #
-    # A WARM queue-cliff candidate (populated input AND a trusted raw speed)
-    # uses its RAW rate for an immediate response: its input is full by
-    # construction, so the raw measurement is trustworthy now and need not wait
-    # for smoothing.
+    # A WARM queue-cliff candidate (populated input AND a trusted speed, so
+    # cap_src[candidate] > 0) sets bottleneck_rate to its own smoothed rate: its
+    # input is full by construction, so the candidate is the live constraint.
     #
     # Otherwise the regime is a fallback. Either there is no queue cliff
     # (balanced) or the cliff stage is COLD - it has a full input queue but no
     # trusted speed yet (just (re)started, still owned by the cold-start ramp),
-    # so its raw rate is 0.0. Sizing then follows the slowest MEASURED smoothed
-    # rate. This is the critical guard: a cold candidate's 0.0 raw rate must NOT
-    # become bottleneck_rate, or every stage collapses to min_workers and the
-    # floor tears down the trusted upstream feeders that are keeping the cold
-    # stage supplied. The sizing rate is always the current candidate's effective
+    # so its cap_src is 0.0. Sizing then follows the slowest MEASURED cap_src.
+    # This is the critical guard: a cold candidate's 0.0 rate must NOT become
+    # bottleneck_rate, or every stage collapses to min_workers and the floor
+    # tears down the trusted upstream feeders that are keeping the cold stage
+    # supplied. The sizing rate is always the current candidate's effective
     # rate, never a held incumbent's rate; sticky identity only owns growth.
-    queue_candidate_warm = has_queue_candidate and bottleneck_candidate >= 0 and cap_real[bottleneck_candidate] > 0.0
-    if queue_candidate_warm:
-        rate_table = cap_real
-        bottleneck_rate = cap_real[bottleneck_candidate]
+    if has_queue_candidate and bottleneck_candidate >= 0 and cap_src[bottleneck_candidate] > 0.0:
+        bottleneck_rate = cap_src[bottleneck_candidate]
     else:
-        rate_table = cap_src
         measured_caps = [cap for cap in cap_src if cap > 0.0]
         bottleneck_rate = min(measured_caps) if measured_caps else 0.0
     bottleneck_candidate_rate = bottleneck_rate
-    next_bottleneck_rate = _second_min_capacity(rate_table, bottleneck_candidate, bottleneck_rate)
+    next_bottleneck_rate = _second_min_capacity(cap_src, bottleneck_candidate, bottleneck_rate)
     headroom_rate = bottleneck_rate * (1.0 + params.capacity_headroom)
 
     stages: list[StageCapacity] = []

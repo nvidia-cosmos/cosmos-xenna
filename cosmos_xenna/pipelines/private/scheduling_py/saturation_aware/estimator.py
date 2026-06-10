@@ -85,10 +85,15 @@ class PipelineRateEstimator:
 
     The scheduler feeds completed-task measurements via :meth:`observe` and
     reads :meth:`speed` / :meth:`num_returns` per stage each cycle.
+
+    ``averaging_samples`` is the minimum number of recent samples each stage's
+    ``1/mean(duration)`` estimate retains even when older than ``window_s``; it
+    sets averaging depth (stability), not cold-start trust. Trust is the
+    scheduler's responsibility, gated on :meth:`sample_count`.
     """
 
     _window_s: float
-    _min_data_points: int
+    _averaging_samples: int
     _min_task_duration_s: float = _DEFAULT_MIN_TASK_DURATION_S
     _returns_alpha: float = _DEFAULT_RETURNS_ALPHA
     _stages: dict[str, _StageEstimator] = attrs.field(factory=dict)
@@ -116,7 +121,7 @@ class PipelineRateEstimator:
         estimator = self._stages.get(stage_name)
         if estimator is None:
             estimator = _StageEstimator(
-                RateEstimatorDuration(self._window_s, self._min_data_points),
+                RateEstimatorDuration(self._window_s, self._averaging_samples),
                 self._returns_alpha,
                 self._min_task_duration_s,
             )

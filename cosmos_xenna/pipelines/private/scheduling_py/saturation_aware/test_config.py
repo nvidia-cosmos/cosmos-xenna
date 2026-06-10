@@ -37,6 +37,30 @@ def test_capacity_headroom_below_zero_is_rejected() -> None:
         SaturationAwareConfig(capacity_headroom=-0.1)
 
 
+def test_speed_alpha_up_zero_is_rejected() -> None:
+    """A speed_alpha_up of 0.0 would freeze the EWMA and is rejected."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_alpha_up=0.0)
+
+
+def test_speed_alpha_up_above_one_is_rejected() -> None:
+    """speed_alpha_up above 1.0 is out of range."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_alpha_up=1.5)
+
+
+def test_speed_alpha_down_zero_is_rejected() -> None:
+    """A speed_alpha_down of 0.0 would freeze the EWMA and is rejected."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_alpha_down=0.0)
+
+
+def test_averaging_samples_below_trust_threshold_is_rejected() -> None:
+    """Averaging depth must be at least the trust threshold."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(speed_estimation_averaging_samples=3, speed_estimation_min_data_points=5)
+
+
 def test_resolve_returns_defaults_when_none() -> None:
     """resolve(None) yields a default-constructed config."""
     assert SaturationAwareConfig.resolve(None) == SaturationAwareConfig()

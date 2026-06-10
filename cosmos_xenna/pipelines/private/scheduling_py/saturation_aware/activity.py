@@ -46,7 +46,8 @@ class StageActivity:
         queue_depth_samples: Inter-stage input queue depth, already in
             stage-input samples.
         pool_queued_tasks: Batches queued in the pool awaiting a free slot.
-        inflight_slots: Slots currently holding an in-flight batch.
+        inflight_slots: Logical in-flight tasks (one per running batch; one per
+            SPMD worker group), not raw actor-rank slots.
         batch_size: Stage input items consumed per batch (each > 0); converts
             the batch-counted terms to stage-input samples.
     """

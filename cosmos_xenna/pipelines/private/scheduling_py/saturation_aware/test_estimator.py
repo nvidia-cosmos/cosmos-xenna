@@ -56,7 +56,7 @@ def test_num_returns_is_ewma_of_observed_returns() -> None:
 
 def test_empty_instant_skip_does_not_poison_speed() -> None:
     """An empty + instant skip must not enter speed or the trust count."""
-    est = estimator.PipelineRateEstimator(_WINDOW_S, 5, 1e-3)  # window, min_dp, eps=1ms
+    est = estimator.PipelineRateEstimator(_WINDOW_S, 5, 1e-3)  # window, averaging_samples, eps=1ms
     for i in range(1, 4):  # 3 real tasks @ 5 s, 2 returns
         est.observe("s", duration_s=5.0, num_returns=2.0, now=float(i))
     est.observe("s", duration_s=1e-4, num_returns=0.0, now=4.0)  # empty + instant skip (~0.1 ms)
@@ -83,3 +83,20 @@ def test_default_eps_used_when_not_supplied() -> None:
     est.observe("s", duration_s=1e-6, num_returns=0.0, now=1.0)
     assert est.sample_count("s") == 0  # instant empty excluded from the trust count
     assert est.speed("s", now=1.0) is None  # below trust count -> cold
+
+
+def test_averaging_depth_retains_samples_beyond_window() -> None:
+    """averaging_samples retains old samples so one slow task cannot crater the rate.
+
+    With a short window, a large averaging depth keeps the recent fast samples
+    instead of letting the time window drop them, so a single slow task is
+    averaged against many fast ones rather than dominating ``1/mean(duration)``.
+    """
+    window_s = 5.0
+    est = estimator.PipelineRateEstimator(window_s, 20)  # averaging depth 20
+    for i in range(1, 20):
+        est.observe("s", duration_s=1.0, num_returns=1.0, now=float(i))
+    est.observe("s", duration_s=135.0, num_returns=1.0, now=20.0)
+    # All 20 samples are retained despite the 5 s window: mean = (19 + 135)/20 =
+    # 7.7 s -> ~0.13/s, not the 1/135 ~0.0074/s a windowed-only estimate gives.
+    assert est.speed("s", now=20.0) == pytest.approx(20.0 / 154.0)

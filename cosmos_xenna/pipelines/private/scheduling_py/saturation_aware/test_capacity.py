@@ -36,10 +36,17 @@ def _params(
     capacity_headroom: float = 0.10,
     hysteresis_margin: float = 0.15,
     switch_confirm: int = 2,
+    speed_alpha_up: float = 1.0,
+    speed_alpha_down: float | None = None,
 ) -> capacity.CapacityParams:
+    # The speed EWMA defaults mirror the arrival alphas, so speed and arrival
+    # smoothing behave identically unless a test opts into the split; tests that
+    # need the production speed smoothing (0.3 / 0.1) pass the alphas explicitly.
     return capacity.CapacityParams(
         alpha_up=1.0,
         alpha_down=alpha_down,
+        speed_alpha_up=speed_alpha_up,
+        speed_alpha_down=speed_alpha_down if speed_alpha_down is not None else alpha_down,
         capacity_headroom=capacity_headroom,
         hysteresis_margin=hysteresis_margin,
         switch_confirm=switch_confirm,
@@ -322,8 +329,12 @@ def test_pre_bottleneck_buffered_stage_is_not_selected() -> None:
     assert result.plan.bottleneck_candidate == 1
 
 
-def test_queue_candidate_uses_raw_speed_for_rate() -> None:
-    """A populated queue cliff is sized from raw speed, not stale smoothed speed."""
+def test_queue_candidate_uses_smoothed_capacity_for_rate() -> None:
+    """A populated queue cliff is sized from the candidate's smoothed cap_src.
+
+    Stage 0 sees its first sample, so its smoothed ``target_speed`` initializes
+    to the raw speed and ``cap_src`` equals the raw source rate this cycle.
+    """
     result = capacity.compute_capacity(
         _inputs(
             workers=(2, 10),
@@ -355,12 +366,56 @@ def test_balanced_pipeline_falls_back_to_smoothed_capacity() -> None:
     assert result.plan.bottleneck_rate == pytest.approx(2.0)
 
 
+def test_warm_queue_cliff_follows_smoothed_capacity_not_raw_drop() -> None:
+    """A warm cliff sizes from smoothed cap_src; a one-cycle raw drop is damped.
+
+    With a stale-high smoothed speed and a collapsed raw speed, bottleneck_rate
+    follows the protective smoothed cap_src instead of snapping to the raw rate.
+    """
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(2, 10),
+            speed=(1.0, 0.2),
+            local_qin=(1.0, 0.0),
+            local_input_threshold=(1.0, 1.0),
+        ),
+        _state(a_ewma=(None, None), target_speed_ewma=(5.0, 1.0), bottleneck=0),
+        _params(speed_alpha_up=0.3, speed_alpha_down=0.1),
+    )
+    assert result.plan.bottleneck_candidate == 0
+    # Smoothed speed: 0.1 * 1.0 + 0.9 * 5.0 = 4.6 -> cap_src = 2 * 4.6 = 9.2,
+    # not the raw 2 * 1.0 = 2.0.
+    assert result.plan.bottleneck_rate == pytest.approx(9.2)
+
+
+def test_modest_speed_alpha_up_damps_fast_sample_spikes() -> None:
+    """Modest speed_alpha_up damps fast-sample spikes vs the no-smoothing baseline.
+
+    A stage whose raw per-worker speed alternates fast/slow must not let a fast
+    sample snap the smoothed sizing rate to the raw spike (the premature-shrink
+    failure mode); a modest alpha_up keeps the peak well below it.
+    """
+    speeds = (0.2, 2.0, 0.2, 2.0, 0.2, 2.0)
+
+    def peak_rate(speed_alpha_up: float) -> float:
+        model = capacity.CapacityModel.create(1, _params(speed_alpha_up=speed_alpha_up, speed_alpha_down=0.1))
+        return max(
+            model.plan(_inputs(workers=(5,), speed=(s,), local_qin=(2.0,), ready_workers=(5,))).bottleneck_rate
+            for s in speeds
+        )
+
+    # alpha_up=1.0 reproduces the old behavior: a fast sample snaps cap_src to
+    # the raw spike (5 * 2.0 = 10.0). The modest 0.3 keeps the peak well below it.
+    assert peak_rate(1.0) == pytest.approx(10.0)
+    assert peak_rate(0.3) < 8.0
+
+
 def test_cold_queue_cliff_candidate_keeps_trusted_upstream_sized() -> None:
     """A cold queue cliff must not collapse bottleneck_rate and strip upstream holds.
 
     Regression: a downstream stage that just (re)started has a full input queue
-    (a queue cliff) but no trusted speed yet, so its raw rate is 0.0. The rate
-    source must fall back to the slowest MEASURED smoothed rate so the trusted
+    (a queue cliff) but no trusted speed yet, so its ``cap_src`` is 0.0. The rate
+    source must fall back to the slowest MEASURED ``cap_src`` so the trusted
     upstream feeder keeps its bottleneck-matched ``w_sustain`` instead of being
     sized down to ``min_workers`` (which the floor would later tear down).
     """
@@ -370,17 +425,17 @@ def test_cold_queue_cliff_candidate_keeps_trusted_upstream_sized() -> None:
             workers=(4, 2, 2),
             speed=(1.0, 0.0, 0.0),
             # stage 1 has a full input queue, stage 2 is empty -> stage 1 is the
-            # cliff, but it is cold so cap_real[1] == 0.0.
+            # cliff, but it is cold so cap_src[1] == 0.0.
             local_qin=(2.0, 2.0, 0.0),
             local_input_threshold=(1.0, 1.0, 1.0),
         ),
         capacity.CapacityState.initial(3),
         _params(),
     )
-    # The cold cliff owns growth identity, but its 0.0 raw rate must not size.
+    # The cold cliff owns growth identity, but its 0.0 cap_src must not size.
     assert result.plan.stages[1].queue_state is capacity.StageQueueState.BOTTLENECK
     assert result.plan.bottleneck_candidate == 1
-    # Sizing falls back to the slowest measured smoothed rate (cap_src[0] = 4*1/1).
+    # Sizing falls back to the slowest measured cap_src (cap_src[0] = 4*1/1).
     assert result.plan.bottleneck_rate == pytest.approx(4.0)
     # The trusted upstream feeder stays bottleneck-matched, not collapsed to 1.
     assert result.plan.stages[0].w_sustain == 4
