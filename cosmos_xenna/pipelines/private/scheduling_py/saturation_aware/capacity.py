@@ -191,6 +191,15 @@ class StageCapacity:
             ``next_bottleneck_rate`` for the bottleneck stage, to
             ``bottleneck_rate + headroom`` for every other stage), never below
             ``w_sustain``.
+        w_target_is_real: True when ``w_target`` is a real capacity-derived
+            growth target, False when it is the ``min_workers`` placeholder used
+            for a stage with no measurable demand this cycle (cold/untrusted
+            speed, collapsed source fan-out ``chain == 0``, or no measured
+            bottleneck). The cold-start ramp consults this flag as the single
+            source of truth for whether to enforce ``w_target`` as a per-cycle
+            growth ceiling: a placeholder is not a real target, so the ramp
+            defers to the solver (uncapped) instead of pinning the stage to
+            ``min_workers``.
         queue_state: Queue-gradient classification emitted for decision logs.
     """
 
@@ -201,6 +210,7 @@ class StageCapacity:
     a_ewma: float
     w_sustain: int
     w_target: int
+    w_target_is_real: bool
     queue_state: StageQueueState = StageQueueState.BALANCED
 
 
@@ -486,11 +496,16 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         a_ewma = asymmetric_ewma(prev.a_ewma[k], a_raw, params.alpha_up, params.alpha_down)
         target_speed = target_speeds[k]
         if target_speed <= 0.0 or inputs.chain[k] <= 0.0 or bottleneck_rate <= 0.0:
-            # Cold / untrusted stage, or no measured bottleneck yet: the
-            # cold-start ramp owns spawning, so target only min_workers.
+            # Cold / untrusted stage, collapsed source fan-out (chain == 0), or
+            # no measured bottleneck yet: there is no source-normalized demand to
+            # divide, so w_target cannot be computed. Emit the min_workers
+            # placeholder and flag it as not-real so the cold-start ramp leaves
+            # growth to the solver instead of pinning the stage to min_workers.
             w_sustain = params.min_workers
             w_target = params.min_workers
+            w_target_is_real = False
         else:
+            w_target_is_real = True
             w_sustain = math.ceil(a_ewma / target_speed)
             if inputs.rate_is_stale[k]:
                 # A stalled stage's target_speed is collapsing toward zero, so
@@ -535,6 +550,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
                 a_ewma=a_ewma,
                 w_sustain=w_sustain,
                 w_target=w_target,
+                w_target_is_real=w_target_is_real,
                 queue_state=queue_states[k],
             )
         )

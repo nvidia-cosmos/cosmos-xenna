@@ -584,11 +584,6 @@ class SaturationAwareScheduler:
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
-        # The capacity model collapses every stage's w_target to min_workers when
-        # it has no measured bottleneck yet (cold start, no live workers). That
-        # placeholder is not a real growth target, so the ceiling must defer to
-        # the solver (uncapped) until a bottleneck is measured.
-        has_bottleneck = capacity.bottleneck_rate > 0.0
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             if stage.is_manual:
@@ -604,6 +599,15 @@ class SaturationAwareScheduler:
             active_depth = cycle.active_depths[index]
             has_pending_work = active_depth > 0.0
             pending_work_age_s = cycle.pending_work_ages[index]
+            # Consult w_target as the per-cycle growth ceiling only when the
+            # capacity model produced a real target. A placeholder (min_workers,
+            # flagged not-real) means there is no source-normalized demand to
+            # compute a ceiling - cold start, no measured bottleneck, or a
+            # collapsed source fan-out (chain == 0) - so defer growth to the
+            # solver (None == uncapped). This is self-correcting: once the stage
+            # has measurable demand again, w_target becomes real and caps growth.
+            stage_capacity = capacity.stages[index]
+            w_target = stage_capacity.w_target if stage_capacity.w_target_is_real else None
             decision = ramp.decide(
                 StageRampInput(
                     current_workers=current,
@@ -612,7 +616,7 @@ class SaturationAwareScheduler:
                     sample_count=samples,
                     pending_work_age_s=pending_work_age_s,
                     has_pending_work=has_pending_work,
-                    w_target=capacity.stages[index].w_target if has_bottleneck else None,
+                    w_target=w_target,
                 ),
                 self.config,
             )
@@ -651,7 +655,7 @@ class SaturationAwareScheduler:
                 f"current={current} deleted={deleted} "
                 f"frag_new={frag_new} frag_post={frag_post} "
                 f"ramp_new={ramp_new} ramp_post={ramp_post} trimmed={frag_new - ramp_new} "
-                f"cap={decision.cap} w_target={capacity.stages[index].w_target} "
+                f"cap={decision.cap} w_target={w_target} "
                 f"samples={samples}/{min_data_points} is_gpu={stage.is_gpu} "
                 f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
             )

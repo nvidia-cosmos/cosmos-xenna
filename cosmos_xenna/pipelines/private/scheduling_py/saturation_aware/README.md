@@ -38,7 +38,9 @@ snapshot --> capacity --> demand --> solve --> ramp --> floor --> commit
 - `chain.py`: cumulative fan-out factors and whole-chain stock in source units.
 - `ramp.py`: per-cycle growth clamp - not-yet-trusted stages grow +1 worker per
   cycle; a trusted stage is capped at its capacity target `w_target` (the growth
-  ceiling), unless no bottleneck is measured yet (then the solver owns growth).
+  ceiling), unless `w_target` is a placeholder (`w_target_is_real == False`: cold
+  speed, no measured bottleneck, or collapsed source fan-out) - then the solver
+  owns growth.
 - `floor.py`: scale-down floor; clamps deletes to `w_sustain` while stock is
   still in flight.
 

@@ -850,3 +850,43 @@ def test_non_stale_drop_is_still_damped_not_snapped() -> None:
     )
     # 0.1 * 0.1 + 0.9 * 1.0 = 0.91 (damped), not the raw 0.1.
     assert result.plan.stages[1].target_speed == pytest.approx(0.91)
+
+
+def test_w_target_is_real_when_bottleneck_measured() -> None:
+    """Trusted stages with a measured bottleneck carry real growth targets.
+
+    The cold-start ramp uses ``w_target_is_real`` to decide whether to enforce
+    ``w_target`` as a ceiling; this locks the flag True for the normal path.
+    """
+    model = capacity.CapacityModel.create(2, _params())
+    plan = model.plan(_inputs(workers=(10, 15), speed=(0.1, 0.5), chain=(1.0, 8.0)))
+    assert plan.bottleneck_rate > 0.0
+    assert all(stage.w_target_is_real for stage in plan.stages)
+
+
+def test_w_target_not_real_at_cold_start_without_speed() -> None:
+    """With no measured speed there is no bottleneck, so no target is real.
+
+    The placeholder collapses to ``min_workers`` and is flagged not-real so the
+    ramp leaves cold-start growth to the solver instead of pinning to one worker.
+    """
+    model = capacity.CapacityModel.create(2, _params())
+    plan = model.plan(_inputs(workers=(0, 0), speed=(0.0, 0.0)))
+    assert plan.bottleneck_rate == 0.0
+    assert not any(stage.w_target_is_real for stage in plan.stages)
+    assert all(stage.w_target == 1 for stage in plan.stages)  # min_workers placeholder
+
+
+def test_w_target_not_real_for_collapsed_source_fanout() -> None:
+    """A chain==0 downstream stage gets a placeholder even with a live bottleneck.
+
+    This is the per-stage case a global ``bottleneck_rate > 0`` proxy would miss:
+    the upstream stage keeps a real target while the stage whose source fan-out
+    collapsed (chain factor 0, no source-normalized demand) is flagged not-real.
+    """
+    model = capacity.CapacityModel.create(2, _params())
+    plan = model.plan(_inputs(workers=(10, 15), speed=(0.1, 0.5), chain=(1.0, 0.0)))
+    assert plan.bottleneck_rate > 0.0  # upstream stage is measured
+    assert plan.stages[0].w_target_is_real
+    assert not plan.stages[1].w_target_is_real
+    assert plan.stages[1].w_target == 1  # min_workers placeholder

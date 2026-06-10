@@ -58,6 +58,7 @@ def _capacity(
     w_sustain: int = 1,
     speed: float = 2.0,
     target_speed: float | None = None,
+    w_target_is_real: bool = True,
 ) -> StageCapacity:
     """A StageCapacity carrying only the fields demand sizing reads."""
     solver_speed = speed if target_speed is None else target_speed
@@ -69,6 +70,7 @@ def _capacity(
         a_ewma=0.0,
         w_sustain=w_sustain,
         w_target=w_target,
+        w_target_is_real=w_target_is_real,
     )
 
 
