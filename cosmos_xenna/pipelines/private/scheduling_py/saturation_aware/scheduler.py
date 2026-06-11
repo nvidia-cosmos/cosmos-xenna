@@ -162,7 +162,9 @@ class _Cycle:
         """Return the scale-down release gate's inputs for this cycle.
 
         Pairs the cycle's active whole-chain stock and depths with the capacity
-        plan's per-stage ``w_sustain`` hold target.
+        plan's per-stage ``w_sustain`` hold target, plus the per-stage
+        utilization signals (``ready_workers``, ``local_pending_depths``) the
+        gate uses to veto shrinking a saturated, backlogged stage.
         """
         return FloorInputs(
             workers=self.workers,
@@ -171,6 +173,8 @@ class _Cycle:
             active_depths=self.active_depths,
             batch_sizes=self.batch_sizes,
             w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
+            ready_workers=self.ready_workers,
+            local_pending_depths=self.local_pending_depths,
             protect_downstream_of=capacity.bottleneck_candidate,
         )
 

@@ -95,6 +95,13 @@ class FloorInputs:
         batch_sizes: Per-stage input batch sizes.
         w_sustain: Per-stage capacity hold target from the capacity plan; the
             floor clamps deletes to ``min(w_sustain, workers)`` while holding.
+        ready_workers: Per-stage count of idle (ready, non-busy) workers. Zero
+            means every worker is occupied this cycle. Paired with
+            ``local_pending_depths`` to veto a shrink of a stage that is both
+            fully utilized and still holding queued work.
+        local_pending_depths: Per-stage local queued depth in stage-input
+            sample units, excluding in-flight work. A value at or above one
+            batch means the stage has admitted work waiting for a free worker.
         protect_downstream_of: Rate-source stage whose downstream stages should
             not shrink while source-normalized stock is still in flight.
     """
@@ -105,6 +112,8 @@ class FloorInputs:
     active_depths: tuple[float, ...]
     batch_sizes: tuple[int, ...]
     w_sustain: tuple[int, ...]
+    ready_workers: tuple[int, ...]
+    local_pending_depths: tuple[float, ...]
     protect_downstream_of: int = -1
 
 
@@ -170,7 +179,9 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
     ``release_confirm_cycles`` consecutive cycles, at which point it releases
     as far as ``min_workers`` without exceeding current workers. Lower hold
     targets must persist for the same confirm window; higher targets take
-    effect immediately.
+    effect immediately. A stage that is fully utilized and still holds a queued
+    batch is held at its current workers regardless of a decayed ``w_sustain``,
+    unless the whole-chain release path confirms its upstream work has drained.
 
     Args:
         inputs: Per-cycle observed per-stage inputs, including the capacity
@@ -189,6 +200,8 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         == len(inputs.active_depths)
         == len(inputs.batch_sizes)
         == len(inputs.w_sustain)
+        == len(inputs.ready_workers)
+        == len(inputs.local_pending_depths)
         == len(prev.release_streak)
         == len(prev.held_floor)
         == len(prev.shrink_streak)
@@ -199,7 +212,9 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             "floor inputs length mismatch: "
             f"workers={num_stages} chain={len(inputs.chain)} stock_src={len(inputs.stock_src)} "
             f"active_depths={len(inputs.active_depths)} batch_sizes={len(inputs.batch_sizes)} "
-            f"w_sustain={len(inputs.w_sustain)} prev_release_streak={len(prev.release_streak)} "
+            f"w_sustain={len(inputs.w_sustain)} ready_workers={len(inputs.ready_workers)} "
+            f"local_pending_depths={len(inputs.local_pending_depths)} "
+            f"prev_release_streak={len(prev.release_streak)} "
             f"prev_held_floor={len(prev.held_floor)} prev_shrink_streak={len(prev.shrink_streak)} "
             f"prev_pending_shrink_floor={len(prev.pending_shrink_floor)}"
         )
@@ -234,6 +249,21 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         min_floor = min(params.min_workers, inputs.workers[k])
         desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
         if inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of and has_stock:
+            desired = inputs.workers[k]
+        # Local-evidence shrink veto. A stage with no ready worker AND at least
+        # one queued batch is demonstrably under-provisioned this cycle, so a
+        # w_sustain decayed by a transient global bottleneck_rate dip must not
+        # shrink it against its own backlog. Hold at current workers; this self
+        # clears the moment the stage drains (a worker frees or the queue falls
+        # below one batch). Raising desired to workers takes the rise branch
+        # below, which resets any in-flight shrink-confirm streak - local
+        # saturation evidence intentionally outranks a pending shrink. The
+        # whole-chain release path below still overrides to min_workers on a
+        # confirmed drain, so the veto cannot pin a stage whose upstream work
+        # has genuinely finished.
+        saturated = inputs.ready_workers[k] == 0
+        backlogged = inputs.local_pending_depths[k] >= float(inputs.batch_sizes[k])
+        if saturated and backlogged:
             desired = inputs.workers[k]
         base = min(prev.held_floor[k], inputs.workers[k])
         if base <= 0 or desired >= base:

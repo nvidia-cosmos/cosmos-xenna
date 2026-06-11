@@ -28,7 +28,10 @@ and shrink (``floor.py``) consumers share:
   climbs toward ``next_bottleneck_rate`` - the second-slowest stage's capacity,
   i.e. the move that actually raises pipeline speed; every other stage,
   including the source, is bounded to ``bottleneck_rate * (1 +
-  capacity_headroom)`` (a small read-ahead, never free growth).
+  capacity_headroom)`` (a small read-ahead, never free growth). Growth is
+  additionally bounded by each stage's best observed per-worker speed
+  (``speed_peak``), so a stage whose per-worker speed collapses under
+  contention cannot inflate its divisive target into a runaway request.
 
 Bottleneck identity is sticky (hysteresis) so a one-cycle queue or ``cap_src``
 dip cannot flap growth ownership. The smoothed arrival rate ``a_ewma`` and the
@@ -81,6 +84,12 @@ class CapacityParams:
         stale_growth_step: Maximum workers a stale-rate stage may grow in one
             cycle, so a stalled stage's collapsing ``target_speed`` cannot
             explode its divisive ``w_target`` into a node-filling request.
+        speed_peak_decay: Per-cycle decay (0, 1] applied to a stage's
+            high-water per-worker speed when the current sample is below it.
+            Bounds ``w_target`` so a stage whose per-worker speed collapses
+            under contention cannot inflate its divisive growth target; the
+            slow decay lets a genuine, sustained per-task slowdown eventually
+            lower the bound and re-enable growth.
     """
 
     alpha_up: float
@@ -92,6 +101,7 @@ class CapacityParams:
     switch_confirm: int
     min_workers: int = 1
     stale_growth_step: int = 1
+    speed_peak_decay: float = 0.999
 
 
 @attrs.frozen
@@ -103,6 +113,10 @@ class CapacityState:
             first observation (then initialized to that value).
         target_speed_ewma: Smoothed speed used for worker-target math; ``None``
             until a trusted speed has been observed.
+        speed_peak: Slowly decaying high-water per-worker speed per stage;
+            ``None`` until a trusted speed has been observed. Bounds the
+            divisive ``w_target`` so a contention-collapsed speed cannot inflate
+            the growth target.
         bottleneck: Incumbent global-bottleneck index, or ``-1`` when no
             stage is measured yet.
         bottleneck_streak: Consecutive cycles a challenger has beaten the
@@ -116,6 +130,7 @@ class CapacityState:
 
     a_ewma: tuple[float | None, ...]
     target_speed_ewma: tuple[float | None, ...]
+    speed_peak: tuple[float | None, ...]
     bottleneck: int
     bottleneck_streak: int
     bottleneck_from_queue: bool = False
@@ -126,6 +141,7 @@ class CapacityState:
         return cls(
             a_ewma=(None,) * num_stages,
             target_speed_ewma=(None,) * num_stages,
+            speed_peak=(None,) * num_stages,
             bottleneck=-1,
             bottleneck_streak=0,
             bottleneck_from_queue=False,
@@ -190,7 +206,9 @@ class StageCapacity:
         w_target: Useful growth target this cycle (matched to
             ``next_bottleneck_rate`` for the bottleneck stage, to
             ``bottleneck_rate + headroom`` for every other stage), never below
-            ``w_sustain``.
+            ``w_sustain`` and never above the worker count that would meet that
+            rate at the stage's best observed per-worker speed (so a
+            contention-collapsed speed cannot inflate it).
         w_target_is_real: True when ``w_target`` is a real capacity-derived
             growth target, False when it is the ``min_workers`` placeholder used
             for a stage with no measurable demand this cycle (cold/untrusted
@@ -384,6 +402,21 @@ def _target_speed_for_cycle(
     return target_speed, target_speed
 
 
+def _speed_peak_for_cycle(prev_peak: float | None, target_speed: float, decay: float) -> float | None:
+    """Return the high-water per-worker speed, decayed when below the peak.
+
+    A sample at or above the peak raises it immediately; a lower sample relaxes
+    the peak geometrically by ``decay`` so a transient contention dip is ignored
+    while a sustained genuine slowdown eventually lowers the bound. A cold
+    sample (``target_speed <= 0``) carries the previous peak unchanged.
+    """
+    if target_speed <= 0.0:
+        return prev_peak
+    if prev_peak is None or target_speed >= prev_peak:
+        return target_speed
+    return max(target_speed, prev_peak * decay)
+
+
 def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: CapacityParams) -> CapacityResult:
     """Compute the capacity plan for one cycle and the next-cycle state.
 
@@ -391,9 +424,11 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
     bottleneck, derives the current candidate's ``bottleneck_rate`` and
     ``next_bottleneck_rate``, smooths each stage's bottleneck-matched arrival,
     and derives the hold target ``w_sustain`` and growth target ``w_target``.
-    Cold / untrusted stages (``speed <= 0`` or ``chain <= 0``) and an all-cold
-    pipeline (``bottleneck_rate <= 0``) yield ``min_workers`` targets so the
-    cold-start ramp keeps owning them.
+    ``w_target`` is bounded by each stage's decaying peak per-worker speed so a
+    contention-collapsed speed cannot inflate the divisive target. Cold /
+    untrusted stages (``speed <= 0`` or ``chain <= 0``) and an all-cold pipeline
+    (``bottleneck_rate <= 0``) yield ``min_workers`` targets so the cold-start
+    ramp keeps owning them.
 
     Args:
         inputs: Per-cycle observed per-stage inputs.
@@ -421,6 +456,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         == len(inputs.rate_is_stale)
         == len(prev.a_ewma)
         == len(prev.target_speed_ewma)
+        == len(prev.speed_peak)
         == num_stages
     ):
         raise ValueError(
@@ -430,7 +466,8 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             f"local_pending_depth={len(inputs.local_pending_depth)} "
             f"local_input_threshold={len(inputs.local_input_threshold)} active_depth={len(inputs.active_depth)} "
             f"ready_workers={len(inputs.ready_workers)} rate_is_stale={len(inputs.rate_is_stale)} "
-            f"prev_a_ewma={len(prev.a_ewma)} prev_target_speed_ewma={len(prev.target_speed_ewma)}"
+            f"prev_a_ewma={len(prev.a_ewma)} prev_target_speed_ewma={len(prev.target_speed_ewma)} "
+            f"prev_speed_peak={len(prev.speed_peak)}"
         )
 
     # Smooth each stage's per-worker speed with the dedicated speed alphas
@@ -439,6 +476,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
     # rate so the feeder it is starving is grown without the slow decay delay.
     target_speeds: list[float] = []
     next_target_speed_ewma: list[float | None] = []
+    speed_peaks: list[float | None] = []
     for k in range(num_stages):
         target_speed, target_speed_state = _target_speed_for_cycle(
             prev.target_speed_ewma[k],
@@ -449,6 +487,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         )
         target_speeds.append(target_speed)
         next_target_speed_ewma.append(target_speed_state)
+        speed_peaks.append(_speed_peak_for_cycle(prev.speed_peak[k], target_speed, params.speed_peak_decay))
 
     cap_src = _source_capacities(inputs.workers, target_speeds, inputs.chain)
     queue_states = classify_stages(inputs)
@@ -531,6 +570,20 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
             w_target = math.ceil(inputs.chain[k] * target_rate / target_speed)
             # Headroom lives in w_target; never target below the hold floor.
             w_target = max(w_target, w_sustain)
+            # Bound growth by the worker count that would already meet
+            # target_rate at this stage's best observed per-worker speed. Past
+            # that knee more workers cannot raise throughput - the per-worker
+            # speed only falls under contention, so the divisive w_target would
+            # inflate without bound (a runaway request/contention feedback loop).
+            # speed_peak is a slowly decaying high-water mark, so a genuine
+            # sustained per-task slowdown (heavier work, not contention)
+            # eventually lowers the bound and re-enables growth. Skip while
+            # rate_is_stale: a stall is one long non-parallelizable task, not
+            # contention, so the stale clamp below owns that growth path instead.
+            stage_speed_peak = speed_peaks[k]
+            if not inputs.rate_is_stale[k] and stage_speed_peak is not None and stage_speed_peak > 0.0:
+                w_target_cap = math.ceil(inputs.chain[k] * target_rate / stage_speed_peak)
+                w_target = max(min(w_target, w_target_cap), w_sustain)
             if inputs.rate_is_stale[k]:
                 # A stalled stage's target_speed is collapsing toward zero, which
                 # would inflate this divisive w_target into a node-filling burst.
@@ -569,6 +622,7 @@ def compute_capacity(inputs: CapacityInputs, prev: CapacityState, params: Capaci
         state=CapacityState(
             a_ewma=tuple(next_ewma),
             target_speed_ewma=tuple(next_target_speed_ewma),
+            speed_peak=tuple(speed_peaks),
             bottleneck=bottleneck_stage,
             bottleneck_streak=bottleneck_streak,
             bottleneck_from_queue=has_queue_candidate,

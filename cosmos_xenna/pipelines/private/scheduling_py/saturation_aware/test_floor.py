@@ -44,9 +44,13 @@ def _inputs(
     active: tuple[float, float] = (0.0, 0.0),
     chain_factors: tuple[float, float] = _CHAIN,
     protect_downstream_of: int = -1,
+    ready_workers: tuple[int, int] = (1, 1),
+    local_pending: tuple[float, float] = (0.0, 0.0),
 ) -> floor.FloorInputs:
     # active_depths only affects the zero-fanout (chain <= 0) release branch.
     # _CHAIN is all-positive, so positive-chain tests are unaffected by it.
+    # ready_workers/local_pending default to "idle, no backlog" so the
+    # saturation+backlog veto stays off unless a test opts into it.
     return floor.FloorInputs(
         workers=workers,
         chain=chain_factors,
@@ -54,6 +58,8 @@ def _inputs(
         active_depths=active,
         batch_sizes=_BATCH,
         w_sustain=w_sustain,
+        ready_workers=ready_workers,
+        local_pending_depths=local_pending,
         protect_downstream_of=protect_downstream_of,
     )
 
@@ -179,6 +185,8 @@ def _zero_fanout_inputs(active_caption_depth: float) -> floor.FloorInputs:
         active_depths=(0.0, active_caption_depth),
         batch_sizes=_BATCH,
         w_sustain=(1, 14),
+        ready_workers=(1, 1),
+        local_pending_depths=(0.0, 0.0),
     )
 
 
@@ -421,6 +429,86 @@ def test_degenerate_chain_factor_does_not_explode_threshold() -> None:
     assert second.plan.floors[1] == 5
 
 
+def test_saturated_backlogged_stage_not_shrunk() -> None:
+    """A fully utilized stage holding a queued batch is held against a decayed w_sustain.
+
+    A transient global bottleneck_rate dip decays caption's w_sustain (5 < 7
+    workers), but with no ready worker and one queued batch the stage is
+    demonstrably under-provisioned, so the veto holds it at its current 7.
+    """
+    params = _params(release_confirm_cycles=2)
+    busy = _inputs(
+        workers=(10, 7),
+        w_sustain=(1, 5),
+        stock=_DEEP_STOCK,
+        ready_workers=(1, 0),
+        local_pending=(0.0, 1.0),
+    )
+    first = floor.compute_floors(busy, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(busy, first.state, params)
+
+    assert first.plan.floors[1] == 7
+    assert second.plan.floors[1] == 7
+    assert second.plan.decisions[1].shrink_streak == 0
+    assert not second.plan.decisions[1].shrink_deferred
+
+
+def test_idle_stage_still_shrinks_despite_backlog() -> None:
+    """A backlog alone does not veto a shrink; an idle worker means it is over-provisioned."""
+    params = _params(release_confirm_cycles=2)
+    over = _inputs(
+        workers=(10, 7),
+        w_sustain=(1, 5),
+        stock=_DEEP_STOCK,
+        ready_workers=(1, 1),
+        local_pending=(0.0, 1.0),
+    )
+    first = floor.compute_floors(over, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(over, first.state, params)
+
+    assert second.plan.floors[1] == 5
+
+
+def test_saturated_but_no_batch_queued_still_shrinks() -> None:
+    """Full utilization without a queued batch does not veto a shrink to w_sustain."""
+    params = _params(release_confirm_cycles=2)
+    drained_queue = _inputs(
+        workers=(10, 7),
+        w_sustain=(1, 5),
+        stock=_DEEP_STOCK,
+        ready_workers=(1, 0),
+        local_pending=(0.0, 0.0),
+    )
+    first = floor.compute_floors(drained_queue, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(drained_queue, first.state, params)
+
+    assert second.plan.floors[1] == 5
+
+
+def test_release_overrides_saturation_veto() -> None:
+    """A confirmed whole-chain drain releases to MIN even while the saturation veto holds.
+
+    The veto sets the desired floor to current workers, but a confirmed
+    upstream drain (stock below one batch for the confirm window) still
+    releases the stage, so the veto cannot pin a stage whose feed has ended.
+    """
+    params = _params(release_confirm_cycles=2)
+    drained = _inputs(
+        workers=(10, 7),
+        w_sustain=(1, 5),
+        stock=_EMPTY_STOCK,
+        ready_workers=(1, 0),
+        local_pending=(0.0, 1.0),
+    )
+    first = floor.compute_floors(drained, floor.FloorState.initial(2), params)
+    second = floor.compute_floors(drained, first.state, params)
+
+    assert first.plan.floors[1] == 7
+    assert not first.plan.decisions[1].releasing
+    assert second.plan.decisions[1].releasing
+    assert second.plan.floors[1] == params.min_workers
+
+
 def test_mismatched_input_length_raises() -> None:
     """A short floor-input tuple is a programming error."""
     short_w_sustain: tuple[int, ...] = (1,)
@@ -431,6 +519,8 @@ def test_mismatched_input_length_raises() -> None:
         active_depths=(0.0, 0.0),
         batch_sizes=_BATCH,
         w_sustain=short_w_sustain,
+        ready_workers=(1, 1),
+        local_pending_depths=(0.0, 0.0),
     )
     with pytest.raises(ValueError, match="length mismatch"):
         floor.compute_floors(mismatched, floor.FloorState.initial(2), _params())

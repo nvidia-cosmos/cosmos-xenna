@@ -88,13 +88,20 @@ def _state(
     *,
     a_ewma: tuple[float | None, ...],
     target_speed_ewma: tuple[float | None, ...] | None = None,
+    speed_peak: tuple[float | None, ...] | None = None,
     bottleneck: int,
     bottleneck_streak: int = 0,
 ) -> capacity.CapacityState:
-    """Return capacity state with optional smoothed speed state."""
+    """Return capacity state with optional smoothed speed and peak-speed state.
+
+    ``speed_peak`` defaults to unset, so the first cycle initializes each peak to
+    that cycle's ``target_speed`` and the growth bound is a no-op unless a test
+    seeds a higher prior peak.
+    """
     return capacity.CapacityState(
         a_ewma=a_ewma,
         target_speed_ewma=target_speed_ewma if target_speed_ewma is not None else (None,) * len(a_ewma),
+        speed_peak=speed_peak if speed_peak is not None else (None,) * len(a_ewma),
         bottleneck=bottleneck,
         bottleneck_streak=bottleneck_streak,
     )
@@ -810,6 +817,31 @@ def test_stalled_stage_growth_is_bounded_to_step() -> None:
     assert stalled.w_target >= stalled.w_sustain  # never below the hold floor
 
 
+def test_stale_growth_is_not_throttled_by_a_high_speed_peak() -> None:
+    """A stall is one long task, not contention, so the peak bound must not cap its step.
+
+    The contention peak bound and the stale growth step address different
+    failure modes; with a high prior ``speed_peak`` and ``rate_is_stale`` set,
+    growth follows ``workers + stale_growth_step``, not the peak-speed knee.
+    """
+    # speed_peak (2.0) is far above the stalled target_speed (0.01); without the
+    # stale carve-out the peak knee would cap growth to ~5 instead of 4 + 2 = 6.
+    # Stage 1 is the (stale) bottleneck so target_rate is next_bottleneck_rate.
+    prev = _state(a_ewma=(None, 5.0), target_speed_ewma=(2.0, 2.0), speed_peak=(2.0, 2.0), bottleneck=1)
+    result = capacity.compute_capacity(
+        _inputs(
+            workers=(4, 4),
+            speed=(2.0, 0.01),
+            local_qin=(2.0, 2.0),
+            ready_workers=(4, 4),
+            rate_is_stale=(False, True),
+        ),
+        prev,
+        _params(speed_alpha_up=0.3, speed_alpha_down=0.1, stale_growth_step=2),
+    )
+    assert result.plan.stages[1].w_target == 4 + 2  # stale step, peak bound skipped
+
+
 def test_stalled_stage_hold_never_drops_below_min_workers() -> None:
     """The stale hold cap to current workers must still respect the min_workers floor.
 
@@ -890,3 +922,70 @@ def test_w_target_not_real_for_collapsed_source_fanout() -> None:
     assert plan.stages[0].w_target_is_real
     assert not plan.stages[1].w_target_is_real
     assert plan.stages[1].w_target == 1  # min_workers placeholder
+
+
+def test_speed_peak_is_high_water_then_decays() -> None:
+    """speed_peak rises immediately to a new high and relaxes geometrically below it."""
+    assert capacity._speed_peak_for_cycle(None, 4.0, 0.9) == 4.0  # cold -> first sample
+    assert capacity._speed_peak_for_cycle(4.0, 6.0, 0.9) == 6.0  # higher sample raises now
+    assert capacity._speed_peak_for_cycle(6.0, 1.0, 0.9) == pytest.approx(5.4)  # decays by 0.9
+    assert capacity._speed_peak_for_cycle(6.0, 5.9, 0.9) == pytest.approx(5.9)  # floored at sample
+    assert capacity._speed_peak_for_cycle(6.0, 0.0, 0.9) == 6.0  # cold sample carries peak
+
+
+def test_w_target_capped_by_peak_speed_under_contention() -> None:
+    """A bottleneck whose per-worker speed collapses under contention cannot inflate w_target.
+
+    The divisive ``w_target = ceil(chain * next_rate / target_speed)`` balloons
+    as ``target_speed`` falls; the peak-speed bound holds it near the worker
+    count that already meets the rate at the stage's best observed speed.
+    """
+    # Stage 1 is the bottleneck; its per-worker speed collapsed to 0.2 from a
+    # peak of 1.0, while the feeder (stage 0) sets next_bottleneck_rate = 10.
+    prev = _state(a_ewma=(None, 1.0), target_speed_ewma=(1.0, 1.0), speed_peak=(1.0, 1.0), bottleneck=1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(10, 2), speed=(1.0, 0.2)),
+        prev,
+        _params(speed_alpha_up=1.0, speed_alpha_down=1.0),
+    )
+    stage = result.plan.stages[1]
+    assert result.plan.bottleneck_stage == 1
+    assert result.plan.next_bottleneck_rate == pytest.approx(10.0)
+    # Uncapped divisive target would be ceil(10 / 0.2) = 50; the peak bound holds
+    # it near ceil(10 / ~1.0) = 11.
+    raw_divisive = math.ceil(result.plan.next_bottleneck_rate / 0.2)
+    assert raw_divisive == 50
+    assert stage.w_target < raw_divisive
+    assert stage.w_target <= 12
+
+
+def test_w_target_uncapped_when_speed_stable() -> None:
+    """When per-worker speed equals its peak, the bound is a no-op (full growth)."""
+    prev = _state(a_ewma=(None, 1.0), target_speed_ewma=(1.0, 1.0), speed_peak=(1.0, 1.0), bottleneck=1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(10, 2), speed=(1.0, 1.0)),
+        prev,
+        _params(speed_alpha_up=1.0, speed_alpha_down=1.0),
+    )
+    # target_speed == peak == 1.0 -> w_target climbs to the full divisive target.
+    assert result.plan.next_bottleneck_rate == pytest.approx(10.0)
+    assert result.plan.stages[1].w_target == math.ceil(10.0 / 1.0)
+
+
+def test_speed_peak_decay_re_enables_growth_after_sustained_slowdown() -> None:
+    """A sustained genuine slowdown decays the peak, lifting the w_target cap.
+
+    Once the peak has relaxed to the new (lower) sustained per-worker speed, the
+    bound no longer holds growth back: w_target rises to the full divisive
+    target so the stage can grow into a genuinely heavier workload.
+    """
+    # The peak has already decayed to the new sustained speed (0.2), matching
+    # target_speed; the cap then equals the raw divisive target (no longer limiting).
+    prev = _state(a_ewma=(None, 1.0), target_speed_ewma=(1.0, 0.2), speed_peak=(1.0, 0.2), bottleneck=1)
+    result = capacity.compute_capacity(
+        _inputs(workers=(10, 2), speed=(1.0, 0.2)),
+        prev,
+        _params(speed_alpha_up=1.0, speed_alpha_down=1.0),
+    )
+    assert result.plan.next_bottleneck_rate == pytest.approx(10.0)
+    assert result.plan.stages[1].w_target == math.ceil(10.0 / 0.2)  # 50, fully re-enabled
