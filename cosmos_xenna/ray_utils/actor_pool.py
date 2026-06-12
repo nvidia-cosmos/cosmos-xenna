@@ -628,7 +628,7 @@ class _NodePortRegistry:
 
 class ClusterPortRegistry:
     def __init__(self) -> None:
-        self._port_registry: dict[str, _NodePortRegistry] = collections.defaultdict(lambda: _NodePortRegistry())
+        self._port_registry: dict[str, _NodePortRegistry] = collections.defaultdict(_NodePortRegistry)
 
     def register_port(self, node_id: str, owned_worker_group_id: str, port: int) -> None:
         self._port_registry[node_id].register_port(port, owned_worker_group_id)
@@ -836,6 +836,23 @@ class ActorPool(Generic[T, V]):
         return sum([x.num_used_slots for x in self._ready_actors.values()], 0)
 
     @property
+    def num_inflight_tasks(self) -> int:
+        """Return the count of logical in-flight tasks for runtime signals.
+
+        An SPMD worker group runs one logical task across one slot on every rank
+        actor (see :meth:`_schedule_task_on_worker_group`), so summing every
+        actor's used slots multiplies one logical batch by the world size.
+        Counting only primary actors (rank 0, or rank ``None`` for non-SPMD
+        actors) reports each logical task once and equals :attr:`num_used_slots`
+        for non-SPMD pools.
+        """
+        return sum(
+            actor.num_used_slots
+            for actor in self._ready_actors.values()
+            if actor.metadata.rank == 0 or actor.metadata.rank is None
+        )
+
+    @property
     def num_empty_slots(self) -> int:
         return sum([x.num_empty_slots for x in self._ready_actors.values()], 0)
 
@@ -885,6 +902,11 @@ class ActorPool(Generic[T, V]):
     @property
     def slots_per_actor(self) -> int:
         return self._slots_per_actor
+
+    @property
+    def stage_batch_size(self) -> int:
+        """Return the number of input samples each scheduled task consumes."""
+        return self._params.stage_batch_size
 
     @property
     def task_extra_data(self) -> collections.deque[stage_worker.TaskResultMetadata]:

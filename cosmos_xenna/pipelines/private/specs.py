@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import copy
 import enum
+import math
 import multiprocessing
 import typing
 from typing import Any, Generic, Optional, Sequence
@@ -28,6 +29,9 @@ import attrs
 from cosmos_xenna import file_distribution
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.pipelines.private.continuous_wrapped_stage import ContinuousWrappedStage
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import (
+    SaturationAwareConfig as SaturationAwareConfig,
+)
 from cosmos_xenna.ray_utils import runtime_envs, stage
 from cosmos_xenna.ray_utils.continuous_stage import ContinuousInterface
 from cosmos_xenna.utils import approx, attrs_utils
@@ -65,6 +69,17 @@ class ExecutionMode(enum.Enum):
     # serving scenarios where requests arrive dynamically via an input source queue and results are
     # pushed to output a sink queue. Workers remain active indefinitely waiting for new requests.
     SERVING = 2
+
+
+class SchedulerKind(enum.StrEnum):
+    """Streaming-mode autoscaler selection.
+
+    ``FRAGMENTATION_BASED`` is the Rust-backed production default;
+    ``SATURATION_AWARE`` is the pure-Python backlog-aware scheduler.
+    """
+
+    FRAGMENTATION_BASED = "fragmentation_based"
+    SATURATION_AWARE = "saturation_aware"
 
 
 class Stage(abc.ABC, Generic[T, V]):
@@ -341,6 +356,22 @@ class StageSpec(typing.Generic[T, V]):
         else:
             return f"Stage {index:02d} - {type(self.stage).__name__}"
 
+    def resolved_num_workers(self, num_nodes: int) -> int | None:
+        """Return the pinned worker count, or None when the stage autoscales.
+
+        Args:
+            num_nodes: Cluster node count, used to expand a per-node count.
+
+        Returns:
+            ``num_workers`` if set; else ``ceil(num_workers_per_node * num_nodes)``;
+            else ``None``.
+        """
+        if self.num_workers is not None:
+            return self.num_workers
+        if self.num_workers_per_node is not None:
+            return math.ceil(self.num_workers_per_node * num_nodes)
+        return None
+
     def validate(self, cluster_resources: resources.ClusterResources) -> None:
         if self.num_workers is not None and self.num_workers_per_node is not None:
             raise ValueError(
@@ -421,6 +452,13 @@ class StreamingSpecificSpec:
     # still applies). End-of-stage teardown bypasses the grace via the
     # ``stages_is_dones`` flag so final drain is never delayed.
     scale_down_grace_after_ready_s: float = 60.0
+    # Streaming-mode autoscaler selection. ``FRAGMENTATION_BASED`` (default) uses the
+    # Rust-backed solver; ``SATURATION_AWARE`` uses the pure-Python backlog-aware
+    # scheduler. Ignored in BATCH execution mode.
+    scheduler: SchedulerKind = SchedulerKind.FRAGMENTATION_BASED
+    # Tunables for the saturation-aware scheduler; consulted only when
+    # ``scheduler`` is ``SATURATION_AWARE``. ``None`` uses the defaults.
+    saturation_aware: SaturationAwareConfig | None = None
 
 
 @attrs.define

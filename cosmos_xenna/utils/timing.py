@@ -202,6 +202,14 @@ class RateEstimator:
 
 
 class RateEstimatorDuration:
+    # CAVEAT (in-flight aging): this estimator only changes on update(), i.e. on
+    # task COMPLETION. While a worker is busy on a long, not-yet-completed task it
+    # contributes nothing, so get_rate() reports a frozen, stale-high rate for a
+    # stalled source. Worse, when min_num_events is set, _remove_old keeps that
+    # many samples even past the time window, so a source that stops completing
+    # never ages out its old fast samples. Consumers that size live capacity off
+    # this rate must apply their own elapsed-since-last-completion ceiling (the
+    # saturation-aware scheduler does this).
     def __init__(self, previous_duration_to_look_s: float, min_num_events: Optional[int] = None):
         """
         Initializes the DurationRateEstimator object.

@@ -37,6 +37,9 @@ from cosmos_xenna.pipelines.private import (
     resources,
     specs,
 )
+from cosmos_xenna.pipelines.private.scheduling_py import runtime_signals
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler
 from cosmos_xenna.ray_utils import actor_pool, stage_worker
 from cosmos_xenna.utils import approx, deque, timing, verbosity
 from cosmos_xenna.utils import python_log as logger
@@ -188,18 +191,12 @@ def _make_problem_from_pipeline_spec(
     num_nodes = len(cluster_resources.nodes)
     for idx, stage in enumerate(pipeline_spec.stages):
         assert isinstance(stage, specs.StageSpec)
-        if stage.num_workers is not None:
-            num_workers = stage.num_workers
-        elif stage.num_workers_per_node is not None:
-            num_workers = math.ceil(stage.num_workers_per_node * num_nodes)
-        else:
-            num_workers = None
         out_stages.append(
             data_structures.ProblemStage(
                 stage.name(idx),
                 stage.stage.stage_batch_size,
                 stage.stage.required_resources.to_worker_shape(cluster_resources),
-                requested_num_workers=num_workers,
+                requested_num_workers=stage.resolved_num_workers(num_nodes),
                 over_provision_factor=stage.over_provision_factor,
             )
         )
@@ -281,6 +278,51 @@ def _required_workers_for_stage(
     capacity_per_actor = slots_per_actor * stage_batch_size
     workers_for_backlog = math.ceil(backlog_samples / capacity_per_actor)
     return max(Autoscaler.MIN_WORKERS_PER_STAGE, workers_for_inflight, workers_for_backlog)
+
+
+class _SchedulerAlgorithm(typing.Protocol):
+    """Per-cycle autoscaling algorithm consumed by :class:`Autoscaler`.
+
+    Both the Rust-backed ``FragmentationBasedAutoscaler`` and the pure-Python
+    ``SaturationAwareScheduler`` satisfy this surface.
+    """
+
+    def setup(self, problem: data_structures.Problem) -> None: ...
+
+    def update_with_measurements(self, time: float, measurements: data_structures.Measurements) -> None: ...
+
+    def autoscale(self, time: float, problem_state: data_structures.ProblemState) -> data_structures.Solution: ...
+
+
+def _effective_autoscale_interval_s(mode_specific: specs.StreamingSpecificSpec) -> float:
+    """Return the decision cadence in seconds for the selected scheduler."""
+    if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
+        return SaturationAwareConfig.resolve(mode_specific.saturation_aware).interval_s
+    return mode_specific.autoscale_interval_s
+
+
+def _make_scheduler_algorithm(
+    pipeline_spec: specs.PipelineSpec,
+    cluster_resources: resources.ClusterResources,
+    mode_specific: specs.StreamingSpecificSpec,
+) -> _SchedulerAlgorithm:
+    """Build and set up the autoscaling algorithm selected by ``mode_specific``.
+
+    ``FRAGMENTATION_BASED`` (default) returns the Rust solver; ``SATURATION_AWARE``
+    returns the pure-Python backlog-aware scheduler.
+    """
+    problem = _make_problem_from_pipeline_spec(pipeline_spec, cluster_resources)
+    algorithm: _SchedulerAlgorithm
+    if mode_specific.scheduler == specs.SchedulerKind.SATURATION_AWARE:
+        config = SaturationAwareConfig.resolve(mode_specific.saturation_aware)
+        algorithm = SaturationAwareScheduler.from_pipeline_spec(pipeline_spec, cluster_resources, config)
+    else:
+        algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
+            mode_specific.autoscale_speed_estimation_window_duration_s,
+            mode_specific.autoscale_speed_estimation_min_data_points,
+        )
+    algorithm.setup(problem)
+    return algorithm
 
 
 class Autoscaler:
@@ -382,11 +424,9 @@ class Autoscaler:
         assert mode_specific is not None, "Autoscaler requires StreamingSpecificSpec; got mode_specific=None"
         self._verbosity_level = verbosity_level
         self._allocator = worker_allocator
-        self._algorithm = autoscaling_algorithms.FragmentationBasedAutoscaler(
-            mode_specific.autoscale_speed_estimation_window_duration_s,
-            mode_specific.autoscale_speed_estimation_min_data_points,
+        self._algorithm: _SchedulerAlgorithm = _make_scheduler_algorithm(
+            pipeline_spec, cluster_resources, mode_specific
         )
-        self._algorithm.setup(_make_problem_from_pipeline_spec(pipeline_spec, cluster_resources))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._autoscale_future: Optional[concurrent.futures.Future] = None
         self._autoscale_start_time: float = 0.0
@@ -404,6 +444,19 @@ class Autoscaler:
     def __exit__(self, exc_type, exc_val, exc_tb):  # noqa: ANN001, ANN204
         """Exits the context manager, shutting down the executor."""
         self._executor.shutdown(wait=True)
+
+    @property
+    def uses_runtime_signals(self) -> bool:
+        """Whether the selected scheduler consumes per-cycle runtime signals.
+
+        Runtime-aware schedulers (for example ``SATURATION_AWARE``) read the
+        per-stage queue/pool/in-flight snapshot published at submission time, so
+        the streaming loop defers their autoscale submission until after
+        completed tasks have been transferred downstream (a phase-consistent
+        snapshot). The fragmentation solver ignores runtime signals, so it keeps
+        the earlier submission point and is unaffected by the deferral.
+        """
+        return isinstance(self._algorithm, runtime_signals.RuntimeAware)
 
     def add_measurements(
         self,
@@ -448,7 +501,26 @@ class Autoscaler:
             )
         return data_structures.ProblemState(stages)
 
-    def start_autoscale_calculation(self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool]) -> None:
+    def _offer_runtime_signals(self, pools: list[actor_pool.ActorPool], upstream_queue_lens: list[int]) -> None:
+        """Deliver this cycle's per-stage runtime signals to a capability-aware scheduler.
+
+        Builds the scheduler-agnostic ``RuntimeSignals`` from pool counters and
+        routes them via :func:`runtime_signals.deliver`, a no-op for schedulers
+        that do not consume runtime signals (such as the fragmentation solver).
+        """
+        runtime_signals.deliver(
+            self._algorithm,
+            runtime_signals.RuntimeSignals(
+                queue_depths=tuple(float(depth) for depth in upstream_queue_lens),
+                pool_queued_tasks=tuple(pool.num_queued_tasks for pool in pools),
+                inflight_slots=tuple(pool.num_inflight_tasks for pool in pools),
+                batch_sizes=tuple(pool.stage_batch_size for pool in pools),
+            ),
+        )
+
+    def start_autoscale_calculation(
+        self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool], upstream_queue_lens: list[int]
+    ) -> None:
         """Starts a new autoscaling calculation in a background thread.
 
         If a calculation is already in progress, this method does nothing.
@@ -456,6 +528,8 @@ class Autoscaler:
         Args:
             pools: The list of actor pools for each stage.
             stages_is_dones: A list of booleans indicating if each stage is done.
+            upstream_queue_lens: Per-stage upstream queue lengths, used by
+                backlog-aware schedulers as the current per-stage queue depth.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
@@ -463,6 +537,7 @@ class Autoscaler:
             return
 
         self._autoscale_start_time = time.time()
+        self._offer_runtime_signals(pools, upstream_queue_lens)
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
 
@@ -470,7 +545,6 @@ class Autoscaler:
         self,
         pools: list[actor_pool.ActorPool],
         upstream_queue_lens: list[int],
-        stage_batch_sizes: list[int],
         stages_is_dones: list[bool],
     ) -> None:
         """Apply a completed autoscaling result, clamping unsafe deletions.
@@ -516,9 +590,6 @@ class Autoscaler:
                 pulled into ``pools[i]`` (the pipeline's input queue for
                 stage ``0``, or ``queues[i - 1]`` for downstream stages).
                 Must have the same length as ``pools``.
-            stage_batch_sizes: Per-stage declared ``stage_batch_size`` values
-                (each must be ``>= 1``). Must have the same length as
-                ``pools``.
             stages_is_dones: Per-stage completion flags. ``True`` means the
                 stage has finished consuming all upstream work and is being
                 torn down by the main loop; the guard skips clamping for
@@ -526,24 +597,19 @@ class Autoscaler:
                 the same length as ``pools``.
 
         Raises:
-            ValueError: If ``upstream_queue_lens``, ``stage_batch_sizes``,
-                ``stages_is_dones``, or ``autoscale_result.stages`` has a
-                length different from ``pools``. These are caller-side or
-                planner-side contract violations, not runtime conditions.
+            ValueError: If ``upstream_queue_lens``, ``stages_is_dones``, or
+                ``autoscale_result.stages`` has a length different from
+                ``pools``. These are caller-side or planner-side contract
+                violations, not runtime conditions.
 
         """
         if self._autoscale_future is None or not self._autoscale_future.done():
             return
 
-        if (
-            len(upstream_queue_lens) != len(pools)
-            or len(stage_batch_sizes) != len(pools)
-            or len(stages_is_dones) != len(pools)
-        ):
+        if len(upstream_queue_lens) != len(pools) or len(stages_is_dones) != len(pools):
             raise ValueError(
                 f"Guard inputs have mismatched lengths: pools={len(pools)}, "
                 f"upstream_queue_lens={len(upstream_queue_lens)}, "
-                f"stage_batch_sizes={len(stage_batch_sizes)}, "
                 f"stages_is_dones={len(stages_is_dones)}"
             )
 
@@ -584,13 +650,14 @@ class Autoscaler:
                 # Unit normalization: ``upstream_queue_lens[idx]`` is sample-
                 # denominated (``Queue.__len__`` counts individual ObjectRefs),
                 # but ``pool.num_queued_tasks`` returns pre-batched Tasks.
-                # Multiply the pool count by ``stage_batch_sizes[idx]`` so the
+                # Multiply the pool count by ``pool.stage_batch_size`` so the
                 # combined ``backlog_samples`` value passed to the helper is
                 # uniformly in samples.
-                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued * stage_batch_sizes[idx]
+                stage_batch_size = pool.stage_batch_size
+                backlog_samples = upstream_queue_lens[idx] + pre_pool_queued * stage_batch_size
                 required_workers = _required_workers_for_stage(
                     slots_per_actor=pre_slots_per_actor,
-                    stage_batch_size=stage_batch_sizes[idx],
+                    stage_batch_size=stage_batch_size,
                     inflight_slots=pre_inflight_slots,
                     backlog_samples=backlog_samples,
                 )
@@ -603,7 +670,7 @@ class Autoscaler:
                         f"proposed_delete={proposed_delete_count}, allowed_delete={allowed_delete_count}, "
                         f"upstream_q={upstream_queue_lens[idx]}, pool_q={pre_pool_queued}, "
                         f"inflight_slots={pre_inflight_slots}, slots_per_actor={pre_slots_per_actor}, "
-                        f"stage_batch_size={stage_batch_sizes[idx]}"
+                        f"stage_batch_size={stage_batch_size}"
                     )
                 deletions = deletions[:allowed_delete_count]
 
@@ -868,6 +935,28 @@ class Queue:
         return all_refs
 
 
+def _upstream_queue_lens(input_queue: Queue, queues: list[Queue], num_pools: int) -> list[int]:
+    """Return each stage's upstream queue length, in input samples.
+
+    Stage 0 draws from the pipeline ``input_queue``; every downstream stage
+    ``idx`` draws from ``queues[idx - 1]`` (its immediate upstream stage's output
+    queue). The streaming loop computes this twice per cycle: once as the
+    pre-dispatch snapshot a completed autoscale result is applied against, and
+    again (after completed tasks are transferred downstream) as the
+    post-transfer snapshot a runtime-aware scheduler reasons about when its next
+    calculation is submitted.
+
+    Args:
+        input_queue: The pipeline's source-input queue (feeds stage 0).
+        queues: Per-stage output queues; ``queues[idx - 1]`` feeds stage ``idx``.
+        num_pools: Number of stages/pools to report a length for.
+
+    Returns:
+        A length-``num_pools`` list of per-stage upstream queue lengths.
+    """
+    return [len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(num_pools)]
+
+
 def run_pipeline(
     pipeline_spec: specs.PipelineSpec,
     cluster_resources: resources.ClusterResources,
@@ -914,14 +1003,9 @@ def run_pipeline(
     # Create a vector used to track whether a stages are finished or not.
     stage_is_dones = [False for _ in pools]
 
-    # Static per-stage ``stage_batch_size`` values used by the backlog-aware
-    # scale-down guard. Stage batch sizes do not change over the
-    # pipeline's lifetime, so build once outside the main loop.
-    stage_batch_sizes: list[int] = [
-        typing.cast(specs.StageSpec, stage).stage.stage_batch_size for stage in pipeline_spec.stages
-    ]
-
-    autoscale_rate_limiter = timing.RateLimitChecker(1.0 / pipeline_spec.config.mode_specific.autoscale_interval_s)
+    autoscale_rate_limiter = timing.RateLimitChecker(
+        1.0 / _effective_autoscale_interval_s(pipeline_spec.config.mode_specific)
+    )
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
     logger.debug("Starting main loop")
@@ -951,10 +1035,10 @@ def run_pipeline(
             # per-stage upstream queue lengths used by the backlog-aware
             # scale-down guard: stage 0 draws from the pipeline
             # input queue; every other stage draws from ``queues[idx - 1]``.
-            upstream_queue_lens: list[int] = [
-                len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(len(pools))
-            ]
-            autoscaler.apply_autoscale_result_if_ready(pools, upstream_queue_lens, stage_batch_sizes, stage_is_dones)
+            # This pre-dispatch snapshot is the state a previously-computed
+            # autoscale result is applied against.
+            apply_queue_lens = _upstream_queue_lens(input_queue, queues, len(pools))
+            autoscaler.apply_autoscale_result_if_ready(pools, apply_queue_lens, stage_is_dones)
             new_stats.auto_scaling_apply_end = time.time()
 
             # Delete all the actors first. We do this as a separate step from "update()" because we may need
@@ -969,10 +1053,21 @@ def run_pipeline(
                     pool.update()
             new_stats.pool_update_end = time.time()
 
-            # Handle scaling the actor pools.
-            # This should get called on the first loop through.
-            if autoscale_rate_limiter.can_call():
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones)
+            # Handle scaling the actor pools. ``can_call()`` advances the
+            # rate-limiter clock as a side effect, so evaluate it once per loop
+            # and reuse the result for whichever submission path runs below.
+            can_submit_autoscale = autoscale_rate_limiter.can_call()
+
+            # The fragmentation solver (default) ignores runtime signals, so it
+            # submits here, on the same early loop phase as before, using the
+            # pre-dispatch queue snapshot. Runtime-aware schedulers
+            # (SATURATION_AWARE) defer submission until after completed tasks are
+            # transferred downstream (see below), so the RuntimeSignals they read
+            # describe the post-transfer pipeline state instead of a stale one.
+            # The deferred path's submission cost is reflected in the add-tasks
+            # timing phase rather than here.
+            if can_submit_autoscale and not autoscaler.uses_runtime_signals:
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones, apply_queue_lens)
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools
@@ -1086,6 +1181,19 @@ def run_pipeline(
                             task = maybe_task
                         logger.trace(f"Stage {idx} adding task: {task}")
                         pool.add_task(task)  # type: ignore
+
+            # Runtime-aware schedulers (SATURATION_AWARE) submit here, after the
+            # reverse stage loop above has transferred completed tasks downstream
+            # and dispatched ready work. Recomputing the upstream queue lengths
+            # now makes the published RuntimeSignals (queue depths plus the
+            # pool's pool-queued and in-flight counters) describe the
+            # post-transfer state the new solve reasons about, instead of a stale
+            # top-of-loop snapshot. ``stage_is_dones`` is still this iteration's
+            # value (the done check below has not run yet), matching the default
+            # path above.
+            if can_submit_autoscale and autoscaler.uses_runtime_signals:
+                submit_queue_lens = _upstream_queue_lens(input_queue, queues, len(pools))
+                autoscaler.start_autoscale_calculation(pools, stage_is_dones, submit_queue_lens)
 
             new_stats.add_tasks_end = time.time()
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
