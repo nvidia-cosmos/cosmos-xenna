@@ -2,6 +2,18 @@
 
 ## Latest
 
+## [0.5.0]
+
+### Released
+
+- 2026-06-12
+
+### Added
+
+- Added the **saturation-aware scheduler** (`SchedulerKind.SATURATION_AWARE`): a pure-Python, backlog-aware streaming autoscaler. Queue occupancy selects which stage to grow or shrink and measured per-worker throughput sizes it, with a cold-start ramp, capacity model, and scale-down floor. Opt in via `StreamingSpecificSpec.scheduler` and tune with `SaturationAwareConfig`; the Rust-backed `FRAGMENTATION_BASED` solver stays the default.
+- Added a scheduler-agnostic `RuntimeSignals` channel plus `ActorPool.num_inflight_tasks()` and `stage_batch_size()`, so runtime-aware schedulers receive per-stage queue depth, in-flight, and pool-queued counts each cycle.
+- Added scheduler design docs under `docs/scheduler/saturation-aware/` (overview, capacity model, bottleneck selection, growth, cold-start ramp, scale-down floor, tuning).
+
 ## [0.4.3]
 
 ### Released
