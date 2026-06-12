@@ -142,7 +142,15 @@ def size_pipeline(
 
     Returns:
         One :class:`StageSizingResult` per stage, in pipeline order.
+
+    Raises:
+        ValueError: If ``snapshots`` and ``capacity.stages`` differ in length
+            (a programming error that would otherwise index out of range).
     """
+    if len(snapshots) != len(capacity.stages):
+        raise ValueError(
+            f"size_pipeline length mismatch: snapshots={len(snapshots)} capacity_stages={len(capacity.stages)}"
+        )
     return tuple(
         size_stage(snapshot, capacity.stages[index], has_local_input(index)) for index, snapshot in enumerate(snapshots)
     )

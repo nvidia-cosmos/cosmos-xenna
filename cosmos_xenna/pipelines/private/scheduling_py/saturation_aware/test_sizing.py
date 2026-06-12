@@ -184,3 +184,18 @@ def test_size_pipeline_pairs_each_stage_with_its_capacity_and_local_input(make_s
 
     assert results[0].multiplier == pytest.approx(3.0)
     assert results[1].multiplier == 1.0
+
+
+def test_size_pipeline_mismatched_lengths_raise(make_snapshot: SnapshotFactory) -> None:
+    """More snapshots than capacity stages is a programming error and fails fast."""
+    snapshots = [make_snapshot(), make_snapshot()]
+    capacity = CapacityPlan(
+        stages=(_capacity(w_target=1),),
+        bottleneck_stage=0,
+        bottleneck_rate=1.0,
+        next_bottleneck_rate=1.0,
+        bottleneck_candidate=0,
+        bottleneck_candidate_rate=1.0,
+    )
+    with pytest.raises(ValueError, match="length mismatch"):
+        size_pipeline(snapshots, capacity, has_local_input=lambda _index: False)
