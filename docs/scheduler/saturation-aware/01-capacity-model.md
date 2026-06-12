@@ -57,18 +57,6 @@ pipeline speed); every other stage is bounded to
 `bottleneck_rate × (1 + capacity_headroom)`, a small read-ahead, never free
 growth.
 
-```
-  cap_src per stage          (bar ∝ capacity, source items/s)
-    S0   40.0  ████████████████████
-    S1   25.0  ████████████
-    S2    6.0  ███    ◀ bottleneck_rate      = 6.0  (slowest measured)
-    S3    9.0  ████▌  ◀ next_bottleneck_rate = 9.0  (2nd slowest)
-
-  pipeline throughput = 6.0 src/s   (S2 sets the pace)
-  only S2 is sized to grow toward 9.0; S0/S1 sit far above the rate,
-  so the floor (note 05) lets them shrink toward w_sustain.
-```
-
 ![Bar chart of per-stage capacity in source items per second. S0 and S1 are long bars, S2 is the shortest and marked as the bottleneck, S3 is the next bottleneck. A dashed line at the S2 level marks the pipeline pace.](assets/01-capacity-bottleneck.png)
 
 *The slowest measured `cap_src` sets `bottleneck_rate`, so the whole pipeline

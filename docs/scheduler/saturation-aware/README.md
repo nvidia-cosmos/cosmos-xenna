@@ -38,23 +38,6 @@ placement**. The net job: keep each stage sized to the rate the pipeline's
 **slowest stage** can sustain, and keep expensive warm stages (e.g. a GPU
 stage with a costly model to load) warm across short upstream lulls.
 
-```
-                       saturation-aware scheduler
-
-   ┌────────────┐    every tick    ┌────────────┐
-   │  signals   │  ─────────────▶  │  decision  │
-   │            │                  │            │
-   │  speeds    │                  │  +N here   │
-   │  queues    │                  │   0 there  │
-   │  in-flight │                  │  −M there  │
-   └────────────┘                  └────────────┘
-         ▲                                │
-         │                                ▼
-   ┌──────────────────────────────────────────────┐
-   │  FRAG places workers; SAT bounds the result   │
-   └──────────────────────────────────────────────┘
-```
-
 `FRAGMENTATION_BASED` stays the production default. `SATURATION_AWARE` is
 opt-in per run; the two are fully isolated and never affect each other.
 
@@ -119,20 +102,6 @@ Everything flows from **one capacity model** that is the single source of truth
 for both growth and shrink (see [01](01-capacity-model.md)). The cycle is a flat
 sequence that wraps the unchanged solver in an input bias and two output bounds
 (an upper cap and a lower floor):
-
-```
-  signals ─▶ capacity ─▶ demand ─▶ FRAG solve ─▶ ramp ─▶ floor ─▶ commit
- (speeds,   (cap_src,   (deflate   (read-only,  (cold   (protect
-  queues,    rates,      bottleneck placement)   cap)    shrink)
-  in-flight) w_sustain,  speed →
-             w_target)   grow it)
-              │              │                    │        │
-              │              └─ INPUT BIAS ───────┘        │
-              │                 (drive useful growth)      │
-              └─ the model both grow and shrink agree on   │
-                                       OUTPUT BOUNDS ───────┘
-                                       (ramp cap + floor)
-```
 
 ![SAT decision cycle from signals through capacity, demand, FRAG solve, ramp, floor, to commit. SAT applies an input bias before the solver and output bounds after it.](assets/readme-cycle-flow.png)
 

@@ -9,19 +9,13 @@ A speed-argmin selector then crowns the *victim* as the bottleneck and grows or
 protects it, while the real producer in front of it never grows. The pipeline
 deadlocks against its own feedback loop.
 
-```
-   pipeline:   S0  ─▶  S1  ─▶  S2  ─▶  S3
-   speed says: fast    fast    fast    SLOW   ← S3 looks slowest...
-   reality:                            ...because S2 isn't feeding it.
-```
-
-Low speed at a starved stage is a **supply symptom**, not a service limit.
-
 ![Pipeline S0 to S3 where measured speed labels S3 as slowest; a red arrow marks S3 as the naive pick while a teal arrow marks S2 as the real constraint that is not feeding S3.](assets/02-speed-argmin-trap.png)
 
 *The speed-argmin trap: by measured speed the starved consumer S3 looks slowest,
 so a naive selector crowns the victim. The real constraint is S2, the producer
 that is not feeding it.*
+
+Low speed at a starved stage is a **supply symptom**, not a service limit.
 
 ## What we do
 
@@ -36,22 +30,13 @@ state (`qstate`):
 | `buffered` | this stage and its consumer both have input: upstream of the cliff, not the cliff itself. |
 | `balanced` | terminal stage with input and ready capacity, or no cliff is visible. |
 
-```
-   S0 in:full     S1 in:full     S2 in:full     S3 in:empty
-       │              │              │              │
-       ▼              ▼              ▼              ▼
-    buffered       buffered      bottleneck      starved
-                                     ▲
-                       deepest full-input / under-fed-consumer stage
-```
-
-![Pipeline of four stages with input buffers. S0, S1, and S2 have full buffers while S3's buffer is empty. A supply-cliff marker sits between S2 and S3, and S3 is starved.](assets/02-queue-cliff.png)
+![Four pipeline stages S0 to S3, each with an input-buffer bar measured against a shared threshold of one batch. S0, S1, and S2 sit above the threshold (qin 6, 5, 5) and are labeled buffered, buffered, and BOTTLENECK; S3 is empty (qin 0) and starved. A supply-cliff marker sits between S2 and S3, with a callout noting S2 is the deepest full stage whose consumer is below threshold.](assets/02-queue-cliff.png)
 
 *The bottleneck is the **deepest** stage that still has a full input buffer while
 its consumer is under-fed: the supply cliff. The starved stage past the cliff is
 a victim of low supply, not the constraint.*
 
-![Animated four-stage queue gradient where upstream buffers fill, the deepest full-input stage becomes the supply cliff, and the downstream stage remains starved.](assets/02-queue-gradient.gif)
+![Animated four-stage queue gradient. As the input buffers fill left to right past the one-batch threshold while S3 stays empty, the supply-cliff marker and BOTTLENECK label march from S0 to S1 to S2; the final frame settles on S2 as the deepest full stage feeding an empty S3.](assets/02-queue-gradient.gif)
 
 *The useful signal is the **drop** between adjacent queues. When S2 has work and
 S3 does not, S2 owns the cliff; S3's idleness is evidence that supply stopped
@@ -77,6 +62,13 @@ growth owner, so a one-cycle dip cannot flap it. But if the current bottleneck
 goes `starved` it is replaced immediately; a starved stage is never a valid
 bottleneck. Stickiness governs *identity* only; the *rate* is re-measured every
 cycle.
+
+![Flowchart of the bottleneck selection algorithm. Classify each stage by queue depth (qin vs the one-batch threshold). If any stage is at a cliff, the candidate is the deepest cliff stage; otherwise it is the slowest measured cap_src (cold or fully balanced). The bottleneck identity is sticky: it switches only when the current owner starves or a challenger stays slower for switch_confirm cycles. The sizing rate is the slowest measured cap_src, with cold zero-capacity stages excluded.](assets/02-selection-flow.png)
+
+*The whole selection algorithm in one view: classify every stage by queue depth,
+take the **deepest** cliff (or the slowest measured `cap_src` when no cliff
+exists), apply the sticky-identity guard, then size from the slowest measured
+`cap_src`.*
 
 Picking the producer directly from the queue gradient sidesteps the
 speed-argmin trap by construction, so the design needs no extra machinery to

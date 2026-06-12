@@ -45,12 +45,6 @@ There is no separate backlog cap to tune and no per-cycle backlog division: the
 multiplier cannot over-grow a stage past the bottleneck because the target it
 chases is itself bounded by the bottleneck rate.
 
-```
-   S2 (bottleneck)   workers=2   w_target=3   has input   → m = 1.5  → grow
-   S0 (fast feeder)  workers=8   w_target=2   has input   → m = 1.0  → no growth
-   S3 (starved)      workers=4   w_target=5   no input    → m = 1.0  → no growth
-```
-
 ![Per-stage demand multiplier table. S2 the bottleneck has 2 workers and w_target 3, so m = 1.5 and it grows from 2 to 3 workers. S0 (8 workers, target 2) and S3 (starved, no input) both have m = 1.0 and do not grow.](assets/03-demand-multiplier.png)
 
 *Only the bottleneck gets a multiplier above 1, so only it grows: S2 has

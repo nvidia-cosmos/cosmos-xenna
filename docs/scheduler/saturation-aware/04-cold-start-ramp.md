@@ -47,6 +47,17 @@ Cap a **not-yet-trusted** stage's post-solve worker count by trimming the solver
 > A not-yet-trusted stage may grow by **at most one worker per cycle**, and only
 > when it has its **own pending work** to feed the new worker.
 
+> **What counts as "pending work".** The gate is the stage's **active depth**
+> being greater than zero, not the input queue alone. Any queued input, any
+> pool-queued batch, or any in-flight task all count
+> (`activity.py::StageActivity.active_depth` is
+> `queue + (pool + inflight) * batch_size`). So a stage still draining in-flight
+> work is not "dry", and **any** nonzero amount trips the gate, not a full batch.
+> The first worker is always allowed (a 0-worker stage is capped at 1 even with
+> no work, so it can start and record a first sample); this gate guards the **+1
+> on each later cycle**. It applies only while the stage is untrusted; a trusted
+> stage is sized by `w_target` ([01](01-capacity-model.md)) regardless.
+
 ```
   stage state                              ramp decision
   ───────────                              ─────────────
@@ -69,7 +80,7 @@ the solver's proposal, until it has a measured speed.*
 large placeholder-speed proposal is trimmed to `+1` per cycle; once trust is
 reached, the normal `w_target` cap takes over.*
 
-The growth step is a fixed `+1`, never scaled by sample count or by the solver's proposal, so a not-yet-trusted stage can **never** convert a large placeholder-driven proposal into a first-cycle burst. A locally dry stage is never grown speculatively; queue-gradient capacity ([02](02-bottleneck-selection.md))
+The growth step is a fixed `+1`, never scaled by sample count or by the solver's proposal, so a not-yet-trusted stage can **never** convert a large placeholder-driven proposal into a first-cycle burst. A stage with no active work (empty input, nothing pooled, nothing in flight) is never grown speculatively; queue-gradient capacity ([02](02-bottleneck-selection.md))
 instead grows the upstream producer.
 
 **Slow-starter release.** The +1 cap assumes a stage produces its first sample within a cycle or two. A heavy stage whose first completion lands far in the future (a stage whose model load and `torch.compile` dwarf the estimation window) would otherwise stay pinned at one worker for the whole warmup, loading a single model while the rest of its budget sits idle. So once a full `speed_estimation_window_s` has elapsed with **zero** samples and the stage still has **work waiting**, it is treated as a confirmed slow-starter and released to the solver: all its workers spawn now and their models load in parallel. The "work waiting" gate is essential: it distinguishes a slow-warming stage with a real backlog (which needs all its workers) from a merely *starved* stage (which would otherwise scatter sub-GPU workers from placeholder throughput, the exact fragmentation the cap prevents).
