@@ -42,9 +42,15 @@ from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, Strea
 _StageSpecList = list[StageSpec[Any, Any]]
 
 
-def _mock_object_ref() -> ray.ObjectRef[Any]:
-    """Placeholder ObjectRef for queue length tests (only ``len`` is used)."""
-    return cast(ray.ObjectRef[Any], object())
+def _mock_object_ref() -> "ray.ObjectRef[Any]":
+    """Placeholder ObjectRef for queue length tests (only ``len`` is used).
+
+    The annotation and cast use string forward references because
+    ``ray.ObjectRef`` is not subscriptable at runtime on all Ray builds, and
+    the project forbids ``from __future__ import annotations``; quoting keeps
+    the type for static checkers without evaluating the subscript at import.
+    """
+    return cast("ray.ObjectRef[Any]", object())
 
 
 def _stage_specs(spec: v1.PipelineSpec) -> _StageSpecList:
