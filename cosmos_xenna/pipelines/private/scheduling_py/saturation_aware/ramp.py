@@ -53,7 +53,8 @@ class RampReason(enum.StrEnum):
         SLOW_START: No sample after a full speed-estimation window with work
             waiting; released to the solver as a confirmed slow-starter.
         CAPPED: Enough samples to trust the speed estimate; held at the capacity
-            growth target ``w_target`` (the per-cycle growth ceiling).
+            growth target ``w_target`` (the per-cycle growth ceiling). Tagged
+            ``growth_cap`` in logs to distinguish it from the cold-start ramp.
         UNCAPPED: Enough samples to trust the speed estimate but no capacity
             target this cycle (no measured bottleneck); the solver owns growth.
     """
@@ -62,7 +63,7 @@ class RampReason(enum.StrEnum):
     PIPELINE_WARMING = "pipeline_warming"
     WARMING = "warming"
     SLOW_START = "slow_start"
-    CAPPED = "capped"
+    CAPPED = "growth_cap"
     UNCAPPED = "uncapped"
 
 

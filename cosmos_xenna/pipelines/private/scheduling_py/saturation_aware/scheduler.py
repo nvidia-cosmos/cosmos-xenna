@@ -664,7 +664,7 @@ class SaturationAwareScheduler:
                 f"has_pending_work={has_pending_work} active_depth={active_depth:.2f}"
             )
         if summaries:
-            logger.debug("saturation-aware ramp: " + " | ".join(summaries))
+            logger.debug("saturation-aware growth control: " + " | ".join(summaries))
         editor.commit()
 
     def _apply_scale_down_floor(
