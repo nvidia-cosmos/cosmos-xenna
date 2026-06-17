@@ -218,8 +218,9 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
     A stage downstream of the bottleneck is held warm while upstream stock is in
     flight, except when it has looked reclaimable (idle, over-provisioned, and
     ``reclaim_beneficial``) for ``reclaim_confirm_cycles`` consecutive cycles -
-    then its hold target may fall to ``min(w_sustain, workers)`` so an
-    over-provisioned downstream stage returns resources the bottleneck needs.
+    then its hold target may fall to ``min(w_sustain, workers)``; the floor
+    follows once the usual shrink-confirm window also passes, returning the
+    over-provisioned stage's resources to the bottleneck.
 
     Args:
         inputs: Per-cycle observed per-stage inputs, including the capacity
@@ -302,8 +303,10 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         # and beneficial (freeing its resource would help the bottleneck grow).
         # The streak resets the moment any of these drops, so a transient
         # bottleneck shift cannot release an expensive stage's warm pin.
+        downstream = inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of
         reclaimable = (
-            inputs.ready_workers[k] > 0
+            downstream
+            and inputs.ready_workers[k] > 0
             and inputs.workers[k] > inputs.w_sustain[k]
             and inputs.w_target_is_real[k]
             and not inputs.is_manual[k]
@@ -311,7 +314,6 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         )
         benefit_streak = prev.benefit_streak[k] + 1 if reclaimable else 0
         reclaim_confirmed = benefit_streak >= params.reclaim_confirm_cycles
-        downstream = inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of
         if downstream and has_stock and not reclaim_confirmed:
             desired = inputs.workers[k]
         # Local-evidence shrink veto. A stage with no ready worker AND at least

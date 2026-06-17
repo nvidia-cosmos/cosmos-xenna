@@ -60,9 +60,10 @@ Two extra guards handle cases the basic gate cannot:
   while upstream work is on the way. The exception is a *genuinely reclaimable*
   stage: idle (a ready worker), over-provisioned (`workers > w_sustain`),
   eligible (a real growth target, not cold; not operator-pinned), and
-  **beneficial** - freeing its resource would help the current bottleneck grow
-  (its worker shape shares a resource type with a growth-wanting, non-manual
-  bottleneck). Once that holds for `reclaim_confirm_cycles` consecutive cycles
+  **beneficial** - freeing it would help the current bottleneck grow: the stage
+  reserves only resource types a growth-wanting, non-manual bottleneck also
+  uses, so nothing it frees is wasted (a whole-GPU stage is not reclaimed for
+  its incidental host CPUs). Once that holds for `reclaim_confirm_cycles` cycles
   the hold target falls to `min(w_sustain, workers)`, so an over-provisioned
   downstream stage returns resources the bottleneck needs instead of stranding
   them (`protect_downstream_of`, `reclaim_beneficial`, `benefit_streak` in

@@ -33,6 +33,7 @@ import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityPlan, StageCapacity
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler, _Cycle
@@ -822,3 +823,125 @@ def test_pending_work_age_resets_when_a_stage_drains() -> None:
     assert scheduler._pending_work_ages(12.0, (0.0, 0.0)) == (0.0, 0.0)  # drained -> timer reset
     assert scheduler._pending_work_ages(20.0, (0.0, 3.0)) == (0.0, 0.0)  # refilled -> fresh start
     assert scheduler._pending_work_ages(25.0, (0.0, 3.0)) == (0.0, 5.0)
+
+
+def _capacity_with_bottleneck(
+    *,
+    bottleneck_stage: int,
+    w_targets: tuple[int, ...],
+    w_target_is_real: tuple[bool, ...] | None = None,
+) -> CapacityPlan:
+    """Build a CapacityPlan carrying only the fields _compute_reclaim_beneficial reads.
+
+    The bottleneck index plus each stage's `w_target` / `w_target_is_real` carry
+    meaning; the remaining capacity fields are inert placeholders.
+    """
+    num_stages = len(w_targets)
+    real = w_target_is_real if w_target_is_real is not None else (True,) * num_stages
+    stages = tuple(
+        StageCapacity(
+            speed=1.0,
+            target_speed=1.0,
+            cap_src=1.0,
+            a_raw=1.0,
+            a_ewma=1.0,
+            w_sustain=1,
+            w_target=w_targets[i],
+            w_target_is_real=real[i],
+        )
+        for i in range(num_stages)
+    )
+    return CapacityPlan(
+        stages=stages,
+        bottleneck_stage=bottleneck_stage,
+        bottleneck_rate=1.0,
+        next_bottleneck_rate=1.0,
+    )
+
+
+def _cycle_for_reclaim(workers: tuple[int, ...], is_manual: tuple[bool, ...]) -> _Cycle:
+    """Build a _Cycle exposing only the workers and is_manual fields the reclaim check reads."""
+    n = len(workers)
+    zeros = (0.0,) * n
+    return _Cycle(
+        time=0.0,
+        pending_work_ages=zeros,
+        workers=workers,
+        demand_snapshots=(),
+        batch_sizes=(1,) * n,
+        chain_factors=(1.0,) * n,
+        is_manual=is_manual,
+        local_depths=zeros,
+        local_pending_depths=zeros,
+        active_depths=zeros,
+        ready_workers=(0,) * n,
+        rate_is_stale=(False,) * n,
+        queued_stock=zeros,
+        active_stock=zeros,
+        activity_snapshot=None,
+    )
+
+
+def _mixed_pipeline_scheduler() -> SaturationAwareScheduler:
+    """A 3-stage pipeline: CPU bottleneck, CPU-only stage, GPU stage (also reserves CPUs)."""
+    spec = v1.PipelineSpec(
+        input_data=range(10),
+        stages=[
+            v1.StageSpec(_CpuStage(1.0, 1.0)),
+            v1.StageSpec(_CpuStage(4.0, 1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+        ],
+    )
+    return _scheduler(spec, _gpu_cluster(8))
+
+
+def test_reclaim_beneficial_cpu_bottleneck_excludes_gpu_stage() -> None:
+    """A CPU bottleneck makes the CPU-only stage reclaimable but never the GPU stage.
+
+    The GPU stage also reserves host CPUs, but freeing it would strand a GPU the
+    CPU bottleneck cannot use, so it is not beneficial.
+    """
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, True, False)
+
+
+def test_reclaim_beneficial_gpu_bottleneck_includes_cpu_and_gpu_stages() -> None:
+    """A GPU bottleneck (which also reserves CPUs) makes both upstream stages reclaimable."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=2, w_targets=(1, 1, 10))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, True, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_is_manual() -> None:
+    """A manual/pinned bottleneck is never grown, so freeing any stage helps nothing."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(True, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_target_not_real() -> None:
+    """A cold bottleneck (placeholder w_target) yields no reclaim signal."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1), w_target_is_real=(False, True, True))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_not_growing() -> None:
+    """A bottleneck already at or above its target is not growing, so nothing is reclaimable."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_no_bottleneck() -> None:
+    """With no measured bottleneck (-1) there is no reclaim signal."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=-1, w_targets=(1, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)

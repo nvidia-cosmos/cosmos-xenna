@@ -1,7 +1,7 @@
 # Operator Tuning Guide
 
 The operator's quick-reference for the saturation-aware scheduler. The six
-concept notes (`01` to `06`) plus [`README.md`](README.md) explain **why** each
+concept notes (`01` to `05`) plus [`README.md`](README.md) explain **why** each
 mechanism exists; this guide explains **when to choose the scheduler** and
 **which knob to turn**.
 
@@ -76,7 +76,7 @@ only a handful, grouped by what they affect.
 | A stage stuck on a long task reports a frozen-high rate | Lower `speed_stale_multiple` toward `2.0` so the stall is detected sooner. |
 | Heavy stage warms one model at a time, budget idle | It should auto-release after `speed_estimation_window_s` with work waiting ([04](04-cold-start-ramp.md)); shorten the window only if warmup genuinely needs it. |
 | Expensive GPU stage idle with `qstate=starved`, `local_pending=0` | **Not a knob.** It is downstream of the bottleneck; fix the upstream feeder ([02](02-bottleneck-selection.md)). |
-| Over-provisioned idle downstream stage strands CPU/GPU while the bottleneck wants to grow | Lower `reclaim_confirm_cycles` so the floor releases the stranded resource sooner. The release only fires when the bottleneck holds the same resource type, so a GPU stage is never shrunk to feed a CPU bottleneck. |
+| Over-provisioned idle downstream stage strands CPU/GPU while the bottleneck wants to grow | Lower `reclaim_confirm_cycles` so the floor releases the stranded resource sooner. A stage is reclaimed only when every resource it reserves is one the growing bottleneck also uses, so a stage holding a GPU is never torn down to feed a CPU-only bottleneck. |
 | Reaction feels slow on a small cluster | Lower `interval_s`; watch that per-cycle work stays well under the interval. |
 
 ## Tuning discipline

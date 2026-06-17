@@ -681,10 +681,14 @@ class SaturationAwareScheduler:
         """Return per-stage whether freeing the stage's resource would help the bottleneck.
 
         True for a stage if the sticky bottleneck stage is non-manual, wants to
-        grow (a real ``w_target`` above its current workers), and its worker
-        shape shares a resource type (CPU or GPU) with the stage. Reading the
-        sticky ``bottleneck_stage`` rather than the one-cycle candidate keeps a
-        transient bottleneck from marking an unrelated stage reclaimable.
+        grow (a real ``w_target`` above its current workers), and the stage
+        reserves only resource types the bottleneck also uses - so freeing it
+        wastes nothing the bottleneck cannot consume (a whole-GPU stage is not
+        torn down for its incidental host CPUs to feed a CPU-only bottleneck) -
+        while overlapping on at least one type. The bottleneck stage itself is
+        always False. Reading the sticky ``bottleneck_stage`` rather than the
+        one-cycle candidate keeps a transient bottleneck from marking an
+        unrelated stage reclaimable.
 
         Args:
             cycle: This cycle's immutable derived inputs.
@@ -703,8 +707,11 @@ class SaturationAwareScheduler:
         beneficial: list[bool] = []
         for stage_index in range(num_stages):
             shape = self.solver_template.stages[stage_index].worker_shape
-            shares = (needs_cpu and shape.get_num_cpus() > 0.0) or (needs_gpu and shape.get_num_gpus() > 0.0)
-            beneficial.append(stage_index != index and shares)
+            has_cpu = shape.get_num_cpus() > 0.0
+            has_gpu = shape.get_num_gpus() > 0.0
+            wastes_nothing = (needs_cpu or not has_cpu) and (needs_gpu or not has_gpu)
+            overlaps = (needs_cpu and has_cpu) or (needs_gpu and has_gpu)
+            beneficial.append(stage_index != index and wastes_nothing and overlaps)
         return tuple(beneficial)
 
     def _apply_scale_down_floor(
@@ -807,8 +814,9 @@ class SaturationAwareScheduler:
             worker_shape = self.solver_template.stages[index].worker_shape
             stage_reserved_cpu = cycle.workers[index] * worker_shape.get_num_cpus()
             stage_used_cpu = min(cycle.workers[index], inflight) * worker_shape.get_num_cpus()
+            stage_reserved_gpu = cycle.workers[index] * worker_shape.get_num_gpus()
             reserved_cpus += stage_reserved_cpu
-            reserved_gpus += cycle.workers[index] * worker_shape.get_num_gpus()
+            reserved_gpus += stage_reserved_gpu
             frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]
             sat_post = cycle.workers[index] + sat_new[index] - sat_delete[index]
             groups.append(
@@ -822,7 +830,7 @@ class SaturationAwareScheduler:
                 f"shrink_streak={decision.shrink_streak} pending_shrink_floor={decision.pending_shrink_floor} "
                 f"releasing={decision.releasing} "
                 f"reclaim_ben={decision.reclaim_beneficial} ben_streak={decision.benefit_streak} "
-                f"cpu_resv={stage_reserved_cpu:.1f} cpu_used~{stage_used_cpu:.1f} "
+                f"cpu_resv={stage_reserved_cpu:.1f} cpu_used~{stage_used_cpu:.1f} gpu_resv={stage_reserved_gpu:.2f} "
                 f"local_qin={cycle.local_depths[index]:.1f} local_pending={cycle.local_pending_depths[index]:.1f} "
                 f"ready={cycle.ready_workers[index]} "
                 f"q_stock={cycle.queued_stock[index]:.1f} a_stock={cycle.active_stock[index]:.1f} "
