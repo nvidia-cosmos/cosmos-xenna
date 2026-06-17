@@ -54,11 +54,19 @@ quickly) and slow down (release reluctantly, at a uniform rate across stages).
 
 Two extra guards handle cases the basic gate cannot:
 
-- **Downstream guard.** While the current rate-source candidate is *upstream* of
-  a stage and source-normalized stock is still in flight, that downstream stage
-  is held at current workers: capacity is not donated while upstream work is
-  still on the way, without reserving anything for a named stage
-  (`protect_downstream_of` in `floor.py`).
+- **Downstream guard (benefit-gated).** While the current rate-source candidate
+  is *upstream* of a stage and source-normalized stock is still in flight, that
+  downstream stage is held warm at current workers - capacity is not donated
+  while upstream work is on the way. The exception is a *genuinely reclaimable*
+  stage: idle (a ready worker), over-provisioned (`workers > w_sustain`),
+  eligible (a real growth target, not cold; not operator-pinned), and
+  **beneficial** - freeing its resource would help the current bottleneck grow
+  (its worker shape shares a resource type with a growth-wanting, non-manual
+  bottleneck). Once that holds for `reclaim_confirm_cycles` consecutive cycles
+  the hold target falls to `min(w_sustain, workers)`, so an over-provisioned
+  downstream stage returns resources the bottleneck needs instead of stranding
+  them (`protect_downstream_of`, `reclaim_beneficial`, `benefit_streak` in
+  `floor.py`).
 - **Local saturation veto.** **Any** stage with **no ready worker** and **at
   least one queued batch** is demonstrably under-provisioned this cycle, so a
   `w_sustain` decayed by a transient `bottleneck_rate` dip cannot shrink it
@@ -84,7 +92,11 @@ its own backlog. It self-clears the moment it drains.*
 The floor never classifies a stage by GPU fraction or warmup cost; it only
 time-confirms lower hold targets so one-cycle integer-boundary dips do not
 trigger delete/re-add churn. A confirmed shrink still happens; a transient one is
-deferred (logged as `shrink_deferred`).
+deferred (logged as `shrink_deferred`). The benefit-gated reclaim is likewise
+resource-type generic, never GPU-specific: it reads the *sticky* bottleneck and
+requires the benefit to hold for `reclaim_confirm_cycles` cycles, so a transient
+bottleneck shift (for example a brief upstream GPU spike) cannot churn an
+expensive downstream stage.
 
 ## Trade-offs
 
@@ -97,10 +109,12 @@ deferred (logged as `shrink_deferred`).
 ## Implementation pointer
 
 - `floor.py`: `compute_floors`, the per-stage release gate, the asymmetric
-  `w_sustain` EWMA, the downstream guard, and the local saturation veto.
+  `w_sustain` EWMA, the benefit-gated downstream guard, and the local
+  saturation veto. The reclaim signal (`reclaim_beneficial`) is computed in
+  `scheduler.py::_compute_reclaim_beneficial` and confirmed via `benefit_streak`.
 - `chain.py`: whole-chain active-stock math (queue depth + pool-queued +
   in-flight, normalized to source units) used for the release decision.
 - Decision snapshot fields: `floor`, `shrink_deferred`, `shrink_streak`,
-  `pending_shrink_floor`, `releasing`.
-- Config: `scale_down_release_cycles`, `scale_down_release_slowdown`
-  (see `tuning.md`).
+  `pending_shrink_floor`, `releasing`, `reclaim_beneficial`, `benefit_streak`.
+- Config: `scale_down_release_cycles`, `scale_down_release_slowdown`,
+  `reclaim_confirm_cycles` (see `tuning.md`).

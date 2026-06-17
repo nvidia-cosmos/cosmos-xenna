@@ -158,13 +158,19 @@ class _Cycle:
             rate_is_stale=self.rate_is_stale,
         )
 
-    def floor_inputs(self, capacity: CapacityPlan) -> FloorInputs:
+    def floor_inputs(self, capacity: CapacityPlan, reclaim_beneficial: tuple[bool, ...]) -> FloorInputs:
         """Return the scale-down release gate's inputs for this cycle.
 
         Pairs the cycle's active whole-chain stock and depths with the capacity
-        plan's per-stage ``w_sustain`` hold target, plus the per-stage
-        utilization signals (``ready_workers``, ``local_pending_depths``) the
-        gate uses to veto shrinking a saturated, backlogged stage.
+        plan's per-stage ``w_sustain`` hold target and ``w_target_is_real`` flag,
+        plus the per-stage utilization signals (``ready_workers``,
+        ``local_pending_depths``) and the ``reclaim_beneficial`` signal the gate
+        uses to decide which downstream stages may release.
+
+        Args:
+            capacity: This cycle's capacity plan (per-stage targets).
+            reclaim_beneficial: Per-stage flag for whether freeing the stage's
+                resource would help the bottleneck grow.
         """
         return FloorInputs(
             workers=self.workers,
@@ -175,6 +181,9 @@ class _Cycle:
             w_sustain=tuple(stage.w_sustain for stage in capacity.stages),
             ready_workers=self.ready_workers,
             local_pending_depths=self.local_pending_depths,
+            is_manual=self.is_manual,
+            w_target_is_real=tuple(stage.w_target_is_real for stage in capacity.stages),
+            reclaim_beneficial=reclaim_beneficial,
             protect_downstream_of=capacity.bottleneck_candidate,
         )
 
@@ -235,6 +244,7 @@ class SaturationAwareScheduler:
             self.shape.num_stages,
             FloorParams(
                 release_confirm_cycles=max(1, math.ceil(cycles / _RELEASE_CONFIRM_DIVISOR)),
+                reclaim_confirm_cycles=config.reclaim_confirm_cycles,
                 min_workers=_MIN_WORKERS,
             ),
         )
@@ -667,6 +677,36 @@ class SaturationAwareScheduler:
             logger.debug("saturation-aware growth control: " + " | ".join(summaries))
         editor.commit()
 
+    def _compute_reclaim_beneficial(self, cycle: _Cycle, capacity: CapacityPlan) -> tuple[bool, ...]:
+        """Return per-stage whether freeing the stage's resource would help the bottleneck.
+
+        True for a stage if the sticky bottleneck stage is non-manual, wants to
+        grow (a real ``w_target`` above its current workers), and its worker
+        shape shares a resource type (CPU or GPU) with the stage. Reading the
+        sticky ``bottleneck_stage`` rather than the one-cycle candidate keeps a
+        transient bottleneck from marking an unrelated stage reclaimable.
+
+        Args:
+            cycle: This cycle's immutable derived inputs.
+            capacity: This cycle's capacity plan.
+        """
+        num_stages = len(cycle.workers)
+        index = capacity.bottleneck_stage
+        if not (0 <= index < num_stages) or cycle.is_manual[index]:
+            return (False,) * num_stages
+        bottleneck = capacity.stages[index]
+        if not bottleneck.w_target_is_real or bottleneck.w_target <= cycle.workers[index]:
+            return (False,) * num_stages
+        bottleneck_shape = self.solver_template.stages[index].worker_shape
+        needs_cpu = bottleneck_shape.get_num_cpus() > 0.0
+        needs_gpu = bottleneck_shape.get_num_gpus() > 0.0
+        beneficial: list[bool] = []
+        for stage_index in range(num_stages):
+            shape = self.solver_template.stages[stage_index].worker_shape
+            shares = (needs_cpu and shape.get_num_cpus() > 0.0) or (needs_gpu and shape.get_num_gpus() > 0.0)
+            beneficial.append(stage_index != index and shares)
+        return tuple(beneficial)
+
     def _apply_scale_down_floor(
         self, solution: data_structures.Solution, cycle: _Cycle, capacity: CapacityPlan
     ) -> FloorPlan:
@@ -690,7 +730,8 @@ class SaturationAwareScheduler:
             The cycle's :class:`FloorPlan`, reused by the decision snapshot.
         """
         editor = SolutionEditor(solution)
-        plan = self._floor.plan(cycle.floor_inputs(capacity))
+        reclaim_beneficial = self._compute_reclaim_beneficial(cycle, capacity)
+        plan = self._floor.plan(cycle.floor_inputs(capacity, reclaim_beneficial))
         bottleneck_name = self._bottleneck_name(capacity)
         for index in range(editor.stage_count):
             frag_delete = editor.proposed_deletes(index)
@@ -714,6 +755,7 @@ class SaturationAwareScheduler:
                 f"releasing={decision.releasing} "
                 f"shrink_deferred={decision.shrink_deferred} shrink_streak={decision.shrink_streak} "
                 f"pending_shrink_floor={decision.pending_shrink_floor} "
+                f"reclaim_beneficial={decision.reclaim_beneficial} benefit_streak={decision.benefit_streak} "
                 f"speed={cap.speed:.4f} target_speed={cap.target_speed:.4f} cap_src={cap.cap_src:.3f} "
                 f"a_raw={cap.a_raw:.2f} a_ewma={cap.a_ewma:.2f} "
                 f"w_sustain={cap.w_sustain} w_target={cap.w_target} qstate={cap.queue_state.value} "
@@ -748,6 +790,9 @@ class SaturationAwareScheduler:
             snapshot.stages if snapshot is not None and len(snapshot.stages) == len(cycle.workers) else None
         )
         bottleneck_name = self._bottleneck_name(capacity)
+        total_pool = self.solver_template.cluster.total_pool()
+        reserved_cpus = 0.0
+        reserved_gpus = 0.0
         groups: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             cap = capacity.stages[index]
@@ -759,6 +804,11 @@ class SaturationAwareScheduler:
                 inflight = 0
                 pool_queued = 0
             utilization = inflight / max(cycle.workers[index], 1)
+            worker_shape = self.solver_template.stages[index].worker_shape
+            stage_reserved_cpu = cycle.workers[index] * worker_shape.get_num_cpus()
+            stage_used_cpu = min(cycle.workers[index], inflight) * worker_shape.get_num_cpus()
+            reserved_cpus += stage_reserved_cpu
+            reserved_gpus += cycle.workers[index] * worker_shape.get_num_gpus()
             frag_post = cycle.workers[index] + frag_new[index] - frag_delete[index]
             sat_post = cycle.workers[index] + sat_new[index] - sat_delete[index]
             groups.append(
@@ -771,6 +821,8 @@ class SaturationAwareScheduler:
                 f"floor={decision.floor} shrink_deferred={decision.shrink_deferred} "
                 f"shrink_streak={decision.shrink_streak} pending_shrink_floor={decision.pending_shrink_floor} "
                 f"releasing={decision.releasing} "
+                f"reclaim_ben={decision.reclaim_beneficial} ben_streak={decision.benefit_streak} "
+                f"cpu_resv={stage_reserved_cpu:.1f} cpu_used~{stage_used_cpu:.1f} "
                 f"local_qin={cycle.local_depths[index]:.1f} local_pending={cycle.local_pending_depths[index]:.1f} "
                 f"ready={cycle.ready_workers[index]} "
                 f"q_stock={cycle.queued_stock[index]:.1f} a_stock={cycle.active_stock[index]:.1f} "
@@ -782,7 +834,9 @@ class SaturationAwareScheduler:
             f"next_bottleneck_rate={capacity.next_bottleneck_rate:.3f} "
             f"bottleneck='{bottleneck_name}' bottleneck_streak={capacity.bottleneck_streak} "
             f"bottleneck_candidate={capacity.bottleneck_candidate} "
-            f"bottleneck_candidate_rate={capacity.bottleneck_candidate_rate:.3f} | " + " | ".join(groups)
+            f"bottleneck_candidate_rate={capacity.bottleneck_candidate_rate:.3f} "
+            f"free_cpu={total_pool.cpus - reserved_cpus:.1f}/{total_pool.cpus:.1f} "
+            f"free_gpu={total_pool.gpus - reserved_gpus:.2f}/{total_pool.gpus:.2f} | " + " | ".join(groups)
         )
 
     def _drain_pending_measurements(self) -> None:

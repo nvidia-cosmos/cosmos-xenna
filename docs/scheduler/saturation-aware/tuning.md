@@ -65,6 +65,7 @@ only a handful, grouped by what they affect.
 |---|---|---|
 | `scale_down_release_cycles` | `6` | Base release speed: `alpha_down = 1 / (scale_down_release_cycles × scale_down_release_slowdown)`. Larger holds a stage warm longer through a lull. |
 | `scale_down_release_slowdown` | `4.0` | Uniform extra hold multiplier. Set to `1.0` to restore the fast base release for every stage. |
+| `reclaim_confirm_cycles` | `6` | Consecutive cycles an idle, over-provisioned downstream stage must look beneficial-to-reclaim (its freed resource would help the bottleneck grow) before its warm pin releases. Lower to return stranded resources sooner; raise to be more conservative against a transient bottleneck shift. |
 
 ## Symptom → knob index
 
@@ -75,6 +76,7 @@ only a handful, grouped by what they affect.
 | A stage stuck on a long task reports a frozen-high rate | Lower `speed_stale_multiple` toward `2.0` so the stall is detected sooner. |
 | Heavy stage warms one model at a time, budget idle | It should auto-release after `speed_estimation_window_s` with work waiting ([04](04-cold-start-ramp.md)); shorten the window only if warmup genuinely needs it. |
 | Expensive GPU stage idle with `qstate=starved`, `local_pending=0` | **Not a knob.** It is downstream of the bottleneck; fix the upstream feeder ([02](02-bottleneck-selection.md)). |
+| Over-provisioned idle downstream stage strands CPU/GPU while the bottleneck wants to grow | Lower `reclaim_confirm_cycles` so the floor releases the stranded resource sooner. The release only fires when the bottleneck holds the same resource type, so a GPU stage is never shrunk to feed a CPU bottleneck. |
 | Reaction feels slow on a small cluster | Lower `interval_s`; watch that per-cycle work stays well under the interval. |
 
 ## Tuning discipline

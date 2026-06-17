@@ -126,7 +126,7 @@ page or two.
 | **02** | [Bottleneck selection](02-bottleneck-selection.md) | Pick the bottleneck from the **queue gradient**, not from speed, and why a starved downstream stage is expected to idle. |
 | **03** | [Growth and sizing](03-growth-and-sizing.md) | Grow only the bottleneck by handing the solver a deflated speed; bound everyone else to the bottleneck rate. |
 | **04** | [Cold-start ramp](04-cold-start-ramp.md) | Cap an unmeasured stage to +1 worker/cycle so a placeholder speed can never trigger a fragmentation burst. |
-| **05** | [Scale-down floor](05-scale-down-floor.md) | A shrink-veto that holds expensive stages warm through transient lulls and releases them only on a confirmed drain. |
+| **05** | [Scale-down floor](05-scale-down-floor.md) | A shrink-veto that holds expensive stages warm through transient lulls; releases on a confirmed drain, or when an over-provisioned idle downstream stage can return resources the bottleneck needs. |
 
 ---
 

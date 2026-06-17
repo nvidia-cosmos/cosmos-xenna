@@ -86,6 +86,11 @@ class SaturationAwareConfig:
         scale_down_release_slowdown: Extra release-time multiplier applied
             uniformly to every stage. The default holds a stage longer through a
             transient dip; ``1.0`` restores the fast base release for all stages.
+        reclaim_confirm_cycles: Consecutive cycles a downstream stage must look
+            idle, over-provisioned, and beneficial-to-reclaim (its freed resource
+            would help the bottleneck grow) before the scale-down floor releases
+            its warm pin. A longer window makes a transient bottleneck shift less
+            able to trigger a coupled scale-down / scale-up.
     """
 
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))
@@ -103,6 +108,7 @@ class SaturationAwareConfig:
     speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
     scale_down_release_slowdown: float = attrs.field(default=4.0, validator=attrs.validators.ge(1.0))
+    reclaim_confirm_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
 
     def __attrs_post_init__(self) -> None:
         """Validate cross-field invariants."""

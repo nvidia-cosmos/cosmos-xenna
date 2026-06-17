@@ -27,7 +27,9 @@ The floor never demands growth (``floor <= workers``), so growth stays owned by
 the demand multiplier. A lower hold target must persist before deletes are
 allowed to follow it, while rises are accepted immediately. Release is driven by
 whole-chain at-or-upstream stock so a downstream stage is not released while
-upstream work is still in flight.
+upstream work is still in flight - except an idle, over-provisioned downstream
+stage whose freed resource the bottleneck needs, which is released after a
+confirmation window so those resources return to the bottleneck.
 """
 
 from typing import Self
@@ -44,10 +46,15 @@ class FloorParams:
     Attributes:
         release_confirm_cycles: Consecutive low-stock cycles before a stage
             releases to ``min_workers``.
+        reclaim_confirm_cycles: Consecutive cycles a downstream stage must look
+            reclaimable (idle, over-provisioned, and beneficial) before its warm
+            pin is released, so a transient bottleneck shift cannot trigger a
+            coupled scale-down / scale-up.
         min_workers: Lower bound a stage is never shrunk below while active.
     """
 
     release_confirm_cycles: int
+    reclaim_confirm_cycles: int
     min_workers: int = 1
 
 
@@ -60,12 +67,16 @@ class FloorState:
         held_floor: Last stabilized hold floor per stage; ``0`` means unset.
         shrink_streak: Consecutive cycles with a lower desired hold floor.
         pending_shrink_floor: Conservative lower hold floor being confirmed.
+        benefit_streak: Consecutive cycles a stage has looked reclaimable (idle,
+            over-provisioned, and beneficial); resets to ``0`` on any cycle it
+            does not.
     """
 
     release_streak: tuple[int, ...]
     held_floor: tuple[int, ...]
     shrink_streak: tuple[int, ...]
     pending_shrink_floor: tuple[int, ...]
+    benefit_streak: tuple[int, ...]
 
     @classmethod
     def initial(cls, num_stages: int) -> Self:
@@ -75,6 +86,7 @@ class FloorState:
             held_floor=(0,) * num_stages,
             shrink_streak=(0,) * num_stages,
             pending_shrink_floor=(0,) * num_stages,
+            benefit_streak=(0,) * num_stages,
         )
 
 
@@ -102,8 +114,19 @@ class FloorInputs:
         local_pending_depths: Per-stage local queued depth in stage-input
             sample units, excluding in-flight work. A value at or above one
             batch means the stage has admitted work waiting for a free worker.
-        protect_downstream_of: Rate-source stage whose downstream stages should
-            not shrink while source-normalized stock is still in flight.
+        is_manual: Per-stage operator-pinned flag; a manual stage is never
+            released by the downstream reclaim gate.
+        w_target_is_real: Per-stage flag for whether the capacity growth target
+            is a real measured value (``True``) or the cold/untrusted
+            ``min_workers`` placeholder (``False``); a stage with a placeholder
+            target is never released by the downstream reclaim gate.
+        reclaim_beneficial: Per-stage flag for whether freeing this stage's
+            resource would help the current bottleneck grow (its resource type
+            is shared with a growth-wanting, non-manual bottleneck). Only a
+            beneficial stage may release its downstream warm pin.
+        protect_downstream_of: Rate-source stage whose downstream stages are held
+            warm while source-normalized stock is in flight, unless the reclaim
+            gate confirms releasing them is beneficial.
     """
 
     workers: tuple[int, ...]
@@ -114,6 +137,9 @@ class FloorInputs:
     w_sustain: tuple[int, ...]
     ready_workers: tuple[int, ...]
     local_pending_depths: tuple[float, ...]
+    is_manual: tuple[bool, ...]
+    w_target_is_real: tuple[bool, ...]
+    reclaim_beneficial: tuple[bool, ...]
     protect_downstream_of: int = -1
 
 
@@ -131,6 +157,10 @@ class FloorDecision:
         shrink_streak: Consecutive lower-hold-target cycles observed so far.
         pending_shrink_floor: Lower hold floor being confirmed.
         shrink_deferred: Whether a lower hold target is awaiting confirmation.
+        reclaim_beneficial: Whether freeing this stage's resource would help the
+            bottleneck grow this cycle (the downstream reclaim signal).
+        benefit_streak: Consecutive reclaimable cycles confirmed so far; the
+            downstream warm pin releases once it reaches ``reclaim_confirm_cycles``.
     """
 
     floor: int
@@ -140,6 +170,8 @@ class FloorDecision:
     shrink_streak: int = 0
     pending_shrink_floor: int = 0
     shrink_deferred: bool = False
+    reclaim_beneficial: bool = False
+    benefit_streak: int = 0
 
 
 @attrs.frozen
@@ -183,6 +215,12 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
     batch is held at its current workers regardless of a decayed ``w_sustain``,
     unless the whole-chain release path confirms its upstream work has drained.
 
+    A stage downstream of the bottleneck is held warm while upstream stock is in
+    flight, except when it has looked reclaimable (idle, over-provisioned, and
+    ``reclaim_beneficial``) for ``reclaim_confirm_cycles`` consecutive cycles -
+    then its hold target may fall to ``min(w_sustain, workers)`` so an
+    over-provisioned downstream stage returns resources the bottleneck needs.
+
     Args:
         inputs: Per-cycle observed per-stage inputs, including the capacity
             plan's ``w_sustain``.
@@ -202,10 +240,14 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         == len(inputs.w_sustain)
         == len(inputs.ready_workers)
         == len(inputs.local_pending_depths)
+        == len(inputs.is_manual)
+        == len(inputs.w_target_is_real)
+        == len(inputs.reclaim_beneficial)
         == len(prev.release_streak)
         == len(prev.held_floor)
         == len(prev.shrink_streak)
         == len(prev.pending_shrink_floor)
+        == len(prev.benefit_streak)
         == num_stages
     ):
         raise ValueError(
@@ -214,9 +256,12 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             f"active_depths={len(inputs.active_depths)} batch_sizes={len(inputs.batch_sizes)} "
             f"w_sustain={len(inputs.w_sustain)} ready_workers={len(inputs.ready_workers)} "
             f"local_pending_depths={len(inputs.local_pending_depths)} "
+            f"is_manual={len(inputs.is_manual)} w_target_is_real={len(inputs.w_target_is_real)} "
+            f"reclaim_beneficial={len(inputs.reclaim_beneficial)} "
             f"prev_release_streak={len(prev.release_streak)} "
             f"prev_held_floor={len(prev.held_floor)} prev_shrink_streak={len(prev.shrink_streak)} "
-            f"prev_pending_shrink_floor={len(prev.pending_shrink_floor)}"
+            f"prev_pending_shrink_floor={len(prev.pending_shrink_floor)} "
+            f"prev_benefit_streak={len(prev.benefit_streak)}"
         )
 
     decisions: list[FloorDecision] = []
@@ -224,6 +269,7 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
     next_held_floor: list[int] = []
     next_shrink_streak: list[int] = []
     next_pending_shrink_floor: list[int] = []
+    next_benefit_streak: list[int] = []
 
     for k in range(num_stages):
         if inputs.chain[k] <= 0.0 and inputs.active_depths[k] > 0.0:
@@ -248,7 +294,25 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
 
         min_floor = min(params.min_workers, inputs.workers[k])
         desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
-        if inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of and has_stock:
+        # Downstream reclaim gate. A stage downstream of the bottleneck is held
+        # warm while upstream stock is in flight, UNLESS reclaiming it is
+        # genuinely useful and that has held for reclaim_confirm_cycles cycles.
+        # "Useful" means idle (a ready worker), over-provisioned (above its own
+        # hold target), eligible (real target, not cold; not operator-pinned),
+        # and beneficial (freeing its resource would help the bottleneck grow).
+        # The streak resets the moment any of these drops, so a transient
+        # bottleneck shift cannot release an expensive stage's warm pin.
+        reclaimable = (
+            inputs.ready_workers[k] > 0
+            and inputs.workers[k] > inputs.w_sustain[k]
+            and inputs.w_target_is_real[k]
+            and not inputs.is_manual[k]
+            and inputs.reclaim_beneficial[k]
+        )
+        benefit_streak = prev.benefit_streak[k] + 1 if reclaimable else 0
+        reclaim_confirmed = benefit_streak >= params.reclaim_confirm_cycles
+        downstream = inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of
+        if downstream and has_stock and not reclaim_confirmed:
             desired = inputs.workers[k]
         # Local-evidence shrink veto. A stage with no ready worker AND at least
         # one queued batch is demonstrably under-provisioned this cycle, so a
@@ -308,12 +372,15 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
                 shrink_streak=shrink_streak,
                 pending_shrink_floor=pending_shrink_floor,
                 shrink_deferred=shrink_deferred,
+                reclaim_beneficial=inputs.reclaim_beneficial[k],
+                benefit_streak=benefit_streak,
             )
         )
         next_release_streak.append(streak)
         next_held_floor.append(held)
         next_shrink_streak.append(shrink_streak)
         next_pending_shrink_floor.append(pending_shrink_floor)
+        next_benefit_streak.append(benefit_streak)
 
     return FloorResult(
         plan=FloorPlan(decisions=tuple(decisions)),
@@ -322,6 +389,7 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
             held_floor=tuple(next_held_floor),
             shrink_streak=tuple(next_shrink_streak),
             pending_shrink_floor=tuple(next_pending_shrink_floor),
+            benefit_streak=tuple(next_benefit_streak),
         ),
     )
 
