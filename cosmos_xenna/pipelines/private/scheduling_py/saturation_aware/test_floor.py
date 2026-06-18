@@ -654,3 +654,43 @@ def test_downstream_reclaim_resets_on_transient_benefit_drop() -> None:
     assert third.plan.decisions[1].benefit_streak == 0
     assert fourth.plan.decisions[1].benefit_streak == 1
     assert fourth.plan.floors[1] == 15
+
+
+def test_cold_stage_held_at_current_workers() -> None:
+    """A cold stage (no trusted target) is held at its workers, not shrunk to the placeholder w_sustain.
+
+    Capacity emits w_sustain=min_workers for a stage with no measured speed, so
+    the baseline desired collapses to 1; the cold hold keeps the floor at the
+    current 4 workers instead, leaving cold growth to the cold-start ramp.
+    """
+    result = floor.compute_floors(
+        _inputs(workers=(10, 4), w_sustain=(1, 1), stock=_DEEP_STOCK, w_target_is_real=(True, False)),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert result.plan.floors[1] == 4  # held at workers, not min(w_sustain=1, workers=4)=1
+
+
+def test_trusted_stage_still_shrinks_to_w_sustain() -> None:
+    """The cold hold is scoped to untrusted stages: a trusted stage still clamps to min(w_sustain, workers)."""
+    result = floor.compute_floors(
+        _inputs(workers=(10, 4), w_sustain=(1, 2), stock=_DEEP_STOCK, w_target_is_real=(True, True)),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert result.plan.floors[1] == 2  # min(w_sustain=2, workers=4); cold hold does not apply
+
+
+def test_cold_stage_with_drained_stock_still_releases_to_min() -> None:
+    """The whole-chain drain override still releases a cold stage to min_workers after the confirm window.
+
+    The cold hold pins a cold stage only while it still owns upstream work; once
+    the whole-chain stock has drained for release_confirm_cycles cycles the
+    release path overrides the hold, so a finished cold stage is not pinned.
+    """
+    params = _params(release_confirm_cycles=2)
+    args = _inputs(workers=(10, 4), w_sustain=(1, 1), stock=_EMPTY_STOCK, w_target_is_real=(True, False))
+    first = floor.compute_floors(args, floor.FloorState.initial(2), params)
+    assert first.plan.floors[1] == 4  # cycle 1: cold hold at workers (release streak 1 < 2)
+    second = floor.compute_floors(args, first.state, params)
+    assert second.plan.floors[1] == 1  # cycle 2: confirmed drain overrides the hold -> MIN

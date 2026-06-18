@@ -118,8 +118,10 @@ class FloorInputs:
             released by the downstream reclaim gate.
         w_target_is_real: Per-stage flag for whether the capacity growth target
             is a real measured value (``True``) or the cold/untrusted
-            ``min_workers`` placeholder (``False``); a stage with a placeholder
-            target is never released by the downstream reclaim gate.
+            ``min_workers`` placeholder (``False``). A placeholder-target stage
+            is held at its current workers by the cold-stage hold and is never
+            released by the downstream reclaim gate; cold growth is owned by the
+            cold-start ramp until the stage gathers enough samples to be trusted.
         reclaim_beneficial: Per-stage flag for whether freeing this stage's
             resource would help the current bottleneck grow (its resource type
             is shared with a growth-wanting, non-manual bottleneck). Only a
@@ -222,6 +224,13 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
     follows once the usual shrink-confirm window also passes, returning the
     over-provisioned stage's resources to the bottleneck.
 
+    A cold stage (no trusted per-worker speed yet, ``w_target_is_real`` False)
+    carries only a placeholder ``w_sustain = min_workers`` from capacity, so the
+    floor holds it at its current workers rather than sizing it down toward a
+    target it cannot trust. Cold growth is owned by the cold-start ramp; the
+    whole-chain release path still drops a cold stage to ``min_workers`` on a
+    genuine drain, so the hold never pins a finished stage.
+
     Args:
         inputs: Per-cycle observed per-stage inputs, including the capacity
             plan's ``w_sustain``.
@@ -295,6 +304,17 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
 
         min_floor = min(params.min_workers, inputs.workers[k])
         desired = max(min_floor, min(inputs.w_sustain[k], inputs.workers[k]))
+        # Cold-stage hold. A stage with no trusted per-worker speed yet gets a
+        # placeholder w_sustain = min_workers from capacity (w_target_is_real is
+        # False), so the baseline desired above collapses to min_workers and would
+        # invite a teardown the streaming post-ready grace must then veto every
+        # cold cycle (spurious proposals + log noise + a layer inversion). The
+        # cold-start ramp owns cold growth, so the floor must not size a cold stage
+        # down toward a placeholder it cannot trust: hold it at its current workers.
+        # The whole-chain release override below still drops it to min_workers on a
+        # genuine drain, so this does not pin a finished stage.
+        if not inputs.w_target_is_real[k]:
+            desired = inputs.workers[k]
         # Downstream reclaim gate. A stage downstream of the bottleneck is held
         # warm while upstream stock is in flight, UNLESS reclaiming it is
         # genuinely useful and that has held for reclaim_confirm_cycles cycles.
