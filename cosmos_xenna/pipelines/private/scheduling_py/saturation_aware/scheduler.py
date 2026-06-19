@@ -678,40 +678,46 @@ class SaturationAwareScheduler:
         editor.commit()
 
     def _compute_reclaim_beneficial(self, cycle: _Cycle, capacity: CapacityPlan) -> tuple[bool, ...]:
-        """Return per-stage whether freeing the stage's resource would help the bottleneck.
+        """Return per-stage whether freeing the stage's resource would help a grower.
 
-        True for a stage if the sticky bottleneck stage is non-manual, wants to
-        grow (a real ``w_target`` above its current workers), and the stage
-        reserves only resource types the bottleneck also uses - so freeing it
-        wastes nothing the bottleneck cannot consume (a whole-GPU stage is not
-        torn down for its incidental host CPUs to feed a CPU-only bottleneck) -
-        while overlapping on at least one type. The bottleneck stage itself is
-        always False. Reading the sticky ``bottleneck_stage`` rather than the
-        one-cycle candidate keeps a transient bottleneck from marking an
-        unrelated stage reclaimable.
+        A grower is any non-manual stage whose real ``w_target`` exceeds its
+        current workers (it wants more workers this cycle). A stage is beneficial
+        to reclaim when some other grower shares a resource type it reserves and
+        the stage reserves no type that grower cannot use (so a whole-GPU stage is
+        never torn down for its incidental host CPUs to feed a CPU-only grower).
+        With no grower, every stage is False.
 
         Args:
             cycle: This cycle's immutable derived inputs.
             capacity: This cycle's capacity plan.
         """
         num_stages = len(cycle.workers)
-        index = capacity.bottleneck_stage
-        if not (0 <= index < num_stages) or cycle.is_manual[index]:
+        growers = [
+            index
+            for index in range(num_stages)
+            if not cycle.is_manual[index]
+            and capacity.stages[index].w_target_is_real
+            and capacity.stages[index].w_target > cycle.workers[index]
+        ]
+        if not growers:
             return (False,) * num_stages
-        bottleneck = capacity.stages[index]
-        if not bottleneck.w_target_is_real or bottleneck.w_target <= cycle.workers[index]:
-            return (False,) * num_stages
-        bottleneck_shape = self.solver_template.stages[index].worker_shape
-        needs_cpu = bottleneck_shape.get_num_cpus() > 0.0
-        needs_gpu = bottleneck_shape.get_num_gpus() > 0.0
+        shapes = [stage.worker_shape for stage in self.solver_template.stages]
         beneficial: list[bool] = []
         for stage_index in range(num_stages):
-            shape = self.solver_template.stages[stage_index].worker_shape
-            has_cpu = shape.get_num_cpus() > 0.0
-            has_gpu = shape.get_num_gpus() > 0.0
-            wastes_nothing = (needs_cpu or not has_cpu) and (needs_gpu or not has_gpu)
-            overlaps = (needs_cpu and has_cpu) or (needs_gpu and has_gpu)
-            beneficial.append(stage_index != index and wastes_nothing and overlaps)
+            has_cpu = shapes[stage_index].get_num_cpus() > 0.0
+            has_gpu = shapes[stage_index].get_num_gpus() > 0.0
+            helps_grower = False
+            for grower in growers:
+                if grower == stage_index:
+                    continue
+                needs_cpu = shapes[grower].get_num_cpus() > 0.0
+                needs_gpu = shapes[grower].get_num_gpus() > 0.0
+                wastes_nothing = (needs_cpu or not has_cpu) and (needs_gpu or not has_gpu)
+                overlaps = (needs_cpu and has_cpu) or (needs_gpu and has_gpu)
+                if wastes_nothing and overlaps:
+                    helps_grower = True
+                    break
+            beneficial.append(helps_grower)
         return tuple(beneficial)
 
     def _apply_scale_down_floor(

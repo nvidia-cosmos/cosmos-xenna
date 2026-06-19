@@ -123,9 +123,9 @@ class FloorInputs:
             released by the downstream reclaim gate; cold growth is owned by the
             cold-start ramp until the stage gathers enough samples to be trusted.
         reclaim_beneficial: Per-stage flag for whether freeing this stage's
-            resource would help the current bottleneck grow (its resource type
-            is shared with a growth-wanting, non-manual bottleneck). Only a
-            beneficial stage may release its downstream warm pin.
+            resource would help an under-capacity stage grow (it reserves only
+            resource types some growth-wanting, non-manual stage also uses). Only
+            a beneficial stage may release its downstream warm pin.
         protect_downstream_of: Rate-source stage whose downstream stages are held
             warm while source-normalized stock is in flight, unless the reclaim
             gate confirms releasing them is beneficial.
@@ -159,8 +159,8 @@ class FloorDecision:
         shrink_streak: Consecutive lower-hold-target cycles observed so far.
         pending_shrink_floor: Lower hold floor being confirmed.
         shrink_deferred: Whether a lower hold target is awaiting confirmation.
-        reclaim_beneficial: Whether freeing this stage's resource would help the
-            bottleneck grow this cycle (the downstream reclaim signal).
+        reclaim_beneficial: Whether freeing this stage's resource would help an
+            under-capacity stage grow this cycle (the downstream reclaim signal).
         benefit_streak: Consecutive reclaimable cycles confirmed so far; the
             downstream warm pin releases once it reaches ``reclaim_confirm_cycles``.
     """
@@ -320,9 +320,10 @@ def compute_floors(inputs: FloorInputs, prev: FloorState, params: FloorParams) -
         # genuinely useful and that has held for reclaim_confirm_cycles cycles.
         # "Useful" means idle (a ready worker), over-provisioned (above its own
         # hold target), eligible (real target, not cold; not operator-pinned),
-        # and beneficial (freeing its resource would help the bottleneck grow).
-        # The streak resets the moment any of these drops, so a transient
-        # bottleneck shift cannot release an expensive stage's warm pin.
+        # and beneficial (freeing its resource would help an under-capacity stage
+        # grow, not only the current bottleneck). The streak resets the moment any
+        # of these drops, so a transient demand spike cannot release an expensive
+        # stage's warm pin.
         downstream = inputs.protect_downstream_of >= 0 and k > inputs.protect_downstream_of
         reclaimable = (
             downstream

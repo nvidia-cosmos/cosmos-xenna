@@ -896,10 +896,11 @@ def _mixed_pipeline_scheduler() -> SaturationAwareScheduler:
 
 
 def test_reclaim_beneficial_cpu_bottleneck_excludes_gpu_stage() -> None:
-    """A CPU bottleneck makes the CPU-only stage reclaimable but never the GPU stage.
+    """A growing CPU bottleneck makes the CPU-only stage reclaimable but never the GPU stage.
 
-    The GPU stage also reserves host CPUs, but freeing it would strand a GPU the
-    CPU bottleneck cannot use, so it is not beneficial.
+    The bottleneck is the only grower; the GPU stage also reserves host CPUs, but
+    freeing it would strand a GPU the CPU grower cannot use, so the subset rule
+    excludes it.
     """
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
@@ -908,7 +909,7 @@ def test_reclaim_beneficial_cpu_bottleneck_excludes_gpu_stage() -> None:
 
 
 def test_reclaim_beneficial_gpu_bottleneck_includes_cpu_and_gpu_stages() -> None:
-    """A GPU bottleneck (which also reserves CPUs) makes both upstream stages reclaimable."""
+    """A growing GPU grower (also reserving CPUs) makes both other stages reclaimable; it never marks itself."""
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=2, w_targets=(1, 1, 10))
     cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
@@ -916,7 +917,7 @@ def test_reclaim_beneficial_gpu_bottleneck_includes_cpu_and_gpu_stages() -> None
 
 
 def test_reclaim_beneficial_false_when_bottleneck_is_manual() -> None:
-    """A manual/pinned bottleneck is never grown, so freeing any stage helps nothing."""
+    """A manual/pinned stage is excluded as a grower, so freeing any stage helps nothing."""
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
     cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(True, False, False))
@@ -924,7 +925,7 @@ def test_reclaim_beneficial_false_when_bottleneck_is_manual() -> None:
 
 
 def test_reclaim_beneficial_false_when_bottleneck_target_not_real() -> None:
-    """A cold bottleneck (placeholder w_target) yields no reclaim signal."""
+    """A cold stage (placeholder w_target) is excluded as a grower, so there is no reclaim signal."""
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1), w_target_is_real=(False, True, True))
     cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
@@ -932,7 +933,7 @@ def test_reclaim_beneficial_false_when_bottleneck_target_not_real() -> None:
 
 
 def test_reclaim_beneficial_false_when_bottleneck_not_growing() -> None:
-    """A bottleneck already at or above its target is not growing, so nothing is reclaimable."""
+    """A stage at or above its target is not a grower; with no grower nothing is reclaimable."""
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 1, 1))
     cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
@@ -940,8 +941,70 @@ def test_reclaim_beneficial_false_when_bottleneck_not_growing() -> None:
 
 
 def test_reclaim_beneficial_false_when_no_bottleneck() -> None:
-    """With no measured bottleneck (-1) there is no reclaim signal."""
+    """With no stage wanting to grow there is no reclaim signal (the bottleneck index is unused)."""
     scheduler = _mixed_pipeline_scheduler()
     capacity = _capacity_with_bottleneck(bottleneck_stage=-1, w_targets=(1, 1, 1))
     cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
     assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def _two_gpu_pipeline_scheduler() -> SaturationAwareScheduler:
+    """A 3-stage pipeline: a CPU-only stage then two GPU stages (each also reserves CPUs)."""
+    spec = v1.PipelineSpec(
+        input_data=range(10),
+        stages=[
+            v1.StageSpec(_CpuStage(1.0, 1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+        ],
+    )
+    return _scheduler(spec, _gpu_cluster(8))
+
+
+def test_reclaim_beneficial_idle_gpu_stage_freed_for_nonbottleneck_gpu_grower() -> None:
+    """An idle GPU stage is reclaimable for a growing GPU stage that is not the bottleneck.
+
+    The sticky bottleneck is a non-growing CPU stage (stage 0); only GPU stage 1
+    wants to grow. The over-provisioned GPU stage 2 is freed for that grower, and
+    the grower never marks itself (stage 1).
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 5, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, False, True)
+
+
+def test_reclaim_beneficial_gpu_stage_excluded_for_nonbottleneck_cpu_grower() -> None:
+    """A CPU-only grower never makes a GPU stage reclaimable, even off the bottleneck.
+
+    Only CPU stage 0 wants to grow; freeing either GPU stage would strand a GPU
+    the CPU grower cannot use, so the subset rule excludes both.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=2, w_targets=(5, 1, 7))
+    cycle = _cycle_for_reclaim(workers=(1, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_ignores_manual_grower() -> None:
+    """A manual stage that wants to grow is excluded as a grower.
+
+    Same shape as the GPU-grower case but the lone grower (stage 1) is
+    operator-pinned, so there is no grower and nothing is reclaimable.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 5, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 7), is_manual=(False, True, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_unions_over_multiple_growers() -> None:
+    """A stage is reclaimable if any grower can use its freed resource.
+
+    Both GPU stages grow, so each is reclaimable for the other and the CPU stage
+    is reclaimable for either - the signal is the union over all growers.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=1, w_targets=(2, 5, 5))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 1), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, True, True)

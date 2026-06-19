@@ -88,9 +88,9 @@ class SaturationAwareConfig:
             transient dip; ``1.0`` restores the fast base release for all stages.
         reclaim_confirm_cycles: Consecutive cycles a downstream stage must look
             idle, over-provisioned, and beneficial-to-reclaim (its freed resource
-            would help the bottleneck grow) before the scale-down floor releases
-            its warm pin. A longer window makes a transient bottleneck shift less
-            able to trigger a coupled scale-down / scale-up.
+            would help an under-capacity stage grow) before the scale-down floor
+            releases its warm pin. A longer window makes a transient demand spike
+            less able to trigger a coupled scale-down / scale-up.
     """
 
     interval_s: float = attrs.field(default=10.0, validator=attrs.validators.gt(0.0))

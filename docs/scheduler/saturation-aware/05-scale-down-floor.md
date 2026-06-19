@@ -113,25 +113,40 @@ Three extra guards handle cases the basic gate cannot:
   while upstream work is on the way. The exception is a *genuinely reclaimable*
   stage: idle (a ready worker), over-provisioned (`workers > w_sustain`),
   eligible (a real growth target, not cold; not operator-pinned), and
-  **beneficial** - freeing it would help the current bottleneck grow: the stage
-  reserves only resource types a growth-wanting, non-manual bottleneck also
-  uses, so nothing it frees is wasted (a whole-GPU stage is not reclaimed for
-  its incidental host CPUs). Once that holds for `reclaim_confirm_cycles` cycles
-  the hold target falls to `min(w_sustain, workers)`, so an over-provisioned
-  downstream stage returns resources the bottleneck needs instead of stranding
-  them (`protect_downstream_of`, `reclaim_beneficial`, `benefit_streak` in
-  `floor.py`).
+  **beneficial** - freeing it would help an under-capacity stage grow: the stage
+  reserves only resource types some growth-wanting, non-manual stage also uses,
+  so nothing it frees is wasted (a whole-GPU stage is not reclaimed for its
+  incidental host CPUs to feed a CPU-only grower). The grower need not be the
+  sticky bottleneck - any stage whose real `w_target` exceeds its workers counts
+  - so an idle GPU stage can be freed for a GPU-starved sibling even while the
+  bottleneck is a different-resource stage. Once that holds for
+  `reclaim_confirm_cycles` cycles the hold target falls to `min(w_sustain,
+  workers)`, so an over-provisioned downstream stage returns resources a grower
+  needs instead of stranding them (`protect_downstream_of`, `reclaim_beneficial`,
+  `benefit_streak` in `floor.py`).
 
 ![Two-row infographic titled "downstream guard: hold warm vs reclaim early". Behind the bottleneck, an idle, over-provisioned downstream stage is held warm. Top row: when nobody needs its CPU it HOLDS WARM at its current size. Bottom row: when a blocked bottleneck needs its CPU (confirmed for N cycles) it RECLAIMS EARLY, shrinking to w_sustain. A banner notes that either way it still releases to min workers once upstream work drains.](assets/05-downstream-guard.png)
 
 *Releasing the downstream warm pin: a stage behind the bottleneck is held warm
 (pinned above its hold target) while upstream work is still in flight, and
 released early toward `min(w_sustain, workers)` only when a blocked,
-growth-wanting bottleneck needs the resource it would free - confirmed for
+growth-wanting stage needs the resource it would free - confirmed for
 `reclaim_confirm_cycles` cycles. This pin is the only thing the benefit gate
 governs: the stage still shrinks to its sustainable size by the normal capacity
 path and drains to `min_workers` once upstream work is gone, so warm-hold is
 temporary, not permanent.*
+
+> **Why demand-coupled, not bottleneck-coupled.** Keying this gate to the single
+> sticky bottleneck once let an idle, over-provisioned GPU stage stay pinned at
+> full size while a GPU-starved sibling that feeds it could not grow - because at
+> that moment the bottleneck was a different-resource (CPU) stage, so freeing the
+> GPU stage "helped the bottleneck" by nothing. The solver kept proposing to
+> delete the idle GPU workers and the floor kept vetoing every one: a circular
+> hold (the stage hoards the resource its own feeder needs) that the chain cannot
+> escape. The gate now asks "does freeing this help *any* stage that wants to
+> grow?", so the idle stage is released to its sustainable size and the starved
+> sibling grows. The subset rule still applies, so a GPU stage is never torn down
+> to feed a CPU-only grower.
 
 - **Local saturation veto.** **Any** stage with **no ready worker** and **at
   least one queued batch** is demonstrably under-provisioned this cycle, so a
