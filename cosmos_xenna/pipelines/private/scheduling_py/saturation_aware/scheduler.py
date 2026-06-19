@@ -701,17 +701,21 @@ class SaturationAwareScheduler:
         ]
         if not growers:
             return (False,) * num_stages
-        shapes = [stage.worker_shape for stage in self.solver_template.stages]
+        # Resolve each stage's (has_cpu, has_gpu) footprint once; the per-grower
+        # scan below would otherwise re-cross into the WorkerShape accessors on
+        # every outer iteration.
+        footprints = [
+            (stage.worker_shape.get_num_cpus() > 0.0, stage.worker_shape.get_num_gpus() > 0.0)
+            for stage in self.solver_template.stages
+        ]
         beneficial: list[bool] = []
         for stage_index in range(num_stages):
-            has_cpu = shapes[stage_index].get_num_cpus() > 0.0
-            has_gpu = shapes[stage_index].get_num_gpus() > 0.0
+            has_cpu, has_gpu = footprints[stage_index]
             helps_grower = False
             for grower in growers:
                 if grower == stage_index:
                     continue
-                needs_cpu = shapes[grower].get_num_cpus() > 0.0
-                needs_gpu = shapes[grower].get_num_gpus() > 0.0
+                needs_cpu, needs_gpu = footprints[grower]
                 wastes_nothing = (needs_cpu or not has_cpu) and (needs_gpu or not has_gpu)
                 overlaps = (needs_cpu and has_cpu) or (needs_gpu and has_gpu)
                 if wastes_nothing and overlaps:
