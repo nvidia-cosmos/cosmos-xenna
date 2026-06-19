@@ -117,10 +117,15 @@ Three extra guards handle cases the basic gate cannot:
   reserves only resource types some growth-wanting, non-manual stage also uses,
   so nothing it frees is wasted (a whole-GPU stage is not reclaimed for its
   incidental host CPUs to feed a CPU-only grower). The grower need not be the
-  sticky bottleneck - any stage whose real `w_target` exceeds its workers counts
-  - so an idle GPU stage can be freed for a GPU-starved sibling even while the
-  bottleneck is a different-resource stage. Once that holds for
-  `reclaim_confirm_cycles` cycles the hold target falls to `min(w_sustain,
+  sticky bottleneck - any non-stalled stage whose real `w_target` exceeds its
+  workers counts - so an idle GPU stage can be freed for a GPU-starved sibling
+  even while the bottleneck is a different-resource stage. A *stalled* stage
+  (`rate_is_stale`) is **not** a grower even though capacity clamps its target to
+  `workers + 1` (making it look perpetually growing): adding workers to a stall
+  only drains its queued backlog and cannot raise its collapsing completion rate,
+  so reclaiming an expensive warm peer for it would strand the freed resources.
+  The exclusion self-clears once completions resume. Once a genuine reclaim holds
+  for `reclaim_confirm_cycles` cycles the hold target falls to `min(w_sustain,
   workers)`, so an over-provisioned downstream stage returns resources a grower
   needs instead of stranding them (`protect_downstream_of`, `reclaim_beneficial`,
   `benefit_streak` in `floor.py`).

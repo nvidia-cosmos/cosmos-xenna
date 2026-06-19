@@ -78,6 +78,16 @@ class SaturationAwareConfig:
             toward infinity), so it is excluded from the speed window and the
             trusted-sample count. Real zero-output filter stages, which take
             real time, are unaffected.
+        pipeline_warmup_growth_step: Maximum workers a trusted stage may grow per
+            cycle while the pipeline as a whole is still warming (some
+            work-bearing stage is untrusted, so ``bottleneck_rate`` excludes it
+            and the derived ``w_target`` is provisional). It bounds growth so a
+            fast upstream stage cannot leap to a node-filling ``w_target`` and
+            over-claim a shared resource (e.g. CPU) before slower downstream
+            stages have warmed. Lower is safer (leaves more headroom for
+            slow-starting stages to acquire resources during warmup); higher
+            ramps a genuinely source-bound pipeline faster once trusted. Has no
+            effect once every work-bearing stage is trusted.
         scale_down_release_cycles: Base scale-down release speed, combined with
             ``scale_down_release_slowdown`` as ``alpha_down = 1 /
             (scale_down_release_cycles * scale_down_release_slowdown)`` (larger
@@ -106,6 +116,7 @@ class SaturationAwareConfig:
     speed_stale_multiple: float = attrs.field(default=3.0, validator=attrs.validators.gt(1.0))
     speed_stale_growth_step: int = attrs.field(default=1, validator=attrs_utils.validate_positive_int)
     speed_estimation_min_task_duration_s: float = attrs.field(default=1e-3, validator=attrs.validators.gt(0.0))
+    pipeline_warmup_growth_step: int = attrs.field(default=4, validator=attrs_utils.validate_positive_int)
     scale_down_release_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)
     scale_down_release_slowdown: float = attrs.field(default=4.0, validator=attrs.validators.ge(1.0))
     reclaim_confirm_cycles: int = attrs.field(default=6, validator=attrs_utils.validate_positive_int)

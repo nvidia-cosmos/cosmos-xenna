@@ -598,6 +598,17 @@ class SaturationAwareScheduler:
         """
         editor = SolutionEditor(solution)
         min_data_points = self.config.speed_estimation_min_data_points
+        # The pipeline is "still warming" while any work-bearing stage is
+        # untrusted: bottleneck_rate excludes cold stages (the deliberate
+        # sat-cold-queue-cliff-rate-collapse guard), so every stage's w_target is
+        # computed from a provisional, often-too-high rate this cycle. One
+        # resource-agnostic signal for the whole cycle; the ramp uses it to bound
+        # a trusted stage's growth so a fast stage cannot leap to that inflated
+        # w_target and starve a shared resource the still-cold stages need.
+        pipeline_warming = any(
+            self._estimator.sample_count(other.name) < min_data_points and cycle.active_depths[other_index] > 0.0
+            for other_index, other in enumerate(self.shape.stages)
+        )
         summaries: list[str] = []
         for index, stage in enumerate(self.shape.stages):
             if stage.is_manual:
@@ -631,6 +642,7 @@ class SaturationAwareScheduler:
                     pending_work_age_s=pending_work_age_s,
                     has_pending_work=has_pending_work,
                     w_target=w_target,
+                    pipeline_warming=pipeline_warming,
                 ),
                 self.config,
             )
@@ -638,7 +650,7 @@ class SaturationAwareScheduler:
                 f"{stage.name}: {decision.reason} samples={samples}/{min_data_points} "
                 f"cap={decision.cap} frag_new={frag_new} is_gpu={stage.is_gpu} "
                 f"has_pending_work={has_pending_work} pending_work_age_s={pending_work_age_s:.1f} "
-                f"active_depth={active_depth:.2f}"
+                f"active_depth={active_depth:.2f} pipeline_warming={pipeline_warming}"
             )
             if decision.reason is RampReason.SLOW_START:
                 # No sample within the warmup window but work is still waiting:
@@ -660,10 +672,13 @@ class SaturationAwareScheduler:
             ramp_new = decision.keep_new
             frag_post = current + frag_new - deleted
             ramp_post = current + ramp_new - deleted
-            # A trusted stage is held at its capacity ceiling (CAPPED); an
-            # untrusted stage is held by the cold-start ramp. Tag each so the
-            # cause of the trim is clear in the trace.
-            tag = "growth cap" if decision.reason is RampReason.CAPPED else "cold-start ramp"
+            # A trusted stage is held at its capacity ceiling (CAPPED), or at a
+            # bounded per-cycle step while the pipeline is still warming
+            # (CAPPED_WARMUP); an untrusted stage is held by the cold-start ramp.
+            # Tag each so the cause of the trim is clear in the trace.
+            tag = (
+                "growth cap" if decision.reason in (RampReason.CAPPED, RampReason.CAPPED_WARMUP) else "cold-start ramp"
+            )
             logger.info(
                 f"saturation-aware {tag}: stage='{stage.name}' reason={decision.reason} "
                 f"current={current} deleted={deleted} "
@@ -680,12 +695,21 @@ class SaturationAwareScheduler:
     def _compute_reclaim_beneficial(self, cycle: _Cycle, capacity: CapacityPlan) -> tuple[bool, ...]:
         """Return per-stage whether freeing the stage's resource would help a grower.
 
-        A grower is any non-manual stage whose real ``w_target`` exceeds its
-        current workers (it wants more workers this cycle). A stage is beneficial
-        to reclaim when some other grower shares a resource type it reserves and
-        the stage reserves no type that grower cannot use (so a whole-GPU stage is
-        never torn down for its incidental host CPUs to feed a CPU-only grower).
-        With no grower, every stage is False.
+        A grower is any non-manual, non-stalled stage whose real ``w_target``
+        exceeds its current workers (it wants more workers this cycle). A stage is
+        beneficial to reclaim when some other grower shares a resource type it
+        reserves and the stage reserves no type that grower cannot use (so a
+        whole-GPU stage is never torn down for its incidental host CPUs to feed a
+        CPU-only grower). With no grower, every stage is False.
+
+        A stalled stage (``rate_is_stale``) is excluded as a grower even though
+        its ``w_target`` exceeds its workers: capacity clamps a stall's target to
+        ``workers + speed_stale_growth_step`` (so it looks perpetually growing),
+        but adding workers to a stall only drains its queued backlog and cannot
+        raise its collapsing completion rate (the single long in-flight task is
+        not parallelizable). Reclaiming an expensive warm peer for it would strand
+        those resources, so a stall must not justify the reclaim. The exclusion
+        self-clears the moment completions resume and ``rate_is_stale`` drops.
 
         Args:
             cycle: This cycle's immutable derived inputs.
@@ -696,6 +720,7 @@ class SaturationAwareScheduler:
             index
             for index in range(num_stages)
             if not cycle.is_manual[index]
+            and not cycle.rate_is_stale[index]
             and capacity.stages[index].w_target_is_real
             and capacity.stages[index].w_target > cycle.workers[index]
         ]

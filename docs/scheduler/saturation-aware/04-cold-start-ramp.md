@@ -62,6 +62,7 @@ Cap a **not-yet-trusted** stage's post-solve worker count by trimming the solver
   stage state                              ramp decision
   ───────────                              ─────────────
   trusted, capacity has a target           cap at w_target  (the growth ceiling)
+  trusted, pipeline still warming          cap at current + pipeline_warmup_growth_step
   trusted, no measured bottleneck yet      uncapped (no target this cycle; solver grows)
   warming (0 < samples < min_data_points)  +1/cycle if it has pending work, else hold
   cold,  pending work present              +1/cycle (warm a worker before 1st sample)
@@ -87,6 +88,48 @@ instead grows the upstream producer.
 
 The ramp **only trims additions**: it never adds a worker and never blocks a shrink. **Pinned** stages (operator-declared `num_workers`) are exempt: there is no evidence to ramp toward, so the solver may take them straight to the requested size.
 
+## Pipeline-warming growth gate
+
+The cap above governs an *untrusted* stage. A different over-growth happens to a
+**trusted** stage while the rest of the pipeline is still cold. `bottleneck_rate`
+is the slowest *measured* `cap_src`, and cold stages (`cap_src = 0`) are
+deliberately excluded so a not-yet-warm stage cannot collapse the rate to zero
+and tear down the feeders keeping it supplied ([01](01-capacity-model.md)). The
+side effect is that while any stage is still cold, `bottleneck_rate` - and every
+`w_target` derived from it - is **provisional and biased high**: it reflects only
+the fast stages that happened to warm first.
+
+A trusted upstream stage sized from that provisional rate can compute a
+node-filling `w_target` and, with nothing bounding the trusted growth path, leap
+to it in a single cycle. In production run `f9fa2dde` a CPU frame-extraction
+stage jumped from 2 to 57 workers on its first trusted cycle, exhausted the
+node's CPUs, and starved a downstream whole-GPU caption stage that needed those
+CPUs to place its workers - a **priority inversion** where a cheap upstream stage
+denied a resource the expensive downstream stage required, leaving GPUs idle.
+
+The gate: while the pipeline is **still warming** - any work-bearing stage is
+untrusted, so `bottleneck_rate` is provisional - a trusted stage's growth is
+bounded to `current + pipeline_warmup_growth_step` (default **4**) per cycle
+instead of jumping straight to `w_target`. `w_target` remains the ceiling, so a
+stage that does not want to grow is unaffected, and the cap only trims
+additions, never forcing a shrink.
+
+```
+                  free CPU on the node              upstream workers
+  without gate    ████░░░░░░░░  (exhausted)         2 ───────▶ 57  (one cycle)
+                  downstream GPU stage: cannot place; GPUs idle
+
+  with gate       ████████████  (stays available)   2 ─▶ 6 ─▶ 10 ... (+step/cycle)
+                  downstream GPU stage: places and warms in parallel
+```
+
+The gate is **self-releasing**: it reads one pipeline-wide signal each cycle and
+opens automatically the moment every work-bearing stage is trusted, after which
+the full `w_target` cap takes over with no behavioral change. It never touches
+`bottleneck_rate`, so the cold-exclusion guard above is preserved. It is
+resource-shape-agnostic - the same rule bounds a CPU, fractional-GPU, or
+whole-GPU stage - so it special-cases no stage, resource, or model.
+
 ## Trade-offs
 
 | Cost | Benefit |
@@ -94,15 +137,17 @@ The ramp **only trims additions**: it never adds a worker and never blocks a shr
 | A trusted stage's first ramp is slower than the solver's one-shot fill. | Resource-shape-agnostic: no fractional-GPU stage can fragment the cluster on cycle one. |
 | Slow-starter release needs a full window of zero samples before firing. | A heavy stage warms all its models in parallel instead of one at a time. |
 | The cap is a fixed `+1`, ignoring how large the solver's proposal was. | A placeholder-driven over-spawn is structurally impossible. |
+| While the pipeline warms, a trusted source-bound stage grows by only `pipeline_warmup_growth_step`/cycle instead of one shot. | A trusted stage cannot over-claim a shared resource off a provisional cold-start rate and starve a still-cold downstream stage. |
 
 ## Implementation pointer
 
 - `ramp.py::decide`: the pure, per-stage ramp decision (cold / warming /
-  slow-start / trusted branches).
+  slow-start / trusted / trusted-while-warming branches).
 - `scheduler.py::_apply_cold_start_ramp`: feeds `has_pending_work`, sample
-  count, and window age into the ramp; trims new workers via the
-  `SolutionEditor`.
+  count, window age, and the pipeline-wide `pipeline_warming` flag into the
+  ramp; trims new workers via the `SolutionEditor`.
 - Config: `speed_estimation_min_data_points` (trust threshold),
   `speed_estimation_averaging_samples` (averaging depth),
-  `speed_estimation_window_s` (estimation + slow-starter window), `interval_s`
-  (decide cadence) (see `tuning.md`).
+  `speed_estimation_window_s` (estimation + slow-starter window),
+  `pipeline_warmup_growth_step` (trusted-stage growth bound while warming),
+  `interval_s` (decide cadence) (see `tuning.md`).

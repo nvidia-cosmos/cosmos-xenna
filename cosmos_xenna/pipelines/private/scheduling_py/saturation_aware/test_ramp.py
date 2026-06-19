@@ -38,6 +38,7 @@ def make_input() -> RampInputFactory:
         pending_work_age_s: float = 0.0,
         has_pending_work: bool = False,
         w_target: int | None = None,
+        pipeline_warming: bool = False,
     ) -> StageRampInput:
         return StageRampInput(
             current_workers=current_workers,
@@ -47,6 +48,7 @@ def make_input() -> RampInputFactory:
             pending_work_age_s=pending_work_age_s,
             has_pending_work=has_pending_work,
             w_target=w_target,
+            pipeline_warming=pipeline_warming,
         )
 
     return _make_input
@@ -290,6 +292,63 @@ def test_trusted_w_target_below_current_never_forces_shrink(make_input: RampInpu
     assert decision.cap == 2
     assert decision.keep_new == 0
     assert decision.reason is RampReason.CAPPED
+
+
+def test_trusted_warming_bounds_growth_to_step(make_input: RampInputFactory) -> None:
+    """While the pipeline is warming, a trusted stage grows by at most the warmup step, not to w_target."""
+    config = _config()
+    decision = decide(
+        make_input(sample_count=5, current_workers=2, proposed_post=57, w_target=57, pipeline_warming=True),
+        config,
+    )
+    assert decision.cap == 2 + config.pipeline_warmup_growth_step
+    assert decision.keep_new == config.pipeline_warmup_growth_step
+    assert decision.reason is RampReason.CAPPED_WARMUP
+
+
+def test_trusted_warming_uses_w_target_when_below_step(make_input: RampInputFactory) -> None:
+    """When w_target is below the warmup step, the bound is w_target, so a low target is honored."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=2, proposed_post=10, w_target=3, pipeline_warming=True),
+        _config(),
+    )
+    assert decision.cap == 3
+    assert decision.keep_new == 1
+    assert decision.reason is RampReason.CAPPED_WARMUP
+
+
+def test_trusted_not_warming_uses_full_w_target(make_input: RampInputFactory) -> None:
+    """With the pipeline warm, a trusted stage is sized to its full w_target in one cycle (unchanged behavior)."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=2, proposed_post=57, w_target=57, pipeline_warming=False),
+        _config(),
+    )
+    assert decision.cap == 57
+    assert decision.reason is RampReason.CAPPED
+
+
+def test_trusted_warming_never_forces_shrink(make_input: RampInputFactory) -> None:
+    """A warmup bound below the current size trims growth to zero, never deletes existing workers."""
+    decision = decide(
+        make_input(
+            sample_count=5, current_workers=10, deleted_count=0, proposed_post=10, w_target=2, pipeline_warming=True
+        ),
+        _config(),
+    )
+    assert decision.cap == 2
+    assert decision.keep_new == 0
+    assert decision.reason is RampReason.CAPPED_WARMUP
+
+
+def test_trusted_warming_without_target_is_uncapped(make_input: RampInputFactory) -> None:
+    """The warmup gate has no real target to bound, so a trusted stage with no w_target stays uncapped."""
+    decision = decide(
+        make_input(sample_count=5, current_workers=1, proposed_post=11, w_target=None, pipeline_warming=True),
+        _config(),
+    )
+    assert decision.cap is None
+    assert decision.keep_new is None
+    assert decision.reason is RampReason.UNCAPPED
 
 
 def test_ramp_input_does_not_carry_resource_shape(make_input: RampInputFactory) -> None:
