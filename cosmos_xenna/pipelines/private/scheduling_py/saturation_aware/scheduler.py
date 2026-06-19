@@ -170,7 +170,7 @@ class _Cycle:
         Args:
             capacity: This cycle's capacity plan (per-stage targets).
             reclaim_beneficial: Per-stage flag for whether freeing the stage's
-                resource would help the bottleneck grow.
+                resource would help an under-capacity stage grow.
         """
         return FloorInputs(
             workers=self.workers,
