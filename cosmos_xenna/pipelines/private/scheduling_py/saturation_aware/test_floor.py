@@ -32,8 +32,12 @@ _DEEP_STOCK = (5000.0, 5000.0)  # plenty of upstream work, in source units
 _EMPTY_STOCK = (0.0, 0.0)
 
 
-def _params(release_confirm_cycles: int = 2) -> floor.FloorParams:
-    return floor.FloorParams(release_confirm_cycles=release_confirm_cycles, min_workers=1)
+def _params(release_confirm_cycles: int = 2, reclaim_confirm_cycles: int = 2) -> floor.FloorParams:
+    return floor.FloorParams(
+        release_confirm_cycles=release_confirm_cycles,
+        reclaim_confirm_cycles=reclaim_confirm_cycles,
+        min_workers=1,
+    )
 
 
 def _inputs(
@@ -46,11 +50,16 @@ def _inputs(
     protect_downstream_of: int = -1,
     ready_workers: tuple[int, int] = (1, 1),
     local_pending: tuple[float, float] = (0.0, 0.0),
+    is_manual: tuple[bool, bool] = (False, False),
+    w_target_is_real: tuple[bool, bool] = (True, True),
+    reclaim_beneficial: tuple[bool, bool] = (False, False),
 ) -> floor.FloorInputs:
     # active_depths only affects the zero-fanout (chain <= 0) release branch.
     # _CHAIN is all-positive, so positive-chain tests are unaffected by it.
     # ready_workers/local_pending default to "idle, no backlog" so the
     # saturation+backlog veto stays off unless a test opts into it.
+    # reclaim_beneficial defaults to all-False so the downstream reclaim gate
+    # stays shut unless a test opts in, preserving the plain warm-keeping pin.
     return floor.FloorInputs(
         workers=workers,
         chain=chain_factors,
@@ -60,6 +69,9 @@ def _inputs(
         w_sustain=w_sustain,
         ready_workers=ready_workers,
         local_pending_depths=local_pending,
+        is_manual=is_manual,
+        w_target_is_real=w_target_is_real,
+        reclaim_beneficial=reclaim_beneficial,
         protect_downstream_of=protect_downstream_of,
     )
 
@@ -187,6 +199,9 @@ def _zero_fanout_inputs(active_caption_depth: float) -> floor.FloorInputs:
         w_sustain=(1, 14),
         ready_workers=(1, 1),
         local_pending_depths=(0.0, 0.0),
+        is_manual=(False, False),
+        w_target_is_real=(True, True),
+        reclaim_beneficial=(False, False),
     )
 
 
@@ -521,6 +536,161 @@ def test_mismatched_input_length_raises() -> None:
         w_sustain=short_w_sustain,
         ready_workers=(1, 1),
         local_pending_depths=(0.0, 0.0),
+        is_manual=(False, False),
+        w_target_is_real=(True, True),
+        reclaim_beneficial=(False, False),
     )
     with pytest.raises(ValueError, match="length mismatch"):
         floor.compute_floors(mismatched, floor.FloorState.initial(2), _params())
+
+
+def test_mismatched_reclaim_beneficial_length_raises() -> None:
+    """A short ``reclaim_beneficial`` tuple is caught by the length check."""
+    mismatched = floor.FloorInputs(
+        workers=(10, 15),
+        chain=_CHAIN,
+        stock_src=_DEEP_STOCK,
+        active_depths=(0.0, 0.0),
+        batch_sizes=_BATCH,
+        w_sustain=(1, 5),
+        ready_workers=(1, 1),
+        local_pending_depths=(0.0, 0.0),
+        is_manual=(False, False),
+        w_target_is_real=(True, True),
+        reclaim_beneficial=(False,),
+    )
+    with pytest.raises(ValueError, match="length mismatch"):
+        floor.compute_floors(mismatched, floor.FloorState.initial(2), _params())
+
+
+def _floor_after_cycles(args: floor.FloorInputs, params: floor.FloorParams, cycles: int) -> floor.FloorPlan:
+    """Run the floor for ``cycles`` cycles at fixed inputs and return the last plan."""
+    state = floor.FloorState.initial(len(args.workers))
+    result = floor.compute_floors(args, state, params)
+    for _ in range(cycles - 1):
+        result = floor.compute_floors(args, result.state, params)
+    return result.plan
+
+
+def _reclaimable_downstream(
+    *,
+    reclaim_beneficial: tuple[bool, bool] = (False, True),
+    w_target_is_real: tuple[bool, bool] = (True, True),
+    is_manual: tuple[bool, bool] = (False, False),
+    ready_workers: tuple[int, int] = (1, 1),
+) -> floor.FloorInputs:
+    """Build a downstream stage that the protect pin would hold but reclaim could release.
+
+    Stage 1 is downstream of the rate source (``protect_downstream_of=0``),
+    over-provisioned (15 workers vs ``w_sustain`` 5), idle, and fed by deep
+    upstream stock - so without a reclaim signal the floor pins it at 15.
+    """
+    return _inputs(
+        workers=(10, 15),
+        w_sustain=(1, 5),
+        stock=_DEEP_STOCK,
+        protect_downstream_of=0,
+        reclaim_beneficial=reclaim_beneficial,
+        w_target_is_real=w_target_is_real,
+        is_manual=is_manual,
+        ready_workers=ready_workers,
+    )
+
+
+def test_downstream_reclaim_releases_when_beneficial_and_confirmed() -> None:
+    """A beneficial, idle, over-provisioned downstream stage releases its warm pin.
+
+    With no reclaim signal the protect pin holds stage 1 at 15. Once it has been
+    reclaimable for the confirm window the floor falls to ``min(w_sustain,
+    workers)`` so the solver's deletes can free workers for the bottleneck.
+    """
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=2)
+    reclaimable = _reclaimable_downstream()
+    assert _floor_after_cycles(reclaimable, params, 1).floors[1] == 15
+    assert _floor_after_cycles(reclaimable, params, 3).floors[1] == 5
+
+
+def test_downstream_reclaim_holds_warm_when_not_beneficial() -> None:
+    """An idle, over-provisioned downstream stage stays warm when reclaiming helps nothing."""
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=2)
+    not_beneficial = _reclaimable_downstream(reclaim_beneficial=(False, False))
+    assert _floor_after_cycles(not_beneficial, params, 6).floors[1] == 15
+
+
+def test_downstream_reclaim_skipped_for_cold_stage() -> None:
+    """A cold stage (placeholder ``w_target``) is never released even when beneficial."""
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=2)
+    cold = _reclaimable_downstream(w_target_is_real=(True, False))
+    assert _floor_after_cycles(cold, params, 6).floors[1] == 15
+
+
+def test_downstream_reclaim_skipped_for_manual_stage() -> None:
+    """An operator-pinned stage is never released even when beneficial."""
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=2)
+    manual = _reclaimable_downstream(is_manual=(False, True))
+    assert _floor_after_cycles(manual, params, 6).floors[1] == 15
+
+
+def test_downstream_reclaim_requires_idle_capacity() -> None:
+    """A fully utilized downstream stage is not reclaimed even when beneficial."""
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=2)
+    busy = _reclaimable_downstream(ready_workers=(1, 0))
+    assert _floor_after_cycles(busy, params, 6).floors[1] == 15
+
+
+def test_downstream_reclaim_resets_on_transient_benefit_drop() -> None:
+    """A benefit signal that flickers off resets the streak, so the pin is not released."""
+    params = _params(release_confirm_cycles=2, reclaim_confirm_cycles=3)
+    on = _reclaimable_downstream()
+    off = _reclaimable_downstream(reclaim_beneficial=(False, False))
+    state = floor.FloorState.initial(2)
+    first = floor.compute_floors(on, state, params)
+    second = floor.compute_floors(on, first.state, params)
+    third = floor.compute_floors(off, second.state, params)
+    fourth = floor.compute_floors(on, third.state, params)
+
+    assert second.plan.decisions[1].benefit_streak == 2
+    assert second.plan.floors[1] == 15
+    assert third.plan.decisions[1].benefit_streak == 0
+    assert fourth.plan.decisions[1].benefit_streak == 1
+    assert fourth.plan.floors[1] == 15
+
+
+def test_cold_stage_held_at_current_workers() -> None:
+    """A cold stage (no trusted target) is held at its workers, not shrunk to the placeholder w_sustain.
+
+    Capacity emits w_sustain=min_workers for a stage with no measured speed, so
+    the baseline desired collapses to 1; the cold hold keeps the floor at the
+    current 4 workers instead, leaving cold growth to the cold-start ramp.
+    """
+    result = floor.compute_floors(
+        _inputs(workers=(10, 4), w_sustain=(1, 1), stock=_DEEP_STOCK, w_target_is_real=(True, False)),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert result.plan.floors[1] == 4  # held at workers, not min(w_sustain=1, workers=4)=1
+
+
+def test_trusted_stage_still_shrinks_to_w_sustain() -> None:
+    """The cold hold is scoped to untrusted stages: a trusted stage still clamps to min(w_sustain, workers)."""
+    result = floor.compute_floors(
+        _inputs(workers=(10, 4), w_sustain=(1, 2), stock=_DEEP_STOCK, w_target_is_real=(True, True)),
+        floor.FloorState.initial(2),
+        _params(),
+    )
+    assert result.plan.floors[1] == 2  # min(w_sustain=2, workers=4); cold hold does not apply
+
+
+def test_cold_stage_with_drained_stock_still_releases_to_min() -> None:
+    """The whole-chain drain override still releases a cold stage to min_workers after the confirm window.
+
+    The cold hold pins a cold stage only while it still owns upstream work; once
+    the whole-chain stock has drained for release_confirm_cycles cycles the
+    release path overrides the hold, so a finished cold stage is not pinned.
+    """
+    params = _params(release_confirm_cycles=2)
+    args = _inputs(workers=(10, 4), w_sustain=(1, 1), stock=_EMPTY_STOCK, w_target_is_real=(True, False))
+    first = floor.compute_floors(args, floor.FloorState.initial(2), params)
+    assert first.plan.floors[1] == 4  # cycle 1: cold hold at workers (release streak 1 < 2)
+    second = floor.compute_floors(args, first.state, params)
+    assert second.plan.floors[1] == 1  # cycle 2: confirmed drain overrides the hold -> MIN

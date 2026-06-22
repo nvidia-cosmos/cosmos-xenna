@@ -1,7 +1,7 @@
 # Operator Tuning Guide
 
 The operator's quick-reference for the saturation-aware scheduler. The six
-concept notes (`01` to `06`) plus [`README.md`](README.md) explain **why** each
+concept notes (`01` to `05`) plus [`README.md`](README.md) explain **why** each
 mechanism exists; this guide explains **when to choose the scheduler** and
 **which knob to turn**.
 
@@ -58,6 +58,7 @@ only a handful, grouped by what they affect.
 | `speed_stale_multiple` | `3.0` | Overdue factor (× mean service time) past which a busy, non-completing stage is treated as stalled and its rate snaps down. |
 | `speed_stale_growth_step` | `1` | Max workers a stalled stage may add per cycle. |
 | `speed_estimation_min_task_duration_s` | `1e-3` | Service-time floor separating a degenerate empty skip from real work. |
+| `pipeline_warmup_growth_step` | `4` | Max workers a **trusted** stage may add per cycle while the pipeline is still warming (some stage is cold, so `bottleneck_rate` and the derived `w_target` are provisional). Bounds an upstream stage from leaping to a node-filling size and starving a still-cold downstream stage of a shared resource ([04](04-cold-start-ramp.md)). Lower is safer; raise to ramp a genuinely source-bound pipeline faster. No effect once every stage is trusted. |
 
 ### Scale-down release (anti-shrink)
 
@@ -65,6 +66,7 @@ only a handful, grouped by what they affect.
 |---|---|---|
 | `scale_down_release_cycles` | `6` | Base release speed: `alpha_down = 1 / (scale_down_release_cycles × scale_down_release_slowdown)`. Larger holds a stage warm longer through a lull. |
 | `scale_down_release_slowdown` | `4.0` | Uniform extra hold multiplier. Set to `1.0` to restore the fast base release for every stage. |
+| `reclaim_confirm_cycles` | `6` | Consecutive cycles an idle, over-provisioned downstream stage must look beneficial-to-reclaim (its freed resource would help an under-capacity stage grow) before its warm pin releases. Lower to return stranded resources sooner; raise to be more conservative against a transient demand spike. |
 
 ## Symptom → knob index
 
@@ -74,7 +76,9 @@ only a handful, grouped by what they affect.
 | Bottleneck identity flaps between two stages cycle to cycle | Lower `speed_alpha_up` toward `0.2` so a transient fast task doesn't swing `target_speed`. |
 | A stage stuck on a long task reports a frozen-high rate | Lower `speed_stale_multiple` toward `2.0` so the stall is detected sooner. |
 | Heavy stage warms one model at a time, budget idle | It should auto-release after `speed_estimation_window_s` with work waiting ([04](04-cold-start-ramp.md)); shorten the window only if warmup genuinely needs it. |
-| Expensive GPU stage idle with `qstate=starved`, `local_pending=0` | **Not a knob.** It is downstream of the bottleneck; fix the upstream feeder ([02](02-bottleneck-selection.md)). |
+| Upstream stage leaps to a node-filling size on its first trusted cycle and starves a downstream stage of a shared resource (e.g. CPU) | The pipeline-warming gate bounds this to `pipeline_warmup_growth_step`/cycle while any stage is still cold ([04](04-cold-start-ramp.md)); lower it if the leap still strands a downstream stage during warmup. |
+| Expensive GPU stage idle with `qstate=starved`, `local_pending=0` | **Mostly not a knob.** It is downstream of the bottleneck and underfed; the floor now reclaims its stranded resource for a blocked same-resource grower (see `reclaim_confirm_cycles`), but the durable fix is the upstream feeder ([02](02-bottleneck-selection.md)). |
+| Over-provisioned idle downstream stage strands CPU/GPU while another stage wants to grow | Lower `reclaim_confirm_cycles` so the floor releases the stranded resource sooner. A stage is reclaimed only when every resource it reserves is one the growing stage also uses, so a stage holding a GPU is never torn down to feed a CPU-only grower. |
 | Reaction feels slow on a small cluster | Lower `interval_s`; watch that per-cycle work stays well under the interval. |
 
 ## Tuning discipline

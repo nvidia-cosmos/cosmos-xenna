@@ -33,8 +33,10 @@ import cosmos_xenna.pipelines.v1 as v1
 from cosmos_xenna.pipelines.private import allocator, data_structures, resources, streaming
 from cosmos_xenna.pipelines.private.autoscaling_algorithms import FragmentationBasedAutoscaler
 from cosmos_xenna.pipelines.private.scheduling_py.runtime_signals import RuntimeSignals
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.capacity import CapacityPlan, StageCapacity
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.config import SaturationAwareConfig
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.problem_template import SolverProblemTemplate
+from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.ramp import RampReason
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.scheduler import SaturationAwareScheduler, _Cycle
 from cosmos_xenna.pipelines.private.scheduling_py.saturation_aware.shape import PipelineShape
 from cosmos_xenna.pipelines.private.specs import SchedulerKind, StageSpec, StreamingSpecificSpec
@@ -414,6 +416,63 @@ def test_downstream_zero_sample_stage_grows_one_worker_per_cycle() -> None:
     assert len(warming.stages[1].new_workers) == 1
     _apply_to_allocator(spec, worker_allocator, warming)
     assert _worker_counts(spec, worker_allocator)[1] == 2
+
+
+def test_trusted_upstream_growth_is_bounded_while_downstream_is_cold(
+    loguru_caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A trusted upstream stage is held to the warmup growth step while a downstream stage is still cold.
+
+    This reproduces the run f9fa2dde priority inversion at the wiring level: a
+    trusted upstream stage (here stage 0) would otherwise grow toward a w_target
+    derived from a provisional bottleneck rate (cold stages are excluded), while
+    the downstream stage 1 is cold with pending work. The scheduler must detect
+    the still-warming pipeline and tag the upstream stage's growth
+    ``growth_cap_warmup``, capping it to ``pipeline_warmup_growth_step`` per
+    cycle instead of a one-cycle leap. It also confirms ``pipeline_warming`` is
+    surfaced in the growth-control summary for traceability.
+    """
+    spec, cluster, problem = _build([1.0, 1.0], num_cpus=64)
+    config = SaturationAwareConfig(speed_estimation_min_data_points=1)
+    scheduler = _scheduler(spec, cluster, config)
+    scheduler.setup(problem)
+    worker_allocator = allocator.WorkerAllocator.make(cluster)
+    upstream = _stage_names(spec)[0]
+    now = 100.0
+
+    # Warm-up/fill cycle: stage 0 is trusted but still has zero workers, so its
+    # cap_src is 0 and it has no real w_target yet. It is correctly UNCAPPED and
+    # the solver fills it (the warming gate guards the w_target growth path, not
+    # the very first cold-start fill). This gives stage 0 a real worker count.
+    scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+    scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+    _apply_to_allocator(spec, worker_allocator, scheduler.autoscale(now, _state(spec, worker_allocator)))
+    assert _worker_counts(spec, worker_allocator)[0] > config.pipeline_warmup_growth_step
+
+    # Stage 0 now has a real w_target while stage 1 stays cold with backlog
+    # (pipeline still warming). Every subsequent cycle the trusted upstream must
+    # be held to the warmup step instead of leaping to its provisional w_target.
+    warmup_summaries: list[str] = []
+    for _ in range(4):
+        now += 10.0
+        scheduler.update_with_measurements(now, _upstream_only_measurements(now))
+        scheduler.observe_runtime(_backlog(2, queue_depth=200.0))
+        loguru_caplog.clear()
+        solution = scheduler.autoscale(now, _state(spec, worker_allocator))
+        warmup_summaries += [
+            record.getMessage()
+            for record in loguru_caplog.records
+            if "saturation-aware growth control:" in record.getMessage()
+        ]
+        assert len(solution.stages[0].new_workers) <= config.pipeline_warmup_growth_step
+        _apply_to_allocator(spec, worker_allocator, solution)
+
+    # The upstream stage must have been bounded by the pipeline-warming gate
+    # (tagged growth_cap_warmup) while the downstream stage was still cold, and
+    # the warming flag must be surfaced in the summary for traceability.
+    upstream_warmup_lines = [line for line in warmup_summaries if f"{upstream}: {RampReason.CAPPED_WARMUP}" in line]
+    assert upstream_warmup_lines, warmup_summaries
+    assert "pipeline_warming=True" in upstream_warmup_lines[-1]
 
 
 def test_autoscale_before_setup_raises() -> None:
@@ -822,3 +881,223 @@ def test_pending_work_age_resets_when_a_stage_drains() -> None:
     assert scheduler._pending_work_ages(12.0, (0.0, 0.0)) == (0.0, 0.0)  # drained -> timer reset
     assert scheduler._pending_work_ages(20.0, (0.0, 3.0)) == (0.0, 0.0)  # refilled -> fresh start
     assert scheduler._pending_work_ages(25.0, (0.0, 3.0)) == (0.0, 5.0)
+
+
+def _capacity_with_bottleneck(
+    *,
+    bottleneck_stage: int,
+    w_targets: tuple[int, ...],
+    w_target_is_real: tuple[bool, ...] | None = None,
+) -> CapacityPlan:
+    """Build a CapacityPlan carrying only the fields _compute_reclaim_beneficial reads.
+
+    The bottleneck index plus each stage's `w_target` / `w_target_is_real` carry
+    meaning; the remaining capacity fields are inert placeholders.
+    """
+    num_stages = len(w_targets)
+    real = w_target_is_real if w_target_is_real is not None else (True,) * num_stages
+    stages = tuple(
+        StageCapacity(
+            speed=1.0,
+            target_speed=1.0,
+            cap_src=1.0,
+            a_raw=1.0,
+            a_ewma=1.0,
+            w_sustain=1,
+            w_target=w_targets[i],
+            w_target_is_real=real[i],
+        )
+        for i in range(num_stages)
+    )
+    return CapacityPlan(
+        stages=stages,
+        bottleneck_stage=bottleneck_stage,
+        bottleneck_rate=1.0,
+        next_bottleneck_rate=1.0,
+    )
+
+
+def _cycle_for_reclaim(
+    workers: tuple[int, ...],
+    is_manual: tuple[bool, ...],
+    rate_is_stale: tuple[bool, ...] | None = None,
+) -> _Cycle:
+    """Build a _Cycle exposing only the workers, is_manual, and rate_is_stale fields the reclaim check reads."""
+    n = len(workers)
+    zeros = (0.0,) * n
+    return _Cycle(
+        time=0.0,
+        pending_work_ages=zeros,
+        workers=workers,
+        demand_snapshots=(),
+        batch_sizes=(1,) * n,
+        chain_factors=(1.0,) * n,
+        is_manual=is_manual,
+        local_depths=zeros,
+        local_pending_depths=zeros,
+        active_depths=zeros,
+        ready_workers=(0,) * n,
+        rate_is_stale=rate_is_stale if rate_is_stale is not None else (False,) * n,
+        queued_stock=zeros,
+        active_stock=zeros,
+        activity_snapshot=None,
+    )
+
+
+def _mixed_pipeline_scheduler() -> SaturationAwareScheduler:
+    """A 3-stage pipeline: CPU bottleneck, CPU-only stage, GPU stage (also reserves CPUs)."""
+    spec = v1.PipelineSpec(
+        input_data=range(10),
+        stages=[
+            v1.StageSpec(_CpuStage(1.0, 1.0)),
+            v1.StageSpec(_CpuStage(4.0, 1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+        ],
+    )
+    return _scheduler(spec, _gpu_cluster(8))
+
+
+def test_reclaim_beneficial_cpu_bottleneck_excludes_gpu_stage() -> None:
+    """A growing CPU bottleneck makes the CPU-only stage reclaimable but never the GPU stage.
+
+    The bottleneck is the only grower; the GPU stage also reserves host CPUs, but
+    freeing it would strand a GPU the CPU grower cannot use, so the subset rule
+    excludes it.
+    """
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, True, False)
+
+
+def test_reclaim_beneficial_gpu_bottleneck_includes_cpu_and_gpu_stages() -> None:
+    """A growing GPU grower (also reserving CPUs) makes both other stages reclaimable; it never marks itself."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=2, w_targets=(1, 1, 10))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, True, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_is_manual() -> None:
+    """A manual/pinned stage is excluded as a grower, so freeing any stage helps nothing."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(True, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_target_not_real() -> None:
+    """A cold stage (placeholder w_target) is excluded as a grower, so there is no reclaim signal."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(10, 1, 1), w_target_is_real=(False, True, True))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_bottleneck_not_growing() -> None:
+    """A stage at or above its target is not a grower; with no grower nothing is reclaimable."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_false_when_no_bottleneck() -> None:
+    """With no stage wanting to grow there is no reclaim signal (the bottleneck index is unused)."""
+    scheduler = _mixed_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=-1, w_targets=(1, 1, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def _two_gpu_pipeline_scheduler() -> SaturationAwareScheduler:
+    """A 3-stage pipeline: a CPU-only stage then two GPU stages (each also reserves CPUs)."""
+    spec = v1.PipelineSpec(
+        input_data=range(10),
+        stages=[
+            v1.StageSpec(_CpuStage(1.0, 1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+            v1.StageSpec(_GpuStage(1.0)),
+        ],
+    )
+    return _scheduler(spec, _gpu_cluster(8))
+
+
+def test_reclaim_beneficial_idle_gpu_stage_freed_for_nonbottleneck_gpu_grower() -> None:
+    """An idle GPU stage is reclaimable for a growing GPU stage that is not the bottleneck.
+
+    The sticky bottleneck is a non-growing CPU stage (stage 0); only GPU stage 1
+    wants to grow. The over-provisioned GPU stage 2 is freed for that grower, and
+    the grower never marks itself (stage 1).
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 5, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, False, True)
+
+
+def test_reclaim_beneficial_gpu_stage_excluded_for_nonbottleneck_cpu_grower() -> None:
+    """A CPU-only grower never makes a GPU stage reclaimable, even off the bottleneck.
+
+    Only CPU stage 0 wants to grow; freeing either GPU stage would strand a GPU
+    the CPU grower cannot use, so the subset rule excludes both.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=2, w_targets=(5, 1, 7))
+    cycle = _cycle_for_reclaim(workers=(1, 5, 7), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_ignores_manual_grower() -> None:
+    """A manual stage that wants to grow is excluded as a grower.
+
+    Same shape as the GPU-grower case but the lone grower (stage 1) is
+    operator-pinned, so there is no grower and nothing is reclaimable.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 5, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 7), is_manual=(False, True, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_unions_over_multiple_growers() -> None:
+    """A stage is reclaimable if any grower can use its freed resource.
+
+    Both GPU stages grow, so each is reclaimable for the other and the CPU stage
+    is reclaimable for either - the signal is the union over all growers.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=1, w_targets=(2, 5, 5))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 1), is_manual=(False, False, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, True, True)
+
+
+def test_reclaim_beneficial_false_when_grower_is_stalled() -> None:
+    """A stalled stage is not a grower, so it cannot trigger reclaim of a warm peer.
+
+    Same shape as the idle-GPU-freed-for-a-GPU-grower case (the lone grower is GPU
+    stage 1, w_target 5 > 1), but the grower is ``rate_is_stale``: capacity has
+    clamped its target to workers + 1 so it merely looks like it wants to grow,
+    while adding workers cannot raise its collapsing completion rate. With no
+    genuine grower nothing is reclaimable - this is the run f9fa2dde regression
+    where a stalled InternVideo2EmbeddingStage tore VllmCaptionStage down.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=0, w_targets=(2, 5, 1))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 7), is_manual=(False, False, False), rate_is_stale=(False, True, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (False, False, False)
+
+
+def test_reclaim_beneficial_non_stale_grower_still_drives_reclaim_when_a_peer_is_stalled() -> None:
+    """Excluding stalled growers is per-stage: a healthy grower still drives reclaim.
+
+    Both GPU stages have a target above their workers, but GPU stage 1 is
+    ``rate_is_stale`` and is dropped from the grower set. The non-stale GPU
+    grower (stage 2) still makes its peers reclaimable: the CPU stage 0 and the
+    stalled GPU stage 1 are freed for it, while stage 2 (the only grower) never
+    marks itself. Contrast the all-True union result when neither is stalled.
+    """
+    scheduler = _two_gpu_pipeline_scheduler()
+    capacity = _capacity_with_bottleneck(bottleneck_stage=1, w_targets=(2, 5, 5))
+    cycle = _cycle_for_reclaim(workers=(2, 1, 1), is_manual=(False, False, False), rate_is_stale=(False, True, False))
+    assert scheduler._compute_reclaim_beneficial(cycle, capacity) == (True, True, False)

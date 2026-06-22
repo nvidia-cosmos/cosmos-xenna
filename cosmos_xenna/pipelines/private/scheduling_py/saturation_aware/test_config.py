@@ -73,6 +73,17 @@ def test_stale_growth_step_zero_is_rejected() -> None:
         SaturationAwareConfig(speed_stale_growth_step=0)
 
 
+def test_reclaim_confirm_cycles_default_is_positive() -> None:
+    """The reclaim confirmation window defaults to a conservative positive value."""
+    assert SaturationAwareConfig().reclaim_confirm_cycles == 6
+
+
+def test_reclaim_confirm_cycles_zero_is_rejected() -> None:
+    """The reclaim confirmation window must be a positive cycle count."""
+    with pytest.raises(ValueError):
+        SaturationAwareConfig(reclaim_confirm_cycles=0)
+
+
 def test_resolve_returns_defaults_when_none() -> None:
     """resolve(None) yields a default-constructed config."""
     assert SaturationAwareConfig.resolve(None) == SaturationAwareConfig()

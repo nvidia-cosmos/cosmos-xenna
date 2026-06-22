@@ -24,10 +24,15 @@ With no completed sample and no pending work the stage is held at one worker;
 once the speed estimate is trusted the stage is capped at its capacity growth
 target ``w_target`` (the per-cycle growth ceiling), so the solver may place and
 degrade within that ceiling but never grow the stage past the size the capacity
-model computed. A stage that still has work waiting but produces no sample within
-a full speed-estimation window is treated as a confirmed slow-starter and is
-uncapped so all its workers spawn and warm up in parallel rather than one at a
-time. Pure and native-extension-free, so it is unit-testable without the solver.
+model computed. While the whole pipeline is still warming (some work-bearing
+stage is untrusted, so ``bottleneck_rate`` and the derived ``w_target`` are
+provisional), a trusted stage's growth is further bounded to a small per-cycle
+step so a fast stage cannot leap to an inflated target and starve a shared
+resource the still-cold stages need to warm. A stage that still has work waiting
+but produces no sample within a full speed-estimation window is treated as a
+confirmed slow-starter and is uncapped so all its workers spawn and warm up in
+parallel rather than one at a time. Pure and native-extension-free, so it is
+unit-testable without the solver.
 """
 
 import enum
@@ -55,6 +60,15 @@ class RampReason(enum.StrEnum):
         CAPPED: Enough samples to trust the speed estimate; held at the capacity
             growth target ``w_target`` (the per-cycle growth ceiling). Tagged
             ``growth_cap`` in logs to distinguish it from the cold-start ramp.
+        CAPPED_WARMUP: Trusted, but the pipeline as a whole is still warming, so
+            ``w_target`` is derived from a provisional bottleneck rate (cold
+            stages are excluded from ``bottleneck_rate`` by design). Growth is
+            bounded to a small per-cycle step instead of jumping to that
+            possibly-inflated ``w_target``, so a fast upstream stage cannot
+            over-claim a shared resource before slower stages have warmed. This
+            is the WHOLE-PIPELINE warming gate; ``PIPELINE_WARMING`` above is the
+            distinct per-stage cold-warmup branch for a stage that has no sample
+            of its own yet.
         UNCAPPED: Enough samples to trust the speed estimate but no capacity
             target this cycle (no measured bottleneck); the solver owns growth.
     """
@@ -64,6 +78,7 @@ class RampReason(enum.StrEnum):
     WARMING = "warming"
     SLOW_START = "slow_start"
     CAPPED = "growth_cap"
+    CAPPED_WARMUP = "growth_cap_warmup"
     UNCAPPED = "uncapped"
 
 
@@ -89,6 +104,14 @@ class StageRampInput:
             when no capacity target is available (no measured bottleneck yet).
             Consulted only once the stage is trusted, where it is the per-cycle
             growth ceiling; ``None`` then falls back to uncapped.
+        pipeline_warming: Pipeline-wide flag that at least one work-bearing stage
+            is still untrusted, so ``bottleneck_rate`` (which excludes cold
+            stages) is provisional and this stage's ``w_target`` may be
+            transiently inflated. While set, a trusted stage's growth is bounded
+            to a small per-cycle step rather than jumping straight to
+            ``w_target``. Distinct from this stage's own cold/warming state: a
+            stage can be fully trusted yet still see ``pipeline_warming`` while a
+            slower sibling warms.
     """
 
     current_workers: int
@@ -98,6 +121,7 @@ class StageRampInput:
     pending_work_age_s: float
     has_pending_work: bool
     w_target: int | None
+    pipeline_warming: bool
 
 
 @attrs.frozen
@@ -147,10 +171,13 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
     not-yet-trusted stage grows by at most one worker per cycle, and only when
     the stage has its own pending work to feed the new worker. A trusted stage
     (sample count at or above the threshold) is capped at its capacity growth
-    target ``w_target``; with no capacity target it is uncapped and the solver
-    owns growth. A 0-sample stage with work still waiting after a full
-    speed-estimation window is released to the solver as a confirmed
-    slow-starter.
+    target ``w_target``, except that while the whole pipeline is still warming
+    (``pipeline_warming``) its growth is bounded to a small per-cycle step so a
+    fast stage cannot leap to a ``w_target`` derived from a provisional
+    bottleneck rate and starve a shared resource the still-cold stages need;
+    with no capacity target it is uncapped and the solver owns growth. A
+    0-sample stage with work still waiting after a full speed-estimation window
+    is released to the solver as a confirmed slow-starter.
 
     Neither the fixed one-per-cycle warming step nor the trusted ``w_target``
     cap scales with the solver's proposal, so a stage can never convert a large
@@ -169,6 +196,16 @@ def decide(stage: StageRampInput, config: SaturationAwareConfig) -> RampDecision
             # Trusted, but capacity has no useful target this cycle (no measured
             # bottleneck): let the solver own growth.
             return RampDecision(cap=None, keep_new=None, reason=RampReason.UNCAPPED)
+        if stage.pipeline_warming:
+            # Trusted, but the pipeline is still warming: bottleneck_rate excludes
+            # the cold stages, so w_target is computed from a provisional (often
+            # too-high) rate and would let this stage leap to a node-filling size
+            # in one cycle, starving a shared resource the still-cold downstream
+            # stages need to warm. Bound growth to a small step until every
+            # work-bearing stage is trusted; w_target stays the ceiling so a
+            # stage that does not want to grow is unaffected.
+            cap = min(stage.w_target, stage.current_workers + config.pipeline_warmup_growth_step)
+            return _apply_cap(stage, cap, RampReason.CAPPED_WARMUP)
         # Trusted: SAT's capacity target is the per-cycle growth ceiling. The
         # shared cap-application trims growth without ever forcing a shrink
         # (keep_new floors at zero); the scale-down floor still owns shrink.
