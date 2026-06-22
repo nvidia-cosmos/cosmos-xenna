@@ -114,14 +114,13 @@ instead of jumping straight to `w_target`. `w_target` remains the ceiling, so a
 stage that does not want to grow is unaffected, and the cap only trims
 additions, never forcing a shrink.
 
-```
-                  free CPU on the node              upstream workers
-  without gate    ████░░░░░░░░  (exhausted)         2 ───────▶ 57  (one cycle)
-                  downstream GPU stage: cannot place; GPUs idle
+![Two-row infographic "pipeline-warming growth gate". Without the gate, an upstream CPU stage jumps from 2 to 57 workers in one cycle, the node-CPU bar is exhausted, and a downstream whole-GPU stage cannot place so its GPUs sit idle. With the gate, the upstream stage grows 2 to 6 to 10 by a small step per cycle, the node-CPU bar stays available, and the downstream whole-GPU stage places and warms in parallel. Banner: self-releasing - opens once every work-bearing stage is trusted.](assets/04-pipeline-warming-gate.png)
 
-  with gate       ████████████  (stays available)   2 ─▶ 6 ─▶ 10 ... (+step/cycle)
-                  downstream GPU stage: places and warms in parallel
-```
+*While the pipeline is still warming, `bottleneck_rate` is provisional and biased
+high, so a trusted upstream stage sized from it would jump to a node-filling
+`w_target` in one cycle and starve the shared resource a still-cold downstream
+stage needs. Bounding trusted growth to `pipeline_warmup_growth_step` per cycle
+keeps that resource available so the downstream stage can place and warm.*
 
 The gate is **self-releasing**: it reads one pipeline-wide signal each cycle and
 opens automatically the moment every work-bearing stage is trusted, after which

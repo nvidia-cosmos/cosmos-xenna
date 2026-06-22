@@ -23,8 +23,8 @@ exactly three ways:
    bottleneck* is normally held warm - pinned above `w_sustain` while upstream
    work is still in flight - so it is ready when the bottleneck drains. It is
    allowed to shrink to `w_sustain` *early* only when a blocked, growth-wanting
-   bottleneck needs the resource it would free, confirmed over
-   `reclaim_confirm_cycles` cycles.
+   *stage* (any grower, not just the bottleneck) needs the resource it would
+   free, confirmed over `reclaim_confirm_cycles` cycles.
 
 Paths 1 and 2 always apply; path 3 only decides whether a downstream stage's warm
 pin is released *before* its work drains. The rest of this note details the gate
@@ -38,7 +38,7 @@ ramp ([04](04-cold-start-ramp.md)). Only path 2 (a genuine whole-chain drain)
 shrinks a cold stage, so a still-warming stage is never torn down toward a target
 the model has not measured.
 
-![Infographic "how a stage shrinks": a STAGE box fans out through three teal arrows to three outcomes - "w_sustain decays" to SHRINK TO w_sustain (normal path), "upstream work drains" to RELEASE TO min workers (work is done), and "a blocked stage needs it" (with a "BOTTLENECK needs CPU" tag and a "confirmed N cycles" pill) to RECLAIM EARLY to w_sustain (downstream of the bottleneck). Subtitle: the floor only shrinks; growth is capped by w_target.](assets/05-how-shrinks.png)
+![Infographic "how a stage shrinks": a STAGE box fans out through three teal arrows to three outcomes - "w_sustain decays" to SHRINK TO w_sustain (normal path), "upstream work drains" to RELEASE TO min workers (work is done), and "a blocked stage needs it" (with an "A GROWER needs CPU" tag and a "confirmed N cycles" pill) to RECLAIM EARLY to w_sustain (downstream of the bottleneck). Subtitle: the floor only shrinks; growth is capped by w_target.](assets/05-how-shrinks.png)
 
 *Three ways a stage gets smaller: its hold target `w_sustain` decays (normal), its
 upstream work drains so it releases to `min_workers`, or - only if it is
@@ -121,7 +121,8 @@ Three extra guards handle cases the basic gate cannot:
   workers counts - so an idle GPU stage can be freed for a GPU-starved sibling
   even while the bottleneck is a different-resource stage. A *stalled* stage
   (`rate_is_stale`) is **not** a grower even though capacity clamps its target to
-  `workers + 1` (making it look perpetually growing): adding workers to a stall
+  `workers + speed_stale_growth_step` (making it look perpetually growing):
+  adding workers to a stall
   only drains its queued backlog and cannot raise its collapsing completion rate,
   so reclaiming an expensive warm peer for it would strand the freed resources.
   The exclusion self-clears once completions resume. Once a genuine reclaim holds
@@ -130,7 +131,7 @@ Three extra guards handle cases the basic gate cannot:
   needs instead of stranding them (`protect_downstream_of`, `reclaim_beneficial`,
   `benefit_streak` in `floor.py`).
 
-![Two-row infographic titled "downstream guard: hold warm vs reclaim early". Behind the bottleneck, an idle, over-provisioned downstream stage is held warm. Top row: when nobody needs its CPU it HOLDS WARM at its current size. Bottom row: when a blocked bottleneck needs its CPU (confirmed for N cycles) it RECLAIMS EARLY, shrinking to w_sustain. A banner notes that either way it still releases to min workers once upstream work drains.](assets/05-downstream-guard.png)
+![Two-row infographic titled "downstream guard: hold warm vs reclaim early". Behind the bottleneck, an idle, over-provisioned downstream stage is held warm. Top row: when nobody needs its CPU it HOLDS WARM at its current size. Bottom row: when a blocked grower needs its CPU (confirmed for N cycles) it RECLAIMS EARLY, shrinking to w_sustain. A banner notes that either way it still releases to min workers once upstream work drains.](assets/05-downstream-guard.png)
 
 *Releasing the downstream warm pin: a stage behind the bottleneck is held warm
 (pinned above its hold target) while upstream work is still in flight, and
@@ -152,6 +153,17 @@ temporary, not permanent.*
 > grow?", so the idle stage is released to its sustainable size and the starved
 > sibling grows. The subset rule still applies, so a GPU stage is never torn down
 > to feed a CPU-only grower.
+
+![Infographic "a stalled stage is not a grower": a STALLED STAGE box with three BUSY workers (each on a long task) and an amber tag "w_target = workers + 1 (looks like it wants to grow)" feeds a red gate "extra workers can't raise its rate - one long task is not parallelizable", which leads to "NOT counted as a grower" and a teal box "downstream caption stage stays WARM (not reclaimed for a stall)". Banner: the exclusion self-clears the moment completions resume.](assets/05-stalled-grower.png)
+
+*A stalled stage (`rate_is_stale`) is the one grower the demand-coupled gate must
+ignore. Capacity clamps a stall's target to `workers + speed_stale_growth_step`,
+so it looks perpetually growing, but the stall is stuck on a single long
+in-flight task that more workers cannot parallelize - they would only drain its
+backlog, not raise its collapsing completion rate. Counting it as a grower would
+reclaim an expensive warm peer (the caption stage) for resources the stall cannot
+turn into throughput. The exclusion self-clears the instant completions resume
+and `rate_is_stale` drops.*
 
 - **Local saturation veto.** **Any** stage with **no ready worker** and **at
   least one queued batch** is demonstrably under-provisioned this cycle, so a
@@ -179,10 +191,12 @@ The floor never classifies a stage by GPU fraction or warmup cost; it only
 time-confirms lower hold targets so one-cycle integer-boundary dips do not
 trigger delete/re-add churn. A confirmed shrink still happens; a transient one is
 deferred (logged as `shrink_deferred`). The benefit-gated reclaim is likewise
-resource-type generic, never GPU-specific: it reads the *sticky* bottleneck and
-requires the benefit to hold for `reclaim_confirm_cycles` cycles, so a transient
-bottleneck shift (for example a brief upstream GPU spike) cannot churn an
-expensive downstream stage.
+resource-type generic, never GPU-specific: it is **demand-coupled**, scanning
+*every* non-manual, non-stalled grower (not the single sticky bottleneck) and
+requiring the benefit to hold for `reclaim_confirm_cycles` cycles. A *stalled*
+grower is excluded because its inflated `workers + speed_stale_growth_step`
+target is not real demand, so neither a transient demand spike nor a stage that
+is merely stuck on one long task can churn an expensive downstream stage.
 
 ## Trade-offs
 
