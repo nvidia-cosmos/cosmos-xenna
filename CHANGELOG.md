@@ -2,6 +2,16 @@
 
 ## Latest
 
+## [0.5.1]
+
+### Released
+
+- 2026-07-07
+
+### Fixed
+
+- Extended user stage `destroy()` and process reaper budgets so graceful worker teardown can finish for stages with slower internal shutdown, preventing premature SIGKILLs that can leave CUDA context memory behind.
+
 ## [0.5.0]
 
 ### Released

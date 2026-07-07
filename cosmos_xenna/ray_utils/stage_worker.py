@@ -124,7 +124,7 @@ _CONTINUOUS_POLL_INTERVAL_S = 0.1
 # Maximum time the user stage's ``destroy()`` is given to release per-worker resources
 # during graceful shutdown. Capped so a misbehaving destroy cannot stall the actor pool's
 # teardown sequence; the rest of the shutdown grace period is reserved for thread joins.
-_USER_STAGE_DESTROY_TIMEOUT_S = 10.0
+_USER_STAGE_DESTROY_TIMEOUT_S = 45.0
 
 
 @attrs.define

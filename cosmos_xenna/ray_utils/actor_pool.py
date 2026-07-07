@@ -159,7 +159,7 @@ def _get_actor_pid_tree(actor_ref: ActorHandle) -> list[tuple[int, float | None]
             return []
 
 
-_REAP_GRACE_PERIOD_S = 15
+_REAP_GRACE_PERIOD_S = 30
 
 _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S = 30.0
 _GRACEFUL_SHUTDOWN_RPC_BUFFER_S = 5.0
@@ -167,7 +167,7 @@ _GRACEFUL_SHUTDOWN_RPC_BUFFER_S = 5.0
 # ``stage_worker._USER_STAGE_DESTROY_TIMEOUT_S`` so the RPC does not time out before
 # destroy() finishes. Duplicated here (rather than imported) to avoid creating a
 # stage_worker -> actor_pool import cycle.
-_USER_STAGE_DESTROY_BUDGET_S = 10.0
+_USER_STAGE_DESTROY_BUDGET_S = 45.0
 
 
 @ray.remote(num_cpus=0)
