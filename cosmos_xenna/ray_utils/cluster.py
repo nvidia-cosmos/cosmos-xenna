@@ -15,12 +15,14 @@
 
 
 import os
+from typing import Any
 
 import loguru
 import ray.runtime_context
 from loguru import logger
 
 from cosmos_xenna.pipelines.private import resources
+from cosmos_xenna.utils import python_log
 
 API_LIMIT = 40000
 
@@ -85,13 +87,18 @@ def init_or_connect_to_cluster(
     )
 
     tracing_hook = os.environ.get("XENNA_RAY_TRACING_HOOK")
-    context = ray.init(
-        include_dashboard=True,
-        ignore_reinit_error=True,
-        log_to_driver=log_to_driver,
-        _metrics_export_port=ray_metrics_port,
-        **({"_tracing_startup_hook": tracing_hook} if tracing_hook else {}),
+    ray_init_kwargs: dict[str, Any] = {
+        "include_dashboard": True,
+        "ignore_reinit_error": True,
+        "_metrics_export_port": ray_metrics_port,
+    }
+    if tracing_hook:
+        ray_init_kwargs["_tracing_startup_hook"] = tracing_hook
+    # Enable Ray structured (JSON) logging when PYTHON_LOG_FORMAT=json; no-op otherwise.
+    ray_init_kwargs["log_to_driver"] = python_log.apply_ray_logging_config(
+        ray_init_kwargs, log_to_driver=log_to_driver
     )
+    context = ray.init(**ray_init_kwargs)
     logger.info("Initialized Ray cluster.")
     logger.info(f"Ray dashboard url: {context.dashboard_url}")
     return context

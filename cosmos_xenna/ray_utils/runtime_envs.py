@@ -15,10 +15,18 @@
 
 
 import copy
+import os
 from typing import Optional
 
 import attrs
 import ray.runtime_env
+
+# Logging env vars forwarded to every actor so worker processes configure loguru
+# (via cosmos_xenna.utils.python_log) identically to the driver. Ray actors are
+# separate processes started by the raylet; they inherit the raylet's environment,
+# but forwarding these explicitly guarantees consistent structured logging even if
+# the raylet was started without them.
+_FORWARDED_LOG_ENV_VARS = ("PYTHON_LOG", "PYTHON_LOG_FORMAT", "CURATOR_RUN_ID", "POD_NAME")
 
 
 @attrs.define
@@ -37,9 +45,18 @@ class RuntimeEnv:
     extra_env_vars: dict[str, str] = attrs.field(factory=dict)
 
     def to_ray_runtime_env(self) -> ray.runtime_env.RuntimeEnv:
-        kwargs = {}
-        kwargs["env_vars"] = copy.deepcopy(self.extra_env_vars)
+        env_vars = copy.deepcopy(self.extra_env_vars)
+        # Only forward logging toggles/identity to workers when structured logging is
+        # active (PYTHON_LOG_FORMAT=json). In the default text mode this is a no-op, so
+        # non-JSON cosmos-xenna consumers see no change to actor environments. Never
+        # override anything a stage explicitly set in extra_env_vars.
+        if os.environ.get("PYTHON_LOG_FORMAT", "").strip().lower() == "json":
+            for name in _FORWARDED_LOG_ENV_VARS:
+                value = os.environ.get(name)
+                if value is not None and name not in env_vars:
+                    env_vars[name] = value
 
+        kwargs: dict[str, object] = {"env_vars": env_vars}
         if self.conda:
             kwargs["conda"] = self.conda.name
 

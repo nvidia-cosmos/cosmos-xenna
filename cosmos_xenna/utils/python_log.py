@@ -42,13 +42,26 @@ Examples:
   PYTHON_LOG=debug,myapp.db=warning
   PYTHON_LOG=myapp.*=trace,sqlalchemy.engine=warning,*=info
   PYTHON_LOG=off  # disables all logs
+
+Structured (JSON) logging: PYTHON_LOG_FORMAT
+  - "text" (default) keeps the human-readable stderr sink (unchanged behavior).
+  - "json" (case-insensitive) replaces the stderr sink with a loguru->stdlib
+    bridge so Ray's structured logging can pick up xenna/curator logs. Every
+    record is enriched with static per-process identity fields (pod, replica,
+    pid, run_id) plus a gap-free per-process ``seq`` tiebreaker.
+  - In json mode a fallback JSON handler is installed on the stdlib root logger so
+    records still render as JSON before ``ray.init`` configures the root logger (or
+    when Ray is not used at all). It is removed at the Ray hand-off to avoid dupes.
 """
 
+import itertools
+import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from typing import Any, Callable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence
 
 from loguru import logger as _logger
 
@@ -94,6 +107,155 @@ _LEVEL_ALIASES = {
 }
 
 _DEFAULT_LEVEL = "INFO"
+
+# ---------- Structured (JSON) logging ----------
+
+# Per-process, gap-free counter stamped onto every EMITTED record (see _make_filter).
+# next() on itertools.count is atomic under the GIL, so it is safe across threads.
+_SEQ_COUNTER = itertools.count()
+
+# loguru defines TRACE=5 and SUCCESS=25 which stdlib logging does not know about.
+_TRACE_LEVEL_NO = 5
+_SUCCESS_LEVEL_NO = 25
+
+# stdlib LogRecord attribute names we must not clobber when flattening loguru
+# extras onto a forwarded record. Derived from a blank record so it tracks the
+# running Python version, plus the two names makeRecord() reserves.
+_RESERVED_LOGRECORD_ATTRS = frozenset(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+
+
+def _wants_json(value: Optional[str] = None) -> bool:
+    """Return True when PYTHON_LOG_FORMAT selects JSON output (case-insensitive)."""
+    raw = os.getenv("PYTHON_LOG_FORMAT", "") if value is None else value
+    return raw.strip().lower() == "json"
+
+
+def _replica_from_pod_name(pod: str) -> str:
+    """Return the trailing ``-N`` ordinal of a pod name, or "" when absent."""
+    _, sep, tail = pod.rpartition("-")
+    return tail if sep and tail.isdigit() else ""
+
+
+def _identity_extra() -> dict[str, Any]:
+    """Static per-process identity fields bound to every record via logger.configure()."""
+    pod = os.getenv("POD_NAME", "")
+    return {
+        "pod": pod,
+        "replica": _replica_from_pod_name(pod),
+        "pid": os.getpid(),
+        "run_id": os.getenv("CURATOR_RUN_ID", ""),
+        "seq": 0,  # placeholder; replaced per emitted record by the sink filter
+    }
+
+
+def _install_stdlib_level_names() -> None:
+    """Teach stdlib logging loguru's custom level names so JSON output stays readable."""
+    logging.addLevelName(_TRACE_LEVEL_NO, "TRACE")
+    logging.addLevelName(_SUCCESS_LEVEL_NO, "SUCCESS")
+
+
+class _LoguruToStdlibBridge(logging.Handler):
+    """Loguru sink that re-emits records into the stdlib logging system.
+
+    In JSON mode we do not want loguru to render its own serialized line; instead
+    every loguru record is forwarded to ``logging.getLogger(record.name)`` so that
+    Ray's root JSON handler renders it, enriched with Ray's job/worker context.
+
+    Loguru's built-in ``StandardSink`` invokes this handler with a stdlib
+    ``LogRecord`` whose ``record.extra`` holds the loguru ``extra`` mapping
+    (pod/replica/pid/run_id/seq plus anything bound via ``logger.bind()``) and
+    whose ``exc_info`` preserves any exception. We flatten those extras onto the
+    record (guarding reserved attribute names) so they surface as structured
+    fields, then route through the named logger so the record propagates to
+    whatever handler Ray installed on the root logger.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        extra = record.__dict__.pop("extra", None)
+        if isinstance(extra, dict):
+            # Flatten loguru extras to top-level attributes (the conventional stdlib
+            # `extra=` shape) so downstream JSON formatters surface them as fields.
+            for key, value in extra.items():
+                attr = key if key not in _RESERVED_LOGRECORD_ATTRS else f"extra_{key}"
+                record.__dict__.setdefault(attr, value)
+        logging.getLogger(record.name).handle(record)
+
+
+class _FlatJsonFormatter(logging.Formatter):
+    """Render a stdlib ``LogRecord`` as a single flat JSON object.
+
+    Used by the fallback root handler so that structured logs still emit as JSON
+    when no external handler (e.g. Ray's) has configured the root logger. The shape
+    intentionally mirrors Ray's structured-logging output (flat, top-level fields)
+    rather than the nested loguru-``serialize`` shape, so a given process emits a
+    consistent schema before and after ``ray.init`` takes over the root logger. Any
+    non-standard record attributes (loguru extras flattened by the bridge, plus
+    anything attached via stdlib ``extra=``) are surfaced as top-level fields.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        data: dict[str, Any] = {
+            "levelname": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "funcName": record.funcName,
+            "lineno": record.lineno,
+            "process": record.process,
+            "asctime": self.formatTime(record),
+            "timestamp_ns": int(record.created * 1_000_000_000),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _RESERVED_LOGRECORD_ATTRS and key not in data:
+                data[key] = value
+        if record.exc_info:
+            data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(data, default=str)
+
+
+class _FallbackJsonHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """Last-resort stderr handler installed on the root logger in JSON mode.
+
+    It guarantees that bridged loguru records render as JSON even before ``ray.init``
+    configures the root logger (without it, stdlib's ``lastResort`` would drop INFO
+    and emit WARNING+ as unstructured text). It is a distinct subclass so it can be
+    identified and removed at the Ray hand-off.
+
+    Crucially, ``emit`` defers to any *other* handler already on the root logger. On
+    the driver the fallback is removed explicitly at the Ray hand-off, but Ray
+    workers never call ``apply_ray_logging_config``: they configure loguru on import
+    (adding this fallback) while Ray has *also* installed its own root handler, so
+    without this emit-time guard every worker record would be written twice (once by
+    Ray, once here). Deferring keeps the fallback a genuine last resort that only
+    writes when nothing else is listening, independent of handler install ordering.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        root = logging.getLogger()
+        for handler in root.handlers:
+            if handler is not self and not isinstance(handler, _FallbackJsonHandler):
+                return
+        super().emit(record)
+
+
+def _remove_fallback_root_handler() -> None:
+    """Remove any previously installed fallback JSON handler from the root logger."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if isinstance(handler, _FallbackJsonHandler):
+            root.removeHandler(handler)
+
+
+def _install_fallback_root_handler() -> None:
+    """Install (idempotently) the fallback JSON handler on the stdlib root logger.
+
+    The handler level is left at NOTSET so it emits every record the loguru sink
+    filter already decided to forward; we deliberately do not change the root
+    logger's level to avoid side effects on unrelated stdlib loggers.
+    """
+    _remove_fallback_root_handler()
+    handler = _FallbackJsonHandler(sys.stderr)
+    handler.setFormatter(_FlatJsonFormatter())
+    logging.getLogger().addHandler(handler)
 
 
 def _parse_env(env: Optional[str]) -> _LogConfig:
@@ -161,13 +323,17 @@ def _module_path_from_record(record: Mapping[str, Any]) -> str:
     return leaf
 
 
-def _make_filter(config: _LogConfig) -> Callable[[Mapping[str, Any]], bool]:
+def _make_filter(config: _LogConfig, *, stamp_seq: bool) -> Callable[[Mapping[str, Any]], bool]:
     """
     Build and return a filter callable suitable for a Loguru sink.
 
     The filter determines, for each record, whether it should be emitted based on
     the most specific matching rule (longest matching pattern) or the default
     threshold when no pattern matches.
+
+    When ``stamp_seq`` is True (JSON mode only), the monotonic ``seq`` tiebreaker is
+    stamped onto passing records. In text mode it is left off so the record ``extra``
+    stays empty, keeping non-JSON cosmos-xenna consumers byte-for-byte unchanged.
     """
     level_no = {name: _logger.level(name).no for name in _LEVEL_ALIASES.values() if name != "OFF"}
     default_no = None if config.default_level_name == "OFF" else level_no[config.default_level_name]
@@ -187,7 +353,13 @@ def _make_filter(config: _LogConfig) -> Callable[[Mapping[str, Any]], bool]:
         thr = select_threshold(mod)
         if thr is None:
             return False
-        return record["level"].no >= thr
+        if record["level"].no < thr:
+            return False
+        if stamp_seq:
+            # Stamp the monotonic seq only on records that actually pass the level
+            # filter, so it stays gap-free and acts as a timestamp-collision tiebreaker.
+            record["extra"]["seq"] = next(_SEQ_COUNTER)
+        return True
 
     return _filter
 
@@ -199,14 +371,42 @@ def _configure_from_env() -> None:
     Steps:
       - Remove any existing sinks to avoid duplicate emission when reloading.
       - Parse PYTHON_LOG into a default level and pattern rules.
-      - Build a filter that enforces thresholds per module path.
-      - Add a single stderr sink at TRACE; filtering is handled by our filter.
+      - In text mode (default): add the human-readable stderr sink (unchanged).
+      - In json mode (PYTHON_LOG_FORMAT=json): bind static per-process identity fields
+        (pod/replica/pid/run_id/seq), add the loguru->stdlib bridge sink so Ray's
+        structured logging renders the records as JSON, and install a fallback JSON
+        handler on the root logger so records still emit as JSON before Ray has
+        configured the root logger (or when Ray is absent entirely). The fallback is
+        removed at the Ray hand-off (see apply_ray_logging_config) to avoid dupes.
     """
     env = os.getenv("PYTHON_LOG", "").strip()
+    json_mode = _wants_json()
     _logger.remove()
+    # Drop any fallback handler from a prior configuration so re-config is clean and
+    # text mode never leaves a stray JSON handler behind.
+    _remove_fallback_root_handler()
+    # Only bind identity extras in JSON mode. In text mode reset to an empty extra so
+    # behavior matches the pre-structured-logging default for other xenna consumers.
+    # Bind via extra (not patcher) so logger.patch() chains such as make_tagged_logger()
+    # keep working while these fields ride on every record.
+    _logger.configure(extra=_identity_extra() if json_mode else {})
     config = _parse_env(env)
-    filt = _make_filter(config)
-    _logger.add(sys.stderr, level="TRACE", filter=filt, backtrace=False, diagnose=False)
+    filt = _make_filter(config, stamp_seq=json_mode)
+    if json_mode:
+        _install_stdlib_level_names()
+        # format="{message}" keeps the raw (tag-prefixed) message so the downstream
+        # JSON encoder wraps it cleanly instead of a pre-rendered loguru line.
+        _logger.add(
+            _LoguruToStdlibBridge(),
+            level="TRACE",
+            filter=filt,
+            format="{message}",
+            backtrace=False,
+            diagnose=False,
+        )
+        _install_fallback_root_handler()
+    else:
+        _logger.add(sys.stderr, level="TRACE", filter=filt, backtrace=False, diagnose=False)
 
 
 def ensure_configured(force: bool = False) -> None:
@@ -238,6 +438,77 @@ def reload_from_env() -> None:
 
 
 ensure_configured()
+
+
+# ---------- Ray structured-logging integration ----------
+
+
+def wants_json_logs() -> bool:
+    """Return True when PYTHON_LOG_FORMAT selects structured (JSON) logging."""
+    return _wants_json()
+
+
+def ray_json_log_level() -> str:
+    """Return the stdlib level name Ray should use for its JSON root logger.
+
+    Honors ``PYTHON_LOG_RAY_LEVEL`` when set; otherwise derives it from the
+    ``PYTHON_LOG`` default level. Ray/stdlib have no TRACE level, so TRACE is
+    clamped to DEBUG and OFF maps to CRITICAL. The loguru sink filter remains the
+    authoritative per-module gate; this only controls Ray's root threshold.
+    """
+    override = os.getenv("PYTHON_LOG_RAY_LEVEL")
+    if override:
+        return override.strip().upper()
+    default_name = _parse_env(os.getenv("PYTHON_LOG", "").strip()).default_level_name
+    return {"TRACE": "DEBUG", "OFF": "CRITICAL"}.get(default_name, default_name)
+
+
+def apply_ray_logging_config(ray_init_kwargs: MutableMapping[str, Any], *, log_to_driver: bool) -> bool:
+    """Gate Ray structured logging on PYTHON_LOG_FORMAT; return effective log_to_driver.
+
+    Text mode is a no-op returning ``log_to_driver`` unchanged. JSON mode sets
+    ``logging_config=ray.LoggingConfig(encoding="JSON", additional_log_standard_attrs=["name"], ...)``
+    when supported and defaults ``log_to_driver`` to False (overridable via
+    ``PYTHON_LOG_TO_DRIVER``) so worker logs are written as structured lines to
+    per-node Ray log files rather than re-printed unstructured on the driver. Older Ray
+    without ``ray.LoggingConfig`` falls back to text with a warning.
+
+    This does not touch ``RAY_BACKEND_LOG_JSON`` (which controls the format of Ray's
+    own C++ backend/system logs); Ray reads that env var natively, so operators opt in
+    to JSON backend logs explicitly (e.g. via the chart's ``logging.rayBackendJson``).
+
+    When Ray's ``LoggingConfig`` will take over the root logger, the fallback JSON
+    handler installed by ``_configure_from_env`` is removed first so records are not
+    emitted twice (once by the fallback, once by Ray's handler). If this Ray version
+    lacks ``LoggingConfig``, the fallback is left in place so logs stay structured.
+    """
+    if not wants_json_logs():
+        return log_to_driver
+    import ray  # local import keeps python_log usable without Ray installed
+
+    logging_config_cls = getattr(ray, "LoggingConfig", None)
+    if logging_config_cls is None:
+        _logger.warning(
+            "PYTHON_LOG_FORMAT=json is set but this Ray version has no ray.LoggingConfig; "
+            "continuing with the fallback JSON root handler (no Ray log context)."
+        )
+        return log_to_driver
+    # Ray is about to configure the root logger; drop our fallback to avoid duplicates.
+    _remove_fallback_root_handler()
+    logging_config_kwargs: dict[str, Any] = {"encoding": "JSON", "log_level": ray_json_log_level()}
+    # ``additional_log_standard_attrs=["name"]`` surfaces the logger name on every Ray
+    # record so Ray output matches the fallback/launcher schema and tolerate older Ray
+    # that lacks the parameter.
+    try:
+        ray_init_kwargs["logging_config"] = logging_config_cls(
+            additional_log_standard_attrs=["name"], **logging_config_kwargs
+        )
+    except TypeError:
+        ray_init_kwargs["logging_config"] = logging_config_cls(**logging_config_kwargs)
+    override = os.getenv("PYTHON_LOG_TO_DRIVER")
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 # ---------- Re-export the logger methods ----------

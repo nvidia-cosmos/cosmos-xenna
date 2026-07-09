@@ -2,6 +2,16 @@
 
 ## Latest
 
+## [0.5.2]
+
+### Released
+
+- 2026-07-09
+
+### Added
+
+- Added opt-in structured JSON logging via `PYTHON_LOG_FORMAT=json`, including Ray logging integration, consistent worker environment propagation, and per-process identity fields (`pod`, `replica`, `pid`, `run_id`, and `seq`).
+
 ## [0.5.1]
 
 ### Released
