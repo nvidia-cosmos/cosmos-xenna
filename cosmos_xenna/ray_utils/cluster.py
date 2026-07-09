@@ -95,9 +95,7 @@ def init_or_connect_to_cluster(
     if tracing_hook:
         ray_init_kwargs["_tracing_startup_hook"] = tracing_hook
     # Enable Ray structured (JSON) logging when PYTHON_LOG_FORMAT=json; no-op otherwise.
-    ray_init_kwargs["log_to_driver"] = python_log.apply_ray_logging_config(
-        ray_init_kwargs, log_to_driver=log_to_driver
-    )
+    ray_init_kwargs["log_to_driver"] = python_log.apply_ray_logging_config(ray_init_kwargs, log_to_driver=log_to_driver)
     context = ray.init(**ray_init_kwargs)
     logger.info("Initialized Ray cluster.")
     logger.info(f"Ray dashboard url: {context.dashboard_url}")

@@ -56,11 +56,9 @@ class RuntimeEnv:
                 if value is not None and name not in env_vars:
                     env_vars[name] = value
 
-        kwargs: dict[str, object] = {"env_vars": env_vars}
         if self.conda:
-            kwargs["conda"] = self.conda.name
-
-        return ray.runtime_env.RuntimeEnv(**kwargs)
+            return ray.runtime_env.RuntimeEnv(env_vars=env_vars, conda=self.conda.name)
+        return ray.runtime_env.RuntimeEnv(env_vars=env_vars)
 
     def format(self) -> str:
         out = []
