@@ -231,20 +231,27 @@ class _FallbackJsonHandler(logging.StreamHandler):  # type: ignore[type-arg]
     and emit WARNING+ as unstructured text). It is a distinct subclass so it can be
     identified and removed at the Ray hand-off.
 
-    Crucially, ``emit`` defers to any *other* handler already on the root logger. On
-    the driver the fallback is removed explicitly at the Ray hand-off, but Ray
-    workers never call ``apply_ray_logging_config``: they configure loguru on import
-    (adding this fallback) while Ray has *also* installed its own root handler, so
-    without this emit-time guard every worker record would be written twice (once by
-    Ray, once here). Deferring keeps the fallback a genuine last resort that only
-    writes when nothing else is listening, independent of handler install ordering.
+    ``emit`` defers to another root handler only when that handler would actually
+    emit the record -- i.e. it is not another ``_FallbackJsonHandler``, the record's
+    level meets the handler's own threshold (``NOTSET`` accepts everything), and no
+    attached filter rejects it. This keeps the fallback a genuine last resort: on
+    Ray workers where loguru is configured while Ray has already installed its own
+    root handler, Ray owns the record so the fallback stays silent; but when an
+    external handler is present yet would drop the record (e.g. its level is above
+    ``record.levelno``), the fallback still writes JSON so records are never
+    silently dropped.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
         root = logging.getLogger()
         for handler in root.handlers:
-            if handler is not self and not isinstance(handler, _FallbackJsonHandler):
-                return
+            if handler is self or isinstance(handler, _FallbackJsonHandler):
+                continue
+            if record.levelno < handler.level:
+                continue
+            if not handler.filter(record):
+                continue
+            return
         super().emit(record)
 
 

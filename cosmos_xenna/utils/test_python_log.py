@@ -304,6 +304,35 @@ def test_json_mode_defers_to_external_root_handler():
     assert _json_lines(err) == []
 
 
+def test_json_mode_emits_when_external_handler_rejects_record():
+    # Regression: the fallback previously deferred whenever ANY external root handler
+    # existed, silently dropping records the external handler would not emit. With a
+    # WARNING-level external handler the INFO record must still be emitted as JSON by
+    # the fallback, while the WARNING record is emitted exactly once by the external
+    # handler (fallback defers only for records another handler would actually emit).
+    code = (
+        "import logging, sys\n"
+        "_h = logging.StreamHandler(sys.stderr)\n"
+        "_h.setLevel(logging.WARNING)\n"
+        "_h.setFormatter(logging.Formatter('EXT:%(message)s'))\n"
+        "logging.getLogger().addHandler(_h)\n"
+        "from cosmos_xenna.utils import python_log as L\n"
+        "L.info('SHOULD_BE_JSON_FALLBACK')\n"
+        "L.warning('SHOULD_BE_EXTERNAL')\n"
+    )
+    err = _run_code_and_capture_stderr(
+        code,
+        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": "json", "POD_NAME": "pod-2"},
+        [_pkg_root()],
+    )
+    objs = _json_lines(err)
+    assert [o["message"] for o in objs] == ["SHOULD_BE_JSON_FALLBACK"]
+    assert objs[0]["pod"] == "pod-2"
+    assert "EXT:SHOULD_BE_JSON_FALLBACK" not in err
+    assert err.count("EXT:SHOULD_BE_EXTERNAL") == 1
+    assert err.count("SHOULD_BE_EXTERNAL") == 1
+
+
 @pytest.mark.parametrize(
     ("python_log", "expected"),
     [
