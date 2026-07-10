@@ -47,6 +47,11 @@ dev = [
 
 [tool.uv]
 default-groups = ["dev", "examples", "gpu"]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
