@@ -26,7 +26,7 @@ import ray.runtime_env
 # separate processes started by the raylet; they inherit the raylet's environment,
 # but forwarding these explicitly guarantees consistent structured logging even if
 # the raylet was started without them.
-_FORWARDED_LOG_ENV_VARS = ("PYTHON_LOG", "PYTHON_LOG_FORMAT", "CURATOR_RUN_ID", "POD_NAME")
+_FORWARDED_LOG_ENV_VARS = ("PYTHON_LOG", "PYTHON_LOG_FORMAT", "CURATOR_RUN_ID")
 
 
 @attrs.define
@@ -50,7 +50,12 @@ class RuntimeEnv:
         # active (PYTHON_LOG_FORMAT=json). In the default text mode this is a no-op, so
         # non-JSON cosmos-xenna consumers see no change to actor environments. Never
         # override anything a stage explicitly set in extra_env_vars.
-        if os.environ.get("PYTHON_LOG_FORMAT", "").strip().lower() == "json":
+        #
+        # Resolve the mode from the effective value the worker would see: a caller that
+        # sets PYTHON_LOG_FORMAT via extra_env_vars still triggers forwarding, even if
+        # the driver process env itself does not carry it.
+        log_format = env_vars.get("PYTHON_LOG_FORMAT", os.environ.get("PYTHON_LOG_FORMAT", ""))
+        if log_format.strip().lower() == "json":
             for name in _FORWARDED_LOG_ENV_VARS:
                 value = os.environ.get(name)
                 if value is not None and name not in env_vars:

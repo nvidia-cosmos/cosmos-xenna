@@ -36,17 +36,37 @@ def test_text_mode_forwards_no_logging_env_vars(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_json_mode_forwards_logging_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
-    # In JSON mode the toggle + identity vars are forwarded so workers log identically.
+    # In JSON mode the toggle + run id are forwarded so workers log identically.
     monkeypatch.setenv("PYTHON_LOG_FORMAT", "json")
     monkeypatch.setenv("PYTHON_LOG", "debug")
     monkeypatch.setenv("CURATOR_RUN_ID", "r1")
-    monkeypatch.setenv("POD_NAME", "pod-1")
     env = _env_vars(RuntimeEnv(extra_env_vars={"FOO": "bar"}).to_ray_runtime_env())
     assert env["FOO"] == "bar"
     assert env["PYTHON_LOG"] == "debug"
     assert env["PYTHON_LOG_FORMAT"] == "json"
     assert env["CURATOR_RUN_ID"] == "r1"
-    assert env["POD_NAME"] == "pod-1"
+
+
+def test_json_mode_does_not_forward_pod_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # POD_NAME is per-pod identity supplied by each pod (k8s downward API); forwarding
+    # the driver's value would misattribute worker logs on multi-node clusters.
+    monkeypatch.setenv("PYTHON_LOG_FORMAT", "json")
+    monkeypatch.setenv("POD_NAME", "driver-pod-0")
+    env = _env_vars(RuntimeEnv().to_ray_runtime_env())
+    assert "POD_NAME" not in env
+
+
+def test_json_mode_via_extra_env_vars_triggers_forwarding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The mode is resolved from the effective value the worker sees: setting
+    # PYTHON_LOG_FORMAT via extra_env_vars alone (absent from the process env) still
+    # forwards the other logging vars from the environment.
+    monkeypatch.delenv("PYTHON_LOG_FORMAT", raising=False)
+    monkeypatch.setenv("PYTHON_LOG", "debug")
+    monkeypatch.setenv("CURATOR_RUN_ID", "r1")
+    env = _env_vars(RuntimeEnv(extra_env_vars={"PYTHON_LOG_FORMAT": "json"}).to_ray_runtime_env())
+    assert env["PYTHON_LOG_FORMAT"] == "json"
+    assert env["PYTHON_LOG"] == "debug"
+    assert env["CURATOR_RUN_ID"] == "r1"
 
 
 def test_json_mode_does_not_override_explicit_extra_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,6 +82,5 @@ def test_json_mode_skips_unset_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHON_LOG_FORMAT", "json")
     monkeypatch.delenv("PYTHON_LOG", raising=False)
     monkeypatch.delenv("CURATOR_RUN_ID", raising=False)
-    monkeypatch.delenv("POD_NAME", raising=False)
     env = _env_vars(RuntimeEnv().to_ray_runtime_env())
     assert env == {"PYTHON_LOG_FORMAT": "json"}
