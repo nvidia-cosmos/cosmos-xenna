@@ -58,6 +58,7 @@ import itertools
 import json
 import logging
 import os
+import socket
 import sys
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -136,9 +137,19 @@ def _replica_from_pod_name(pod: str) -> str:
     return tail if sep and tail.isdigit() else ""
 
 
+def _node_identity() -> str:
+    """Best-effort identifier for the emitting node/instance across platforms.
+
+    Prefers the k8s ``POD_NAME`` (downward API), then SLURM's ``SLURMD_NODENAME``,
+    then the container/host name. This keeps the ``pod`` field populated and
+    distinguishable off-k8s (SLURM/NVCF/local), where ``POD_NAME`` is absent.
+    """
+    return os.getenv("POD_NAME") or os.getenv("SLURMD_NODENAME") or socket.gethostname() or ""
+
+
 def _identity_extra() -> dict[str, Any]:
     """Static per-process identity fields bound to every record via logger.configure()."""
-    pod = os.getenv("POD_NAME", "")
+    pod = _node_identity()
     return {
         "pod": pod,
         "replica": _replica_from_pod_name(pod),

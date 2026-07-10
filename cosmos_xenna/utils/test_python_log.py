@@ -217,16 +217,24 @@ def test_json_mode_off_still_silences():
     assert _json_lines(err) == []
 
 
-def test_json_mode_empty_pod_name_degrades_gracefully():
+def test_json_mode_pod_falls_back_to_slurm_nodename():
+    # Off k8s POD_NAME is absent; pod must fall back to SLURMD_NODENAME so SLURM nodes
+    # stay distinguishable in pre-Ray/worker logs (empty POD_NAME is treated as unset).
     code = _JSON_ROOT_PREAMBLE + "from cosmos_xenna.utils import python_log as L\nL.info('NOPOD')\n"
     err = _run_code_and_capture_stderr(
         code,
-        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": "json", "POD_NAME": "", "CURATOR_RUN_ID": ""},
+        {
+            "PYTHON_LOG": "info",
+            "PYTHON_LOG_FORMAT": "json",
+            "POD_NAME": "",
+            "SLURMD_NODENAME": "slurm-node-4",
+            "CURATOR_RUN_ID": "",
+        },
         [_pkg_root()],
     )
     obj = _json_lines(err)[0]
-    assert obj["pod"] == ""
-    assert obj["replica"] == ""
+    assert obj["pod"] == "slurm-node-4"
+    assert obj["replica"] == "4"
     assert obj["run_id"] == ""
 
 
