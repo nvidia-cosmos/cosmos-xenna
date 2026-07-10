@@ -388,7 +388,8 @@ def test_ray_log_level_ignores_blank_or_invalid_override(monkeypatch, override):
 def test_ray_handoff_removes_fallback_handler(monkeypatch):
     # When Ray's LoggingConfig will own the root logger, apply_ray_logging_config must
     # remove the fallback handler (so records are not emitted twice) and set the
-    # logging_config kwarg with log_to_driver defaulting to False.
+    # logging_config kwarg while leaving log_to_driver at the caller's value (True) so
+    # worker logs stay visible on the driver, matching text-mode behavior.
     import logging
     import types
 
@@ -414,7 +415,7 @@ def test_ray_handoff_removes_fallback_handler(monkeypatch):
         kwargs: dict = {}
         log_to_driver = L.apply_ray_logging_config(kwargs, log_to_driver=True)
 
-        assert log_to_driver is False
+        assert log_to_driver is True
         assert isinstance(kwargs["logging_config"], _LoggingConfig)
         assert kwargs["logging_config"].kwargs["encoding"] == "JSON"
         # Logger name is surfaced on every Ray record for schema parity.
@@ -478,10 +479,38 @@ def test_ray_handoff_tolerates_old_logging_config(monkeypatch):
         kwargs: dict = {}
         log_to_driver = L.apply_ray_logging_config(kwargs, log_to_driver=True)
 
-        assert log_to_driver is False
+        assert log_to_driver is True
         assert isinstance(kwargs["logging_config"], _OldLoggingConfig)
         assert kwargs["logging_config"].kwargs["encoding"] == "JSON"
         assert "additional_log_standard_attrs" not in kwargs["logging_config"].kwargs
+    finally:
+        monkeypatch.setenv("PYTHON_LOG_FORMAT", "text")
+        L.ensure_configured(force=True)
+
+
+def test_ray_handoff_respects_log_to_driver_override(monkeypatch):
+    # PYTHON_LOG_TO_DRIVER=false opts a JSON-mode deployment out of driver forwarding so
+    # the driver stream stays pure JSON (worker logs shipped from per-node Ray files).
+    import types
+
+    from cosmos_xenna.utils import python_log as L
+
+    monkeypatch.setenv("PYTHON_LOG_FORMAT", "json")
+    monkeypatch.setenv("PYTHON_LOG_TO_DRIVER", "false")
+    try:
+        L.ensure_configured(force=True)
+
+        fake_ray = types.ModuleType("ray")
+
+        class _LoggingConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        fake_ray.LoggingConfig = _LoggingConfig  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+        log_to_driver = L.apply_ray_logging_config({}, log_to_driver=True)
+        assert log_to_driver is False
     finally:
         monkeypatch.setenv("PYTHON_LOG_FORMAT", "text")
         L.ensure_configured(force=True)

@@ -523,21 +523,16 @@ def ray_json_log_level() -> str:
 def apply_ray_logging_config(ray_init_kwargs: MutableMapping[str, Any], *, log_to_driver: bool) -> bool:
     """Gate Ray structured logging on PYTHON_LOG_FORMAT; return effective log_to_driver.
 
-    Text mode is a no-op returning ``log_to_driver`` unchanged. JSON mode sets
-    ``logging_config=ray.LoggingConfig(encoding="JSON", additional_log_standard_attrs=["name"], ...)``
-    when supported and defaults ``log_to_driver`` to False (overridable via
-    ``PYTHON_LOG_TO_DRIVER``) so worker logs are written as structured lines to
-    per-node Ray log files rather than re-printed unstructured on the driver. Older Ray
-    without ``ray.LoggingConfig`` falls back to text with a warning.
+    Text mode is a no-op. JSON mode sets ``ray.LoggingConfig(encoding="JSON", ...)`` and
+    removes the fallback root handler so records are not emitted twice. Older Ray without
+    ``LoggingConfig`` logs a warning and leaves the fallback in place.
 
-    This does not touch ``RAY_BACKEND_LOG_JSON`` (which controls the format of Ray's
-    own C++ backend/system logs); Ray reads that env var natively, so operators opt in
-    to JSON backend logs explicitly (e.g. via the chart's ``logging.rayBackendJson``).
+    ``log_to_driver`` is returned unchanged unless ``PYTHON_LOG_TO_DRIVER`` overrides it:
+      - ``true``  -> workers forward logs to the driver (default; matches text mode).
+      - ``false`` -> no worker log forwarding; the driver stream stays strict JSON
+        (Ray prefixes forwarded worker lines with ``(Actor pid=…)``, which is not valid JSON).
 
-    When Ray's ``LoggingConfig`` will take over the root logger, the fallback JSON
-    handler installed by ``_configure_from_env`` is removed first so records are not
-    emitted twice (once by the fallback, once by Ray's handler). If this Ray version
-    lacks ``LoggingConfig``, the fallback is left in place so logs stay structured.
+    ``RAY_BACKEND_LOG_JSON`` (Ray's C++ backend log format) is left to the operator.
     """
     if not wants_json_logs():
         return log_to_driver
@@ -565,7 +560,7 @@ def apply_ray_logging_config(ray_init_kwargs: MutableMapping[str, Any], *, log_t
     override = os.getenv("PYTHON_LOG_TO_DRIVER")
     if override is not None:
         return override.strip().lower() in {"1", "true", "yes", "on"}
-    return False
+    return log_to_driver
 
 
 # ---------- Re-export the logger methods ----------
