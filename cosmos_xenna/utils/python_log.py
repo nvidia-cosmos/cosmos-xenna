@@ -152,7 +152,10 @@ def _identity_extra() -> dict[str, Any]:
     pod = _node_identity()
     return {
         "pod": pod,
-        "replica": _replica_from_pod_name(pod),
+        # replica = k8s StatefulSet ordinal; sourced strictly from POD_NAME so it is
+        # populated only on k8s/NVCF and stays "" off-k8s (SLURM/local) instead of
+        # misreading a node name like pool0-0218 as a replica ordinal.
+        "replica": _replica_from_pod_name(os.getenv("POD_NAME", "")),
         "pid": os.getpid(),
         "run_id": os.getenv("CURATOR_RUN_ID", ""),
         "seq": 0,  # placeholder; replaced per emitted record by the sink filter

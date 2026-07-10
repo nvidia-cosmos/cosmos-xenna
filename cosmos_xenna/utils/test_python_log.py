@@ -222,6 +222,8 @@ def test_json_mode_off_still_silences():
 def test_json_mode_pod_falls_back_to_slurm_nodename():
     # Off k8s POD_NAME is absent; pod must fall back to SLURMD_NODENAME so SLURM nodes
     # stay distinguishable in pre-Ray/worker logs (empty POD_NAME is treated as unset).
+    # replica stays empty off-k8s: it is a k8s StatefulSet ordinal sourced only from
+    # POD_NAME, so a numeric-suffixed node name must not be misread as a replica.
     code = _JSON_ROOT_PREAMBLE + "from cosmos_xenna.utils import python_log as L\nL.info('NOPOD')\n"
     err = _run_code_and_capture_stderr(
         code,
@@ -236,7 +238,7 @@ def test_json_mode_pod_falls_back_to_slurm_nodename():
     )
     obj = _json_lines(err)[0]
     assert obj["pod"] == "slurm-node-4"
-    assert obj["replica"] == "4"
+    assert obj["replica"] == ""
     assert obj["run_id"] == ""
 
 
