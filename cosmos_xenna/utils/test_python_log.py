@@ -20,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _pkg_root() -> str:
     # Path to directory that contains the top-level package 'cosmos_xenna'
@@ -300,6 +302,56 @@ def test_json_mode_defers_to_external_root_handler():
     assert err.count("DEFERTEST") == 1
     assert "EXT:DEFERTEST" in err
     assert _json_lines(err) == []
+
+
+@pytest.mark.parametrize(
+    ("python_log", "expected"),
+    [
+        ("", "INFO"),
+        ("warning", "WARNING"),
+        ("info,my.module=debug", "DEBUG"),
+        ("warning,my.module=trace", "DEBUG"),
+        ("trace,my.module=off", "DEBUG"),
+        ("off,my.module=warning", "WARNING"),
+        ("off,my.module=off,other.*=off", "CRITICAL"),
+    ],
+)
+def test_ray_log_level_allows_most_verbose_enabled_threshold(monkeypatch, python_log, expected):
+    from cosmos_xenna.utils import python_log as L
+
+    monkeypatch.delenv("PYTHON_LOG_RAY_LEVEL", raising=False)
+    monkeypatch.setenv("PYTHON_LOG", python_log)
+
+    assert L.ray_json_log_level() == expected
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        (" error ", "ERROR"),
+        ("warn", "WARNING"),
+        ("fatal", "CRITICAL"),
+        ("trace", "DEBUG"),
+        ("off", "CRITICAL"),
+    ],
+)
+def test_ray_log_level_normalizes_valid_override(monkeypatch, override, expected):
+    from cosmos_xenna.utils import python_log as L
+
+    monkeypatch.setenv("PYTHON_LOG", "warning,my.module=trace")
+    monkeypatch.setenv("PYTHON_LOG_RAY_LEVEL", override)
+
+    assert L.ray_json_log_level() == expected
+
+
+@pytest.mark.parametrize("override", ["", " \t ", "verbose"])
+def test_ray_log_level_ignores_blank_or_invalid_override(monkeypatch, override):
+    from cosmos_xenna.utils import python_log as L
+
+    monkeypatch.setenv("PYTHON_LOG", "error,my.module=debug")
+    monkeypatch.setenv("PYTHON_LOG_RAY_LEVEL", override)
+
+    assert L.ray_json_log_level() == "DEBUG"
 
 
 def test_ray_handoff_removes_fallback_handler(monkeypatch):

@@ -462,16 +462,52 @@ def wants_json_logs() -> bool:
 def ray_json_log_level() -> str:
     """Return the stdlib level name Ray should use for its JSON root logger.
 
-    Honors ``PYTHON_LOG_RAY_LEVEL`` when set; otherwise derives it from the
-    ``PYTHON_LOG`` default level. Ray/stdlib have no TRACE level, so TRACE is
-    clamped to DEBUG and OFF maps to CRITICAL. The loguru sink filter remains the
-    authoritative per-module gate; this only controls Ray's root threshold.
+    A valid ``PYTHON_LOG_RAY_LEVEL`` overrides ``PYTHON_LOG`` using the same aliases
+    as other level directives. Blank or unrecognized overrides are ignored, matching
+    ``PYTHON_LOG`` parsing. Otherwise, the most verbose enabled default or per-module
+    level is selected. Ray/stdlib have no TRACE or OFF level, so those map to DEBUG
+    and CRITICAL respectively. The loguru sink filter remains the authoritative
+    per-module gate; this only prevents Ray's root threshold from discarding a record
+    that already passed that filter.
+
+    PYTHON_LOG input     Canonical level     Ray JSON level
+    -------------------------------------------------------
+    trace                TRACE               DEBUG
+    debug                DEBUG               DEBUG
+    info / unset         INFO                INFO
+    warn / warning       WARNING             WARNING
+    error                ERROR               ERROR
+    critical / fatal     CRITICAL            CRITICAL
+    off                  OFF                 CRITICAL*
+
+    * Loguru filters all matching records; CRITICAL is only the safe Ray threshold.
+
+    Derived-level examples:
+
+    PYTHON_LOG                         Derived Ray level
+    ----------------------------------------------------
+    info                               INFO
+    info,my.module=debug               DEBUG
+    warning,my.module=trace            DEBUG
+    off,my.module=warning              WARNING
+    off,my.module=off                  CRITICAL
+
+    * PYTHON_LOG_RAY_LEVEL overrides the derived level. Blank or invalid overrides are ignored.
     """
     override = os.getenv("PYTHON_LOG_RAY_LEVEL")
-    if override:
-        return override.strip().upper()
-    default_name = _parse_env(os.getenv("PYTHON_LOG", "").strip()).default_level_name
-    return {"TRACE": "DEBUG", "OFF": "CRITICAL"}.get(default_name, default_name)
+    selected_level_name = _normalize_level(override.strip()) if override else None
+    if selected_level_name is None:
+        config = _parse_env(os.getenv("PYTHON_LOG", "").strip())
+        enabled_level_names = [
+            level_name
+            for level_name in (config.default_level_name, *(rule.level_name for rule in config.rules))
+            if level_name != "OFF"
+        ]
+        if not enabled_level_names:
+            selected_level_name = "OFF"
+        else:
+            selected_level_name = min(enabled_level_names, key=lambda name: _logger.level(name).no)
+    return {"TRACE": "DEBUG", "OFF": "CRITICAL"}.get(selected_level_name, selected_level_name)
 
 
 def apply_ray_logging_config(ray_init_kwargs: MutableMapping[str, Any], *, log_to_driver: bool) -> bool:
