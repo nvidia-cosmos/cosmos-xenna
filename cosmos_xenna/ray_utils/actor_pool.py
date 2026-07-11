@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import copy
 import enum
 import os
@@ -296,6 +297,33 @@ def _kill_actor_and_reap(
                 node_id=node_id, soft=False
             ),
         ).remote(pid_entries)
+
+
+# Soft cap on concurrent teardown threads. Threads block on Ray RPCs, so this
+# bounds thread growth on large pools rather than acting as a throughput knob.
+_MAX_PARALLEL_ACTOR_KILLS = 64
+
+
+def _kill_actors_and_reap_parallel(
+    kills: list[tuple[ActorHandle, str, str, float]],
+    max_parallel: int = _MAX_PARALLEL_ACTOR_KILLS,
+) -> None:
+    """Kill each actor in ``kills`` in parallel via a bounded thread pool.
+
+    Each tuple ``(actor_ref, node_id, label, grace_period_s)`` is forwarded
+    verbatim to :func:`_kill_actor_and_reap`. Ray's driver API is thread-safe
+    and releases the GIL during blocking calls, so RPC waits inside each call
+    run concurrently and wall time is bounded by the slowest actor's teardown.
+    A no-op when ``kills`` is empty.
+    """
+    if not kills:
+        return
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(kills), max_parallel),
+        thread_name_prefix="actor-kill",
+    ) as ex:
+        # ``list(...)`` forces exception propagation from ``ex.map``.
+        list(ex.map(lambda args: _kill_actor_and_reap(*args), kills))
 
 
 _RATE_ESTIMATE_LOOKBACK_S = 60 * 10
@@ -1534,16 +1562,23 @@ class ActorPool(Generic[T, V]):
         for actor in self._ready_actors.values():
             actor.maybe_resize_num_slots_per_actor(self._slots_per_actor)
 
-    def _delete_worker_group(self, worker_group_id: str) -> resources.WorkerGroup:
-        """Deletes a worker group regardless of its current state."""
-        worker_group = self._worker_groups.pop(worker_group_id)
-        logger.debug(f"Deleting worker group {worker_group_id}.")
+    def _release_worker_group_resources(self, worker_group_id: str) -> _WorkerGroup:
+        """Release a worker group's allocator and port-registry entries.
 
-        # Remove the entire worker group from allocator (not individual actors)
+        Assumes the actors in the group are already dead or handed off to
+        another teardown path. Callers that still need to kill actors should
+        use :meth:`_delete_worker_group` instead.
+        """
+        worker_group = self._worker_groups.pop(worker_group_id)
         self._allocator.remove_worker(worker_group.worker_group.id)
         if self._is_spmd:
             self._cluster_port_registry.clear_port(worker_group.primary_node_id, worker_group_id)
+        return worker_group
 
+    def _delete_worker_group(self, worker_group_id: str) -> resources.WorkerGroup:
+        """Deletes a worker group regardless of its current state."""
+        logger.debug(f"Deleting worker group {worker_group_id}.")
+        worker_group = self._release_worker_group_resources(worker_group_id)
         for actor_id in worker_group.actors:
             self._delete_actor(actor_id)  # Use internal method that skips allocator removal
         return worker_group.worker_group
@@ -2170,25 +2205,61 @@ class ActorPool(Generic[T, V]):
         logger.trace(f"Finished update cycle for {self.name}")
 
     def stop(self) -> None:
-        """Terminates all actors managed by this pool and cleans up resources."""
+        """Terminate all actors managed by this pool and release its resources.
+
+        Actors are killed in parallel via :func:`_kill_actors_and_reap_parallel`,
+        so shutdown wall time is bounded by the slowest actor's teardown.
+        """
         logger.debug(f"Stopping actor pool {self.name}. Terminating all actors.")
-        actor_ids_to_kill = set()
 
-        # Collect IDs from all states
-        actor_ids_to_kill.update(self._pending_actors.keys())
-        actor_ids_to_kill.update(self._ready_actors.keys())
-        actor_ids_to_kill.update(pna.metadata.worker_id for pna in self._pending_node_actors.values())
+        # Ready actors use grace=0: drained results would be discarded at pipeline
+        # end but ``destroy()`` still runs to release GPU/native resources. Other
+        # states get a cooperative drain window.
+        kills: list[tuple[ActorHandle, str, str, float]] = []
+        kills.extend(
+            (
+                actor.actor_ref,
+                actor.metadata.allocation.node,
+                f"ready actor {actor.metadata.worker_id}",
+                0.0,
+            )
+            for actor in self._ready_actors.values()
+        )
+        kills.extend(
+            (
+                actor.actor_ref,
+                actor.metadata.allocation.node,
+                f"pending actor {actor.metadata.worker_id}",
+                _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+            )
+            for actor in self._pending_actors.values()
+        )
+        kills.extend(
+            (
+                actor.actor_ref,
+                actor.metadata.allocation.node,
+                f"node-setup actor {actor.metadata.worker_id}",
+                _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+            )
+            for actor in self._pending_node_actors.values()
+        )
         for waiting_list in self._actors_waiting_for_node_setup.values():
-            actor_ids_to_kill.update(wna.metadata.worker_id for wna in waiting_list)
+            kills.extend(
+                (
+                    actor.actor_ref,
+                    actor.metadata.allocation.node,
+                    f"waiting actor {actor.metadata.worker_id}",
+                    _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+                )
+                for actor in waiting_list
+            )
 
-        logger.debug(f"Found {len(actor_ids_to_kill)} actor IDs across all states to terminate.")
+        logger.debug(f"Parallel-killing {len(kills)} actor(s) across all states.")
+        _kill_actors_and_reap_parallel(kills)
 
-        # Kill worker groups
+        # Actors are already dead; only allocator / port-registry cleanup remains.
         for worker_group_id in list(self._worker_groups.keys()):
-            self._delete_worker_group(worker_group_id)
-
-        # TODO: Technically, we should clear up the worker groups here as well, but this is not a big deal as we do
-        # not expected users to re-use instances of ActorPool.
+            self._release_worker_group_resources(worker_group_id)
 
         # Surface any tasks the clear() below would otherwise drop
         # silently. Per-origin counts let the operator attribute the

@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.3]
+
+### Changed
+
+- `ActorPool.stop()` tears actors down in parallel via a bounded thread pool, so shutdown wall time scales with the slowest actor's teardown rather than the sum across actors. The mid-pipeline autoscaler kill path is unchanged.
+
 ## [0.5.2]
 
 ### Released
