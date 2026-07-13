@@ -269,6 +269,7 @@ def _build_pool_with_one_worker_group(
             actor.kill()
 
     pool._delete_actor = _stub_delete_actor
+    pool._release_worker_group_resources = ap_module.ActorPool._release_worker_group_resources.__get__(pool)
     pool._delete_worker_group = ap_module.ActorPool._delete_worker_group.__get__(pool)
 
     return pool, actor, allocator
