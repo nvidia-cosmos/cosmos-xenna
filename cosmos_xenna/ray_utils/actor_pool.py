@@ -299,9 +299,10 @@ def _kill_actor_and_reap(
         ).remote(pid_entries)
 
 
-# Soft cap on concurrent teardown threads. Threads block on Ray RPCs, so this
-# bounds thread growth on large pools rather than acting as a throughput knob.
-_MAX_PARALLEL_ACTOR_KILLS = 64
+# Soft cap on concurrent teardown threads. Threads block on Ray RPCs and each
+# carries a stack (~8 MB), so this bounds memory during teardown of very large
+# pools.
+_MAX_PARALLEL_ACTOR_KILLS = 512
 
 
 def _kill_actors_and_reap_parallel(
