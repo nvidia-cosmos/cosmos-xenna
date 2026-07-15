@@ -49,7 +49,7 @@ use crate::file_distribution::models::{
     ChunkToDownload, ObjectAndRange, ObjectStoreByProfile, RetryConfig,
 };
 use log::{debug, trace, warn};
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,7 +122,7 @@ async fn download_chunk_internal(
     let bytes = if let Some(range) = &task.object_and_range.range {
         debug!("Downloading range {:?} for object {}", range, object_path);
         client
-            .get_range(&object_path, (range.start as usize)..(range.end as usize))
+            .get_range(&object_path, range.start..range.end)
             .await?
     } else {
         debug!("Downloading full object {}", object_path);
@@ -169,7 +169,7 @@ async fn run_download_task_async(
         .map(jitter) // Add randomness to prevent thundering herd
         .take(retry_config.num_retries as usize);
 
-    let result = Retry::spawn(retry_strategy, || async {
+    let result = Retry::start(retry_strategy, || async {
         match download_chunk_internal(&task, &by_profile).await {
             Ok(data) => Ok(data),
             Err(e) => {

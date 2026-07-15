@@ -42,7 +42,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 /// * `requested_num_workers` - Optional explicitly requested number of workers.
 ///     If specified, this is the exact number of workers requested for the stage.
 ///     If None, the number of workers will be determined by the autoscaling algorithm.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ProblemStage {
     pub name: String,
@@ -78,7 +78,7 @@ impl ProblemStage {
 /// # Attributes
 /// * `id` - Unique identifier for the worker group.
 /// * `workers` - List of workers in this group.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProblemWorkerGroupState {
     pub id: String,
@@ -160,7 +160,7 @@ impl ProblemWorkerGroupState {
 /// * `workers` - List of workers currently assigned to this stage.
 /// * `slots_per_worker` - Number of task slots available per worker.
 /// * `is_finished` - Boolean indicating if this stage has completed processing.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ProblemStageState {
     pub stage_name: String,
@@ -198,7 +198,7 @@ impl ProblemStageState {
 ///
 /// # Attributes
 /// * `stages` - List of all stage states in the system.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ProblemState {
     pub stages: Vec<ProblemStageState>,
@@ -262,7 +262,7 @@ impl Display for ProblemState {
 /// # Attributes
 /// * `cluster_resources` - Total available resources in the cluster.
 /// * `stages` - List of all stages that need resource allocation.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Problem {
     pub cluster_resources: resources::ClusterResources,
@@ -295,7 +295,7 @@ impl Problem {
 /// * `slots_per_worker` - Number of task slots to allocate per worker.
 /// * `new_workers` - List of workers to be added to the stage.
 /// * `deleted_workers` - List of workers to be removed from the stage.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct StageSolution {
     pub slots_per_worker: usize,
@@ -319,7 +319,7 @@ impl StageSolution {
 ///
 /// # Attributes
 /// * `stages` - List of solutions for each stage in the system.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct Solution {
     pub stages: Vec<StageSolution>,
@@ -422,7 +422,7 @@ impl Display for Solution {
 /// # Attributes
 /// * `state` - Current state of the system.
 /// * `result` - Proposed changes to the system.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ProblemStateAndSolution {
     pub state: ProblemState,
@@ -452,7 +452,7 @@ impl Display for ProblemStateAndSolution {
 /// # Attributes
 /// * `start_time` - Time when the task started processing.
 /// * `end_time` - Time when the task completed processing.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, Copy)]
 pub struct TaskMeasurement {
     pub start_time: f64,
@@ -483,7 +483,7 @@ impl TaskMeasurement {
 ///
 /// # Attributes
 /// * `task_measurements` - List of measurements for individual tasks in this stage.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct StageMeasurements {
     pub task_measurements: Vec<TaskMeasurement>,
@@ -505,7 +505,7 @@ impl StageMeasurements {
 /// # Attributes
 /// * `time` - Timestamp when these measurements were taken.
 /// * `stages` - List of measurements for each stage.
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Measurements {
     pub time: f64,

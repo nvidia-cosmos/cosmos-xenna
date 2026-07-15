@@ -75,7 +75,7 @@ impl<'py> ImportablePyModuleBuilder<'py> {
 
             // Create a bound reference and downcast
             let bound = Bound::from_borrowed_ptr(py, ptr);
-            bound.downcast_into::<PyModule>()?
+            bound.cast_into::<PyModule>()?
         };
 
         // Initialize basic module attributes
@@ -146,7 +146,7 @@ impl<'py> ImportablePyModuleBuilder<'py> {
 
         // Update the __module__ attribute to the correct module name
         let py = self.inner.py();
-        let type_object = T::lazy_type_object().get_or_init(py);
+        let type_object = T::lazy_type_object().get_or_try_init(py)?;
 
         // Only override the __module__ if it's set to "builtins" (default)
         let current_module = type_object.getattr("__module__")?.extract::<String>()?;

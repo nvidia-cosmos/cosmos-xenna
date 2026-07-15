@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.4]
+
+### Changed
+
+- Bumped Rust extension dependencies to clear `cargo-audit` advisories, including `object_store` (0.10 → 0.14) and `pyo3` (0.25 → 0.29), and updated the native bindings for their API changes. No public Python API changes.
+
 ## [0.5.3]
 
 ### Changed

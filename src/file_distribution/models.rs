@@ -47,7 +47,7 @@ impl From<XennaError> for PyErr {
     }
 }
 
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnpackMethod {
     Auto,
@@ -56,7 +56,7 @@ pub enum UnpackMethod {
     Zip,
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpackOptions {
     pub destination: PathBuf,
@@ -74,7 +74,7 @@ impl UnpackOptions {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectToDownload {
     pub object_id: Uuid,
@@ -110,7 +110,7 @@ impl ObjectToDownload {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadCatalog {
     pub objects: HashMap<Uuid, ObjectToDownload>,
@@ -138,7 +138,7 @@ impl DownloadCatalog {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ByteRange {
     // Starting byte position (inclusive)
@@ -155,7 +155,7 @@ impl ByteRange {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectAndRange {
     pub object_uri: String,
@@ -175,7 +175,7 @@ impl ObjectAndRange {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChunkToDownload {
     pub chunk_id: Uuid,
@@ -208,7 +208,7 @@ impl ChunkToDownload {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DownloadFromNodeOrder {
     pub download_chunk: ChunkToDownload,
@@ -252,7 +252,7 @@ impl DownloadFromNodeOrder {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Orders {
     pub download_from_s3: Vec<ChunkToDownload>,
@@ -273,7 +273,7 @@ impl Orders {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMetadata {
     pub size: u64,
@@ -291,7 +291,7 @@ impl ObjectMetadata {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ObjectNameAndMetadata {
     pub uri: String,
@@ -306,7 +306,7 @@ impl ObjectNameAndMetadata {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct NodeStatus {
     pub node_id: String,
@@ -331,7 +331,7 @@ impl NodeStatus {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CacheInfo {
     pub uri: String,
@@ -371,7 +371,7 @@ impl CacheInfo {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeMetadata {
     pub node_id: String,
@@ -396,7 +396,7 @@ impl NodeMetadata {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RetryConfig {
     pub num_retries: u32,
@@ -414,7 +414,7 @@ impl RetryConfig {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ObjectStoreConfig {
     pub uri: String,
@@ -428,7 +428,7 @@ impl ObjectStoreConfig {
         Self { uri, config_args }
     }
 }
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfigByProfile {
     pub profiles: HashMap<Option<String>, ObjectStoreConfig>,
@@ -442,7 +442,7 @@ impl ObjectStoreConfigByProfile {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ObjectStoreByProfile {
     pub profiles: HashMap<Option<String>, Arc<dyn ObjectStore>>,

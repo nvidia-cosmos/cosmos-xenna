@@ -134,7 +134,7 @@ pub enum WorkerAllocatorError {
 /// * `num_nodes` - Number of nodes in the cluster.
 /// * `totals` - Total available resources across all nodes.
 /// * `available_resources` - Currently unallocated resources across all nodes.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct WorkerAllocator {
     pub cluster_resources: ClusterResources,

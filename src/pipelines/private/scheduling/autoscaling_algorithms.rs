@@ -53,7 +53,7 @@ use super::{data_structures as ds, fragmentation_allocation_algorithms as frag, 
 /// This simple counter-based ID generator ensures each worker gets a unique string identifier.
 /// The IDs are generated sequentially starting from 0.
 #[derive(Debug, Default, Clone)]
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 pub struct WorkerIdFactory {
     count: usize,
 }
@@ -186,7 +186,7 @@ impl RateEstimatorDuration {
 }
 
 #[derive(Debug, Clone, Default)]
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 pub struct Estimate {
     pub batches_per_second_per_worker: Option<f64>,
     pub num_returns_per_batch: Option<f64>,
@@ -204,7 +204,7 @@ impl Estimate {
 }
 
 #[derive(Debug, Clone, Default)]
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 pub struct Estimates {
     pub stages: Vec<Estimate>,
 }

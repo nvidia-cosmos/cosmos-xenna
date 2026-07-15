@@ -34,7 +34,7 @@ pub type FixedUtil = FixedU32<fixed::types::extra::U16>;
 /// A shape which only requires a certain number of CPUs.
 ///
 /// `num_cpus` can be a fraction. In means multiple workers can be allocated to the same cpu.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct CpuOnly {
     pub num_cpus: FixedUtil,
@@ -47,7 +47,7 @@ pub struct CpuOnly {
 /// `num_gpus` must be 0.0 < x < 1.0.
 ///
 /// This enables multiple workers to be allocated on a single gpu.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct FractionalGpu {
     pub gpu_fraction: FixedUtil,
@@ -57,14 +57,14 @@ pub struct FractionalGpu {
 /// A shape which requires a whole number GPU(s).
 ///
 /// Can also require cpus, nvdecs and nvencs
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct WholeNumberedGpu {
     pub num_gpus: u8,
     pub num_cpus: FixedUtil,
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct SpmdNodeMultiple {
     pub num_gpu_actors_in_group: u16,
@@ -82,7 +82,7 @@ impl SpmdNodeMultiple {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct SpmdSmallerThanNodeResources {
     pub num_gpu_actors_in_group: u16,
@@ -105,7 +105,7 @@ pub struct SpmdSmallerThanNodeResources {
 /// let cpu_config = CpuOnly { num_cpus: FixedUtil::from_num(4.0) };
 /// let worker = WorkerShape::CpuOnly(cpu_config);
 /// ```
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerShape {
     CpuOnly(CpuOnly),
@@ -247,7 +247,7 @@ pub enum ShapeError {
 ///
 /// This class provides an intuitive interface for specifying resource requirements
 /// that get translated into more detailed internal worker shapes.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub struct Resources {
     #[pyo3(get, set)]
@@ -404,7 +404,7 @@ impl Resources {
 ///
 /// This is a way of reporting resources which doesn't keep track of the nuances around node/gpu boundaries. It can
 /// be useful for user facing reporting and some simple allocation algorithms.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub struct PoolOfResources {
     /// Number of CPUs (can be fractional)
@@ -487,7 +487,7 @@ impl PoolOfResources {
 // GpuResources
 // --------------------
 /// Represents the state of allocation for a single GPU.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone)]
 pub struct GpuResources {
     #[pyo3(get, set)]
@@ -582,7 +582,7 @@ impl GpuResources {
 /// // To get the actual hardware GPU index:
 /// // let hardware_index = node_resources.gpus[alloc.offset].index;
 /// ```
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub struct GpuAllocation {
     #[pyo3(get, set)]
@@ -640,7 +640,7 @@ pub(crate) fn create_bar_chart(used: f32, total: f32, width: usize) -> String {
 }
 
 /// Represents all the resources allocated to a single worker.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct WorkerGroupResources {
     pub workers: Vec<WorkerResources>,
@@ -650,7 +650,7 @@ pub struct WorkerGroupResources {
 // WorkerResources
 // --------------------
 /// Represents all the resources allocated to a single worker.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct WorkerResources {
     #[pyo3(get, set)]
@@ -704,7 +704,7 @@ impl WorkerResources {
 // NodeResources
 // --------------------
 /// Represents all the resources available on a single node in a cluster.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone)]
 pub struct NodeResources {
     pub used_cpus: FixedUtil,
@@ -874,7 +874,7 @@ impl NodeResources {
 // ClusterResources
 // --------------------
 /// Represents the total resources available in the entire cluster.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone)]
 pub struct ClusterResources {
     /// dict of all nodes in the cluster
@@ -1130,7 +1130,7 @@ impl ClusterResources {
 // Worker
 // --------------------
 /// An allocated worker
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Worker {
     #[pyo3(get, set)]
@@ -1183,7 +1183,7 @@ impl Worker {
     }
 }
 
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerGroup {
     pub id: String,
@@ -1259,7 +1259,7 @@ impl WorkerGroup {
 // --------------------
 // NodeInfo
 // --------------------
-#[pyclass(get_all, set_all)]
+#[pyclass(get_all, set_all, from_py_object)]
 #[derive(Debug, PartialEq, Clone)]
 pub struct NodeInfo {
     pub node_id: String,
