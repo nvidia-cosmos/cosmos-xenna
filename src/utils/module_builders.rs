@@ -33,7 +33,7 @@ use std::ffi::CString;
 /// use pyo3::wrap_pyfunction;
 ///
 /// fn example_usage() -> PyResult<()> {
-///     Python::with_gil(|py| {
+///     Python::attach(|py| {
 ///         let m = PyModule::new(py, "my_module")?;
 ///         let my_module = ImportablePyModuleBuilder::new(py, "my_package.my_module")?
 ///             .add_function(wrap_pyfunction!(my_function, m)?)?
