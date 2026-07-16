@@ -990,7 +990,17 @@ class StageWorker(abc.ABC, Generic[T, V]):
         native call, infinite loop) cannot stall the actor pool. Exceptions are logged
         but never re-raised: teardown must always proceed to ``ray.kill()`` to release
         Ray resources, even when the user destroy fails.
+
+        Skipped when setup has not signalled completion: destroy() would race
+        resources setup is still acquiring (e.g. mid-spawn subprocesses).
+        ``ray.kill()`` + ``_reap_pids`` handle cleanup for that path.
         """
+        if not self._setup_completed.is_set():
+            logger.info(
+                f"StageWorker.shutdown: skipping destroy() for stage={self._params.name}; "
+                "setup incomplete, will use ray.kill() + reap."
+            )
+            return
         if timeout_s <= 0.0:
             return
 

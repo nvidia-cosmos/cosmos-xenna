@@ -2213,9 +2213,10 @@ class ActorPool(Generic[T, V]):
         """
         logger.debug(f"Stopping actor pool {self.name}. Terminating all actors.")
 
-        # Ready actors use grace=0: drained results would be discarded at pipeline
-        # end but ``destroy()`` still runs to release GPU/native resources. Other
-        # states get a cooperative drain window.
+        # grace=0 for all states. Ready actors still run ``destroy()`` inside
+        # ``StageWorker.shutdown`` to release GPU/native resources. Pre-ready
+        # actors have no in-flight work to drain and ``StageWorker.shutdown``
+        # skips their ``destroy()``; cleanup falls to ``ray.kill()`` + reap.
         kills: list[tuple[ActorHandle, str, str, float]] = []
         kills.extend(
             (
@@ -2231,7 +2232,7 @@ class ActorPool(Generic[T, V]):
                 actor.actor_ref,
                 actor.metadata.allocation.node,
                 f"pending actor {actor.metadata.worker_id}",
-                _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+                0.0,
             )
             for actor in self._pending_actors.values()
         )
@@ -2240,7 +2241,7 @@ class ActorPool(Generic[T, V]):
                 actor.actor_ref,
                 actor.metadata.allocation.node,
                 f"node-setup actor {actor.metadata.worker_id}",
-                _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+                0.0,
             )
             for actor in self._pending_node_actors.values()
         )
@@ -2250,7 +2251,7 @@ class ActorPool(Generic[T, V]):
                     actor.actor_ref,
                     actor.metadata.allocation.node,
                     f"waiting actor {actor.metadata.worker_id}",
-                    _GRACEFUL_SHUTDOWN_GRACE_PERIOD_S,
+                    0.0,
                 )
                 for actor in waiting_list
             )

@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.5]
+
+### Fixed
+
+- `ActorPool.stop()` skips the graceful drain and user `destroy()` for actors still in setup, avoiding a race with the in-flight `setup()` that surfaced as spurious `Engine core initialization failed` tracebacks. Those actors are torn down via `ray.kill()` plus the node-local pid reap.
+
 ## [0.5.4]
 
 ### Changed
