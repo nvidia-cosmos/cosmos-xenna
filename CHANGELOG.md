@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.6]
+
+### Fixed
+
+- Structured JSON logging (`PYTHON_LOG_FORMAT=json`) no longer drops OpenTelemetry's `trace_id` / `span_id` fields, which were silently stripped depending on import order.
+
 ## [0.5.5]
 
 ### Fixed
