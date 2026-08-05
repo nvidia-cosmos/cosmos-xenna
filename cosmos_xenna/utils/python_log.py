@@ -122,7 +122,15 @@ _SUCCESS_LEVEL_NO = 25
 # stdlib LogRecord attribute names we must not clobber when flattening loguru
 # extras onto a forwarded record. Derived from a blank record so it tracks the
 # running Python version, plus the two names makeRecord() reserves.
-_RESERVED_LOGRECORD_ATTRS = frozenset(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+#
+# LogRecord is instantiated directly rather than via logging.makeLogRecord(), which
+# would route through logging._logRecordFactory: any factory patched in before this
+# module is first imported (e.g. OTel's logging instrumentation adding trace_id /
+# span_id) would otherwise land in this set and be silently dropped from JSON output,
+# depending on import order. Direct instantiation captures the stdlib names only.
+_RESERVED_LOGRECORD_ATTRS = frozenset(
+    vars(logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None))
+) | {"message", "asctime"}
 
 
 def _wants_json(value: Optional[str] = None) -> bool:

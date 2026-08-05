@@ -15,6 +15,7 @@
 
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -333,6 +334,62 @@ def test_json_mode_emits_when_external_handler_rejects_record():
     assert "EXT:SHOULD_BE_JSON_FALLBACK" not in err
     assert err.count("EXT:SHOULD_BE_EXTERNAL") == 1
     assert err.count("SHOULD_BE_EXTERNAL") == 1
+
+
+@pytest.fixture
+def patched_record_factory():
+    """Install a record factory that adds an extra attribute, then restore the original."""
+    original = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        record = original(*args, **kwargs)
+        record.trace_id = "deadbeef"
+        return record
+
+    logging.setLogRecordFactory(factory)
+    try:
+        yield
+    finally:
+        logging.setLogRecordFactory(original)
+
+
+def test_reserved_attrs_are_independent_of_the_record_factory(patched_record_factory):
+    # _RESERVED_LOGRECORD_ATTRS must name stdlib attributes only. Deriving it via
+    # logging.makeLogRecord() routed through logging._logRecordFactory, so attributes
+    # added by a patched factory were classified as reserved and dropped from the JSON
+    # output. Assert both the set and the resulting formatter output.
+    from cosmos_xenna.utils import python_log as L
+
+    assert "trace_id" in logging.makeLogRecord({}).__dict__, "factory must be active for this test to mean anything"
+    assert "trace_id" not in L._RESERVED_LOGRECORD_ATTRS
+
+    record = logging.getLogger("t").makeRecord("t", logging.INFO, __file__, 1, "MSG", (), None)
+    assert json.loads(L._FlatJsonFormatter().format(record))["trace_id"] == "deadbeef"
+
+
+def test_json_mode_keeps_attrs_from_a_factory_patched_before_import():
+    # Regression for the import-order landmine: OTel's logging instrumentation patches
+    # the record factory to inject trace_id/span_id, and may do so before python_log is
+    # first imported in a process. Those attributes must still reach the JSON line.
+    code = (
+        "import logging\n"
+        "_old = logging.getLogRecordFactory()\n"
+        "def _factory(*args, **kwargs):\n"
+        "    record = _old(*args, **kwargs)\n"
+        "    record.trace_id = 'deadbeef'\n"
+        "    return record\n"
+        "logging.setLogRecordFactory(_factory)\n"
+        "from cosmos_xenna.utils import python_log as L\n"
+        "L.info('FACTORY_ATTR')\n"
+    )
+    err = _run_code_and_capture_stderr(
+        code,
+        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": "json", "POD_NAME": "pod-8"},
+        [_pkg_root()],
+    )
+    obj = _json_lines(err)[0]
+    assert obj["message"] == "FACTORY_ATTR"
+    assert obj["trace_id"] == "deadbeef"
 
 
 @pytest.mark.parametrize(
