@@ -155,18 +155,44 @@ def _node_identity() -> str:
     return os.getenv("POD_NAME") or os.getenv("SLURMD_NODENAME") or socket.gethostname() or ""
 
 
-def _identity_extra() -> dict[str, Any]:
-    """Static per-process identity fields bound to every record via logger.configure()."""
-    pod = _node_identity()
-    return {
-        "pod": pod,
+# pod/replica/run_id derive from env/hostname and do not change within a
+# configured process, so they are computed once per (re)configuration --
+# see `_refresh_static_identity_extra` -- rather than on every emitted
+# record. `pid` is deliberately NOT cached here: a process can fork after
+# configuring, and a cached pid would go stale for the child in exactly the
+# way a pickled-and-revived logger's frozen `extra` used to (see
+# `_LoguruToStdlibBridge.emit`). `os.getpid()` is a cheap syscall wrapper,
+# unlike the `socket.gethostname()` fallback in `_node_identity()`.
+_STATIC_IDENTITY_EXTRA: dict[str, str] = {"pod": "", "replica": "", "run_id": ""}
+
+
+def _refresh_static_identity_extra() -> None:
+    """Recompute the per-process identity fields that are safe to cache.
+
+    Called once per (re)configuration from `_configure_from_env`, so
+    `_identity_extra()` can read them without re-deriving them (env lookups,
+    a `socket.gethostname()` fallback) on every emitted record.
+    """
+    global _STATIC_IDENTITY_EXTRA  # noqa: PLW0603
+    _STATIC_IDENTITY_EXTRA = {
+        "pod": _node_identity(),
         # replica = k8s StatefulSet ordinal; sourced strictly from POD_NAME so it is
         # populated only on k8s/NVCF and stays "" off-k8s (SLURM/local) instead of
         # misreading a node name like pool0-0218 as a replica ordinal.
         "replica": _replica_from_pod_name(os.getenv("POD_NAME", "")),
-        "pid": os.getpid(),
         "run_id": os.getenv("CURATOR_RUN_ID", ""),
-        "seq": 0,  # placeholder; replaced per emitted record by the sink filter
+    }
+
+
+def _identity_extra() -> dict[str, Any]:
+    """Per-process identity fields bound to every record via logger.configure().
+
+    `seq` is not part of this: it is stamped once, in
+    `_LoguruToStdlibBridge.emit`, as the sole site that ticks `_SEQ_COUNTER`.
+    """
+    return {
+        **_STATIC_IDENTITY_EXTRA,
+        "pid": os.getpid(),
     }
 
 
@@ -200,7 +226,56 @@ class _LoguruToStdlibBridge(logging.Handler):
             for key, value in extra.items():
                 attr = key if key not in _RESERVED_LOGRECORD_ATTRS else f"extra_{key}"
                 record.__dict__.setdefault(attr, value)
+        # A record reaching this sink may come from a Logger that cloudpickle
+        # reconstructed in another process: __reduce__ below only makes this
+        # handler picklable, so the whole Logger -- including its `extra` --
+        # serializes by value, and a revived logger's identity fields are
+        # frozen at whichever process pickled it. Overwrite them with this
+        # process's own values so a record is attributed to whoever actually
+        # emitted it, not a snapshot of wherever the logger was created. This
+        # is a no-op for an ordinary (never-pickled) logger: its `extra`
+        # already holds this same process's identity.
+        for key, value in _identity_extra().items():
+            attr = key if key not in _RESERVED_LOGRECORD_ATTRS else f"extra_{key}"
+            record.__dict__[attr] = value
+        # `seq` is stamped here and ONLY here -- not in the loguru filter (see
+        # `_make_filter`) -- so there is exactly one tick per emitted record.
+        # `_SEQ_COUNTER` is a live module global, and this method runs as
+        # this process's own code even for a revived logger (the class is
+        # referenced, not snapshotted -- see __reduce__ below), so the value
+        # is always drawn from whoever is actually emitting. Stamping it in
+        # the filter as well as here would double-consume the counter for an
+        # ordinary logger (each record ticks twice, e.g. 1, 3, 5, ...);
+        # stamping it only in the filter is what let a revived logger's
+        # frozen closure resume counting from a stale position and collide
+        # with the live process's own stream.
+        seq_attr = "seq" if "seq" not in _RESERVED_LOGRECORD_ATTRS else "extra_seq"
+        record.__dict__[seq_attr] = next(_SEQ_COUNTER)
         logging.getLogger(record.name).handle(record)
+
+    def __reduce__(self) -> tuple[type["_LoguruToStdlibBridge"], tuple[()]]:
+        """Rebuild a fresh bridge rather than pickling this one.
+
+        ``@ray.remote`` rebinds the decorated class, which defeats cloudpickle's
+        by-reference lookup and makes it serialize actor classes *by value* --
+        pickling every global the actor's methods reference. A module-level
+        ``from loguru import logger`` therefore drags loguru's installed sinks
+        along, and in JSON mode this handler is one of them. ``logging.Handler``
+        holds a ``threading.RLock``, so without this, actor creation dies with
+        "cannot pickle '_thread.RLock' object" -- at runtime, inside the deployed
+        job, with nothing failing at build time.
+
+        The bridge carries no state worth moving between processes: ``emit`` only
+        forwards into ``logging.getLogger(record.name)``. The receiving process
+        gets a new instance with its own lock, which is what it wants anyway.
+
+        Making the handler picklable is not the end of the story: it lets the
+        *whole* ``Logger`` pickle by value (its ``_core``, including ``extra``,
+        was the only other thing standing in the way), which trades the crash
+        for a revived logger whose identity fields are frozen at the pickling
+        process's state. ``emit`` corrects that on the way out -- see there.
+        """
+        return (self.__class__, ())
 
 
 class _FlatJsonFormatter(logging.Formatter):
@@ -352,7 +427,7 @@ def _module_path_from_record(record: Mapping[str, Any]) -> str:
     return leaf
 
 
-def _make_filter(config: _LogConfig, *, stamp_seq: bool) -> Callable[[Mapping[str, Any]], bool]:
+def _make_filter(config: _LogConfig) -> Callable[[Mapping[str, Any]], bool]:
     """
     Build and return a filter callable suitable for a Loguru sink.
 
@@ -360,9 +435,9 @@ def _make_filter(config: _LogConfig, *, stamp_seq: bool) -> Callable[[Mapping[st
     the most specific matching rule (longest matching pattern) or the default
     threshold when no pattern matches.
 
-    When ``stamp_seq`` is True (JSON mode only), the monotonic ``seq`` tiebreaker is
-    stamped onto passing records. In text mode it is left off so the record ``extra``
-    stays empty, keeping non-JSON cosmos-xenna consumers byte-for-byte unchanged.
+    This filter does not stamp `seq`: that is `_LoguruToStdlibBridge.emit`'s job,
+    and its sole job, so there is exactly one tick of `_SEQ_COUNTER` per emitted
+    record regardless of which process's code is running `emit` (see there).
     """
     level_no = {name: _logger.level(name).no for name in _LEVEL_ALIASES.values() if name != "OFF"}
     default_no = None if config.default_level_name == "OFF" else level_no[config.default_level_name]
@@ -382,13 +457,7 @@ def _make_filter(config: _LogConfig, *, stamp_seq: bool) -> Callable[[Mapping[st
         thr = select_threshold(mod)
         if thr is None:
             return False
-        if record["level"].no < thr:
-            return False
-        if stamp_seq:
-            # Stamp the monotonic seq only on records that actually pass the level
-            # filter, so it stays gap-free and acts as a timestamp-collision tiebreaker.
-            record["extra"]["seq"] = next(_SEQ_COUNTER)
-        return True
+        return record["level"].no >= thr
 
     return _filter
 
@@ -414,13 +483,17 @@ def _configure_from_env() -> None:
     # Drop any fallback handler from a prior configuration so re-config is clean and
     # text mode never leaves a stray JSON handler behind.
     _remove_fallback_root_handler()
+    # Refresh the cached static identity fields on every (re)configuration --
+    # e.g. a test monkeypatching POD_NAME and calling ensure_configured(force=True)
+    # -- so _identity_extra() never serves a value from a prior configuration.
+    _refresh_static_identity_extra()
     # Only bind identity extras in JSON mode. In text mode reset to an empty extra so
     # behavior matches the pre-structured-logging default for other xenna consumers.
     # Bind via extra (not patcher) so logger.patch() chains such as make_tagged_logger()
     # keep working while these fields ride on every record.
     _logger.configure(extra=_identity_extra() if json_mode else {})
     config = _parse_env(env)
-    filt = _make_filter(config, stamp_seq=json_mode)
+    filt = _make_filter(config)
     if json_mode:
         _install_stdlib_level_names()
         # format="{message}" keeps the raw (tag-prefixed) message so the downstream

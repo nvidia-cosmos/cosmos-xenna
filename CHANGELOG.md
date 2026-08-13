@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.7]
+
+### Fixed
+
+- Ray actor creation under `PYTHON_LOG_FORMAT=json` no longer fails with `cannot pickle '_thread.RLock' object` when an actor references the configured logger. The revived logger's `pod`/`replica`/`pid`/`run_id` identity fields and `seq` tiebreaker are now attributed to the process actually emitting each record, rather than frozen at whichever process created the actor.
+
 ## [0.5.6]
 
 ### Fixed

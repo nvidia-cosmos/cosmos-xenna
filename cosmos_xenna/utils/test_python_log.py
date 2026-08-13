@@ -17,6 +17,7 @@
 import json
 import logging
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -571,3 +572,271 @@ def test_ray_handoff_respects_log_to_driver_override(monkeypatch):
     finally:
         monkeypatch.setenv("PYTHON_LOG_FORMAT", "text")
         L.ensure_configured(force=True)
+
+
+# ---------- Serializability across the Ray actor boundary ----------
+
+
+def test_loguru_stdlib_bridge_reconstructs_on_unpickle():
+    """The JSON-mode sink must pickle; ``logging.Handler`` holds an unpicklable lock."""
+    from cosmos_xenna.utils import python_log as L
+
+    bridge = L._LoguruToStdlibBridge()
+    revived = pickle.loads(pickle.dumps(bridge))
+
+    assert isinstance(revived, L._LoguruToStdlibBridge)
+    # A fresh instance with its own lock, not a copy of the original's state.
+    assert revived is not bridge
+
+
+# The class is defined in the child's ``__main__``, which is what makes cloudpickle
+# serialize it *by value* -- the same path ``@ray.remote`` forces for actor classes.
+# cloudpickle walks only the globals a method actually names, so ``run`` has to
+# genuinely reference ``logger``: drop that line and this test stops covering anything.
+_PICKLE_ACTOR_CODE = """
+import ray.cloudpickle as cloudpickle
+from loguru import logger
+
+from cosmos_xenna.utils import python_log as L
+
+
+class Actorish:
+    def run(self):
+        logger.info('inside the actor')
+
+
+cloudpickle.dumps(Actorish)
+L.info('DUMPED')
+"""
+
+
+@pytest.mark.parametrize("log_format", ["text", "json"])
+def test_configured_logger_survives_by_value_actor_pickling(log_format):
+    """An actor class reaching the configured logger must still cloudpickle.
+
+    Regression test for actor creation dying with "cannot pickle '_thread.RLock'
+    object" under ``PYTHON_LOG_FORMAT=json``: the bridge sink is a
+    ``logging.Handler``, and by-value actor serialization drags the logger's whole
+    sink set along. Text mode is covered too so a future sink cannot reintroduce
+    this on the default path.
+    """
+    err = _run_code_and_capture_stderr(
+        _JSON_ROOT_PREAMBLE + _PICKLE_ACTOR_CODE,
+        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": log_format},
+        [_pkg_root()],
+    )
+
+    assert "cannot pickle" not in err, err
+    assert "Traceback" not in err, err
+    assert "DUMPED" in err, err
+
+
+def test_bridge_emit_corrects_identity_and_stamps_seq_fresh(monkeypatch):
+    """``emit`` overwrites identity fields and is the sole ``seq``-stamping site.
+
+    Making the bridge picklable lets cloudpickle serialize the *whole* Logger
+    by value (only its handlers were blocking it before), so a revived
+    logger's ``extra`` -- including pod/replica/pid/run_id -- is frozen at
+    whichever process pickled it, and a revived logger's filter closure
+    resumes ``seq`` from a frozen, disconnected counter position, colliding
+    with the live process's own stream at the same pid. ``emit`` corrects
+    both: identity fields are overwritten from this process's own state
+    (cached pod/replica/run_id, live pid), and ``seq`` is always drawn fresh
+    from the live ``_SEQ_COUNTER`` -- never taken from ``record.extra`` --
+    which is what makes a single tick per emitted record possible regardless
+    of whether the logger emitting it was ever pickled.
+    """
+    from cosmos_xenna.utils import python_log as L
+
+    monkeypatch.setenv("POD_NAME", "real-pod-7")
+    monkeypatch.setenv("CURATOR_RUN_ID", "real-run")
+    # The cached pod/replica/run_id fields refresh on (re)configuration, not on
+    # every call -- see _refresh_static_identity_extra -- so picking up the env
+    # change above needs an explicit refresh, matching what _configure_from_env
+    # does on a real (re)configure.
+    L._refresh_static_identity_extra()
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    logger_name = "bridge-emit-identity-test"
+    target = logging.getLogger(logger_name)
+    target.addHandler(_Capture())
+    target.setLevel(logging.DEBUG)
+
+    def _make_stale_record(msg: str) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name=logger_name,
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=msg,
+            args=(),
+            exc_info=None,
+        )
+        # Shape a revived logger's frozen closure could plausibly produce: a
+        # driver's identity, and a seq resumed from wherever its counter was
+        # pickled -- not necessarily lower than this process's own position.
+        record.extra = {
+            "pod": "stale-driver-pod",
+            "replica": "stale-replica",
+            "pid": -1,
+            "run_id": "stale-run",
+            "seq": 999,
+        }
+        return record
+
+    bridge = L._LoguruToStdlibBridge()
+    bridge.emit(_make_stale_record("first"))
+    bridge.emit(_make_stale_record("second"))
+
+    assert len(captured) == 2
+    first, second = captured
+    # Read via __dict__, not dot access: these are dynamic attributes emit()
+    # sets on the record (see python_log.py), not declared LogRecord fields --
+    # pyright can't see them through the append/index round-trip via `captured`.
+    assert first.__dict__["pod"] == "real-pod-7"
+    assert first.__dict__["pid"] == os.getpid()
+    assert first.__dict__["run_id"] == "real-run"
+    # Never taken from record.extra (999 above) -- always the live counter.
+    assert first.__dict__["seq"] != 999
+    # Exactly one tick per emitted record: gap-free across two calls.
+    assert second.__dict__["seq"] == first.__dict__["seq"] + 1
+
+
+_FORK_REVIVED_LOGGER_CODE = """
+import ray.cloudpickle as cloudpickle
+from loguru import logger
+
+data = cloudpickle.dumps(logger)
+
+r, w = os.pipe()
+child_pid = os.fork()
+if child_pid == 0:
+    os.close(r)
+    revived = cloudpickle.loads(data)
+    os.dup2(w, 2)
+    revived.info('FROMCHILD')
+    sys.stderr.flush()
+    os._exit(0)
+os.close(w)
+os.waitpid(child_pid, 0)
+output = os.read(r, 65536).decode()
+print(output, file=sys.stderr)
+print(json.dumps({'child_pid': child_pid}), file=sys.stderr)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_revived_logger_reports_the_emitting_process_pid():
+    """Regression test for the exact bug this pins: a genuine cross-process pickle.
+
+    Cloudpickle a configured JSON-mode logger in one process, revive it in a
+    *forked* child with a different real pid, and confirm the emitted record
+    carries the child's pid -- not the parent's, frozen at pickling time. This
+    exercises the real mechanism (fork gives an unambiguous, genuinely
+    different pid) rather than approximating it.
+    """
+    code = (
+        _JSON_ROOT_PREAMBLE
+        + "import os, sys, json\n"
+        + "from cosmos_xenna.utils import python_log as L\n"
+        + _FORK_REVIVED_LOGGER_CODE
+    )
+    err = _run_code_and_capture_stderr(
+        code,
+        {
+            "PYTHON_LOG": "info",
+            "PYTHON_LOG_FORMAT": "json",
+            "POD_NAME": "driver-pod-0",
+            "CURATOR_RUN_ID": "run-xyz",
+        },
+        [_pkg_root()],
+    )
+
+    objs = _json_lines(err)
+    child_pid_obj = next(o for o in objs if "child_pid" in o)
+    from_child = next(o for o in objs if o.get("message") == "FROMCHILD")
+
+    assert from_child["pid"] == child_pid_obj["child_pid"]
+    assert from_child["pod"] == "driver-pod-0"
+
+
+_FORK_SEQ_COLLISION_CODE = """
+import ray.cloudpickle as cloudpickle
+from loguru import logger
+
+# Advance the driver's counter before pickling, simulating a driver that has
+# already been logging for a while -- this is what let a revived logger's
+# frozen closure resume counting from a stale, nonzero position.
+for _ in range(500):
+    next(L._SEQ_COUNTER)
+
+data = cloudpickle.dumps(logger)
+
+r, w = os.pipe()
+child_pid = os.fork()
+if child_pid == 0:
+    os.close(r)
+    os.dup2(w, 2)
+    revived = cloudpickle.loads(data)
+    # Interleave native (this process's own configured logger) and revived
+    # (unpickled) emissions -- the exact shape that used to produce two
+    # independent seq lineages sharing one pid.
+    L.info('native-1')
+    revived.info('revived-1')
+    revived.info('revived-2')
+    L.info('native-2')
+    revived.info('revived-3')
+    L.info('native-3')
+    sys.stderr.flush()
+    os._exit(0)
+os.close(w)
+os.waitpid(child_pid, 0)
+output = os.read(r, 65536).decode()
+print(output, file=sys.stderr)
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_revived_logger_seq_does_not_collide_with_native_stream():
+    """Regression test for the exact collision this pins.
+
+    Cloudpickle a JSON-mode logger after its counter has already advanced (as
+    a driver's would after logging for a while), revive it in a forked child,
+    and interleave native and revived emissions from that one pid. Before
+    moving seq-stamping into `emit` as the sole site, the revived logger's
+    filter closure resumed counting from its own frozen snapshot, so the two
+    streams produced duplicate seq values under the same pid -- exactly what
+    `seq` exists to prevent.
+    """
+    code = (
+        _JSON_ROOT_PREAMBLE
+        + "import os, sys\n"
+        + "from cosmos_xenna.utils import python_log as L\n"
+        + _FORK_SEQ_COLLISION_CODE
+    )
+    err = _run_code_and_capture_stderr(
+        code,
+        {
+            "PYTHON_LOG": "info",
+            "PYTHON_LOG_FORMAT": "json",
+            "POD_NAME": "driver-pod-0",
+            "CURATOR_RUN_ID": "run-xyz",
+        },
+        [_pkg_root()],
+    )
+
+    objs = _json_lines(err)
+    messages = {o["message"] for o in objs}
+    expected = {"native-1", "revived-1", "revived-2", "native-2", "revived-3", "native-3"}
+    assert messages == expected, err
+
+    seqs = [o["seq"] for o in objs]
+    assert len(seqs) == len(set(seqs)), f"duplicate seq values across native/revived streams: {seqs}"
+    # Single counter, single stamp site: strictly increasing across both
+    # streams, not just within each one -- the gap-free guarantee restored.
+    assert seqs == sorted(seqs), seqs
