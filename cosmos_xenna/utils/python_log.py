@@ -202,6 +202,24 @@ class _LoguruToStdlibBridge(logging.Handler):
                 record.__dict__.setdefault(attr, value)
         logging.getLogger(record.name).handle(record)
 
+    def __reduce__(self) -> tuple[type["_LoguruToStdlibBridge"], tuple[()]]:
+        """Rebuild a fresh bridge rather than pickling this one.
+
+        ``@ray.remote`` rebinds the decorated class, which defeats cloudpickle's
+        by-reference lookup and makes it serialize actor classes *by value* --
+        pickling every global the actor's methods reference. A module-level
+        ``from loguru import logger`` therefore drags loguru's installed sinks
+        along, and in JSON mode this handler is one of them. ``logging.Handler``
+        holds a ``threading.RLock``, so without this, actor creation dies with
+        "cannot pickle '_thread.RLock' object" -- at runtime, inside the deployed
+        job, with nothing failing at build time.
+
+        The bridge carries no state worth moving between processes: ``emit`` only
+        forwards into ``logging.getLogger(record.name)``. The receiving process
+        gets a new instance with its own lock, which is what it wants anyway.
+        """
+        return (self.__class__, ())
+
 
 class _FlatJsonFormatter(logging.Formatter):
     """Render a stdlib ``LogRecord`` as a single flat JSON object.

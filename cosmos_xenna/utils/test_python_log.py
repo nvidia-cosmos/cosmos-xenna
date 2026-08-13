@@ -17,6 +17,7 @@
 import json
 import logging
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -571,3 +572,60 @@ def test_ray_handoff_respects_log_to_driver_override(monkeypatch):
     finally:
         monkeypatch.setenv("PYTHON_LOG_FORMAT", "text")
         L.ensure_configured(force=True)
+
+
+# ---------- Serializability across the Ray actor boundary ----------
+
+
+def test_loguru_stdlib_bridge_reconstructs_on_unpickle():
+    """The JSON-mode sink must pickle; ``logging.Handler`` holds an unpicklable lock."""
+    from cosmos_xenna.utils import python_log as L
+
+    bridge = L._LoguruToStdlibBridge()
+    revived = pickle.loads(pickle.dumps(bridge))
+
+    assert isinstance(revived, L._LoguruToStdlibBridge)
+    # A fresh instance with its own lock, not a copy of the original's state.
+    assert revived is not bridge
+
+
+# The class is defined in the child's ``__main__``, which is what makes cloudpickle
+# serialize it *by value* -- the same path ``@ray.remote`` forces for actor classes.
+# cloudpickle walks only the globals a method actually names, so ``run`` has to
+# genuinely reference ``logger``: drop that line and this test stops covering anything.
+_PICKLE_ACTOR_CODE = """
+import ray.cloudpickle as cloudpickle
+from loguru import logger
+
+from cosmos_xenna.utils import python_log as L
+
+
+class Actorish:
+    def run(self):
+        logger.info('inside the actor')
+
+
+cloudpickle.dumps(Actorish)
+L.info('DUMPED')
+"""
+
+
+@pytest.mark.parametrize("log_format", ["text", "json"])
+def test_configured_logger_survives_by_value_actor_pickling(log_format):
+    """An actor class reaching the configured logger must still cloudpickle.
+
+    Regression test for actor creation dying with "cannot pickle '_thread.RLock'
+    object" under ``PYTHON_LOG_FORMAT=json``: the bridge sink is a
+    ``logging.Handler``, and by-value actor serialization drags the logger's whole
+    sink set along. Text mode is covered too so a future sink cannot reintroduce
+    this on the default path.
+    """
+    err = _run_code_and_capture_stderr(
+        _JSON_ROOT_PREAMBLE + _PICKLE_ACTOR_CODE,
+        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": log_format},
+        [_pkg_root()],
+    )
+
+    assert "cannot pickle" not in err, err
+    assert "Traceback" not in err, err
+    assert "DUMPED" in err, err
