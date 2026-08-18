@@ -26,7 +26,7 @@ This pipeline demonstrates:
 
 import io
 import random
-from typing import Optional
+from typing import Any, Optional
 
 import attrs
 import huggingface_hub
@@ -131,7 +131,6 @@ class _InferenceStage(pipelines_v1.Stage):
             repo_id=self._model_name,
             revision=MODEL_REVISION,
             local_files_only=False,  # Download if not cached
-            resume_download=True,  # Resume interrupted downloads
             # trust_remote_code is handled by from_pretrained in the worker setup
         )
         logger.info(f"Model {self._model_name} artifacts are cached or downloading on node {node_info.node_id}.")
@@ -141,7 +140,9 @@ class _InferenceStage(pipelines_v1.Stage):
         logger.info(f"Loading model {self._model_name} from cache on worker...")
         # Load Phi-3.5 model from cache only.
         # Assumes setup_per_node has already downloaded it.
-        self.model = AutoModelForCausalLM.from_pretrained(
+        # trust_remote_code returns a repository-defined model class that Transformers'
+        # static _BaseModelWithGenerate protocol cannot describe.
+        self.model: Any = AutoModelForCausalLM.from_pretrained(
             self._model_name,
             revision=MODEL_REVISION,
             trust_remote_code=True,
