@@ -18,8 +18,9 @@ import os
 from typing import Any
 
 import loguru
-import ray.runtime_context
+import ray
 from loguru import logger
+from ray._private.worker import BaseContext
 
 from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.utils import python_log
@@ -45,7 +46,7 @@ def logger_custom_deserializer(obj: None) -> "loguru.Logger":  # String literal 
 
 def init_or_connect_to_cluster(
     log_to_driver: bool = True,
-) -> ray.runtime_context.RuntimeContext:
+) -> BaseContext:
     """Initializes a new local Ray cluster or connects to an existing one.
 
     This function serves as a central point for managing Ray cluster connections.
@@ -66,7 +67,7 @@ def init_or_connect_to_cluster(
             If False (default), start a new local Ray cluster.
 
     Returns:
-        ray.runtime_context.RuntimeContext: The Ray RuntimeContext object, which provides
+        BaseContext: The context returned by ``ray.init()``, which provides
             information about the connected Ray cluster, including the dashboard URL.
     """
 

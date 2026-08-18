@@ -23,10 +23,11 @@ See the "Running a multinode Ray job" of pipelines/examples/README.md for more i
 import os
 import time
 import uuid
-from typing import Iterator, Optional
+from typing import Iterator, Optional, cast
 
 import pytest
 import ray
+from ray.actor import ActorHandle
 
 import cosmos_xenna.pipelines.v1 as pipelines_v1
 from cosmos_xenna.pipelines.private import resources
@@ -254,7 +255,7 @@ def test_autoscaler_does_not_starve_downstream_under_cpu_pressure(monkeypatch: p
             )
             assert elapsed < 90.0, f"Pipeline took {elapsed:.1f}s; likely deadlocked; counts={counts}"
         finally:
-            ray.kill(tracker)
+            ray.kill(cast(ActorHandle, tracker))
     finally:
         ray.shutdown()
 
@@ -312,7 +313,7 @@ def test_autoscaler_preempts_upstream_for_slow_downstream(monkeypatch: pytest.Mo
                 f"{counts.get('downstream', 0)} unique worker(s); counts={counts}"
             )
         finally:
-            ray.kill(tracker)
+            ray.kill(cast(ActorHandle, tracker))
     finally:
         ray.shutdown()
 
@@ -408,7 +409,7 @@ def test_autoscaler_chain_with_gpu_tail(monkeypatch: pytest.MonkeyPatch) -> None
             assert elapsed < 180.0, f"Chain pipeline took {elapsed:.1f}s; possible deadlock; counts={counts}"
             assert counts.get("gpu_tail", 0) >= 1, f"GPU tail starved (production cascade reproduced): counts={counts}"
         finally:
-            ray.kill(tracker)
+            ray.kill(cast(ActorHandle, tracker))
     finally:
         ray.shutdown()
 

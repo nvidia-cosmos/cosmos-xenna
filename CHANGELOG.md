@@ -2,6 +2,17 @@
 
 ## Latest
 
+## [0.5.8]
+
+### Changed
+
+- Raised the minimum supported Ray version from 2.46.0 to 2.57.0.
+- Updated the optional `examples` dependencies for current model stacks: added Pillow 12.3.0 or newer, raised PyTorch from 2.6.0 to 2.13.0 or newer, and raised Transformers from 4.51.3 to 5.14.1 or newer.
+
+### Fixed
+
+- Updated Ray actor and initialization-context annotations for compatibility with Ray 2.57's stricter type information.
+
 ## [0.5.7]
 
 ### Fixed
