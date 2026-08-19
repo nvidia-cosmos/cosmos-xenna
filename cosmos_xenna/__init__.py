@@ -12,3 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+import os
+
+# Ray otherwise wraps every worker launch in another ``uv run`` when the driver
+# is running under uv, which can cause worker startup to hang. Users can opt
+# back into Ray's uv runtime-environment integration by setting this before
+# importing cosmos_xenna.
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")

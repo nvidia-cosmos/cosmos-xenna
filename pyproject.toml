@@ -1,6 +1,6 @@
 [project]
 name = "cosmos-xenna"
-version = "0.5.7"
+version = "0.5.8"
 description = "A framework for building and running distributed, AI-powered data pipelines using Ray"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -11,7 +11,7 @@ dependencies = [
     "jinja2",
     "loguru",
     "pulp",
-    "ray[default]>=2.46.0",
+    "ray[default]>=2.56.0,<2.57.0",
     "tabulate",
     "obstore<0.9.0",  # 0.9.0 regression: delete() ignores store prefix from from_url()
     "portpicker>=1.6.0",
@@ -23,10 +23,11 @@ dependencies = [
 gpu = ["gpustat", "pynvml"]
 examples = [
     "huggingface-hub>=0.30.2",
+    "pillow>=12.3.0",
     "requests>=2.32.3",
-    "torch>=2.6.0",
+    "torch>=2.13.0",
     "torchvision>=0.21.0",
-    "transformers>=4.51.3",
+    "transformers>=5.14.1",
 ]
 
 [dependency-groups]
@@ -220,7 +221,7 @@ mypy-init-return = true # Let RUFF infer the return type for most __init__ metho
 [tool.pyright]
 typeCheckingMode = "basic"
 pythonVersion = "3.12"
-include = ["cosmos_xenna"]
+include = ["cosmos_xenna", "examples"]
 
 reportOptionalCall = false
 reportOptionalIterable = false
