@@ -301,7 +301,7 @@ requires-dist = [
     { name = "portpicker", specifier = ">=1.6.0" },
     { name = "pulp" },
     { name = "pynvml", marker = "extra == 'gpu'" },
-    { name = "ray", extras = ["default"], specifier = ">=2.57.0" },
+    { name = "ray", extras = ["default"], specifier = ">=2.56.0" },
     { name = "requests", marker = "extra == 'examples'", specifier = ">=2.32.3" },
     { name = "tabulate" },
     { name = "torch", marker = "extra == 'examples'", specifier = ">=2.13.0" },
