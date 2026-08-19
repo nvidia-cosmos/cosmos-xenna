@@ -616,7 +616,8 @@ This will auto-sync dependencies if needed and execute the command in the UV-man
 When imported, Cosmos-xenna defaults `RAY_ENABLE_UV_RUN_RUNTIME_ENV` to `0`. This prevents Ray from wrapping
 worker startup in nested `uv run` commands, which can hang worker initialization. Applications that need Ray's
 uv runtime-environment integration can opt back in by setting `RAY_ENABLE_UV_RUN_RUNTIME_ENV=1` before importing
-`cosmos_xenna`.
+`cosmos_xenna`. Due to import ordering, in certain scenarios, the environmant may need to be set before importing
+anything from Ray.
 
 ### VSCode integration
 

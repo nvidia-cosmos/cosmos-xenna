@@ -11,7 +11,7 @@ dependencies = [
     "jinja2",
     "loguru",
     "pulp",
-    "ray[default]>=2.56.0",
+    "ray[default]>=2.56.0,<2.57.0",
     "tabulate",
     "obstore<0.9.0",  # 0.9.0 regression: delete() ignores store prefix from from_url()
     "portpicker>=1.6.0",
