@@ -51,9 +51,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Verify uv.lock is current
+        run: uv lock --check
+
       - name: Install dependencies and build extension
         run: |
-          uv sync
+          uv sync --locked
           uv run maturin develop --release
 
       - name: Lint (ruff, pyright, license headers)
@@ -85,7 +88,7 @@ jobs:
 
       - name: Install dependencies and build extension
         run: |
-          uv sync
+          uv sync --locked
           uv run maturin develop --release
 
       - name: Unit tests
