@@ -220,6 +220,7 @@ def _run_command(command: str) -> None:
 
 
 def _lint(fix: bool = True) -> None:
+    _run_command("uv lock --check")
     if fix:
         _fix_headers()
     _check_headers()
