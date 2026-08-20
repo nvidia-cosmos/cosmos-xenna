@@ -2,6 +2,13 @@
 
 ## Latest
 
+## [0.5.9]
+
+### Changed
+
+- uv.lock regenerated with --upgrade
+- Added lock check in CI workflows
+
 ## [0.5.8]
 
 ### Changed
