@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.9]
+
+### Fixed
+
+- Stage workers and resource monitors now exit reliably under Ray 2.57, which enables `process_group_cleanup_enabled` by default and waits for a worker to exit rather than force-killing it. Their loops ran on non-daemon threads whose stop flag was never set, so interpreter shutdown blocked, pipelines stalled, and actors were repeatedly recreated.
+
 ## [0.5.8]
 
 ### Changed
