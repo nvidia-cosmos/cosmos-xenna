@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import contextlib
 import math
 import queue as python_queue
 import random
 import time
 import typing
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
 import attrs
 import ray
@@ -957,6 +958,39 @@ def _upstream_queue_lens(input_queue: Queue, queues: list[Queue], num_pools: int
     return [len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(num_pools)]
 
 
+@contextlib.contextmanager
+def _pool_stopper(pools: list[actor_pool.ActorPool]) -> Iterator[Callable[[int], None]]:
+    """Yield a ``stop_pool(idx)`` callable which stops any still-running pool on exit.
+
+    The streaming loop leaves through several routes and only one of them - the per-stage
+    "stage is done" cascade - used to stop its pools. SERVING mode's ``None`` sentinel, the
+    all-stages-done break and any propagating exception all left actors alive, and neither
+    ``Autoscaler.__exit__`` nor ``PipelineMonitor.__exit__`` touches actor pools. Ray 2.57
+    enables ``process_group_cleanup_enabled`` by default, so the raylet waits on a
+    disconnecting worker to exit before sweeping its process group; surviving actors wedge
+    teardown instead of being reaped.
+
+    Each pool is stopped exactly once, and failures are logged rather than raised so
+    teardown cannot mask an in-flight exception.
+    """
+    stopped: set[int] = set()
+
+    def stop_pool(idx: int) -> None:
+        if idx in stopped:
+            return
+        stopped.add(idx)
+        try:
+            pools[idx].stop()
+        except Exception:  # noqa: BLE001 - teardown is best-effort
+            logger.exception(f"Failed to stop actor pool {pools[idx].name}")
+
+    try:
+        yield stop_pool
+    finally:
+        for idx in range(len(pools)):
+            stop_pool(idx)
+
+
 def run_pipeline(
     pipeline_spec: specs.PipelineSpec,
     cluster_resources: resources.ClusterResources,
@@ -1025,6 +1059,9 @@ def run_pipeline(
             pools,
             pipeline_spec.config.monitoring_verbosity_level,
         ) as monitor,
+        # Entered last so it exits first: pools are stopped before the monitor's final
+        # stats pass, matching the ordering of the in-loop done cascade.
+        _pool_stopper(pools) as stop_pool,
     ):
         # This is the loop which does all the interesting stuff. It was difficult to find the correct way to iterate
         # through this which managed backpressure the correct way.
@@ -1212,7 +1249,7 @@ def run_pipeline(
                 if is_done:
                     stage_is_dones[idx] = True
                     logger.info(f"Stopping stages {idx}")
-                    pool.stop()
+                    stop_pool(idx)
                 else:
                     break
 

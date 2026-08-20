@@ -74,6 +74,10 @@ from cosmos_xenna.utils import timing
 from cosmos_xenna.utils.verbosity import VerbosityLevel
 
 _GPU_ORPHAN_SCAN_INTERVAL_S = 30
+# Per-thread budget for NodeResourceMonitor.stop() to observe the stop event.
+_MONITOR_THREAD_JOIN_TIMEOUT_S = 5.0
+# Budget for the driver-side ``stop()`` RPC to each per-node monitor actor.
+_MONITOR_STOP_RPC_TIMEOUT_S = 15.0
 
 
 def _get_live_ray_pids_on_node(node_id: str) -> set[int]:
@@ -128,7 +132,12 @@ class NodeResourceMonitor:
         self._stop_event = threading.Event()
         self._pynvml: Any | None = None
         self._nvml_handles: list[Any] | None = None
-        self._thread = threading.Thread(target=self._metrics_loop)
+        # daemon=True so a monitor that is killed rather than stopped can still finalize
+        # its interpreter. Ray 2.57 enables ``process_group_cleanup_enabled`` by default
+        # and the raylet waits for a gracefully-disconnecting worker to exit before
+        # sweeping its process group, so a monitor wedged in ``threading._shutdown()``
+        # survives indefinitely while its metrics loop keeps scanning the process table.
+        self._thread = threading.Thread(target=self._metrics_loop, daemon=True)
         self._thread.start()
         self._orphan_thread: threading.Thread | None = None
         if HAS_NVML:
@@ -149,9 +158,9 @@ class NodeResourceMonitor:
             sleeper.sleep()
 
     def _orphan_scan_loop(self) -> None:
-        sleeper = timing.RateLimiter(1.0 / _GPU_ORPHAN_SCAN_INTERVAL_S)
-        while not self._stop_event.is_set():
-            sleeper.sleep()
+        # ``Event.wait`` doubles as the scan interval and returns True once stopped, so
+        # ``stop()`` is not left waiting out a full 30 s sleep.
+        while not self._stop_event.wait(_GPU_ORPHAN_SCAN_INTERVAL_S):
             try:
                 self._scan_gpu_orphans()
             except Exception as e:  # noqa: BLE001
@@ -211,6 +220,23 @@ class NodeResourceMonitor:
             raise Exception(f"Error in metrics collection: {self._exception}")
         return self._latest_metrics
 
+    def stop(self) -> None:
+        """Signal the background loops to exit and join them with a bounded budget.
+
+        Without this, ``_stop_event`` was never set anywhere and the metrics loop kept
+        scanning the whole process table once a second for the lifetime of the process.
+        """
+        self._stop_event.set()
+        for name, thread in (("metrics", self._thread), ("orphan-scan", self._orphan_thread)):
+            if thread is None:
+                continue
+            thread.join(timeout=_MONITOR_THREAD_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                logger.warning(
+                    f"NodeResourceMonitor({self._node_ip}): {name} thread did not exit within "
+                    f"{_MONITOR_THREAD_JOIN_TIMEOUT_S:.1f}s; it is a daemon thread and will not block exit."
+                )
+
 
 class RayResourceMonitor:
     """A class which starts up starts up a NodeResourceMonitor on each node and collect stats from them."""
@@ -233,6 +259,26 @@ class RayResourceMonitor:
         for node_id, result in zip(self._node_ids, results, strict=True):
             out[node_id] = result
         return out
+
+    def stop(self) -> None:
+        """Stop and kill every per-node monitor actor.
+
+        These actors were previously never torn down, so each one outlived its pipeline
+        burning CPU on process-table scans. Best-effort and idempotent: this runs during
+        pipeline shutdown when Ray itself may already be going away, so an unreachable
+        actor is logged rather than raised.
+        """
+        for node_id, monitor in zip(self._node_ids, self._monitors, strict=True):
+            try:
+                ray.get(monitor.stop.remote(), timeout=_MONITOR_STOP_RPC_TIMEOUT_S)  # type: ignore
+            except Exception as e:  # noqa: BLE001 - teardown is best-effort
+                logger.warning(f"Failed to stop NodeResourceMonitor on node {node_id}: {e}")
+            try:
+                ray.kill(monitor)  # type: ignore
+            except Exception as e:  # noqa: BLE001 - teardown is best-effort
+                logger.warning(f"Failed to kill NodeResourceMonitor on node {node_id}: {e}")
+        self._monitors.clear()
+        self._node_ids.clear()
 
 
 def get_ray_actors(state: str = "ALIVE") -> List[ActorInfo]:
@@ -493,6 +539,8 @@ class PipelineMonitor:
 
     def close(self) -> None:
         assert self._opened
+        self._opened = False
+        self._nodes_resource_monitor.stop()
 
     def _create_ray_metrics(self) -> None:
         self._metrics_input_tasks = Gauge(

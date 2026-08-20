@@ -17,10 +17,11 @@
 import collections
 import random
 from typing import Any, List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
-from cosmos_xenna.pipelines.private.streaming import Queue
+from cosmos_xenna.pipelines.private.streaming import Queue, _pool_stopper
 from cosmos_xenna.ray_utils.actor_pool import Task as ActualTask
 
 
@@ -302,3 +303,56 @@ class TestQueue:
         all_retrieved = batch1.task_data + batch2.task_data + remaining_samples
         assert set(all_retrieved) == {1, 2, 3, 4, 5, 6}
         assert q.avg_samples_per_task() == 2.0  # Still unchanged
+
+
+class TestPoolStopper:
+    """Every exit from the streaming loop must stop all actor pools exactly once.
+
+    Only the per-stage "stage is done" cascade used to call ``pool.stop()``; SERVING mode's
+    ``None`` sentinel, the all-stages-done break and any propagating exception all left
+    actors alive. Under Ray 2.57's default ``process_group_cleanup_enabled`` the raylet
+    waits for a disconnecting worker to exit before sweeping its process group, so
+    surviving actors wedge teardown.
+    """
+
+    @staticmethod
+    def _pools(count: int) -> list[Any]:
+        pools = []
+        for idx in range(count):
+            pool = MagicMock(name=f"pool-{idx}")
+            pool.name = f"stage-{idx}"
+            pools.append(pool)
+        return pools
+
+    def test_stops_pools_never_stopped_in_the_loop(self):
+        pools = self._pools(3)
+        with _pool_stopper(pools):
+            pass  # e.g. SERVING mode's None sentinel: no stage was ever marked done.
+        for pool in pools:
+            pool.stop.assert_called_once_with()
+
+    def test_does_not_double_stop_pools_stopped_in_the_loop(self):
+        pools = self._pools(3)
+        with _pool_stopper(pools) as stop_pool:
+            stop_pool(0)
+            stop_pool(1)
+            stop_pool(1)  # A repeat request is also a no-op.
+        for pool in pools:
+            pool.stop.assert_called_once_with()
+
+    def test_stops_pools_when_an_exception_propagates(self):
+        pools = self._pools(2)
+        with pytest.raises(ValueError, match="boom"), _pool_stopper(pools):
+            raise ValueError("boom")
+        for pool in pools:
+            pool.stop.assert_called_once_with()
+
+    def test_a_failing_stop_neither_masks_the_exception_nor_skips_other_pools(self):
+        pools = self._pools(3)
+        pools[0].stop.side_effect = RuntimeError("actor is unreachable")
+
+        with pytest.raises(ValueError, match="boom"), _pool_stopper(pools):
+            raise ValueError("boom")
+
+        for pool in pools:
+            pool.stop.assert_called_once_with()

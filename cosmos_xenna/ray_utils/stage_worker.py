@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import atexit
 import copy
 import os
 import queue
@@ -193,6 +194,19 @@ class _ProcessDataResult(Generic[V]):
     pool_info: FailureInfo
 
 
+def _signal_stop_at_exit(stop_flag: threading.Event) -> None:
+    """``atexit`` hook which breaks the worker loops on any interpreter exit path.
+
+    Takes the ``Event`` rather than the worker so the registration cannot keep the
+    actor (and the user stage it holds) alive. Never raises: this runs during
+    interpreter teardown, where an exception would be printed and ignored anyway.
+    """
+    try:
+        stop_flag.set()
+    except Exception:  # noqa: BLE001 - teardown must not raise
+        pass
+
+
 def _get_object_size(ref: ray.ObjectRef) -> int:
     """Gets the size of an object store in Ray's object store."""
     # Get object locations
@@ -280,13 +294,37 @@ class StageWorker(abc.ABC, Generic[T, V]):
         self._setup_on_node_completed = threading.Event()
         self._setup_on_node_error: Exception | None = None
 
-        self._downloader_thread = threading.Thread(target=self._downloader_loop)
+        # All three loops spin until ``stop_flag`` is set, and ``shutdown()`` used to be
+        # the only thing that set it. Every other way this actor can go away - SIGTERM at
+        # cluster teardown, the handle going out of scope, ``ray.actor.exit_actor()`` from
+        # user stage code - therefore left the threads looping and CPython's
+        # ``threading._shutdown()`` blocking forever joining them. Ray 2.57 turned that
+        # from a slow exit into a hang: with ``process_group_cleanup_enabled`` on by
+        # default the raylet polls for a gracefully-disconnecting worker to exit before
+        # sweeping its process group, on the assumption that a worker which never exits is
+        # a bug.
+        #
+        # ``daemon=True`` is what fixes that, and the ``atexit`` hook cannot substitute for
+        # it: ``Py_FinalizeEx`` joins non-daemon threads *before* running ``atexit``
+        # handlers, so a hook that sets ``stop_flag`` never gets the chance to run. Once the
+        # threads are daemons the hook does become useful - it fires while they are still
+        # alive, letting each loop leave on its own terms instead of being torn down
+        # mid-iteration.
+        #
+        # ``daemon=True`` cannot lose results a caller is still awaiting: it only changes
+        # interpreter finalization, which the actor process reaches solely on its way out,
+        # at which point in-flight ``process_data`` results are unreachable regardless.
+        # The graceful path is unaffected - ``shutdown()`` still joins all three threads
+        # within its budget before returning, and ``Thread.join`` ignores the daemon flag.
+        atexit.register(_signal_stop_at_exit, self.stop_flag)
+
+        self._downloader_thread = threading.Thread(target=self._downloader_loop, daemon=True)
         self._downloader_thread.start()
 
-        self._deserializer_thread = threading.Thread(target=self._deserializer_loop)
+        self._deserializer_thread = threading.Thread(target=self._deserializer_loop, daemon=True)
         self._deserializer_thread.start()
 
-        self._process_data_thread = threading.Thread(target=self._process_data_loop)
+        self._process_data_thread = threading.Thread(target=self._process_data_loop, daemon=True)
         self._process_data_thread.start()
 
         self._error_map: dict[str, Exception] = {}
