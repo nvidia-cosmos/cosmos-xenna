@@ -59,7 +59,7 @@ use crate::file_distribution::p2p_download::{
     DownloadError as P2pDownloadError, P2pDownloadTask, P2pDownloaderWorkerPool,
     TaskStatus as P2pTaskStatus,
 };
-use crate::file_distribution::p2p_server::{P2pServer, P2pServerError};
+use crate::file_distribution::p2p_server::{P2pServer, P2pServerError, ServableChunks};
 use crate::file_distribution::unpacker::{
     TaskStatus as UnpackerTaskStatus, UnpackerError, UnpackerPool, UnpackerTask,
 };
@@ -72,6 +72,7 @@ use log::{debug, warn};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -668,6 +669,9 @@ pub struct DataPlane {
     node_parallelism: usize,
     download_catalog: Option<DownloadCatalog>,
     object_store_by_profile: Option<ObjectStoreByProfile>,
+    /// Validated at construction and retained so `start_p2p_server` does not depend
+    /// on `download_catalog` still being present.
+    servable_chunks: Arc<ServableChunks>,
     p2p_server: Option<P2pServer>,
     object_store_retry_config: RetryConfig,
     p2p_retry_config: RetryConfig,
@@ -685,27 +689,35 @@ impl DataPlane {
         object_store_by_profile: ObjectStoreByProfile,
         object_store_retry_config: RetryConfig,
         p2p_retry_config: RetryConfig,
-    ) -> Self {
+    ) -> Result<Self, P2pServerError> {
         // Default to warn level.
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-        Self {
+        // Reject a malformed catalog here, before any actor reports itself ready.
+        let servable_chunks = Arc::new(ServableChunks::from_catalog(&download_catalog)?);
+        Ok(Self {
             node_id: node_id.to_string(),
             is_test,
             node_parallelism,
             download_catalog: Some(download_catalog),
             object_store_by_profile: Some(object_store_by_profile),
+            servable_chunks,
             p2p_server: None,
             object_store_retry_config,
             p2p_retry_config,
             orchestrator: None,
-        }
+        })
     }
 
     pub fn start_p2p_server(&mut self, port: Option<u16>) -> Result<u16, P2pServerError> {
         let port = port
             .or_else(|| Some(portpicker::pick_unused_port().unwrap()))
             .unwrap();
-        self.p2p_server = Some(P2pServer::new(port, self.node_id.clone(), self.is_test)?);
+        self.p2p_server = Some(P2pServer::new(
+            port,
+            self.node_id.clone(),
+            Arc::clone(&self.servable_chunks),
+            self.is_test,
+        )?);
         Ok(port)
     }
 
