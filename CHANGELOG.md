@@ -2,6 +2,18 @@
 
 ## Latest
 
+## [0.5.10]
+
+### Changed
+
+- The Rust `DataPlane::new` is now fallible and `P2pServer::new` takes the node's validated chunk set. The Python API is unchanged.
+
+### Fixed
+
+- The P2P file-distribution server now resolves each chunk's destination, range, and size from the node's download catalog instead of the peer's query parameters, and rejects uncatalogued chunks. `destination`, `range_start`, and `range_end` are now ignored.
+- P2P chunk uploads must match the chunk's catalogued size exactly, rejecting oversized bodies with `413 Payload Too Large` and truncated ones with `400 Bad Request`.
+- Fixed an off-by-one in chunked download sizes. Byte ranges are end-exclusive, so chunk length no longer adds one.
+
 ## [0.5.9]
 
 ### Fixed

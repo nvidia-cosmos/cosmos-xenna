@@ -212,8 +212,8 @@ def _create_download_catalog(
             chunks_by_object[obj.object_id].append(chunk_id)
         else:
             for chunk_range in chunk_ranges:
-                # Calculate the size of this specific byte range chunk
-                chunk_length = chunk_range.end - chunk_range.start + 1
+                # Byte ranges are end-exclusive, so the length is the plain difference.
+                chunk_length = chunk_range.end - chunk_range.start
                 chunk_id = uuid.uuid4()
                 chunks.append(
                     models._DownloadChunk(
