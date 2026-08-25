@@ -9,11 +9,11 @@ name = "_cosmos_xenna"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.29.0", features = ["abi3-py312", "uuid"] }
+pyo3 = { version = "0.29.2", features = ["abi3-py312", "uuid"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.23.5", features = ["v4", "serde"] }
-tokio = { version = "1.52.3", features = ["full", "rt-multi-thread"] }
+uuid = { version = "1.25.0", features = ["v4", "serde"] }
+tokio = { version = "1.53.1", features = ["full", "rt-multi-thread"] }
 axum = "0.7.9"
 # disable-features is set to avoid needing to download openssl
 reqwest = { version = "0.12.28", default-features = false, features = [
@@ -22,12 +22,12 @@ reqwest = { version = "0.12.28", default-features = false, features = [
 ] }
 thiserror = "1.0.69"
 env_logger = "0.11.11"
-log = "0.4.33"
+log = "0.4.34"
 crossbeam-channel = "0.5.16"
 tempfile = "3.27.0"
 object_store = { version = "0.14.1", features = ["aws"] }
 url = "2.5.8"
-futures = "0.3.32"
+futures = "0.3.34"
 retry = "2.2.0"
 tokio-retry = "0.3"
 portpicker = "0.1.1"
