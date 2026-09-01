@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.11]
+
+### Fixed
+
+- Updated chacha20 to 0.10.2 to fix an incorrectly gated SSE4.1 intrinsic that could cause undefined behavior on older x86 CPUs.
+
 ## [0.5.10]
 
 ### Changed
