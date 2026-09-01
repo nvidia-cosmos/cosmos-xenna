@@ -25,8 +25,10 @@ jobs:
 
       - name: Extract changelog section for tag
         id: extract
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           TAG=${TAG#v}  # Strip leading 'v' if present
           echo "Looking for changelog section for tag: $TAG"
 
@@ -49,9 +51,10 @@ jobs:
       - name: Create release with gh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          gh release create ${{ github.event.inputs.tag || github.ref_name }} \
-            --title "Release ${{ github.event.inputs.tag || github.ref_name }}" \
+          gh release create "$RELEASE_TAG" \
+            --title "Release $RELEASE_TAG" \
             --notes-file release_notes.md
 
   build-wheels:
@@ -131,8 +134,9 @@ jobs:
       - name: Attach wheels to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          gh release upload ${{ github.event.inputs.tag || github.ref_name }} ${{ env.DIST_DIR }}/*
+          gh release upload "$RELEASE_TAG" "$DIST_DIR"/*
 
       - name: Publish to TestPyPI
         if: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) }}
