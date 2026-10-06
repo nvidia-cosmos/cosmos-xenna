@@ -26,8 +26,13 @@ from cosmos_xenna.pipelines import v1 as pipelines_v1
 
 
 class Stage(pipelines_v1.Stage):
-    def __init__(self, run_time_s: float):
+    def __init__(self, run_time_s: float, batch_size: int = 1):
         self._run_time_s = run_time_s
+        self._batch_size = batch_size
+
+    @property
+    def stage_batch_size(self) -> int:
+        return self._batch_size
 
     @property
     def required_resources(self) -> pipelines_v1.Resources:
@@ -100,5 +105,87 @@ def test_serving() -> None:
         pipeline_thread.join()
 
 
+def _get_results(output_queue: multiprocessing.Queue, num_results: int, timeout_s: float) -> list[int]:
+    results = []
+    while len(results) < num_results:
+        try:
+            results.append(output_queue.get(block=True, timeout=timeout_s))
+        except queue.Empty:
+            break
+    return results
+
+
+def test_serving_flushes_partial_batches_on_close() -> None:
+    input_queue = multiprocessing.Queue()
+    output_queue = multiprocessing.Queue()
+    serving_queues = pipelines_v1.ServingQueues(source=input_queue, sink=output_queue)
+
+    # The second stage only gets full batches of 4 while the source is open.
+    stages = [
+        Stage(0.0),
+        Stage(0.0, batch_size=4),
+    ]
+
+    spec = pipelines_v1.PipelineSpec(
+        [],
+        stages,
+        pipelines_v1.PipelineConfig(execution_mode=pipelines_v1.ExecutionMode.SERVING),
+        serving_queues=serving_queues,
+    )
+
+    num_requests = 6
+    pipeline_thread = threading.Thread(target=_start_serving_pipeline, args=(spec,))
+    pipeline_thread.start()
+    try:
+        for i in range(num_requests):
+            input_queue.put(i)
+        # the first full batch comes out while the source is still open
+        results = _get_results(output_queue, 4, timeout_s=60)
+        assert len(results) == 4
+    finally:
+        # closing the source must hand the second stage its remainder
+        input_queue.put(None)
+        pipeline_thread.join(timeout=60)
+
+    results += _get_results(output_queue, num_requests - len(results), timeout_s=5)
+    assert not pipeline_thread.is_alive()
+    assert sorted(results) == [x * 4 for x in range(num_requests)]
+
+
+def test_serving_close_waits_for_in_flight_tasks() -> None:
+    input_queue = multiprocessing.Queue()
+    output_queue = multiprocessing.Queue()
+    serving_queues = pipelines_v1.ServingQueues(source=input_queue, sink=output_queue)
+
+    stages = [
+        Stage(1.0),
+        Stage(0.1),
+    ]
+
+    spec = pipelines_v1.PipelineSpec(
+        [],
+        stages,
+        pipelines_v1.PipelineConfig(execution_mode=pipelines_v1.ExecutionMode.SERVING),
+        serving_queues=serving_queues,
+    )
+
+    # close the source while every request is still queued or running
+    num_requests = 3
+    for i in range(num_requests):
+        input_queue.put(i)
+    input_queue.put(None)
+
+    pipeline_thread = threading.Thread(target=_start_serving_pipeline, args=(spec,))
+    pipeline_thread.start()
+    pipeline_thread.join(timeout=120)
+
+    # every request admitted before None must reach the sink before run_pipeline returns
+    results = _get_results(output_queue, num_requests, timeout_s=5)
+    assert not pipeline_thread.is_alive()
+    assert sorted(results) == [x * 4 for x in range(num_requests)]
+
+
 if __name__ == "__main__":
     test_serving()
+    test_serving_flushes_partial_batches_on_close()
+    test_serving_close_waits_for_in_flight_tasks()

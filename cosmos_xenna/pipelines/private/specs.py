@@ -68,6 +68,8 @@ class ExecutionMode(enum.Enum):
     # Online serving mode where stages run continuously. Similar to STREAMING but designed for online
     # serving scenarios where requests arrive dynamically via an input source queue and results are
     # pushed to output a sink queue. Workers remain active indefinitely waiting for new requests.
+    # Putting None on the source queue closes it: requests already read (including partial batches)
+    # are finished and pushed to the sink, then the workers are stopped and the pipeline returns.
     SERVING = 2
 
 

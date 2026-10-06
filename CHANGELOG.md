@@ -2,6 +2,10 @@
 
 ## Latest
 
+### Fixed
+
+- SERVING mode now drains when `None` is put on the source queue. Requests already read, including the partial batch in front of a stage with `stage_batch_size > 1`, are processed and pushed to the sink before the workers are stopped and `run_pipeline` returns. Previously `None` returned at once and dropped them, and such a partial batch was never processed.
+
 ## [0.5.11]
 
 ### Fixed

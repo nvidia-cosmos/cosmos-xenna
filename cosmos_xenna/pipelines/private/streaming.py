@@ -1046,6 +1046,9 @@ def run_pipeline(
 
     streaming_loop_metrics = _StreamingLoopMetrics()
     last_stats: Optional[StreamingExecutorStats] = None
+    # In SERVING mode, set once the source queue yields None. From then on the source is not polled and the
+    # pipeline drains through the same stage-done cascade as STREAMING.
+    serving_source_closed = False
     with (
         Autoscaler(
             worker_allocator,
@@ -1121,19 +1124,20 @@ def run_pipeline(
 
             autoscaler.add_measurements(pool_extra_metadatas)
 
-            # In SERVING mode, poll the source queue for new-arriving requests.
-            if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+            # In SERVING mode, poll the source queue for new-arriving requests until it is closed.
+            if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING and not serving_source_closed:
                 assert pipeline_spec.serving_queues is not None
                 try:
                     new_task = pipeline_spec.serving_queues.source.get(block=False)
-                    if new_task is None:
-                        # consider a None task as a termination signal
-                        logger.info("Received None task which is the termination signal of serving mode")
-                        break
                 except python_queue.Empty:
                     pass
                 else:
-                    input_queue.by_node_id[None].append(new_task)
+                    if new_task is None:
+                        # consider a None task as the end of the input: finish what was admitted, then stop
+                        logger.info("Received None task which closes the source of serving mode; draining")
+                        serving_source_closed = True
+                    else:
+                        input_queue.by_node_id[None].append(new_task)
 
             # Add tasks if needed and able.
             # Start from the back and
@@ -1236,8 +1240,8 @@ def run_pipeline(
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
             # NOTE: This is iterating forward
             for idx, pool in enumerate(pools):
-                # In SERVING mode, we never mark stages as done.
-                if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+                # In SERVING mode, stages are only marked done once the source has been closed.
+                if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING and not serving_source_closed:
                     break
                 # A pool can never become "undone". Skip past anything which is already done.
                 if stage_is_dones[idx]:
