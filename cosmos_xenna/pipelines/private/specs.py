@@ -68,6 +68,9 @@ class ExecutionMode(enum.Enum):
     # Online serving mode where stages run continuously. Similar to STREAMING but designed for online
     # serving scenarios where requests arrive dynamically via an input source queue and results are
     # pushed to output a sink queue. Workers remain active indefinitely waiting for new requests.
+    # Putting None on the source queue closes it. By default the pipeline then stops immediately and drops any
+    # request it has read but not yet pushed to the sink. Set PipelineConfig.serving_drain_on_close to finish those
+    # requests (including partial batches) first.
     SERVING = 2
 
 
@@ -517,6 +520,22 @@ class PipelineConfig:
     # be discarded and `run_pipeline` will return None. Retaining this data can be useful if you want to further process
     # it. However, users can also very easily forget that they are doing this and run our of memory.
     return_last_stage_outputs: bool = False
+    # SERVING mode only; ignored by the other modes. Controls what happens when None is put on the source queue.
+    # If False (default), the pipeline stops immediately: requests already read but not yet pushed to the sink,
+    # including tasks running in workers, are dropped and a warning reports how much was dropped.
+    # If True, the source is closed instead. Requests already read, including the partial batch waiting in front of a
+    # stage with stage_batch_size > 1, are processed and pushed to the sink before the workers stop and run_pipeline
+    # returns. Keep reading the sink until run_pipeline returns: the sink push blocks while the sink is full, so a
+    # bounded sink that nobody reads stops the drain from finishing. Requests can still be lost to the usual task
+    # failure handling (retry limits, ignore_failures, failures_return_nones). Anything put on the source after None
+    # is not processed.
+    serving_drain_on_close: bool = False
+    # SERVING mode only, and only valid with serving_drain_on_close=True. Maximum number of seconds to drain after the
+    # source closes. When it expires, the pipeline stops and drops the work still in flight, with a warning. None (the
+    # default) waits until the drain finishes.
+    serving_drain_timeout_s: float | None = attrs.field(
+        default=None, validator=attrs_utils.validate_optional_positive_finite_float
+    )
     # Logging verbosity control
     actor_pool_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
     monitoring_verbosity_level: VerbosityLevel = VerbosityLevel.INFO
@@ -532,6 +551,19 @@ class PipelineConfig:
     # Otherwise, CUDA_VISIBLE_DEVICES will be set as they are on the node.
     # This is needed to turn off sometimes for libraries which require GPU access on import.
     clear_cuda_visible_devices_on_cpu_actors: bool = True
+
+    def validate_serving_close_options(self) -> None:
+        """Reject a SERVING close configuration whose settings contradict each other.
+
+        Raises:
+            ValueError: If ``serving_drain_timeout_s`` is set while ``serving_drain_on_close`` is False. The timeout
+                would otherwise be silently ignored and the pipeline would drop in-flight requests on close.
+        """
+        if self.serving_drain_timeout_s is not None and not self.serving_drain_on_close:
+            raise ValueError(
+                f"serving_drain_timeout_s={self.serving_drain_timeout_s} requires serving_drain_on_close=True; "
+                "set serving_drain_on_close=True to drain on close, or leave serving_drain_timeout_s as None."
+            )
 
 
 @attrs.define

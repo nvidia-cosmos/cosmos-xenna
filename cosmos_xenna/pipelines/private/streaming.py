@@ -958,6 +958,50 @@ def _upstream_queue_lens(input_queue: Queue, queues: list[Queue], num_pools: int
     return [len(input_queue) if idx == 0 else len(queues[idx - 1]) for idx in range(num_pools)]
 
 
+def _serving_drain_timed_out(closed_at: float | None, timeout_s: float | None, now: float) -> bool:
+    """Return whether a SERVING drain has outlived ``serving_drain_timeout_s``.
+
+    Args:
+        closed_at: Monotonic time the source queue was closed, or None if it is still open.
+        timeout_s: The configured drain timeout, or None to drain without a deadline.
+        now: Current monotonic time.
+    """
+    if closed_at is None or timeout_s is None:
+        return False
+    return now - closed_at > timeout_s
+
+
+@attrs.frozen
+class _PendingWork:
+    """Work admitted to a SERVING pipeline that has not yet been pushed to the sink.
+
+    Samples waiting in queues and tasks held by stage pools are counted separately, because a pool task holds a whole
+    batch of samples.
+    """
+
+    queued_samples: int
+    pool_tasks: int
+
+    @property
+    def is_empty(self) -> bool:
+        return self.queued_samples == 0 and self.pool_tasks == 0
+
+    def describe(self) -> str:
+        return f"{self.queued_samples} queued sample(s) and {self.pool_tasks} task(s) queued or running in stage pools"
+
+
+def _pending_work(input_queue: Queue, queues: list[Queue], pools: list[actor_pool.ActorPool]) -> _PendingWork:
+    """Measure the work that would be dropped if the SERVING loop stopped now.
+
+    Pool tasks include completed tasks that have not been handed downstream (or, for the last stage, pushed to the
+    sink) yet. SPMD worker groups count once per logical task.
+    """
+    return _PendingWork(
+        queued_samples=len(input_queue) + sum(len(q) for q in queues),
+        pool_tasks=sum(pool.num_queued_tasks + pool.num_inflight_tasks + len(pool.completed_tasks) for pool in pools),
+    )
+
+
 @contextlib.contextmanager
 def _pool_stopper(pools: list[actor_pool.ActorPool]) -> Iterator[Callable[[int], None]]:
     """Yield a ``stop_pool(idx)`` callable which stops any still-running pool on exit.
@@ -1046,6 +1090,11 @@ def run_pipeline(
 
     streaming_loop_metrics = _StreamingLoopMetrics()
     last_stats: Optional[StreamingExecutorStats] = None
+    is_serving = pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING
+    # SERVING only: monotonic time at which the source queue yielded None, or None while the source is still open.
+    # With serving_drain_on_close, the source is no longer polled after this and the pipeline drains through the same
+    # stage-done cascade STREAMING uses.
+    serving_source_closed_at: float | None = None
     with (
         Autoscaler(
             worker_allocator,
@@ -1121,19 +1170,41 @@ def run_pipeline(
 
             autoscaler.add_measurements(pool_extra_metadatas)
 
-            # In SERVING mode, poll the source queue for new-arriving requests.
-            if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+            # In SERVING mode, poll the source queue for new-arriving requests until it is closed with None.
+            if is_serving and serving_source_closed_at is None:
                 assert pipeline_spec.serving_queues is not None
+                received_close = False
                 try:
                     new_task = pipeline_spec.serving_queues.source.get(block=False)
-                    if new_task is None:
-                        # consider a None task as a termination signal
-                        logger.info("Received None task which is the termination signal of serving mode")
-                        break
                 except python_queue.Empty:
                     pass
                 else:
-                    input_queue.by_node_id[None].append(new_task)
+                    if new_task is None:
+                        received_close = True
+                    else:
+                        input_queue.by_node_id[None].append(new_task)
+                if received_close:
+                    serving_source_closed_at = time.monotonic()
+                    if not pipeline_spec.config.serving_drain_on_close:
+                        logger.info("Received None task which is the termination signal of serving mode")
+                        pending = _pending_work(input_queue, queues, pools)
+                        if not pending.is_empty:
+                            logger.warning(
+                                f"SERVING stopped with {pending.describe()}, which are dropped. Set "
+                                "PipelineConfig.serving_drain_on_close=True to finish requests already read before "
+                                "run_pipeline returns."
+                            )
+                        break
+                    logger.info("Received None on the serving source queue; draining requests already read")
+            elif is_serving and _serving_drain_timed_out(
+                serving_source_closed_at, pipeline_spec.config.serving_drain_timeout_s, time.monotonic()
+            ):
+                logger.warning(
+                    f"SERVING drain did not finish within serving_drain_timeout_s="
+                    f"{pipeline_spec.config.serving_drain_timeout_s}s; stopping with "
+                    f"{_pending_work(input_queue, queues, pools).describe()} dropped."
+                )
+                break
 
             # Add tasks if needed and able.
             # Start from the back and
@@ -1236,8 +1307,8 @@ def run_pipeline(
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
             # NOTE: This is iterating forward
             for idx, pool in enumerate(pools):
-                # In SERVING mode, we never mark stages as done.
-                if pipeline_spec.config.execution_mode == specs.ExecutionMode.SERVING:
+                # In SERVING mode, stages are only marked done while draining after the source has closed.
+                if is_serving and serving_source_closed_at is None:
                     break
                 # A pool can never become "undone". Skip past anything which is already done.
                 if stage_is_dones[idx]:
@@ -1265,6 +1336,15 @@ def run_pipeline(
             for idx, queue in enumerate(queues):
                 logger.trace(f"Queue {idx}: {len(queue)}")
             logger.trace(last_stats.to_log_string())
+
+    if serving_source_closed_at is not None:
+        assert pipeline_spec.serving_queues is not None
+        # ``empty()`` is approximate for multiprocessing queues, which is fine for a warning.
+        if not pipeline_spec.serving_queues.source.empty():
+            logger.warning(
+                "The serving source queue still holds items put after None; they were not processed and remain on "
+                "the queue. Use a fresh source queue for the next run."
+            )
 
     if pipeline_spec.config.return_last_stage_outputs:
         return ray.get(queues[-1].get_all_samples())
