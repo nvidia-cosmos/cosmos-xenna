@@ -2,6 +2,17 @@
 
 ## Latest
 
+## [0.5.12]
+
+### Added
+
+- Added the opt-in `PipelineConfig.serving_drain_on_close` for SERVING mode. When set, `None` on the source queue finishes the requests already read, including partial batches, before the workers stop and `run_pipeline` returns. By default, `None` still stops the pipeline immediately.
+- SERVING mode now warns when closing with `None` drops requests that haven't reached the sink, and when items are left on the source queue after `None`.
+
+### Fixed
+
+- Updated rustls to 0.23.46 and quinn-proto to 0.11.19 to address RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348 and RUSTSEC-2026-0349 (rustls) and RUSTSEC-2026-0338, RUSTSEC-2026-0340 and RUSTSEC-2026-0343 (quinn-proto).
+
 ## [0.5.11]
 
 ### Fixed

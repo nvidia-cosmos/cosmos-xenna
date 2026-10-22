@@ -16,6 +16,7 @@
 
 import hashlib
 import json
+import math
 import pprint
 from typing import Any
 
@@ -49,4 +50,15 @@ def validate_optional_positive_int(_: Any, attribute: "attrs.Attribute[int | Non
         return
     if value < 1:
         msg = f"{attribute.name} must be >= 1 (or None), got {value}"
+        raise ValueError(msg)
+
+
+def validate_optional_positive_finite_float(
+    _: Any, attribute: "attrs.Attribute[float | None]", value: float | None
+) -> None:
+    """Reject values that are not None and not a finite number > 0 (rejects 0, negatives, NaN and infinities)."""
+    if value is None:
+        return
+    if not math.isfinite(value) or value <= 0:
+        msg = f"{attribute.name} must be a finite number > 0 (or None), got {value}"
         raise ValueError(msg)

@@ -457,6 +457,8 @@ def run_pipeline(
         _validate_method_signature(stage_class, "setup_on_node", specs.Stage, "setup_on_node")
         _validate_method_signature(stage_class, "process_data", specs.Stage, "process_data")
 
+    pipeline_spec.config.validate_serving_close_options()
+
     # Override stage level params with global params if needed
     for idx in range(len(pipeline_spec.stages)):
         pipeline_spec.stages[idx] = pipeline_spec.stages[idx].override_with_pipeline_params(pipeline_spec.config)
