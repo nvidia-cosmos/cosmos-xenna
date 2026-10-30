@@ -171,6 +171,64 @@ def test_text_mode_leaves_record_extra_empty():
     assert json.loads(markers[0][len("EXTRAKEYS") :]) == []
 
 
+_HOST_SINK_CODE = (
+    "import sys\n"
+    "from loguru import logger\n"
+    "seen = []\n"
+    "sink_id = logger.add(lambda message: seen.append(message.record['message']), level='INFO')\n"
+    "from cosmos_xenna.utils import python_log as L\n"
+    "L.info('ONCE')\n"
+    "L.reload_from_env()\n"
+    "L.info('AGAIN')\n"
+    "logger.remove(sink_id)\n"
+    "print('SEEN=' + ','.join(seen), file=sys.stderr)\n"
+)
+
+
+@pytest.mark.parametrize("autoinit", ["", "false"])
+def test_configuration_keeps_host_sinks(autoinit):
+    """Configuring and reloading replace only this module's sinks and loguru's default one.
+
+    A sink the host added before importing xenna keeps receiving records and can
+    still be removed by its ID. With LOGURU_AUTOINIT disabled, that sink is the
+    one holding loguru's default ID.
+    """
+    env = {"PYTHON_LOG": "info"} | ({"LOGURU_AUTOINIT": autoinit} if autoinit else {})
+    err = _run_code_and_capture_stderr(_HOST_SINK_CODE, env, [_pkg_root()])
+
+    assert "Traceback" not in err, err
+    assert "SEEN=ONCE,AGAIN" in err, err
+    # Neither loguru's default sink nor a reloaded xenna sink writes a second copy.
+    lines = err.splitlines()
+    assert sum(line.endswith(" - ONCE") for line in lines) == 1, err
+    assert sum(line.endswith(" - AGAIN") for line in lines) == 1, err
+
+
+_REDIRECTED_IMPORT_CODE = (
+    "import contextlib, io, sys\n"
+    "stale = io.StringIO()\n"
+    "with contextlib.redirect_stderr(stale):\n"
+    "    from cosmos_xenna.utils import python_log as L\n"
+    "redirected = io.StringIO()\n"
+    "with contextlib.redirect_stderr(redirected):\n"
+    "    L.info('REDIRECTED')\n"
+    "L.info('AFTER')\n"
+    "print('STALE=' + repr(stale.getvalue()), file=sys.stderr)\n"
+    "print('REDIRECTED=' + repr(redirected.getvalue()), file=sys.stderr)\n"
+)
+
+
+def test_text_sink_writes_to_the_current_stderr():
+    """Records follow sys.stderr, not the stream that was current when xenna was imported."""
+    err = _run_code_and_capture_stderr(_REDIRECTED_IMPORT_CODE, {"PYTHON_LOG": "info"}, [_pkg_root()])
+
+    lines = err.splitlines()
+    assert "STALE=''" in lines, err
+    redirected = next(line for line in lines if line.startswith("REDIRECTED="))
+    assert "- REDIRECTED" in redirected, err
+    assert sum(line.endswith(" - AFTER") for line in lines) == 1, err
+
+
 # ---------- Structured (JSON) logging tests ----------
 
 # In json mode python_log installs its own fallback JSON handler on the stdlib root
@@ -209,6 +267,21 @@ def test_json_mode_emits_valid_json_with_identity_fields():
     seqs = [o["seq"] for o in objs]
     assert seqs == sorted(seqs)
     assert len(set(seqs)) == len(seqs)
+
+
+def test_json_fallback_writes_to_the_current_stderr():
+    """The JSON fallback follows sys.stderr, not the stream current when xenna was imported."""
+    err = _run_code_and_capture_stderr(
+        _JSON_ROOT_PREAMBLE + _REDIRECTED_IMPORT_CODE,
+        {"PYTHON_LOG": "info", "PYTHON_LOG_FORMAT": "json"},
+        [_pkg_root()],
+    )
+
+    lines = err.splitlines()
+    assert "STALE=''" in lines, err
+    redirected = next(line for line in lines if line.startswith("REDIRECTED="))
+    assert '"message": "REDIRECTED"' in redirected, err
+    assert [o["message"] for o in _json_lines(err)] == ["AFTER"], err
 
 
 def test_json_mode_off_still_silences():
