@@ -2,6 +2,13 @@
 
 ## Latest
 
+## [0.5.13]
+
+### Fixed
+
+- `cosmos_xenna.utils.python_log` no longer removes loguru sinks the host application added when it configures logging on import or on `reload_from_env()`. It replaces only its own sinks and loguru's default stderr sink, so a sink added before importing xenna, or before a lazy import inside a task, keeps receiving records and can still be removed by its ID.
+- Text-mode records and the JSON-mode fallback handler now write to the current `sys.stderr` instead of the stream that was current when xenna was imported, so later redirection, including pytest's `capfd`, sees them. The text sink's colours now follow only whether stderr is a terminal; loguru no longer forces them in CI, PyCharm, or Jupyter.
+
 ## [0.5.12]
 
 ### Added

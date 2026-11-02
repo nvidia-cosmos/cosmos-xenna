@@ -60,9 +60,9 @@ import logging
 import os
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence, TextIO
 
 from loguru import logger as _logger
 
@@ -88,6 +88,8 @@ class _RuntimeState:
     """Mutable runtime state for this module's initialization."""
 
     configured: bool = False
+    # Loguru handler IDs this module added; reconfiguration removes only these.
+    sink_ids: List[int] = field(default_factory=list)
 
 
 # initialize on import
@@ -108,6 +110,11 @@ _LEVEL_ALIASES = {
 }
 
 _DEFAULT_LEVEL = "INFO"
+
+# Loguru installs its own stderr handler as ID 0 when it is imported, unless
+# LOGURU_AUTOINIT disables it. Handler IDs are never reused.
+_LOGURU_DEFAULT_HANDLER_ID = 0
+_FALSE_ENV_VALUES = {"0", "false", "no", "n", "nok", "off"}  # Loguru's own spellings of false.
 
 # ---------- Structured (JSON) logging ----------
 
@@ -309,6 +316,27 @@ class _FlatJsonFormatter(logging.Formatter):
         return json.dumps(data, default=str)
 
 
+class _CurrentStderr:
+    """Loguru stream sink that writes to whatever ``sys.stderr`` is when a record is emitted.
+
+    Adding ``sys.stderr`` itself binds the stream that is current at configuration
+    time, which for import-time configuration can be a temporary redirect, such as
+    pytest's capture stream during collection. Like ``logging.lastResort``, this
+    sink follows later redirection. It is stateless, so by-value actor pickling (see
+    ``_LoguruToStdlibBridge.__reduce__``) restores it by reference.
+    """
+
+    def write(self, message: str) -> None:
+        sys.stderr.write(message)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+    def isatty(self) -> bool:
+        """Let loguru's colour detection see the stream that is current at configuration."""
+        return sys.stderr.isatty()
+
+
 class _FallbackJsonHandler(logging.StreamHandler):  # type: ignore[type-arg]
     """Last-resort stderr handler installed on the root logger in JSON mode.
 
@@ -326,7 +354,19 @@ class _FallbackJsonHandler(logging.StreamHandler):  # type: ignore[type-arg]
     external handler is present yet would drop the record (e.g. its level is above
     ``record.levelno``), the fallback still writes JSON so records are never
     silently dropped.
+
+    Like ``logging.lastResort``, it writes to the current ``sys.stderr`` rather than
+    the stream at installation, which import-time configuration may see redirected.
     """
+
+    def __init__(self) -> None:
+        # Skip StreamHandler.__init__, which would assign the stream ``stream`` resolves.
+        logging.Handler.__init__(self)
+
+    @property
+    def stream(self) -> TextIO:
+        """Return the current ``sys.stderr``."""
+        return sys.stderr
 
     def emit(self, record: logging.LogRecord) -> None:
         root = logging.getLogger()
@@ -357,7 +397,7 @@ def _install_fallback_root_handler() -> None:
     logger's level to avoid side effects on unrelated stdlib loggers.
     """
     _remove_fallback_root_handler()
-    handler = _FallbackJsonHandler(sys.stderr)
+    handler = _FallbackJsonHandler()
     handler.setFormatter(_FlatJsonFormatter())
     logging.getLogger().addHandler(handler)
 
@@ -467,9 +507,11 @@ def _configure_from_env() -> None:
     Configure Loguru according to the PYTHON_LOG environment variable.
 
     Steps:
-      - Remove any existing sinks to avoid duplicate emission when reloading.
+      - Remove the sinks this module added and loguru's default stderr sink, so
+        reloading does not emit twice. Sinks the host application added are kept.
       - Parse PYTHON_LOG into a default level and pattern rules.
-      - In text mode (default): add the human-readable stderr sink (unchanged).
+      - In text mode (default): add the human-readable sink, which writes to the
+        current sys.stderr.
       - In json mode (PYTHON_LOG_FORMAT=json): bind static per-process identity fields
         (pod/replica/pid/run_id/seq), add the loguru->stdlib bridge sink so Ray's
         structured logging renders the records as JSON, and install a fallback JSON
@@ -479,7 +521,7 @@ def _configure_from_env() -> None:
     """
     env = os.getenv("PYTHON_LOG", "").strip()
     json_mode = _wants_json()
-    _logger.remove()
+    _remove_own_sinks()
     # Drop any fallback handler from a prior configuration so re-config is clean and
     # text mode never leaves a stray JSON handler behind.
     _remove_fallback_root_handler()
@@ -498,7 +540,7 @@ def _configure_from_env() -> None:
         _install_stdlib_level_names()
         # format="{message}" keeps the raw (tag-prefixed) message so the downstream
         # JSON encoder wraps it cleanly instead of a pre-rendered loguru line.
-        _logger.add(
+        sink_id = _logger.add(
             _LoguruToStdlibBridge(),
             level="TRACE",
             filter=filt,
@@ -508,7 +550,27 @@ def _configure_from_env() -> None:
         )
         _install_fallback_root_handler()
     else:
-        _logger.add(sys.stderr, level="TRACE", filter=filt, backtrace=False, diagnose=False)
+        sink_id = _logger.add(_CurrentStderr(), level="TRACE", filter=filt, backtrace=False, diagnose=False)
+    _STATE.sink_ids.append(sink_id)
+
+
+def _remove_own_sinks() -> None:
+    """Remove the sinks this module added, plus loguru's default stderr sink.
+
+    Removing every handler would also drop sinks the host application added, both
+    those installed before its first xenna import and those a task adds before a
+    lazy import, whose later removal by ID would then raise.
+    """
+    owned = list(_STATE.sink_ids)
+    autoinit = os.getenv("LOGURU_AUTOINIT", "").lower() not in _FALSE_ENV_VALUES
+    if autoinit:
+        owned.append(_LOGURU_DEFAULT_HANDLER_ID)
+    for sink_id in owned:
+        try:
+            _logger.remove(sink_id)
+        except ValueError:
+            pass  # Already removed, e.g. by the host application.
+    _STATE.sink_ids.clear()
 
 
 def ensure_configured(force: bool = False) -> None:
