@@ -352,7 +352,9 @@ class Autoscaler:
         from a "donor" stage that stays above the current minimum
         throughput after losing it), keep doing so. This is the
         mechanism that re-balances workers from over-provisioned
-        upstream stages toward a slower downstream bottleneck.
+        upstream stages toward a slower downstream bottleneck. A stage
+        that has not completed a task yet is never a donor: its speed
+        is only a placeholder until it is measured.
       * Phase 4 (HEADROOM) - controlled over-allocation up to
         ``base_min * overallocation_target`` (default 1.5).
 

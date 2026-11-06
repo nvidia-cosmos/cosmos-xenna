@@ -2,11 +2,12 @@
 
 ## Latest
 
-## [0.5.14]
+## [0.6.0]
 
 ### Fixed
 
 - In STREAMING and SERVING mode, a finished stage now triggers an autoscale solve right away, so the remaining stages get its CPUs and GPUs immediately. Previously, freed GPUs could sit idle for up to `autoscale_interval_s` while a downstream GPU stage still had queued work.
+- The streaming autoscaler no longer takes workers from a stage that has not completed a task yet. Until a stage is measured, the solver assumes it processes one batch per second per worker, which made slow stages such as vLLM captioning look over-provisioned, so busy GPU workers were deleted to grow upstream CPU stages and then re-created minutes later.
 
 ## [0.5.13]
 
