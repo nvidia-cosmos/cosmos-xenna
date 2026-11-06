@@ -2,6 +2,12 @@
 
 ## Latest
 
+## [0.5.14]
+
+### Fixed
+
+- In STREAMING and SERVING mode, a finished stage now triggers an autoscale solve right away, so the remaining stages get its CPUs and GPUs immediately. Previously, freed GPUs could sit idle for up to `autoscale_interval_s` while a downstream GPU stage still had queued work.
+
 ## [0.5.13]
 
 ### Fixed
