@@ -318,11 +318,43 @@ impl SpeedAndNumberOfReturnsEstimator {
 // Helper structures and functions
 // --------------------
 
+/// Per-worker processing speed a stage is balanced with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WorkerSpeed {
+    /// Batches per second per worker, estimated from completed tasks.
+    Measured(f64),
+    /// The stage has not completed a task yet. Its placeholder speed can vastly overstate a
+    /// slow stage, so the stage must not donate workers until it is measured.
+    Unmeasured,
+}
+
+impl WorkerSpeed {
+    const UNMEASURED_BATCHES_PER_SECOND: f64 = 1.0;
+
+    fn from_estimate(batches_per_second_per_worker: Option<f64>) -> Self {
+        batches_per_second_per_worker.map_or(Self::Unmeasured, Self::Measured)
+    }
+
+    fn batches_per_second(self) -> f64 {
+        match self {
+            Self::Measured(batches_per_second) => batches_per_second,
+            Self::Unmeasured => Self::UNMEASURED_BATCHES_PER_SECOND,
+        }
+    }
+
+    fn is_measured(self) -> bool {
+        match self {
+            Self::Measured(_) => true,
+            Self::Unmeasured => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StageInternal {
     name: String,
     current_workers: usize,
-    speed_per_worker: Option<f64>,
+    speed: WorkerSpeed,
     stage_batch_size: usize,
     num_returns_per_batch: Option<f64>,
     num_input_samples_per_sample: Option<f64>,
@@ -333,7 +365,7 @@ struct StageInternal {
 
 impl StageInternal {
     fn throughput(&self) -> f64 {
-        let s = self.speed_per_worker.expect("speed_per_worker is None");
+        let s = self.speed.batches_per_second();
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
@@ -341,7 +373,7 @@ impl StageInternal {
     }
 
     fn throughput_if_one_removed(&self) -> f64 {
-        let s = self.speed_per_worker.expect("speed_per_worker is None");
+        let s = self.speed.batches_per_second();
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
@@ -349,7 +381,7 @@ impl StageInternal {
     }
 
     fn throughput_if_one_added(&self) -> f64 {
-        let s = self.speed_per_worker.expect("speed_per_worker is None");
+        let s = self.speed.batches_per_second();
         let k = self
             .num_input_samples_per_sample
             .expect("num_input_samples_per_sample is None");
@@ -817,8 +849,10 @@ fn remove_best_worker_fn(
 /// - `problem`: Static pipeline description, including cluster resources, per-stage shapes
 ///   and optional `requested_num_workers`/`over_provision_factor`.
 /// - `state`: Current dynamic state: existing workers per stage and slots per worker.
-/// - `estimates`: Latest speed and return-count estimates per stage. Missing speeds are
-///   treated as 1.0; missing or non-positive returns-per-batch default to `stage_batch_size`.
+/// - `estimates`: Latest speed and return-count estimates per stage. A missing speed marks the
+///   stage as unmeasured: it is balanced as if it ran 1.0 batches per second per worker, but it
+///   never donates workers. Missing or non-positive returns-per-batch default to
+///   `stage_batch_size`.
 /// - `overallocation_target`: If > 1.0, slower stages can be allocated additional workers as
 ///   long as their throughput with one more worker does not exceed
 ///   `base_min_throughput * overallocation_target`.
@@ -830,10 +864,10 @@ fn remove_best_worker_fn(
 ///    requested count is met. Returns `Err` if resources cannot satisfy a hard manual request.
 /// 2) Ensure minimum one worker: For non-manual stages, allocate a worker if none exists.
 ///    Returns `Err` if the cluster cannot fit even a single required worker shape.
-/// 3) Balance minimum throughput: Among active stages (non-manual with valid speeds), repeatedly
+/// 3) Balance minimum throughput: Among active stages (non-manual and unfinished), repeatedly
 ///    pick the slowest stage and try to allocate one worker. If allocation fails due to
-///    fragmentation, attempt to remove one worker from a donor stage that can afford it (keeps
-///    donor throughput above the current min). Donor selection prefers the stage whose
+///    fragmentation, attempt to remove one worker from a measured donor stage that can afford it
+///    (keeps donor throughput above the current min). Donor selection prefers the stage whose
 ///    throughput remains highest after removal. Stops when no safe donor remains.
 /// 4) Over-allocation: Using the minimum throughput at the start of this phase as a baseline,
 ///    repeatedly try to add workers to stages whose next-worker throughput is still below
@@ -845,7 +879,8 @@ fn remove_best_worker_fn(
 ///   (`find_best_allocation_using_fragmentation_gradient_descent` and
 ///   `find_worker_to_delete_using_fragmentation_gradient_descent`) so that add/delete decisions
 ///   account for heterogeneous resources and packing constraints.
-/// - Never reduces any active, non-manual stage below one worker.
+/// - Never reduces any active, non-manual stage below one worker, and never reduces an
+///   unmeasured one at all.
 /// - Builds `slots_per_worker` for the output upfront from current measurements and last known
 ///   speeds via `calculate_num_slots_per_worker_for_all_stages`.
 /// - Side-effect free: Only the returned `ds::Solution` communicates the desired changes.
@@ -966,7 +1001,7 @@ pub fn run_fragmentation_autoscaler(
         stages.push(StageInternal {
             name: stage_problem.name.clone(),
             current_workers: stage_state.num_workers(),
-            speed_per_worker: stage_estimate.batches_per_second_per_worker,
+            speed: WorkerSpeed::from_estimate(stage_estimate.batches_per_second_per_worker),
             stage_batch_size: stage_problem.stage_batch_size,
             num_returns_per_batch: stage_estimate.num_returns_per_batch,
             num_input_samples_per_sample: None,
@@ -976,12 +1011,9 @@ pub fn run_fragmentation_autoscaler(
         });
     }
 
-    // Guardrails: if measurements are missing or invalid, fall back to conservative
-    // defaults (speed = 1.0) to keep the algorithm progressing instead of stalling.
+    // Guardrail: if returns-per-batch is missing or invalid, fall back to the batch size to
+    // keep the algorithm progressing instead of stalling.
     for stage in &mut stages {
-        if stage.speed_per_worker.is_none() {
-            stage.speed_per_worker = Some(1.0);
-        }
         if stage
             .num_returns_per_batch
             .map(|x| x <= 0.0)
@@ -1145,9 +1177,7 @@ pub fn run_fragmentation_autoscaler(
     // stage whose throughput remains above the current minimum after removal.
     let mut active: Vec<StageInternal> = stages
         .iter()
-        .filter(|s| {
-            s.requested_num_workers.is_none() && s.speed_per_worker.is_some() && !s.is_finished
-        })
+        .filter(|s| s.requested_num_workers.is_none() && !s.is_finished)
         .cloned()
         .collect();
 
@@ -1173,13 +1203,14 @@ pub fn run_fragmentation_autoscaler(
                 continue;
             }
 
-            // Otherwise, look for donor stages that can afford to give up one worker
-            // while staying above the current minimum throughput.
+            // Otherwise, look for measured donor stages that can afford to give up one
+            // worker while staying above the current minimum throughput.
             let mut removable: Vec<usize> = active
                 .iter()
                 .enumerate()
                 .filter(|(i, s)| {
                     *i != min_idx
+                        && s.speed.is_measured()
                         && s.current_workers > 1
                         && s.throughput_if_one_removed() > min_throughput
                 })
@@ -2242,6 +2273,148 @@ mod tests {
         assert_eq!(sol.num_deleted_workers_per_stage(), vec![1]);
     }
 
+    /// Runs one solve on a single node whose CPUs and GPUs are exactly used by the existing
+    /// workers of a CPU `prep` stage measured as slow and a GPU `caption` stage, so growing
+    /// `prep` requires a donor.
+    fn solve_saturated_prep_and_caption(
+        prep_workers: usize,
+        caption_workers: usize,
+        caption_speed: Option<f64>,
+    ) -> ds::Solution {
+        let problem = ds::Problem {
+            cluster_resources: make_cluster(
+                1,
+                prep_workers + caption_workers,
+                caption_workers,
+                false,
+            ),
+            stages: vec![
+                ds::ProblemStage {
+                    name: "prep".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::CpuOnly(rds::CpuOnly {
+                        num_cpus: rds::FixedUtil::ONE,
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+                ds::ProblemStage {
+                    name: "caption".into(),
+                    stage_batch_size: 1,
+                    worker_shape: rds::WorkerShape::WholeNumberedGpu(rds::WholeNumberedGpu {
+                        num_gpus: 1,
+                        num_cpus: rds::FixedUtil::ONE,
+                    }),
+                    requested_num_workers: None,
+                    over_provision_factor: None,
+                },
+            ],
+        };
+        let cpu_worker = |id: &str| ds::ProblemWorkerGroupState {
+            id: id.to_string(),
+            resources: vec![rds::WorkerResources {
+                node: "node0".to_string(),
+                cpus: rds::FixedUtil::ONE,
+                gpus: vec![],
+            }],
+        };
+        let gpu_worker = |id: &str, offset: usize| ds::ProblemWorkerGroupState {
+            id: id.to_string(),
+            resources: vec![rds::WorkerResources {
+                node: "node0".to_string(),
+                cpus: rds::FixedUtil::ONE,
+                gpus: vec![rds::GpuAllocation {
+                    offset,
+                    used_fraction: rds::FixedUtil::ONE,
+                }],
+            }],
+        };
+        let state = ds::ProblemState {
+            stages: vec![
+                ds::ProblemStageState {
+                    stage_name: "prep".to_string(),
+                    worker_groups: (0..prep_workers)
+                        .map(|i| cpu_worker(&format!("prep_{i}")))
+                        .collect(),
+                    slots_per_worker: 2,
+                    is_finished: false,
+                },
+                ds::ProblemStageState {
+                    stage_name: "caption".to_string(),
+                    worker_groups: (0..caption_workers)
+                        .map(|i| gpu_worker(&format!("caption_{i}"), i))
+                        .collect(),
+                    slots_per_worker: 2,
+                    is_finished: false,
+                },
+            ],
+        };
+        let estimates = estimates_from_speeds(&[Some(0.01), caption_speed]);
+        let mut worker_id_factory = WorkerIdFactory::new();
+        super::run_fragmentation_autoscaler(
+            &problem,
+            &state,
+            &estimates,
+            1.5,
+            &mut worker_id_factory,
+        )
+        .expect("a saturated but feasible cluster must produce a solution")
+    }
+
+    #[test]
+    fn test_worker_speed_from_estimate() {
+        let measured = WorkerSpeed::from_estimate(Some(0.25));
+        let unmeasured = WorkerSpeed::from_estimate(None);
+
+        assert_eq!(measured, WorkerSpeed::Measured(0.25));
+        assert!(measured.is_measured());
+        assert!((measured.batches_per_second() - 0.25).abs() < f64::EPSILON);
+        assert_eq!(unmeasured, WorkerSpeed::Unmeasured);
+        assert!(!unmeasured.is_measured());
+        assert!(
+            (unmeasured.batches_per_second() - WorkerSpeed::UNMEASURED_BATCHES_PER_SECOND).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_unmeasured_stage_is_never_a_donor() {
+        let sol = solve_saturated_prep_and_caption(2, 2, None);
+
+        assert_eq!(sol.num_new_workers_per_stage(), vec![0, 0]);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 0]);
+    }
+
+    #[test]
+    fn test_measured_fast_stage_still_donates_to_slowest_stage() {
+        let sol = solve_saturated_prep_and_caption(2, 2, Some(1.0));
+
+        assert_eq!(sol.num_new_workers_per_stage(), vec![1, 0]);
+        assert_eq!(sol.num_deleted_workers_per_stage(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_unmeasured_stage_keeps_workers_across_stage_sizes() {
+        for prep_workers in 1..=4 {
+            for caption_workers in 2..=4 {
+                let unmeasured =
+                    solve_saturated_prep_and_caption(prep_workers, caption_workers, None);
+                let measured =
+                    solve_saturated_prep_and_caption(prep_workers, caption_workers, Some(1.0));
+
+                assert_eq!(
+                    unmeasured.num_deleted_workers_per_stage(),
+                    vec![0, 0],
+                    "unmeasured caption lost workers: prep={prep_workers} caption={caption_workers}"
+                );
+                assert!(
+                    measured.num_deleted_workers_per_stage()[1] > 0,
+                    "measured caption should donate: prep={prep_workers} caption={caption_workers}"
+                );
+            }
+        }
+    }
+
     // Turned off for normal tests because it takes too long when compiled without optimizations.
     // Run with:
     // cargo test --release --features release-tests
@@ -2735,7 +2908,7 @@ mod tests {
     /// Builds a tiny `StageInternal` suitable for driving `add_worker_fn` /
     /// `remove_best_worker_fn` directly in tests.
     ///
-    /// The `speed_per_worker` / `stage_batch_size` / `num_returns_per_batch` /
+    /// The `speed` / `stage_batch_size` / `num_returns_per_batch` /
     /// `num_input_samples_per_sample` fields are unused on the add/remove bookkeeping
     /// path (those are `throughput()`-only inputs), but `StageInternal` requires them.
     fn make_stage_internal(
@@ -2746,7 +2919,7 @@ mod tests {
         StageInternal {
             name: name.to_string(),
             current_workers,
-            speed_per_worker: Some(1.0),
+            speed: WorkerSpeed::Measured(1.0),
             stage_batch_size: 1,
             num_returns_per_batch: Some(1.0),
             num_input_samples_per_sample: Some(1.0),

@@ -414,5 +414,51 @@ def test_autoscaler_chain_with_gpu_tail(monkeypatch: pytest.MonkeyPatch) -> None
         ray.shutdown()
 
 
+@pytest.mark.slow
+def test_finished_stage_gpu_is_reassigned_before_next_autoscale_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A GPU released by a finished stage is reassigned without waiting for the periodic tick.
+
+    Scenario:
+
+    - 2 fake GPUs; two stages with ``gpus=1`` each, so the first tick gives
+      each stage one worker and leaves no free GPU.
+    - ``gpu_head`` is fast and finishes once its backpressured input drains;
+      ``gpu_tail`` is slow and still has queued work at that point.
+    - ``autoscale_interval_s`` is far longer than the test, so no periodic
+      tick follows the initial one.
+
+    ``gpu_tail`` can only reach a second worker if the head's completion
+    triggers an out-of-band solve that hands it the released GPU.
+    """
+    _install_fake_gpus(monkeypatch, count=2)
+    _init_ray_for_autoscale_test(monkeypatch, num_cpus=16, num_gpus=2)
+    try:
+        tracker = _WorkerTracker.options(name="stage_done_tracker").remote()  # type: ignore[attr-defined]
+        try:
+            spec = pipelines_v1.PipelineSpec(
+                input_data=list(range(24)),
+                stages=[
+                    _FixedCpuStage("gpu_head", cpus=1, gpus=1, process_dur=0.05, tracker_name="stage_done_tracker"),
+                    _FixedCpuStage("gpu_tail", cpus=1, gpus=1, process_dur=1.0, tracker_name="stage_done_tracker"),
+                ],
+                config=pipelines_v1.PipelineConfig(
+                    logging_interval_s=2,
+                    mode_specific=pipelines_v1.StreamingSpecificSpec(
+                        autoscale_interval_s=600,
+                        autoscaler_verbosity_level=pipelines_v1.VerbosityLevel.DEBUG,
+                    ),
+                ),
+            )
+            pipelines_v1.run_pipeline(spec)
+            counts: dict[str, int] = ray.get(tracker.counts.remote())  # type: ignore[attr-defined]
+            assert counts.get("gpu_tail", 0) >= 2, (
+                f"GPU released by finished gpu_head was not reassigned to gpu_tail: counts={counts}"
+            )
+        finally:
+            ray.kill(cast(ActorHandle, tracker))
+    finally:
+        ray.shutdown()
+
+
 if __name__ == "__main__":
     test_autoscaling()

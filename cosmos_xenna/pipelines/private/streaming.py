@@ -352,7 +352,9 @@ class Autoscaler:
         from a "donor" stage that stays above the current minimum
         throughput after losing it), keep doing so. This is the
         mechanism that re-balances workers from over-provisioned
-        upstream stages toward a slower downstream bottleneck.
+        upstream stages toward a slower downstream bottleneck. A stage
+        that has not completed a task yet is never a donor: its speed
+        is only a placeholder until it is measured.
       * Phase 4 (HEADROOM) - controlled over-allocation up to
         ``base_min * overallocation_target`` (default 1.5).
 
@@ -521,7 +523,7 @@ class Autoscaler:
 
     def start_autoscale_calculation(
         self, pools: list[actor_pool.ActorPool], stages_is_dones: list[bool], upstream_queue_lens: list[int]
-    ) -> None:
+    ) -> bool:
         """Starts a new autoscaling calculation in a background thread.
 
         If a calculation is already in progress, this method does nothing.
@@ -531,16 +533,21 @@ class Autoscaler:
             stages_is_dones: A list of booleans indicating if each stage is done.
             upstream_queue_lens: Per-stage upstream queue lengths, used by
                 backlog-aware schedulers as the current per-stage queue depth.
+
+        Returns:
+            ``True`` if a calculation was submitted, ``False`` if one was
+            already in progress or pending application.
         """
         if self._autoscale_future is not None:
             if self._verbosity_level > verbosity.VerbosityLevel.INFO:
                 logger.info("Autoscale calculation already in progress or pending application. Skipping.")
-            return
+            return False
 
         self._autoscale_start_time = time.time()
         self._offer_runtime_signals(pools, upstream_queue_lens)
         problem_state = self._make_problem_state(pools, stages_is_dones)
         self._autoscale_future = self._executor.submit(self._algorithm.autoscale, time.time(), problem_state)
+        return True
 
     def apply_autoscale_result_if_ready(
         self,
@@ -1084,6 +1091,11 @@ def run_pipeline(
     autoscale_rate_limiter = timing.RateLimitChecker(
         1.0 / _effective_autoscale_interval_s(pipeline_spec.config.mode_specific)
     )
+    # A finished stage releases its resources immediately, but the solver would not
+    # reassign them until the next periodic tick (up to ``autoscale_interval_s`` later).
+    # Stays set until a solve is actually submitted, since a pending solve computed
+    # against the pre-release state causes ``start_autoscale_calculation`` to skip.
+    autoscale_requested_by_stage_done = False
     rate_limiter = timing.RateLimiter(_MAX_MAIN_LOOP_RATE_HZ)
 
     logger.debug("Starting main loop")
@@ -1142,7 +1154,7 @@ def run_pipeline(
             # Handle scaling the actor pools. ``can_call()`` advances the
             # rate-limiter clock as a side effect, so evaluate it once per loop
             # and reuse the result for whichever submission path runs below.
-            can_submit_autoscale = autoscale_rate_limiter.can_call()
+            can_submit_autoscale = autoscale_rate_limiter.can_call() or autoscale_requested_by_stage_done
 
             # The fragmentation solver (default) ignores runtime signals, so it
             # submits here, on the same early loop phase as before, using the
@@ -1153,7 +1165,8 @@ def run_pipeline(
             # The deferred path's submission cost is reflected in the add-tasks
             # timing phase rather than here.
             if can_submit_autoscale and not autoscaler.uses_runtime_signals:
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones, apply_queue_lens)
+                if autoscaler.start_autoscale_calculation(pools, stage_is_dones, apply_queue_lens):
+                    autoscale_requested_by_stage_done = False
             new_stats.auto_scaling_submit_end = time.time()
 
             # Grab stats from the pools
@@ -1301,7 +1314,8 @@ def run_pipeline(
             # path above.
             if can_submit_autoscale and autoscaler.uses_runtime_signals:
                 submit_queue_lens = _upstream_queue_lens(input_queue, queues, len(pools))
-                autoscaler.start_autoscale_calculation(pools, stage_is_dones, submit_queue_lens)
+                if autoscaler.start_autoscale_calculation(pools, stage_is_dones, submit_queue_lens):
+                    autoscale_requested_by_stage_done = False
 
             new_stats.add_tasks_end = time.time()
             # Determine if any stages are finished. If they are finished, mark them as done and stop the actor pool.
@@ -1321,6 +1335,7 @@ def run_pipeline(
                     stage_is_dones[idx] = True
                     logger.info(f"Stopping stages {idx}")
                     stop_pool(idx)
+                    autoscale_requested_by_stage_done = True
                 else:
                     break
 
