@@ -668,7 +668,8 @@ def _respect_cuda_visible_devices(gpus: list[GpuInfo]) -> list[GpuInfo]:
     return filter_gpus_by_cuda_visible_devices(gpus, cuda_visible_devices)
 
 
-@ray.remote
+# num_cpus=0 so the probe also runs on nodes with no free (or no) CPUs.
+@ray.remote(num_cpus=0)
 def _get_node_info_from_current_node() -> ResourceInfoFromNode:
     """Get the resources for a node."""
     node_id = ray.get_runtime_context().get_node_id()
@@ -728,6 +729,10 @@ def make_cluster_resources_for_ray_cluster(
     We will use this node info to collect the number of CPUS and GPUs for each node. We also rely on a
     user-provided "resources_per_gpu" parameter. This parameter tells use how many NVDECs/NVENCs are on each
     GPU. Ideally, which is something Ray does not give us.
+
+    Ray leaves a resource out of "Resources" when the node has none of it. A node with no CPUs and no GPUs, such as a
+    head node started with `--num-cpus=0` so that no work runs on it (as on Anyscale), is skipped. A missing CPU entry
+    on any other node counts as 0 CPUs instead of the CPU count of the machine.
     """
     if nodes is None:
         nodes = ray.nodes()
@@ -742,11 +747,15 @@ def make_cluster_resources_for_ray_cluster(
         if not alive:
             logger.warning(f"Node {node_id} on {node_name} is not alive?? Skipping it.")
             continue
+        ray_resources = node.get("Resources", {})
+        if not ray_resources.get("CPU") and not ray_resources.get("GPU"):
+            logger.info(f"Node {node_id} on {node_name} has no CPUs or GPUs in Ray. Not scheduling work on it.")
+            continue
         alive_nodes.append(node_id)
         reported_resources[node_id] = ResourceInfoFromRay(
             node_id=node_id,
-            cpus=node.get("Resources", {}).get("CPU", None),
-            gpus=node.get("Resources", {}).get("GPU", None),
+            cpus=ray_resources.get("CPU", 0.0),
+            gpus=ray_resources.get("GPU", None),
         )
 
     futures = [
@@ -806,7 +815,8 @@ def _get_gpus(info_from_ray: ResourceInfoFromRay, info_from_node: ResourceInfoFr
 
 
 def _get_cpu_count(info_from_ray: ResourceInfoFromRay, info_from_node: ResourceInfoFromNode) -> int:
-    # use the Ray-reported CPU count if available, otherwise use the number of CPUs from the node info
-    if info_from_ray.cpus is not None and isinstance(info_from_ray.cpus, float) and info_from_ray.cpus > 0:
+    # use the Ray-reported CPU count if available, otherwise use the number of CPUs from the node info.
+    # A Ray-reported 0 is kept: the node was started with no CPUs, so stages must not be placed on it.
+    if info_from_ray.cpus is not None:
         return int(info_from_ray.cpus)
     return info_from_node.cpus
