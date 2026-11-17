@@ -2,6 +2,10 @@
 
 ## Latest
 
+### Fixed
+
+- Pipelines now run on Ray clusters whose head node has no CPUs, such as Anyscale, where the head node is started with `--num-cpus=0` so that no work runs on it. Previously, `run_pipeline` failed at startup with `TaskUnschedulableError` because the per-node probe and the per-node monitor actor each asked for a CPU on every node, including the head node. Nodes with neither CPUs nor GPUs in Ray are now skipped, the probe needs no CPU, the monitor actor is started only on nodes with a CPU, and a node with no CPUs in Ray is counted with 0 CPUs instead of the CPU count of the machine.
+
 ## [0.6.0]
 
 ### Fixed

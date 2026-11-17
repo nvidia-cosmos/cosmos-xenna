@@ -15,9 +15,11 @@
 
 
 import uuid
+from unittest import mock
 
 import pytest
 
+from cosmos_xenna.pipelines.private import resources
 from cosmos_xenna.pipelines.private.resources import parse_visible_cuda_devices
 
 
@@ -82,3 +84,75 @@ def test_parse_multiple_mixed_tokens():
 def test_parse_invalid_token_raises():
     with pytest.raises(ValueError):
         parse_visible_cuda_devices("GPU-")
+
+
+# Ray checks that node IDs are 28-byte hex strings.
+_HEAD_ID = "aa" * 28
+_WORKER_ID = "bb" * 28
+
+
+def _ray_node(node_id: str, ray_resources: dict[str, float]) -> dict:
+    """A ``ray.nodes()`` entry. Like Ray, leave out resources the node has none of."""
+    return {"NodeID": node_id, "Alive": True, "NodeManagerHostname": node_id, "Resources": ray_resources}
+
+
+def _make_cluster_resources(
+    nodes: list[dict], machine_cpus: int, machine_gpus: int
+) -> tuple[resources.ClusterResources, list[str]]:
+    """Run ``make_cluster_resources_for_ray_cluster`` without Ray.
+
+    The per-node probe is replaced by one that reports ``machine_cpus`` CPUs and ``machine_gpus`` GPUs for every
+    node, as ``os.cpu_count()`` and NVML would on a real machine. Returns the cluster and the probed node IDs.
+    """
+    probed: list[str] = []
+
+    def options(scheduling_strategy, **kwargs):
+        probed.append(scheduling_strategy.node_id)
+        return mock.MagicMock(remote=mock.MagicMock(return_value=scheduling_strategy.node_id))
+
+    def fake_get(node_ids):
+        gpus = [resources.GpuInfo(index=i, name="gpu", uuid_=uuid.uuid4()) for i in range(machine_gpus)]
+        return [resources.ResourceInfoFromNode(node_id=x, cpus=machine_cpus, gpus=gpus) for x in node_ids]
+
+    probe = mock.MagicMock(options=options)
+    with (
+        mock.patch.object(resources, "_get_node_info_from_current_node", probe),
+        mock.patch.object(resources.ray, "get", fake_get),
+    ):
+        cluster = resources.make_cluster_resources_for_ray_cluster(nodes=nodes)
+    return cluster, probed
+
+
+def test_node_without_cpus_or_gpus_in_ray_is_skipped():
+    # A head node started with `ray start --head --num-cpus=0 --num-gpus=0`, as on Anyscale.
+    head = _ray_node(_HEAD_ID, {"memory": 1.0, "node:__internal_head__": 1.0})
+    worker = _ray_node(_WORKER_ID, {"CPU": 4.0, "GPU": 1.0, "memory": 1.0})
+
+    cluster, probed = _make_cluster_resources([head, worker], machine_cpus=64, machine_gpus=1)
+
+    assert probed == [_WORKER_ID]
+    assert list(cluster.nodes) == [_WORKER_ID]
+    assert cluster.nodes[_WORKER_ID].total_cpus == 4
+    assert len(cluster.nodes[_WORKER_ID].gpus) == 1
+
+
+def test_node_without_cpus_in_ray_has_no_cpus():
+    # A missing CPU entry means the node has no CPUs, not "use the CPU count of the machine".
+    node = _ray_node(_WORKER_ID, {"GPU": 2.0, "memory": 1.0})
+
+    cluster, _ = _make_cluster_resources([node], machine_cpus=64, machine_gpus=2)
+
+    assert cluster.nodes[_WORKER_ID].total_cpus == 0
+    assert len(cluster.nodes[_WORKER_ID].gpus) == 2
+
+
+def test_cpu_count_keeps_zero_reported_by_ray():
+    from_ray = resources.ResourceInfoFromRay(node_id="n", cpus=0.0, gpus=None)
+    from_node = resources.ResourceInfoFromNode(node_id="n", cpus=64, gpus=[])
+    assert resources._get_cpu_count(from_ray, from_node) == 0
+
+
+def test_cpu_count_falls_back_to_node_when_ray_does_not_report():
+    from_ray = resources.ResourceInfoFromRay(node_id="n", cpus=None, gpus=None)
+    from_node = resources.ResourceInfoFromNode(node_id="n", cpus=64, gpus=[])
+    assert resources._get_cpu_count(from_ray, from_node) == 64

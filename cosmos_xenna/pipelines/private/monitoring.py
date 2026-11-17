@@ -242,7 +242,11 @@ class RayResourceMonitor:
     """A class which starts up starts up a NodeResourceMonitor on each node and collect stats from them."""
 
     def __init__(self) -> None:
-        self._node_ids = [x["NodeID"] for x in ray.nodes() if x.get("Alive", True)]
+        # Each monitor needs one CPU, so skip nodes without one in Ray, such as a head node started with
+        # `--num-cpus=0`. A monitor there would never start and `update()` would wait for it forever.
+        self._node_ids = [
+            x["NodeID"] for x in ray.nodes() if x.get("Alive", True) and x.get("Resources", {}).get("CPU", 0.0) >= 1.0
+        ]
         self._monitors = [
             NodeResourceMonitor.options(  # type: ignore
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
